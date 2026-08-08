@@ -1,0 +1,24 @@
+# Security Policy
+
+Investor App is experimental, security-sensitive software for private campaign content and participant interest records. Report vulnerabilities privately to the maintainer. Do not file public issues containing exploits, private keys, client secrets, refresh tokens, access tokens, authorization codes, cookies, campaign private content, exports, or PII.
+
+## Public Repository Secret Safety
+
+The public repository must contain no secrets or private campaign data. Never commit runtime `.env` files, hosted secret values, active deployment credentials, identity-provider secrets, storage credentials, generated session secrets, private package content, participant records, exports, or production backups.
+
+Checked-in example configuration contains only inert placeholders. Keep real values in ignored local files or hosted secret/configuration stores.
+
+If exposure is suspected, do not echo or paste the value. Escalate privately with only its category, path, and commit. Rotation, revocation, or history rewrite requires explicit maintainer approval.
+
+## Application Security Boundary
+
+- Production storage uses the configured AittaDB-compatible adapter only.
+- Owner setup must prevent first-user takeover and bind authorization to a stable backend identity.
+- Every server route must enforce authorization independently.
+- Public aggregate output must never disclose participant counts, identities, notes, private fields, or database structure unless explicitly configured and reviewed by the specification.
+- Private package, profile, indication, founder, owner, and export responses should use non-cacheable headers.
+- No visitor analytics or non-essential cookies in version one.
+
+## Publication Blockers
+
+Production publication is blocked until the configured backend supports the required authorization, consistency, listing, pagination, quota, and non-disclosure behavior and the production adapter passes contract and end-to-end tests.
