@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-020:** Bind the initial scaffold to one ChatGPT Sites project. DoD: the Sites project is created exactly once, its returned project identifier is persisted unchanged alongside null logical storage bindings, site metadata identifies Investor App, and no runtime secret, access-policy, or custom-domain change is bundled into the binding.
+
+  Acceptance evidence: one owner-only Sites project was created with the Investor App title and description, and the returned opaque identifier is stored unchanged in `.openai/hosting.json` with `d1` and `r2` still null. Runtime environment, access policy, and custom domains were left unchanged. `npm run validate` passes for the bound source.
+
 - **TASK-004:** Define shared domain foundation types. DoD: money minor-unit, timestamps, stable identifiers, actor subjects, country codes, validation-result, and non-disclosing domain-error types are documented and typed in framework-independent modules; tests cover integer money handling, amount bounds, country normalization hooks, and generic error mapping.
 
   Acceptance evidence: `domain/foundation.ts` defines the framework-independent branded values, constructors, validation result, actor shape, and fixed-message error mapping. Focused tests reject fractional, unsafe, negative, misconfigured, and out-of-range minor-unit amounts; exercise default and injected country normalization; validate timestamp, identifier, and subject boundaries; and prove authorization, missing-record, unknown-error, and private-cause responses do not disclose internal details. `npm run validate` passes with strict type checking included.
