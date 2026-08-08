@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-004:** Define shared domain foundation types. DoD: money minor-unit, timestamps, stable identifiers, actor subjects, country codes, validation-result, and non-disclosing domain-error types are documented and typed in framework-independent modules; tests cover integer money handling, amount bounds, country normalization hooks, and generic error mapping.
+
+  Acceptance evidence: `domain/foundation.ts` defines the framework-independent branded values, constructors, validation result, actor shape, and fixed-message error mapping. Focused tests reject fractional, unsafe, negative, misconfigured, and out-of-range minor-unit amounts; exercise default and injected country normalization; validate timestamp, identifier, and subject boundaries; and prove authorization, missing-record, unknown-error, and private-cause responses do not disclose internal details. `npm run validate` passes with strict type checking included.
+
 - **TASK-001:** Establish the initial Sites-compatible repository scaffold. DoD: app package metadata, neutral first screen, runtime environment template, FSL-1.1-MIT license, README, AGENTS, PLAN, ROADMAP, BACKLOG, CHANGELOG, CONTRIBUTING, SECURITY, architecture, style guidance, AGENTS size guard, rendered-output test, lint, test, and production build all exist and pass local validation.
 
   Acceptance evidence: `npm run validate` passed locally. The run included `npm run agents:check` with `AGENTS.md` at 7,073 bytes out of the 32,000 byte limit, `npm run lint`, `npm run build`, and `node --test tests/*.test.mjs` with one passing rendered-output test. A private-content scan over public repository files found no matches for the sensitive reference-campaign terms identified during review. Residual uncertainty: this is a local scaffold only; no production deployment, AittaDB adapter, owner setup flow, or campaign publication was attempted.

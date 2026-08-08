@@ -6,7 +6,7 @@ The approved baseline is [docs/AittaDB-Investor-App-Specification.md](docs/Aitta
 
 ## Status
 
-Experimental initial scaffold. This repository is not ready for production campaign publication.
+Experimental initial scaffold with framework-independent domain foundation contracts. This repository is not ready for production campaign publication.
 
 The public source must not hard-code any reference campaign, person, country, currency, funding target, legal entity, country rule, private package content, or private campaign decision.
 
@@ -45,6 +45,7 @@ Useful checks:
 ```sh
 npm run agents:check
 npm run lint
+npm run typecheck
 npm test
 npm run build
 npm run validate

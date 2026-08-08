@@ -28,6 +28,12 @@ The specification expects these narrow boundaries:
 
 Domain logic should depend on these interfaces instead of framework request objects or AittaDB HTTP details.
 
+### Shared foundation
+
+`domain/foundation.ts` is the framework-independent boundary for values shared by later contracts. It provides branded integer minor units, canonical UTC timestamps, bounded stable identifiers, case-sensitive identity subjects, normalized two-letter country codes, structured validation results, and fixed-message public error mapping.
+
+Money constructors reject floating-point, unsafe-integer, negative, and configured out-of-range values. Country parsing uppercases and trims by default and accepts an injectable normalization hook; campaign eligibility remains a separate campaign rule. Authorization failures for inaccessible records map to the same public response as missing records, and unknown failures map to a generic response without serializing causes.
+
 ## Storage plan
 
 Development can use a deterministic in-memory/test adapter. Production must use an AittaDB-compatible adapter and pass the same contract tests.
