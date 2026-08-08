@@ -59,6 +59,8 @@ Before repository-affecting implementation, add or amend an unchecked root `PLAN
 
 Split broad work into the smallest coherent increments. Do not combine independent resources, methods, controls, migrations, or live proof matrices in one task. Broad requests first create a decomposition task; add dependency-ordered replacements, then retire the umbrella unchanged in `CHANGELOG.md` with its mapping.
 
+If a proposed task names several independent repositories, routes, use cases, or security controls, split it. A good PLAN item can be reviewed by asking one yes/no question: did this one primitive or bounded proof meet its stated contract? Prefer ten small tasks with crisp DoDs over one umbrella that hides partial progress.
+
 After a task's DoD passes, remove it from `PLAN.md` and append its unchanged description plus evidence to `CHANGELOG.md`. Do not keep completed PLAN checkboxes.
 
 `ROADMAP.md` is a flat stable `ROADMAP-NNN` future-direction list. `BACKLOG.md` is a flat stable `BACKLOG-NNN` unscheduled-idea list. Neither implies availability or authority to implement. Move work into `PLAN.md` before implementation.
