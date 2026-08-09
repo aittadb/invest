@@ -24,6 +24,7 @@ export type OwnerHomeDocument = Readonly<{
 
 export type OwnerHomeCapabilities = Readonly<{
   founderApplicationReview?: boolean;
+  aggregateReconciliation?: boolean;
 }>;
 
 export function createOwnerHomeDocument(
@@ -56,6 +57,12 @@ export function createOwnerHomeDocument(
         ? [{
           rel: ["founder-applications"],
           href: absolute("/owner/founder-applications"),
+        }]
+        : []),
+      ...(capabilities.aggregateReconciliation
+        ? [{
+          rel: ["aggregate-reconciliation"],
+          href: absolute("/owner/aggregate-reconciliation"),
         }]
         : []),
     ],

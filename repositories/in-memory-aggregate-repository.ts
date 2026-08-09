@@ -4,10 +4,16 @@ import {
 } from "../domain/amount-aggregate-configuration.ts";
 import {
   DomainError,
+  parseActorSubject,
   parseMinorUnits,
   parseStableId,
+  parseTimestamp,
+  type ActorSubject,
   type MinorUnits,
+  type StableId,
+  type Timestamp,
 } from "../domain/foundation.ts";
+import type { AuditEvent } from "../domain/audit-notification.ts";
 import {
   calculateInvestmentAggregateSummary,
   confirmInvestmentAggregateCorrection,
@@ -35,6 +41,10 @@ import {
   type StorageOperationId,
   type StorageRecord,
 } from "../domain/storage-adapter.ts";
+import {
+  prepareAuditAppend,
+  verifyPreparedAuditAppend,
+} from "./in-memory-audit-notification-repositories.ts";
 
 const AGGREGATE_SCHEMA_VERSION = 1;
 const AGGREGATE_STATES = storageCollection("investment-aggregate-states");
@@ -85,6 +95,11 @@ const CONTRIBUTION_RESULT_KEYS = new Set([
   "calculated",
 ]);
 const CORRECTION_RESULT_KEYS = new Set(["preview", "stored"]);
+const AUDITED_CORRECTION_RESULT_KEYS = new Set([
+  "preview",
+  "stored",
+  "auditEvent",
+]);
 const PREVIEW_KEYS = new Set([
   "status",
   "stored",
@@ -121,6 +136,20 @@ export type ApplyAggregateCorrectionResult = Readonly<{
   replayed: boolean;
 }>;
 
+export type ApplyAuditedAggregateCorrectionRequest = Readonly<{
+  operationId: unknown;
+  confirmation: unknown;
+  ownerSubject: unknown;
+  occurredAt: unknown;
+}>;
+
+export type ApplyAuditedAggregateCorrectionResult = Readonly<{
+  preview: InvestmentAggregateReconciliationPreview;
+  stored: StoredInvestmentAggregateSnapshot;
+  auditEvent: AuditEvent;
+  replayed: boolean;
+}>;
+
 /** Storage-backed aggregate contract shared by development and production adapters. */
 export interface InvestmentAggregateRepository {
   readStored(): Promise<StoredInvestmentAggregateSnapshot>;
@@ -138,16 +167,26 @@ export interface InvestmentAggregateRepository {
   ): Promise<SanitizedPublicInvestmentAggregate | null>;
 }
 
+/** Correction capability that commits the aggregate, receipt, and audit atomically. */
+export interface AtomicInvestmentAggregateCorrectionRepository {
+  readonly correctionConsistency: "atomic-aggregate-audit";
+  previewReconciliation(): Promise<InvestmentAggregateReconciliationPreview>;
+  applyConfirmedCorrectionWithAudit(
+    request: ApplyAuditedAggregateCorrectionRequest,
+  ): Promise<ApplyAuditedAggregateCorrectionResult>;
+}
+
 type StoredAggregateRecord = Readonly<{
   record: StorageRecord;
   snapshot: StoredInvestmentAggregateSnapshot;
 }>;
 
-type OperationKind = "contribution" | "correction";
+type OperationKind = "contribution" | "correction" | "audited-correction";
 
 type StoredOperationResult =
   | Omit<ApplyAggregateContributionResult, "replayed">
-  | Omit<ApplyAggregateCorrectionResult, "replayed">;
+  | Omit<ApplyAggregateCorrectionResult, "replayed">
+  | Omit<ApplyAuditedAggregateCorrectionResult, "replayed">;
 
 /**
  * Deterministic development repository composed entirely through StorageAdapter.
@@ -155,9 +194,12 @@ type StoredOperationResult =
  * aggregate, contribution, reconciliation, and retry records.
  */
 export class DevelopmentInMemoryAggregateRepository
-  implements InvestmentAggregateRepository
+  implements
+    InvestmentAggregateRepository,
+    AtomicInvestmentAggregateCorrectionRepository
 {
   readonly storageKind = "development-in-memory" as const;
+  readonly correctionConsistency = "atomic-aggregate-audit" as const;
 
   readonly #storage: StorageAdapter;
   readonly #currency: CurrencyCode;
@@ -404,6 +446,113 @@ export class DevelopmentInMemoryAggregateRepository
     return correctionResult(decodedOperation, transaction.replayed);
   }
 
+  async applyConfirmedCorrectionWithAudit(
+    request: ApplyAuditedAggregateCorrectionRequest,
+  ): Promise<ApplyAuditedAggregateCorrectionResult> {
+    const operationId = requiredOperationId(request.operationId);
+    const ownerSubject = requiredOwnerSubject(request.ownerSubject);
+    const occurredAt = requiredOccurredAt(request.occurredAt);
+    const fingerprint = await operationFingerprint({
+      kind: "audited-correction",
+      operationId,
+      confirmation: requiredJsonValue(request.confirmation),
+      ownerSubject,
+    });
+    const replay = await this.#readOperation(
+      operationId,
+      "audited-correction",
+      fingerprint,
+    );
+    if (replay !== null) {
+      const result = auditedCorrectionResult(replay, true);
+      await verifyAggregateReconciledAuditEvent(
+        result.auditEvent,
+        operationId,
+        ownerSubject,
+      );
+      const prepared = prepareAuditAppend({
+        type: "append-audit-event",
+        event: result.auditEvent,
+      });
+      verifyPreparedAuditAppend(
+        prepared,
+        await this.#storage.read(prepared.mutation.key),
+      );
+      return result;
+    }
+
+    const aggregate = await this.#readStoredRecord();
+    const stored = aggregate?.snapshot ?? zeroStoredSnapshot(this.#currency);
+    const calculated = await this.calculate();
+    const reconciliation = preview(stored, calculated);
+    const confirmed = confirmCorrection(reconciliation, request.confirmation);
+    const auditEvent = await createAggregateReconciledAuditEvent(
+      operationId,
+      ownerSubject,
+      occurredAt,
+    );
+    const preparedAudit = prepareAuditAppend({
+      type: "append-audit-event",
+      event: auditEvent,
+    });
+    if (preparedAudit.operationId !== operationId) unavailable();
+
+    const persisted = Object.freeze({
+      preview: reconciliation,
+      stored: confirmed.replacement,
+      auditEvent,
+    });
+    const transaction = await this.#storage.transact({
+      operationId,
+      mutations: [
+        {
+          type: "put",
+          key: CURRENT_AGGREGATE_KEY,
+          expectedRevision: aggregate?.record.revision ?? null,
+          value: aggregateDocument(confirmed.replacement),
+        },
+        {
+          type: "put",
+          key: operationStorageKey(operationId),
+          expectedRevision: null,
+          value: operationDocument(
+            "audited-correction",
+            fingerprint,
+            persisted,
+          ),
+        },
+        preparedAudit.mutation,
+      ],
+    });
+
+    const aggregateRecord = transaction.records[0];
+    const operationRecord = transaction.records[1];
+    if (!aggregateRecord || !operationRecord) unavailable();
+    const decodedAggregate = decodeAggregateRecord(
+      aggregateRecord,
+      this.#currency,
+    );
+    if (!sameSnapshot(decodedAggregate, confirmed.replacement)) unavailable();
+    const decodedOperation = decodeOperationRecord(
+      operationRecord,
+      operationStorageKey(operationId),
+      "audited-correction",
+      fingerprint,
+      this.#currency,
+    );
+    verifyPreparedAuditAppend(preparedAudit, transaction.records[2]);
+    const result = auditedCorrectionResult(
+      decodedOperation,
+      transaction.replayed,
+    );
+    await verifyAggregateReconciledAuditEvent(
+      result.auditEvent,
+      operationId,
+      ownerSubject,
+    );
+    return result;
+  }
+
   async readPublicAggregate(
     configuration: AmountAggregateConfiguration,
     publicTargetAmount: unknown | null,
@@ -599,8 +748,12 @@ function operationDocument(
       ? contributionResultDocument(
           result as Omit<ApplyAggregateContributionResult, "replayed">,
         )
-      : correctionResultDocument(
+      : operationKind === "correction"
+      ? correctionResultDocument(
           result as Omit<ApplyAggregateCorrectionResult, "replayed">,
+        )
+      : auditedCorrectionResultDocument(
+          result as Omit<ApplyAuditedAggregateCorrectionResult, "replayed">,
         ),
   });
 }
@@ -621,6 +774,16 @@ function correctionResultDocument(
   return {
     preview: previewDocument(result.preview),
     stored: snapshotDocument(result.stored),
+  };
+}
+
+function auditedCorrectionResultDocument(
+  result: Omit<ApplyAuditedAggregateCorrectionResult, "replayed">,
+): StorageDocument {
+  return {
+    preview: previewDocument(result.preview),
+    stored: snapshotDocument(result.stored),
+    auditEvent: requiredJsonValue(result.auditEvent) as StorageDocument,
   };
 }
 
@@ -736,7 +899,8 @@ function decodeOperationRecord(
     source.kind !== "investment-aggregate-operation" ||
     source.schemaVersion !== AGGREGATE_SCHEMA_VERSION ||
     (source.operationKind !== "contribution" &&
-      source.operationKind !== "correction") ||
+      source.operationKind !== "correction" &&
+      source.operationKind !== "audited-correction") ||
     typeof source.operationFingerprint !== "string" ||
     !/^sha256:[0-9a-f]{64}$/.test(source.operationFingerprint)
   ) {
@@ -750,7 +914,9 @@ function decodeOperationRecord(
   }
   return expectedKind === "contribution"
     ? decodeContributionResult(source.result, currency)
-    : decodeCorrectionResult(source.result, currency);
+    : expectedKind === "correction"
+    ? decodeCorrectionResult(source.result, currency)
+    : decodeAuditedCorrectionResult(source.result, currency);
 }
 
 function decodeContributionResult(
@@ -807,6 +973,29 @@ function decodeCorrectionResult(
     unavailable();
   }
   return deepFreeze({ preview: reconciliation, stored });
+}
+
+function decodeAuditedCorrectionResult(
+  value: unknown,
+  currency: CurrencyCode,
+): Omit<ApplyAuditedAggregateCorrectionResult, "replayed"> {
+  const source = objectRecord(value);
+  if (
+    source === null ||
+    !hasExactKeys(source, AUDITED_CORRECTION_RESULT_KEYS)
+  ) {
+    unavailable();
+  }
+  const correction = decodeCorrectionResult({
+    preview: source.preview,
+    stored: source.stored,
+  }, currency);
+  const prepared = prepareAuditAppend({
+    type: "append-audit-event",
+    event: source.auditEvent,
+  });
+  assertAggregateReconciledAuditEvent(prepared.event);
+  return deepFreeze({ ...correction, auditEvent: prepared.event });
 }
 
 function decodePreview(
@@ -970,7 +1159,15 @@ function correctionResult(
   value: StoredOperationResult,
   replayed: boolean,
 ): ApplyAggregateCorrectionResult {
-  if (!("preview" in value)) unavailable();
+  if (!("preview" in value) || "auditEvent" in value) unavailable();
+  return deepFreeze({ ...value, replayed });
+}
+
+function auditedCorrectionResult(
+  value: StoredOperationResult,
+  replayed: boolean,
+): ApplyAuditedAggregateCorrectionResult {
+  if (!("preview" in value) || !("auditEvent" in value)) unavailable();
   return deepFreeze({ ...value, replayed });
 }
 
@@ -1016,6 +1213,69 @@ async function operationFingerprint(value: StorageDocument): Promise<string> {
   return `sha256:${hexadecimal}`;
 }
 
+async function createAggregateReconciledAuditEvent(
+  operationId: StorageOperationId,
+  ownerSubject: ActorSubject,
+  occurredAt: Timestamp,
+): Promise<AuditEvent> {
+  const event = deepFreeze({
+    id: await aggregateAuditEventId(operationId),
+    operationId: requiredStableId<"audit-operation">(operationId),
+    occurredAt,
+    actor: { type: "owner" as const, subject: ownerSubject },
+    detail: {
+      kind: "resource-transition" as const,
+      resource: {
+        type: "aggregate" as const,
+        id: requiredStableId<"audit-resource">("aggregate:investment-interest"),
+      },
+      transition: "reconciled" as const,
+    },
+  });
+  await verifyAggregateReconciledAuditEvent(event, operationId, ownerSubject);
+  return event;
+}
+
+async function verifyAggregateReconciledAuditEvent(
+  event: AuditEvent,
+  operationId: StorageOperationId,
+  ownerSubject: ActorSubject,
+): Promise<void> {
+  assertAggregateReconciledAuditEvent(event);
+  if (
+    event.id !== await aggregateAuditEventId(operationId) ||
+    (event.operationId as string) !== (operationId as string) ||
+    event.actor.type !== "owner" ||
+    event.actor.subject !== ownerSubject
+  ) {
+    unavailable();
+  }
+}
+
+function assertAggregateReconciledAuditEvent(event: AuditEvent): void {
+  if (
+    event.actor.type !== "owner" ||
+    event.detail.kind !== "resource-transition" ||
+    event.detail.resource.type !== "aggregate" ||
+    event.detail.resource.id !== "aggregate:investment-interest" ||
+    event.detail.transition !== "reconciled"
+  ) {
+    unavailable();
+  }
+}
+
+async function aggregateAuditEventId(
+  operationId: StorageOperationId,
+): Promise<StableId<"audit-event">> {
+  const fingerprint = await operationFingerprint({
+    kind: "aggregate-reconciliation-audit",
+    operationId,
+  });
+  return requiredStableId<"audit-event">(
+    `aggregate-audit:${fingerprint.slice("sha256:".length)}`,
+  );
+}
+
 function requiredJsonValue(value: unknown): JsonValue {
   canonicalJson(value);
   return value as JsonValue;
@@ -1048,6 +1308,26 @@ function canonicalJson(value: unknown, ancestors = new Set<object>()): string {
 
 function requiredOperationId(value: unknown): StorageOperationId {
   const parsed = parseStorageOperationId(value);
+  if (!parsed.ok) invalidRequest();
+  return parsed.value;
+}
+
+function requiredStableId<Entity extends string>(
+  value: unknown,
+): StableId<Entity> {
+  const parsed = parseStableId<Entity>(value);
+  if (!parsed.ok) invalidRequest();
+  return parsed.value;
+}
+
+function requiredOwnerSubject(value: unknown): ActorSubject {
+  const parsed = parseActorSubject(value);
+  if (!parsed.ok) invalidRequest();
+  return parsed.value;
+}
+
+function requiredOccurredAt(value: unknown): Timestamp {
+  const parsed = parseTimestamp(value);
   if (!parsed.ok) invalidRequest();
   return parsed.value;
 }

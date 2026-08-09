@@ -36,6 +36,9 @@ import {
   type ApplyAggregateContributionRequest,
   type InvestmentAggregateRepository,
 } from "../repositories/in-memory-aggregate-repository.ts";
+import {
+  DevelopmentInMemoryAuditRepository,
+} from "../repositories/in-memory-audit-notification-repositories.ts";
 
 const currency = "XYZ" as CurrencyCode;
 
@@ -288,6 +291,108 @@ test("persisted mismatches require an exact preview-bound correction", async () 
     calculated: summary(10_000, 1),
     correctionRequired: false,
   });
+});
+
+test("audited corrections commit one retry-stable aggregate and audit transaction", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state);
+  const repository = new DevelopmentInMemoryAggregateRepository(
+    adapter,
+    currency,
+  );
+  await repository.applyContribution(applyRequest(
+    "aggregate-operation:audited-seed",
+    0,
+    contribution("indication:audited", 1, "active", 25_000),
+  ));
+  mutateAggregateRecord(state, (snapshot) => {
+    snapshot.totalAmount = 20_000;
+  });
+  const preview = await repository.previewReconciliation();
+  const request = {
+    operationId: "aggregate-operation:audited-correction",
+    confirmation: confirmationFor(preview),
+    ownerSubject: "issuer.invalid/subject:owner",
+    occurredAt: "2026-08-09T12:00:00.000Z",
+  };
+
+  const before = state.transactionCalls;
+  const correction = await repository.applyConfirmedCorrectionWithAudit(request);
+  assert.equal(state.transactionCalls, before + 1);
+  assert.equal(correction.replayed, false);
+  assert.deepEqual(correction.stored, stored(2, 25_000, 1));
+  assert.deepEqual(correction.auditEvent.actor, {
+    type: "owner",
+    subject: "issuer.invalid/subject:owner",
+  });
+  assert.deepEqual(correction.auditEvent.detail, {
+    kind: "resource-transition",
+    resource: {
+      type: "aggregate",
+      id: "aggregate:investment-interest",
+    },
+    transition: "reconciled",
+  });
+
+  const events = await new DevelopmentInMemoryAuditRepository(adapter).list({
+    limit: 10,
+  });
+  assert.deepEqual(events.items, [correction.auditEvent]);
+
+  const replay = await new DevelopmentInMemoryAggregateRepository(
+    adapter,
+    currency,
+  ).applyConfirmedCorrectionWithAudit({
+    ...request,
+    occurredAt: "2026-08-09T12:05:00.000Z",
+  });
+  assert.deepEqual(replay, { ...correction, replayed: true });
+  assert.deepEqual((await new DevelopmentInMemoryAuditRepository(adapter).list({
+    limit: 10,
+  })).items, [correction.auditEvent]);
+
+  await rejectsStorage(
+    () => repository.applyConfirmedCorrectionWithAudit({
+      ...request,
+      ownerSubject: "issuer.invalid/subject:other-owner",
+    }),
+    "CONFLICT",
+  );
+});
+
+test("audited correction failure leaves both aggregate and audit untouched", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state);
+  const seed = new DevelopmentInMemoryAggregateRepository(adapter, currency);
+  await seed.applyContribution(applyRequest(
+    "aggregate-operation:atomic-failure-seed",
+    0,
+    contribution("indication:atomic-failure", 1, "active", 5_000),
+  ));
+  mutateAggregateRecord(state, (snapshot) => {
+    snapshot.totalAmount = 4_000;
+  });
+  const preview = await seed.previewReconciliation();
+  const failing = new DevelopmentInMemoryAggregateRepository(
+    new RejectAuditedCorrectionAdapter(adapter),
+    currency,
+  );
+
+  await rejectsStorage(
+    () => failing.applyConfirmedCorrectionWithAudit({
+      operationId: "aggregate-operation:atomic-failure",
+      confirmation: confirmationFor(preview),
+      ownerSubject: "issuer.invalid/subject:owner",
+      occurredAt: "2026-08-09T12:00:00.000Z",
+    }),
+    "UNAVAILABLE",
+  );
+  assert.deepEqual(await seed.previewReconciliation(), preview);
+  assert.deepEqual(
+    (await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }))
+      .items,
+    [],
+  );
 });
 
 test("integer overflow and malformed projections fail without partial writes", async () => {
@@ -562,6 +667,35 @@ class MemoryStorageState {
     Readonly<{ fingerprint: string; result: StorageTransactionResult }>
   >();
   transactionCalls = 0;
+}
+
+class RejectAuditedCorrectionAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    if (
+      request.mutations.some((mutation) =>
+        mutation.type === "put" && mutation.value.kind === "audit-event"
+      )
+    ) {
+      throw new StorageFailure("UNAVAILABLE");
+    }
+    return this.#delegate.transact(request);
+  }
 }
 
 class DeterministicMemoryStorageAdapter implements StorageAdapter {

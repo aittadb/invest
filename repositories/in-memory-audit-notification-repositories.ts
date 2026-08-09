@@ -29,6 +29,7 @@ import {
   type StorageDocument,
   type StorageKey,
   type StorageOperationId,
+  type StoragePutMutation,
   type StorageRecord,
 } from "../domain/storage-adapter.ts";
 
@@ -59,6 +60,17 @@ export type AuditAppendResult = Readonly<{
   replayed: boolean;
 }>;
 
+/**
+ * Validated audit mutation that can join another repository's transaction.
+ * This is intentionally narrow: callers cannot select the audit collection or
+ * serialized document shape, and must verify the returned storage record.
+ */
+export type PreparedAuditAppend = Readonly<{
+  event: AuditEvent;
+  operationId: StorageOperationId;
+  mutation: StoragePutMutation;
+}>;
+
 export type AuditListRequest = Readonly<{
   limit: number;
   cursor?: StorageCursor;
@@ -74,6 +86,36 @@ export interface AuditRepository {
   append(intent: unknown): Promise<AuditAppendResult>;
   get(id: unknown): Promise<AuditEvent | null>;
   list(request: AuditListRequest): Promise<AuditEventPage>;
+}
+
+export function prepareAuditAppend(intent: unknown): PreparedAuditAppend {
+  const parsed = parseAuditAppendIntent(intent);
+  if (!parsed.ok) invalidRequest();
+
+  const event = parsed.value.event;
+  return Object.freeze({
+    event,
+    operationId: requiredOperationId(event.operationId),
+    mutation: Object.freeze({
+      type: "put" as const,
+      key: auditEventKey(event.id),
+      expectedRevision: null,
+      value: auditDocument(event),
+    }),
+  });
+}
+
+export function verifyPreparedAuditAppend(
+  prepared: PreparedAuditAppend,
+  stored: StorageRecord | null | undefined,
+): AuditEvent {
+  if (!stored) unavailable();
+  const event = decodeAuditEvent(stored, prepared.mutation.key);
+  if (canonicalJson(auditEventDocument(event)) !==
+    canonicalJson(auditEventDocument(prepared.event))) {
+    unavailable();
+  }
+  return event;
 }
 
 export type ManualNotificationSnapshot = Readonly<{
@@ -141,25 +183,14 @@ export class DevelopmentInMemoryAuditRepository implements AuditRepository {
   }
 
   async append(intent: unknown): Promise<AuditAppendResult> {
-    const parsed = parseAuditAppendIntent(intent);
-    if (!parsed.ok) invalidRequest();
-
-    const operationId = requiredOperationId(parsed.value.event.operationId);
-    const key = auditEventKey(parsed.value.event.id);
+    const prepared = prepareAuditAppend(intent);
     const result = await this.#storage.transact({
-      operationId,
-      mutations: [{
-        type: "put",
-        key,
-        expectedRevision: null,
-        value: auditDocument(parsed.value.event),
-      }],
+      operationId: prepared.operationId,
+      mutations: [prepared.mutation],
     });
-    const stored = result.records[0];
-    if (stored === null || stored === undefined) unavailable();
 
     return Object.freeze({
-      event: decodeAuditEvent(stored, key),
+      event: verifyPreparedAuditAppend(prepared, result.records[0]),
       replayed: result.replayed,
     });
   }
