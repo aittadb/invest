@@ -19,83 +19,16 @@ import {
 import {
   DevelopmentInMemoryCampaignRepository,
   parseCampaignSetup,
-  type CampaignRepository,
 } from "../repositories/in-memory-campaign-repository.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
-
-const FIRST_SAVE = "2026-08-09T08:00:00.000Z";
-const SECOND_SAVE = "2026-08-09T09:00:00.000Z";
-
-export type CampaignRepositoryContractFixture = Readonly<{
-  owner: CampaignRepository;
-  outsider: CampaignRepository;
-  reopenOwner: () => CampaignRepository;
-}>;
-
-export type CampaignRepositoryContractFactory =
-  () => CampaignRepositoryContractFixture;
-
-/** Reusable behavior contract for development and production campaign repositories. */
-export async function verifyCampaignRepositoryContract(
-  createFixture: CampaignRepositoryContractFactory,
-): Promise<void> {
-  const fixture = createFixture();
-  assert.equal(await fixture.owner.readSetup(), null);
-  assert.deepEqual(await fixture.owner.listSetupHistory({ limit: 10 }), {
-    items: [],
-    nextCursor: null,
-  });
-
-  const create = saveRequest({
-    operationId: "campaign-operation:create",
-    recordedAt: FIRST_SAVE,
-    expectedRevision: null,
-    setup: explicitSetup(),
-  });
-  const first = await fixture.owner.saveSetup(create);
-  assert.equal(first.revision, 1);
-  assert.equal(first.setup.publicCampaign.name, syntheticPublicCampaign.name);
-
-  const replay = await fixture.owner.saveSetup(create);
-  assert.deepEqual(replay, first);
-
-  const reopened = fixture.reopenOwner();
-  assert.deepEqual(await reopened.readSetup(), first);
-
-  const second = await fixture.owner.saveSetup(saveRequest({
-    operationId: "campaign-operation:update",
-    recordedAt: SECOND_SAVE,
-    expectedRevision: 1,
-    setup: explicitSetup({ campaignName: "Northstar Systems" }),
-  }));
-  assert.equal(second.revision, 2);
-
-  const stale = await captureStorageFailure(() => fixture.owner.saveSetup(
-    saveRequest({
-      operationId: "campaign-operation:stale",
-      recordedAt: SECOND_SAVE,
-      expectedRevision: 1,
-      setup: explicitSetup({ campaignName: "Stale Campaign Name" }),
-    }),
-  ));
-  assert.equal(stale.code, "PRECONDITION_FAILED");
-
-  const firstPage = await reopened.listSetupHistory({ limit: 1 });
-  assert.deepEqual(firstPage.items.map(({ revision }) => revision), [1]);
-  assert.notEqual(firstPage.nextCursor, null);
-  const secondPage = await reopened.listSetupHistory({
-    limit: 1,
-    ...(firstPage.nextCursor ? { cursor: firstPage.nextCursor } : {}),
-  });
-  assert.deepEqual(secondPage.items.map(({ revision }) => revision), [2]);
-  assert.equal(secondPage.nextCursor, null);
-
-  assert.equal(await fixture.outsider.readSetup(), null);
-  assert.deepEqual(await fixture.outsider.listSetupHistory({ limit: 10 }), {
-    items: [],
-    nextCursor: null,
-  });
-}
+import {
+  FIRST_CAMPAIGN_SAVE as FIRST_SAVE,
+  SECOND_CAMPAIGN_SAVE as SECOND_SAVE,
+  campaignSaveRequest as saveRequest,
+  captureStorageFailure,
+  explicitCampaignSetup as explicitSetup,
+  verifyCampaignRepositoryContract,
+} from "./support/campaign-repository-contract.ts";
 
 test("adapter-backed development repository passes the campaign contract", async () => {
   await verifyCampaignRepositoryContract(() => {
@@ -300,65 +233,6 @@ test("stale and inaccessible records fail without disclosing campaign data", asy
   assert.equal((await owner.readSetup())?.setup.publicCampaign.name, "Private Current Name");
   assert.equal((await owner.listSetupHistory({ limit: 10 })).items.length, 2);
 });
-
-type ExplicitSetupOptions = Readonly<{
-  campaignName?: string;
-  phaseState?: "closed" | "open";
-}>;
-
-function explicitSetup(options: ExplicitSetupOptions = {}) {
-  return {
-    publicCampaign: {
-      ...syntheticPublicCampaign,
-      name: options.campaignName ?? syntheticPublicCampaign.name,
-    },
-    phases: [
-      {
-        id: "phase:domestic",
-        state: options.phaseState ?? "open",
-        enabledParticipationPaths: ["investor", "founder"],
-        countryEligibility: {
-          mode: "allow",
-          countries: ["se", "FI"],
-        },
-      },
-    ],
-    amountAggregate: {
-      amount: {
-        currency: "sek",
-        minimum: 25_000,
-        increment: 5_000,
-        maximum: 500_000,
-      },
-      publicAggregate: {
-        visibility: "non_zero",
-        label: "Recorded non-binding interest",
-        qualifier: "Self-declared, unverified, and non-binding.",
-      },
-    },
-  };
-}
-
-function saveRequest(input: Readonly<{
-  operationId: unknown;
-  recordedAt: unknown;
-  expectedRevision: number | null;
-  setup: unknown;
-}>) {
-  return input;
-}
-
-async function captureStorageFailure(
-  operation: () => Promise<unknown>,
-): Promise<StorageFailure> {
-  try {
-    await operation();
-  } catch (error) {
-    assert(error instanceof StorageFailure);
-    return error;
-  }
-  assert.fail("Expected a StorageFailure.");
-}
 
 class MemoryStorageState {
   readonly records = new Map<string, StorageRecord>();

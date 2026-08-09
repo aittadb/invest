@@ -152,11 +152,17 @@ Public totals render only when configured for non-zero visibility and the saniti
 
 `DevelopmentInMemoryCampaignRepository` persists one explicitly configured campaign setup through a supplied development/test `StorageAdapter`. It does not retain separate process-local state, so recreating the repository over the same adapter proves the persistence boundary. A setup contains the validated public presentation, one or more explicit phases, and explicit amount and aggregate-display policy; the parser supplies no campaign, country, path, currency, or visibility default.
 
-Each save atomically compare-and-sets the current setup and creates an immutable revision record under one retry-stable operation ID. History is bounded and cursor-paged. The adapter remains credential-bound, so unauthorized reads and lists have the same shape as missing state. This repository and deterministic adapter fixtures are development proof only; production still requires the AittaDB implementation and the same behavioral contract.
+Each save atomically compare-and-sets the current setup and creates an immutable revision record under one retry-stable operation ID. History is bounded and cursor-paged. The adapter remains credential-bound, so unauthorized reads and lists have the same shape as missing state. This repository and deterministic adapter fixtures are development proof only.
+
+### AittaDB campaign repository
+
+`AittaDBCampaignConfigurationRepository` implements the same campaign contract against one explicitly configured AittaDB JSON-record URL. The record contains the current setup and its immutable retry-addressed history, and both request and response bodies have finite byte limits. The issuer origin, logical key, access-token provider, and HTTP implementation are deployment inputs; reusable source contains no production hostname, owner identity, credential, or campaign content.
+
+Before any write, the repository reads the configured issuer's OpenAPI document and requires an advertised strong `ETag` on reads and writes, `If-Match` and `If-None-Match` request fields, and `412` conflict semantics. It then creates with `If-None-Match: *` or replaces with the exact previously read strong `ETag`. Missing capability, validators, malformed or oversized representations, and unexpected write results fail closed with fixed non-disclosing errors. An AittaDB deployment that only advertises unconditional record replacement remains readable through this repository, but the repository performs no write against it.
 
 ## Storage plan
 
-Development can use a deterministic in-memory/test adapter. Production must use an AittaDB-compatible adapter and pass the same contract tests.
+Development can use a deterministic in-memory/test adapter. The AittaDB campaign-configuration repository runs the same campaign contract tests over a deterministic HTTP service. Other production repositories must likewise use AittaDB-compatible adapters and pass their shared contracts.
 
 Production remains blocked until the configured backend provides the consistency, listing, pagination, quota, authorization, and non-disclosure behavior described in the use cases.
 
