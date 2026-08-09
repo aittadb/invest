@@ -23,6 +23,7 @@ type CapturedRequest = Readonly<{
   redirect: RequestRedirect;
   headers: Headers;
   body: Readonly<Record<string, string>>;
+  signal: AbortSignal;
 }>;
 
 test("defaults backend transport to the logical issuer and caches the token", async () => {
@@ -176,6 +177,10 @@ test("rejects malformed runtime configuration with one redacted failure", () => 
     { expirySkewSeconds: 0 },
     { expirySkewSeconds: 301 },
     { expirySkewSeconds: 1.5 },
+    { requestTimeoutMs: undefined },
+    { requestTimeoutMs: 0 },
+    { requestTimeoutMs: 60_001 },
+    { requestTimeoutMs: 1.5 },
     { fetch: undefined },
     { fetch: null },
     { now: undefined },
@@ -275,6 +280,21 @@ test("coalesces a failed acquisition, clears it, and permits a fresh retry", asy
     assert.rejects(first, publicFailure),
     assert.rejects(second, publicFailure),
   ]);
+
+  assert.equal(await harness.provider.accessToken(), ACCESS_TOKEN);
+  assert.equal(harness.fetchCalls(), 2);
+});
+
+test("aborts a stalled acquisition, clears renewal, and permits a retry", async () => {
+  const stalled = deferred<Response>();
+  const harness = createHarness({
+    requestTimeoutMs: 10,
+    responses: [stalled.promise, jsonResponse(tokenDocument())],
+  });
+
+  await assert.rejects(harness.provider.accessToken(), publicFailure);
+  assert.equal(harness.fetchCalls(), 1);
+  assert.equal(harness.requests[0]?.signal.aborted, true);
 
   assert.equal(await harness.provider.accessToken(), ACCESS_TOKEN);
   assert.equal(harness.fetchCalls(), 2);
@@ -496,6 +516,7 @@ function createHarness(
     clientSecret?: unknown;
     storageScopes?: unknown;
     expirySkewSeconds?: unknown;
+    requestTimeoutMs?: unknown;
     fetch?: unknown;
     now?: unknown;
     responses?: readonly (Response | Error | Promise<Response>)[];
@@ -519,6 +540,7 @@ function createHarness(
       redirect: request.redirect,
       headers: new Headers(request.headers),
       body,
+      signal: request.signal,
     }));
     const next = responses.shift() ?? jsonResponse(
       tokenDocument({ scope: responseScope }),
@@ -541,6 +563,9 @@ function createHarness(
     expirySkewSeconds: "expirySkewSeconds" in options
       ? options.expirySkewSeconds
       : 30,
+    requestTimeoutMs: "requestTimeoutMs" in options
+      ? options.requestTimeoutMs
+      : 1_000,
     fetch: "fetch" in options ? options.fetch : fetch,
     now: "now" in options ? options.now : () => NOW,
   } as AittaDBServiceTokenDependencies;

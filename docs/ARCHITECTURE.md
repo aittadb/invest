@@ -36,6 +36,39 @@ The repository tracks only `.openai/hosting.example.json`. Each production, acce
 
 `worker/hosted-oauth-configuration.ts` parses the all-or-nothing deployment boundary and imports separate non-extractable cookie keys. `repositories/d1-oauth-proof-store.ts` owns the dedicated atomic replay claim and closed proof rows, and the build stages its migration only when the ignored active Sites binding declares D1. `worker/hosted-oauth-composition.ts` keeps the client secret inside the OAuth service closure and returns only the route service and CSRF capability. `worker/index.ts` installs that fail-closed resolver; `worker/application-worker.ts` advertises and dispatches the route only for a successfully resolved request-scoped deployment capability. Source validation is not hosted proof, so TASK-030 remains open until the acceptance callback succeeds. See `docs/AITTADB_OAUTH_PROOF.md`.
 
+### Hosted AittaDB application runtime
+
+`worker/hosted-application-configuration.ts` parses an independent,
+all-or-nothing production storage configuration. It requires the exact app
+origin, logical AittaDB issuer, same-issuer discovery resource, dedicated
+service client, complete canonical storage scopes, and independent browser
+mutation key. An optional backend transport origin changes only network routing.
+The service-client credential remains inside a provider-construction closure;
+the parsed object has no readable credential field.
+
+`worker/hosted-application-composition.ts` caches one immutable runtime per
+Sites environment, creates one service-token provider and bounded AittaDB
+adapter, and closes that adapter inside `StorageApplicationRepositoryFactory`.
+The factory has no generic builder or adapter accessor. It exposes only named,
+narrow capabilities; its first atomically stores expiry-only browser-mutation
+replay claims through the adapter. The returned runtime contains only the
+repository factory and mutation session, never a provider, adapter,
+configuration, credential, key, or token. Token acquisition has an independent
+deadline and clears failed renewal so a stalled request cannot poison the
+isolate.
+
+`worker/index.ts` installs the resolver, and `worker/application-worker.ts`
+resolves it without placing it in route context. Runtime availability has no
+browser header or navigation control. TASK-068 and later tasks must compose
+concrete repositories centrally and inject only narrow capabilities into the
+authorized route group. The framework renderer receives only `ASSETS` and
+`IMAGES`, never the secret-bearing Worker environment. Participant-state
+readers are explicit composition dependencies rather than runtime environment
+fallbacks. Partial or malformed configuration resolves to no runtime and
+performs no provider request. Local composition is independent from hosted
+proof, while TASK-059 remains a direct activation prerequisite of TASK-080.
+See `docs/HOSTED_AITTADB_RUNTIME.md`.
+
 ## Resource representations
 
 Application URLs identify resources rather than HTML-only pages. `Accept: text/html` selects the human interface. `Accept: application/vnd.aittadb-invest+json; version=0.1` selects the versioned hypermedia contract, and `application/json` is a compatibility representation. Representation selection never uses `User-Agent`.

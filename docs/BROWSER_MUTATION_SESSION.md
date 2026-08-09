@@ -68,10 +68,13 @@ mutation. Successful verification also returns a matching expired cookie value
 for the route to attach to its response; replay remains blocked even if the
 client ignores that deletion.
 
-Production composition must implement the claim as a durable, expiry-bounded
-AittaDB operation. A Worker-global map, process memory, browser storage, or
-best-effort read-then-write is not authority. Tests may use a deterministic
-in-memory claimer solely as an adapter fixture.
+Production composition implements the claim as a durable, expiry-bounded
+AittaDB atomic create through `StorageApplicationRepositoryFactory`. It stores
+only the one-way capability identifier, schema version, and expiry and returns
+true only for the first committed transaction. A Worker-global map, process
+memory, browser storage, D1, or best-effort read-then-write is not authority.
+Tests may use a deterministic in-memory claimer solely as an adapter fixture.
+See `docs/HOSTED_AITTADB_RUNTIME.md`.
 
 Because a proof is one-time, a response retry needs a newly rendered proof.
 Business mutations still require their own operation ID, compare-and-set rules,

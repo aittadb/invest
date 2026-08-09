@@ -3,6 +3,8 @@ import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } fr
 import handler from "vinext/server/app-router-entry";
 
 import { createApplicationWorker } from "./application-worker.ts";
+import type { ParticipantAccessStateReader } from "../domain/participant-home-resource.ts";
+import { createHostedApplicationRuntimeResolver } from "./hosted-application-composition.ts";
 import { createHostedOwnerOAuthProofResolver } from "./hosted-oauth-composition.ts";
 
 // Image security config. SVG sources with .svg extension auto-skip the
@@ -11,27 +13,35 @@ import { createHostedOwnerOAuthProofResolver } from "./hosted-oauth-composition.
 // dangerouslyAllowSVG: true in next.config.js and uncomment below:
 // const imageConfig: ImageConfig = { dangerouslyAllowSVG: true };
 
-const worker = createApplicationWorker({
-  fetchApplication: (request, env, context) =>
-    handler.fetch(request, env, context),
-  fetchOptimizedImage: (request, env) => {
-    const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
-    return handleImageOptimization(
-      request,
-      {
-        fetchAsset: (path) =>
-          env.ASSETS.fetch(new Request(new URL(path, request.url))),
-        transformImage: async (body, { width, format, quality }) => {
-          const result = await env.IMAGES.input(body)
-            .transform(width > 0 ? { width } : {})
-            .output({ format, quality });
-          return result.response();
+export function createInvestorAppWorker(
+  dependencies: Readonly<{
+    participantAccessReader?: ParticipantAccessStateReader;
+  }> = {},
+) {
+  return createApplicationWorker({
+    fetchApplication: (request, env, context) =>
+      handler.fetch(request, env, context),
+    fetchOptimizedImage: (request, env) => {
+      const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
+      return handleImageOptimization(
+        request,
+        {
+          fetchAsset: (path) =>
+            env.ASSETS.fetch(new Request(new URL(path, request.url))),
+          transformImage: async (body, { width, format, quality }) => {
+            const result = await env.IMAGES.input(body)
+              .transform(width > 0 ? { width } : {})
+              .output({ format, quality });
+            return result.response();
+          },
         },
-      },
-      allowedWidths,
-    );
-  },
-  resolveOwnerOAuthProof: createHostedOwnerOAuthProofResolver(),
-});
+        allowedWidths,
+      );
+    },
+    participantAccessReader: dependencies.participantAccessReader,
+    resolveApplicationRuntime: createHostedApplicationRuntimeResolver(),
+    resolveOwnerOAuthProof: createHostedOwnerOAuthProofResolver(),
+  });
+}
 
-export default worker;
+export default createInvestorAppWorker();

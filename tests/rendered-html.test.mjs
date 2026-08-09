@@ -5,13 +5,19 @@ import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
 
 let workerPromise;
 
-async function loadWorker() {
+async function loadWorker(participantAuthorizationState) {
   if (!workerPromise) {
     const workerUrl = new URL("../dist/server/index.js", import.meta.url);
     workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-    workerPromise = import(workerUrl.href).then(({ default: worker }) => worker);
+    workerPromise = import(workerUrl.href);
   }
-  return workerPromise;
+  const workerModule = await workerPromise;
+  if (participantAuthorizationState === undefined) return workerModule.default;
+  return workerModule.createInvestorAppWorker({
+    participantAccessReader: {
+      read: async () => participantAuthorizationState,
+    },
+  });
 }
 
 async function render(
@@ -22,7 +28,7 @@ async function render(
   campaignConfiguration = syntheticPublicCampaign,
   participantAuthorizationState,
 ) {
-  const worker = await loadWorker();
+  const worker = await loadWorker(participantAuthorizationState);
   const serializedCampaign =
     typeof campaignConfiguration === "string"
       ? campaignConfiguration
@@ -38,14 +44,13 @@ async function render(
       APP_BASE_URL: appBaseUrl,
       CAMPAIGN_CONFIG_JSON: serializedCampaign,
       OWNER_EMAIL: ownerEmail,
-      PARTICIPANT_ACCESS:
-        participantAuthorizationState === undefined
-          ? undefined
-          : {
-              read: async () => participantAuthorizationState,
-            },
       ASSETS: {
         fetch: async () => new Response("Not found", { status: 404 }),
+      },
+      IMAGES: {
+        input() {
+          throw new Error("Image optimization is outside this render test.");
+        },
       },
     },
     {

@@ -29,7 +29,10 @@ import type {
   InvestorAppEnv,
   WorkerExecutionContext,
 } from "./contracts.ts";
-import type { CampaignWorkspaceDeploymentCapability } from "./deployment-capabilities.ts";
+import type {
+  ApplicationRuntimeDeploymentCapability,
+  CampaignWorkspaceDeploymentCapability,
+} from "./deployment-capabilities.ts";
 import {
   createApplicationRouteDispatcher,
   dispatchApplicationRoute,
@@ -70,10 +73,15 @@ export type ApplicationWorkerDependencies = Readonly<{
   ownerReviewExports?: OwnerReviewExportRouteDependencies;
   participantFounderInterest?: FounderInterestRouteDependencies;
   participantInvestmentInterests?: InvestmentInterestRouteDependencies;
+  participantAccessReader?: ParticipantAccessStateReader;
   ownerOAuthProof?: OwnerOAuthProofRouteDependencies;
   resolveOwnerOAuthProof?: (
     env: InvestorAppEnv,
   ) => Promise<OwnerOAuthProofRouteDependencies | null | undefined>;
+  applicationRuntime?: ApplicationRuntimeDeploymentCapability;
+  resolveApplicationRuntime?: (
+    env: InvestorAppEnv,
+  ) => Promise<ApplicationRuntimeDeploymentCapability | null | undefined>;
   publicCampaignReader?: PublicCampaignPresentationReader;
   campaignWorkspace?: CampaignWorkspaceDeploymentCapability;
   resolveCampaignWorkspace?: () =>
@@ -111,6 +119,7 @@ export function createApplicationWorker(
       );
       const actor = authenticatedActor(request);
       const isOwner = isConfiguredOwner(actor?.email, env.OWNER_EMAIL);
+      await resolveApplicationRuntime(dependencies, env);
       const ownerOAuthProof = dependencies.dispatchRoute === undefined
         ? await resolveOwnerOAuthProof(dependencies, env)
         : null;
@@ -127,8 +136,9 @@ export function createApplicationWorker(
         : publicCampaign;
       const participantAccess = await resolveParticipantAccess(
         actor,
-        env.PARTICIPANT_ACCESS,
+        dependencies.participantAccessReader,
       );
+      const renderEnvironment = applicationRenderEnvironment(env);
       const campaignEditorAvailable = campaignWorkspace !== null;
       const renderApplication: ApplicationRouteContext["renderApplication"] = (
         options = {},
@@ -160,7 +170,7 @@ export function createApplicationWorker(
             },
             preview,
           ),
-          env,
+          renderEnvironment,
           executionContext,
         );
       };
@@ -203,12 +213,21 @@ export function createApplicationWorker(
       if (routeResponse) return routeResponse;
 
       if (url.pathname === "/_vinext/image") {
-        return dependencies.fetchOptimizedImage(request, env);
+        return dependencies.fetchOptimizedImage(request, renderEnvironment);
       }
 
       return renderApplication();
     },
   };
+}
+
+function applicationRenderEnvironment(
+  env: InvestorAppEnv,
+): Readonly<Pick<InvestorAppEnv, "ASSETS" | "IMAGES">> {
+  return Object.freeze({
+    ASSETS: env.ASSETS,
+    IMAGES: env.IMAGES,
+  });
 }
 
 type InjectedRouteAvailability = Readonly<{
@@ -278,6 +297,20 @@ function createInjectedRouteDispatcher(
       },
     ),
   });
+}
+
+async function resolveApplicationRuntime(
+  dependencies: ApplicationWorkerDependencies,
+  env: InvestorAppEnv,
+): Promise<ApplicationRuntimeDeploymentCapability | null> {
+  if (dependencies.applicationRuntime !== undefined) {
+    return dependencies.applicationRuntime;
+  }
+  try {
+    return await dependencies.resolveApplicationRuntime?.(env) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 async function resolveOwnerOAuthProof(

@@ -513,23 +513,23 @@ test("an injected public campaign reader controls the public resource and fails 
 
 test("the Worker resolves participant state from the trusted actor and replaces spoofed state", async () => {
   const renderedRequests: Request[] = [];
+  const state = participantAuthorizationState("participant-subject");
   const worker = createApplicationWorker({
     fetchApplication: async (request) => {
       renderedRequests.push(request);
       return new Response("rendered");
     },
     fetchOptimizedImage: async () => new Response("image"),
-  });
-  const state = participantAuthorizationState("participant-subject");
-  const env = testEnvironment({
-    PARTICIPANT_ACCESS: {
+    participantAccessReader: {
       read: async (account) => {
-        assert.equal(account.subject, "participant-subject");
-        assert.equal(account.accountEmailLabel, "participant@example.com");
+        if (account.subject === "participant-subject") {
+          assert.equal(account.accountEmailLabel, "participant@example.com");
+        }
         return state;
       },
     },
   });
+  const env = testEnvironment();
 
   await worker.fetch(
     new Request("https://campaign.example/", {
@@ -560,11 +560,7 @@ test("the Worker resolves participant state from the trusted actor and replaces 
         [PARTICIPANT_ACCESS_HEADER]: JSON.stringify(authorized),
       },
     }),
-    testEnvironment({
-      PARTICIPANT_ACCESS: {
-        read: async () => state,
-      },
-    }),
+    testEnvironment(),
     executionContext,
   );
   assert.equal(
@@ -572,7 +568,14 @@ test("the Worker resolves participant state from the trusted actor and replaces 
     null,
   );
 
-  await worker.fetch(
+  const workerWithoutParticipantReader = createApplicationWorker({
+    fetchApplication: async (request) => {
+      renderedRequests.push(request);
+      return new Response("rendered");
+    },
+    fetchOptimizedImage: async () => new Response("image"),
+  });
+  await workerWithoutParticipantReader.fetch(
     new Request("https://campaign.example/", {
       headers: {
         "oai-authenticated-user-id": "participant-subject",

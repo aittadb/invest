@@ -10,7 +10,9 @@ aggregates.
 
 The adapter exists independently from hosted runtime composition. Creating the
 class does not install it in the Worker, register a service client, choose a
-deployment, or provide a credential.
+deployment, or provide a credential. `worker/hosted-application-composition.ts`
+now installs one adapter behind a backend repository factory only when all
+runtime values are valid; it still advertises no feature route by itself.
 
 ## Injected capabilities
 
@@ -115,4 +117,5 @@ redaction.
 
 Hosted acceptance remains separate: the configured backend must advertise and
 implement the atomic transaction action before this adapter can be proven or
-enabled against that deployment.
+enabled against that deployment. See `docs/HOSTED_AITTADB_RUNTIME.md` for the
+fail-closed Worker assembly and activation boundary.

@@ -3,6 +3,8 @@ const ACCESS_TOKEN_MAX_LENGTH = 4_096;
 const MAX_TOKEN_LIFETIME_SECONDS = 3_600;
 const MIN_EXPIRY_SKEW_SECONDS = 1;
 const MAX_EXPIRY_SKEW_SECONDS = 300;
+const MIN_REQUEST_TIMEOUT_MS = 1;
+const MAX_REQUEST_TIMEOUT_MS = 60_000;
 const STORAGE_SCOPES = [
   "storage.read",
   "storage.write",
@@ -25,6 +27,7 @@ export type AittaDBServiceTokenDependencies = Readonly<{
   clientSecret: string;
   storageScopes: readonly AittaDBStorageScope[];
   expirySkewSeconds: number;
+  requestTimeoutMs: number;
   fetch: AittaDBServiceTokenFetch;
   now: () => Date;
 }>;
@@ -48,6 +51,7 @@ type ValidatedConfiguration = Readonly<{
   authorization: string;
   scope: string;
   expirySkewSeconds: number;
+  requestTimeoutMs: number;
   fetch: AittaDBServiceTokenFetch;
   now: () => Date;
 }>;
@@ -122,10 +126,14 @@ function validatedConfiguration(
     );
     const storageScopes = exactStorageScopes(dependencies.storageScopes);
     const expirySkewSeconds = dependencies.expirySkewSeconds;
+    const requestTimeoutMs = dependencies.requestTimeoutMs;
     if (
       !Number.isInteger(expirySkewSeconds) ||
       expirySkewSeconds < MIN_EXPIRY_SKEW_SECONDS ||
       expirySkewSeconds > MAX_EXPIRY_SKEW_SECONDS ||
+      !Number.isInteger(requestTimeoutMs) ||
+      requestTimeoutMs < MIN_REQUEST_TIMEOUT_MS ||
+      requestTimeoutMs > MAX_REQUEST_TIMEOUT_MS ||
       typeof dependencies.fetch !== "function" ||
       typeof dependencies.now !== "function"
     ) {
@@ -137,6 +145,7 @@ function validatedConfiguration(
       authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
       scope: storageScopes.join(" "),
       expirySkewSeconds,
+      requestTimeoutMs,
       fetch: dependencies.fetch,
       now: dependencies.now,
     });
@@ -211,6 +220,32 @@ function exactStorageScopes(
 async function acquireToken(
   config: ValidatedConfiguration,
 ): Promise<CachedToken> {
+  const abortController = new AbortController();
+  let rejectDeadline: (() => void) | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = () => reject(new AittaDBServiceTokenFailure());
+  });
+  const timeout = setTimeout(() => {
+    abortController.abort();
+    rejectDeadline?.();
+  }, config.requestTimeoutMs);
+  try {
+    return await Promise.race([
+      acquireTokenBeforeDeadline(config, abortController.signal),
+      deadline,
+    ]);
+  } catch {
+    unavailable();
+  } finally {
+    clearTimeout(timeout);
+    rejectDeadline = undefined;
+  }
+}
+
+async function acquireTokenBeforeDeadline(
+  config: ValidatedConfiguration,
+  signal: AbortSignal,
+): Promise<CachedToken> {
   try {
     const response = await config.fetch(config.tokenEndpoint, {
       method: "POST",
@@ -225,6 +260,7 @@ async function acquireToken(
         scope: config.scope,
       }),
       redirect: "manual",
+      signal,
     });
     if (!(response instanceof Response) || response.status !== 200) {
       unavailable();

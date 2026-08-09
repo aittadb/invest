@@ -14,6 +14,24 @@ assert.equal(
   ".openai/hosting.json contains per-instance state and must not be tracked",
 );
 
+const trackedRuntimeState = execFileSync(
+  "git",
+  [
+    "ls-files",
+    "--",
+    ".env*",
+    ".dev.vars*",
+    ".openai/hosting.json",
+    ".openai/hosting.example.json",
+  ],
+  { encoding: "utf8" },
+).trim().split("\n").filter(Boolean).sort();
+assert.deepEqual(
+  trackedRuntimeState,
+  [".env.example", ".openai/hosting.example.json"],
+  "only inert runtime examples may be tracked",
+);
+
 const example = JSON.parse(
   readFileSync(new URL("../.openai/hosting.example.json", import.meta.url), "utf8"),
 );

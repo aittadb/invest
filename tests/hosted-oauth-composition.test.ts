@@ -331,7 +331,7 @@ test("hosted availability evidence is fixed and credential-free", async (t) => {
   assert.deepEqual(observed, ["fetch"]);
 });
 
-test("the production entry point installs only the fail-closed hosted resolver", () => {
+test("the production entry point installs the fail-closed OAuth resolver", () => {
   const entrypoint = readFileSync(
     new URL("../worker/index.ts", import.meta.url),
     "utf8",

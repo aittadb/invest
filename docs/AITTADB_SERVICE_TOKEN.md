@@ -9,9 +9,9 @@ Cloudflare Worker composition. It is not an interactive sign-in flow and has no
 browser origin, redirect URI, cookie, user identity, or consent step.
 
 The provider does not make Investor App persistence production-ready by itself.
-The production storage adapter and hosted runtime composition must inject this
-capability without exposing it to route or rendering code that can serialize a
-token.
+The hosted application runtime now injects it into the production storage
+adapter without exposing it to route or rendering code that can serialize a
+token. Persistent feature routes and hosted acceptance remain separate work.
 
 ## Injected Contract
 
@@ -25,6 +25,7 @@ The Worker must supply every dependency explicitly:
 - a non-empty canonical subset of `storage.read`, `storage.write`, and
   `storage.delete`, in that order;
 - an expiry skew from 1 through 300 seconds;
+- a request deadline from 1 through 60,000 milliseconds;
 - Worker-native `fetch`; and
 - a trusted clock.
 
@@ -49,13 +50,15 @@ const provider = createAittaDBServiceTokenProvider({
   clientSecret,
   storageScopes,
   expirySkewSeconds,
+  requestTimeoutMs,
   fetch,
   now: () => new Date(),
 });
 
-const repository = new AittaDBCampaignConfigurationRepository({
+const storage = new AittaDBStorageAdapter({
   issuer,
-  recordKey,
+  transportOrigin,
+  entryHref,
   accessToken: provider.accessToken,
   fetch,
 });
@@ -65,10 +68,12 @@ The identifiers and origins in this example are injected server-side variables,
 not literal instance values. `issuer` remains the logical OAuth security
 identity used by the application and storage contract. `transportOrigin` only
 selects the network origin for the fixed token path; it does not replace or
-redefine that issuer. Runtime composition must read the secret from hosted
-secret storage and must never place either origin, the dependency object, or
-the provider in React props, hypermedia data, browser code, logs, exports,
-campaign content, or error responses.
+redefine that issuer. `worker/hosted-application-configuration.ts` reads the
+secret from hosted secret storage and captures it inside a
+provider-construction closure. Runtime composition must never place either
+origin, the dependency object, or the provider in React props, hypermedia data,
+browser code, logs, exports, campaign content, or error responses. See
+`docs/HOSTED_AITTADB_RUNTIME.md`.
 
 ## Token Request
 
@@ -102,10 +107,12 @@ skew begins. At the skew boundary the cached value is discarded before renewal,
 so a failed renewal cannot fall back to an old token. A backward or invalid
 clock also prevents reuse.
 
-Concurrent callers share one in-flight acquisition. A failed acquisition is
-cleared after all callers receive the same fixed failure class, and a later call
-may attempt a fresh request. Worker restarts naturally discard both cached and
-in-flight state; persistence must never be added to preserve this cache.
+Concurrent callers share one in-flight acquisition. The complete request and
+bounded body read race an independent abort deadline. A failed or timed-out
+acquisition is cleared after all callers receive the same fixed failure class,
+and a later call may attempt a fresh request. Worker restarts naturally discard
+both cached and in-flight state; persistence must never be added to preserve
+this cache.
 
 ## Failure and Disclosure Boundary
 
