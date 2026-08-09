@@ -106,6 +106,12 @@ Founder applications do not import, create, mutate, or gate investment indicatio
 
 Participants can edit or withdraw active indications and reactivate withdrawn indications after satisfying the current package requirement. The configured owner can reject an active indication with a bounded participant-visible reason. Each transition appends a full immutable history snapshot, and participant capability projections include only transitions valid in the current lifecycle without exposing owner identity.
 
+### Aggregate and reconciliation contracts
+
+`domain/investment-aggregate.ts` accepts only a closed projection of indication ID, revision, lifecycle status, amount, and currency. Calculation keeps the highest revision for each indication, accepts an identical repeated revision as a retry, rejects conflicting same-revision facts, and sums only active indications with safe integer arithmetic. Withdrawn and rejected latest revisions therefore remove their indication from the calculated total.
+
+Reconciliation compares a stored revision, amount, and private contributing count with a fresh calculation. A correction intent exists only for a mismatch and only after an explicit confirmation binds every stored and calculated preview value; persistence must still compare-and-set the stored revision. Public output is rebuilt from an allowlist containing configured amount, currency, label, qualifier, and optional integer target progress. It has no structural place for indication IDs, participant or company identity, notes, lifecycle detail, moderation, or private counts.
+
 ### Phase and country eligibility
 
 `domain/phase-configuration.ts` requires explicit phase identity, state, participation paths, and country policy. It supplies no built-in country, path, or campaign default. Country codes pass through the shared normalizer before duplicate and allow or deny evaluation.
