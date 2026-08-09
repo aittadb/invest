@@ -32,15 +32,15 @@ Version one collects non-binding interest only. It does not accept money, reserv
 - AittaDB-compatible identity and storage adapters for production
 - Deterministic in-memory/test storage adapter before production integration
 
-The current scaffold intentionally does not declare local D1 or R2 bindings in `.openai/hosting.json`. Production publication remains blocked until the configured backend passes this app's authorization, consistency, listing, pagination, quota, and non-disclosure contract tests.
+The reusable source keeps D1 and R2 null in `.openai/hosting.example.json`. A deployment may opt into a D1 binding only for the OAuth connection proof's short-lived replay claims and closed verification evidence; campaign and participant data still belongs behind the configured AittaDB adapter. Production publication remains blocked until that backend passes this app's authorization, consistency, listing, pagination, quota, and non-disclosure contract tests.
 
 Each application URI supports equivalent human HTML and versioned hypermedia JSON selected through `Accept`. See [docs/HYPERMEDIA_API.md](docs/HYPERMEDIA_API.md) for the media type, document structure, authorization rules, and route definition of done.
 
 ### AittaDB OAuth proof status
 
-The source includes an optionally injected, owner-only confidential Authorization Code with PKCE boundary for development verification. The default production Worker does not install it and contains no OAuth client, secret, cookie key, hostname, owner, or scope default. See [docs/AITTADB_OAUTH_PROOF.md](docs/AITTADB_OAUTH_PROOF.md) for its route and hosted-secret contract.
+The source includes an opt-in, owner-only confidential Authorization Code with PKCE boundary for development verification. The production Worker exposes it only when one deployment supplies a complete exact OAuth configuration, separate hosted cookie keys, and the dedicated D1 proof binding. Missing or malformed values leave the route absent. Reusable source contains no OAuth client, secret, cookie key, hostname, owner, or scope default. See [docs/AITTADB_OAUTH_PROOF.md](docs/AITTADB_OAUTH_PROOF.md) for its route and hosted-secret contract.
 
-TASK-030 remains open. As observed on August 9, 2026, [aittadb.com](https://aittadb.com/) reports `features.oauthApps=false`, and its [discovery document](https://aittadb.com/.well-known/openid-configuration) does not advertise authorization, token, or introspection endpoints. This commit is injected callback infrastructure only, not hosted proof.
+TASK-030 remains open until an acceptance client completes the hosted callback. The selected acceptance AittaDB deployment advertises Authorization Code, S256 PKCE, confidential client authentication, and storage scopes, but discovery evidence and source validation alone are not a successful callback proof.
 
 ## Repository Files
 

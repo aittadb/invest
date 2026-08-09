@@ -4,11 +4,20 @@ import type {
   ParticipantAccessStateReader,
 } from "../domain/participant-home-resource.ts";
 import type { RuntimeCampaignPreview } from "../http/runtime-preview.ts";
+import type { D1OAuthProofDatabase } from "../repositories/d1-oauth-proof-store.ts";
 
 export interface InvestorAppEnv {
   APP_BASE_URL?: string;
+  AITTADB_OAUTH_ISSUER?: string;
+  AITTADB_OAUTH_CLIENT_ID?: string;
+  AITTADB_OAUTH_CLIENT_SECRET?: string;
+  AITTADB_OAUTH_CALLBACK_URI?: string;
+  AITTADB_OAUTH_STORAGE_SCOPES?: string;
+  AITTADB_OAUTH_TRANSACTION_KEY?: string;
+  AITTADB_OAUTH_CSRF_KEY?: string;
   CAMPAIGN_CONFIG_JSON?: string;
   OWNER_EMAIL?: string;
+  OAUTH_PROOF_DB?: D1OAuthProofDatabase;
   PARTICIPANT_ACCESS?: ParticipantAccessStateReader;
   ASSETS: {
     fetch(request: Request): Promise<Response>;

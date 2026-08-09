@@ -71,6 +71,9 @@ export type ApplicationWorkerDependencies = Readonly<{
   participantFounderInterest?: FounderInterestRouteDependencies;
   participantInvestmentInterests?: InvestmentInterestRouteDependencies;
   ownerOAuthProof?: OwnerOAuthProofRouteDependencies;
+  resolveOwnerOAuthProof?: (
+    env: InvestorAppEnv,
+  ) => Promise<OwnerOAuthProofRouteDependencies | null | undefined>;
   publicCampaignReader?: PublicCampaignPresentationReader;
   campaignWorkspace?: CampaignWorkspaceDeploymentCapability;
   resolveCampaignWorkspace?: () =>
@@ -99,9 +102,6 @@ export function createApplicationWorker(
   const participantInvestmentInterestsAvailable =
     dependencies.dispatchRoute === undefined &&
     dependencies.participantInvestmentInterests !== undefined;
-  const ownerOAuthProofAvailable = dependencies.dispatchRoute === undefined &&
-    dependencies.ownerOAuthProof !== undefined;
-
   return {
     async fetch(request, env, executionContext) {
       const url = new URL(request.url);
@@ -111,6 +111,10 @@ export function createApplicationWorker(
       );
       const actor = authenticatedActor(request);
       const isOwner = isConfiguredOwner(actor?.email, env.OWNER_EMAIL);
+      const ownerOAuthProof = dependencies.dispatchRoute === undefined
+        ? await resolveOwnerOAuthProof(dependencies, env)
+        : null;
+      const ownerOAuthProofAvailable = ownerOAuthProof !== null;
       const campaignWorkspace = dependencies.dispatchRoute === undefined
         ? resolveCampaignWorkspace(dependencies)
         : null;
@@ -173,6 +177,7 @@ export function createApplicationWorker(
           ? createInjectedRouteDispatcher(
               dependencies,
               campaignWorkspace,
+              ownerOAuthProof,
               {
                 ownerPackageAvailable,
                 ownerIndicationModerationAvailable,
@@ -219,6 +224,7 @@ type InjectedRouteAvailability = Readonly<{
 function createInjectedRouteDispatcher(
   dependencies: ApplicationWorkerDependencies,
   campaignWorkspace: CampaignWorkspaceDeploymentCapability | null,
+  ownerOAuthProof: OwnerOAuthProofRouteDependencies | null,
   available: InjectedRouteAvailability,
 ): ApplicationRouteHandler {
   return createApplicationRouteDispatcher({
@@ -259,8 +265,8 @@ function createInjectedRouteDispatcher(
         ...(campaignWorkspace
           ? [createOwnerCampaignEditorRouteHandler(campaignWorkspace)]
           : []),
-        ...(dependencies.ownerOAuthProof
-          ? [createOwnerOAuthProofRouteHandler(dependencies.ownerOAuthProof)]
+        ...(ownerOAuthProof
+          ? [createOwnerOAuthProofRouteHandler(ownerOAuthProof)]
           : []),
       ],
       {
@@ -272,6 +278,20 @@ function createInjectedRouteDispatcher(
       },
     ),
   });
+}
+
+async function resolveOwnerOAuthProof(
+  dependencies: ApplicationWorkerDependencies,
+  env: InvestorAppEnv,
+): Promise<OwnerOAuthProofRouteDependencies | null> {
+  if (dependencies.ownerOAuthProof !== undefined) {
+    return dependencies.ownerOAuthProof;
+  }
+  try {
+    return await dependencies.resolveOwnerOAuthProof?.(env) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function canonicalResourceUrl(url: URL, appOrigin: string): string {

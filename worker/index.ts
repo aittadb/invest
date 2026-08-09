@@ -3,6 +3,7 @@ import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } fr
 import handler from "vinext/server/app-router-entry";
 
 import { createApplicationWorker } from "./application-worker.ts";
+import { createHostedOwnerOAuthProofResolver } from "./hosted-oauth-composition.ts";
 
 // Image security config. SVG sources with .svg extension auto-skip the
 // optimization endpoint on the client side (served directly, no proxy).
@@ -30,6 +31,7 @@ const worker = createApplicationWorker({
       allowedWidths,
     );
   },
+  resolveOwnerOAuthProof: createHostedOwnerOAuthProofResolver(),
 });
 
 export default worker;

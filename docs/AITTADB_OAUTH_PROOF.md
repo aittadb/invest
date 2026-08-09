@@ -2,9 +2,9 @@
 
 ## Scope
 
-This repository contains injected application infrastructure for a confidential AittaDB Authorization Code flow with PKCE. It does not configure an OAuth client, install a client secret, enable OAuth Apps, change a Sites setting, or prove a hosted callback.
+This repository contains opt-in hosted composition for a confidential AittaDB Authorization Code flow with PKCE. It does not register an OAuth client, install a real client secret, enable OAuth Apps on an AittaDB deployment, change a Sites access policy, or by itself prove a hosted callback.
 
-The capability is absent from `worker/index.ts`. A deployment-specific composition layer must deliberately inject it before `/owner/aittadb-connection` exists. TASK-030 therefore remains open until the live proof in this document succeeds.
+`worker/index.ts` installs only a fail-closed resolver. `/owner/aittadb-connection` exists when one deployment supplies every exact configuration and secret value plus the dedicated D1 binding; absent, partial, malformed, or unbound deployments keep the route and owner navigation absent. TASK-030 remains open until the live proof in this document succeeds.
 
 ## Application Resources
 
@@ -16,7 +16,7 @@ HTML forms and hypermedia actions come from `domain/owner-oauth-proof-resource.t
 
 ## Injected Boundary
 
-The deployment composition must inject all of the following. Reusable source supplies no instance value:
+The deployment composition requires all of the following. Reusable source supplies no instance value:
 
 - exact HTTPS issuer;
 - confidential client ID and hosted-only client secret;
@@ -29,9 +29,11 @@ The deployment composition must inject all of the following. Reusable source sup
 - `fetch`, clock, cryptographic randomness, and the short transaction lifetime;
 - the exact canonical application origin used by the owner CSRF session.
 
+`APP_BASE_URL`, `AITTADB_OAUTH_ISSUER`, `AITTADB_OAUTH_CLIENT_ID`, `AITTADB_OAUTH_CALLBACK_URI`, and `AITTADB_OAUTH_STORAGE_SCOPES` are ordinary per-instance runtime values. `AITTADB_OAUTH_CLIENT_SECRET`, `AITTADB_OAUTH_TRANSACTION_KEY`, and `AITTADB_OAUTH_CSRF_KEY` are hosted secrets. The ignored active Sites binding names the dedicated D1 capability as `OAUTH_PROOF_DB`; the inert tracked hosting example remains null. Every OAuth value must be configured together.
+
 The client requests only configured `storage.read`, `storage.write`, or `storage.delete` scopes. It never requests `offline_access`, `openid`, profile, or email. A concrete later requirement must justify any scope expansion.
 
-The result sink receives only owner subject, issuer, client audience, exact validated storage scopes, verification time, and access-token expiry. It never receives an access token, refresh token, authorization code, PKCE verifier, OAuth state, client secret, cookie plaintext, AittaDB token subject, token ID, or credential-bearing exception cause.
+The result sink receives the owner subject only as service-owned authorization context, validates it, and persists no owner-derived value. Stored proof rows contain only issuer, client audience, exact validated storage scopes, verification time, and access-token expiry. The sink never receives an access token, refresh token, authorization code, PKCE verifier, OAuth state, client secret, cookie plaintext, AittaDB token subject, token ID, or credential-bearing exception cause.
 
 ## Protocol Checks
 
@@ -49,20 +51,20 @@ Callback representations never reflect their query string. Private responses use
 
 Observed on August 9, 2026:
 
-- The public [AittaDB service resource](https://aittadb.com/) reports `features.oauthApps=false`.
-- The public [OpenID configuration](https://aittadb.com/.well-known/openid-configuration) exposes only issuer, JWKS URI, and ES256 verification metadata. It does not advertise authorization, token, or introspection endpoints.
+- The selected [acceptance AittaDB service](https://test.aittadb.com/) has OAuth Apps enabled.
+- Its [OpenID configuration](https://test.aittadb.com/.well-known/openid-configuration) advertises the exact authorization, token, and introspection endpoints, Authorization Code, S256 PKCE, confidential client authentication, and storage scopes required by this proof.
+- The public production [AittaDB service](https://aittadb.com/) remains a separate deployment and does not need to change for acceptance testing.
 
-That state correctly makes the injected connection resource unavailable and prevents initiation.
+This is provider-capability evidence only. No confidential Investor App acceptance client or successful hosted callback is claimed yet.
 
 ## Remaining Live Proof
 
-An authorized operator must complete all of these steps outside this commit:
+An authorized acceptance operator must complete all of these steps:
 
-1. Enable OAuth Apps on the selected AittaDB deployment.
-2. Register one confidential client with only the required storage scopes and the exact development callback URI.
-3. Install the client secret and separate AES-GCM transaction and CSRF cookie keys in hosted secret storage, and inject durable transaction-claim and result-sink adapters.
-4. Sign in as the configured Investor App owner and run the owner-only connection check end to end.
-5. Confirm discovery, consent, callback, token exchange, introspection, exact scope/audience/expiry validation, replay rejection, cookie clearing, and closed proof persistence without credentials in responses or private logs.
-6. Record the hosted evidence on the integrating branch, then and only then archive TASK-030.
+1. Register one confidential acceptance client with only the required storage scopes and the exact acceptance callback URI.
+2. Install the client secret and separate AES-GCM transaction and CSRF cookie keys in hosted secret storage, bind the dedicated proof D1, and deploy the exact validated source to the acceptance Investor App.
+3. Sign in as the configured acceptance owner and run the owner-only connection check end to end.
+4. Confirm discovery, consent, callback, token exchange, introspection, exact scope/audience/expiry validation, replay rejection, cookie clearing, and closed proof persistence without credentials in responses or private logs.
+5. Record the hosted evidence on the integrating branch, then and only then archive TASK-030.
 
 Use a development or acceptance deployment for this proof. Do not change production access or production data as part of source validation.

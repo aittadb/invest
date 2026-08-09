@@ -4,7 +4,7 @@ Investor App is a ChatGPT Sites application that uses an AittaDB-compatible back
 
 ## Initial stack decision
 
-The initial repository uses the Sites Vinext starter with React server components and a Cloudflare Worker-compatible build. It does not declare local D1 or R2 resources in `.openai/hosting.json` because production campaign data must stay behind the configured app storage adapter.
+The initial repository uses the Sites Vinext starter with React server components and a Cloudflare Worker-compatible build. Its tracked hosting example declares no D1 or R2 resource because production campaign data must stay behind the configured app storage adapter. A deployment can opt into a dedicated D1 binding solely for OAuth proof replay claims and closed verification evidence; that binding is not an alternative campaign-data store.
 
 ## Runtime boundary
 
@@ -34,7 +34,7 @@ The repository tracks only `.openai/hosting.example.json`. Each production, acce
 
 `http/owner-oauth-csrf-session.ts` is the injected anti-forgery primitive for OAuth initiation. It accepts a deployment-imported, non-extractable AES-GCM `CryptoKey`; it does not parse runtime configuration. HTML and JSON discovery each receive a random proof plus one encrypted cookie that is host-only, short-lived, and scoped to the owner connection path. Ciphertext and authenticated additional data bind the trusted owner subject, exact HTTPS application origin, cookie name, and path. The capability resolves that state into the generic browser mutation guard, which verifies the matching form field or JSON header before the route can call the OAuth service. Without the complete capability, the route omits initiation and direct mutation fails closed.
 
-The route is optional application-worker composition. `worker/index.ts` installs no OAuth proof dependencies, so normal production source remains fail-closed. A hosted composition must supply a durable claim store and result sink in addition to secret/config values. Source validation is not hosted proof, and TASK-030 remains open while the configured AittaDB deployment advertises OAuth Apps as disabled. See `docs/AITTADB_OAUTH_PROOF.md`.
+`worker/hosted-oauth-configuration.ts` parses the all-or-nothing deployment boundary and imports separate non-extractable cookie keys. `repositories/d1-oauth-proof-store.ts` owns the dedicated atomic replay claim and closed proof rows, and the build stages its migration only when the ignored active Sites binding declares D1. `worker/hosted-oauth-composition.ts` keeps the client secret inside the OAuth service closure and returns only the route service and CSRF capability. `worker/index.ts` installs that fail-closed resolver; `worker/application-worker.ts` advertises and dispatches the route only for a successfully resolved request-scoped deployment capability. Source validation is not hosted proof, so TASK-030 remains open until the acceptance callback succeeds. See `docs/AITTADB_OAUTH_PROOF.md`.
 
 ## Resource representations
 
