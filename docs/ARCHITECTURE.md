@@ -58,6 +58,12 @@ The generic `StorageAdapter` supplies bounded persistence primitives; it must no
 
 Money constructors reject floating-point, unsafe-integer, negative, and configured out-of-range values. Country parsing uppercases and trims by default and accepts an injectable normalization hook; campaign eligibility remains a separate campaign rule. Authorization failures for inaccessible records map to the same public response as missing records, and unknown failures map to a generic response without serializing causes.
 
+### Package versions and acknowledgment
+
+`domain/package-content.ts` parses package Markdown into a syntax tree and rejects raw HTML and unsafe link or image protocols before content becomes renderable. Package versions clone and freeze ordered sections, hash only canonical reader content and acknowledgment text, and keep save metadata outside that content hash.
+
+The first version requires acceptance. A material version replaces the required acceptance hash; a non-material version inherits the preceding requirement. This propagation prevents a later editorial save from bypassing an earlier material version that a participant has not accepted. Acceptance records derive version and hash evidence from the trusted snapshot rather than client input.
+
 ## Storage plan
 
 Development can use a deterministic in-memory/test adapter. Production must use an AittaDB-compatible adapter and pass the same contract tests.

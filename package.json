@@ -19,6 +19,7 @@
     "validate": "npm run agents:check && npm run plan:check && npm run instances:check && npm run lint && npm run typecheck && npm test"
   },
   "dependencies": {
+    "mdast-util-from-markdown": "2.0.3",
     "react": "19.2.6",
     "react-dom": "19.2.6"
   },
