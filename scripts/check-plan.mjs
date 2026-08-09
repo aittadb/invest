@@ -1,79 +1,122 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 
 const root = new URL("../", import.meta.url);
-const [plan, changelog] = await Promise.all([
-  readFile(new URL("PLAN.md", root), "utf8"),
-  readFile(new URL("CHANGELOG.md", root), "utf8"),
-]);
+const requiredPlanGuidance = [
+  "unfinished implementation work",
+  "Completed tasks move to `CHANGELOG.md`",
+];
 
-const openTasks = new Map();
-const planTaskPattern = /^- \[ \] (TASK-\d{3}): (.+)$/gm;
-const uncheckedTaskLines = plan.match(/^- \[ \] TASK-/gm) ?? [];
-
-for (const match of plan.matchAll(planTaskPattern)) {
-  const [, id, description] = match;
-  assert(!openTasks.has(id), `${id} is duplicated in PLAN.md`);
-  assert(description.includes(". DoD: "), `${id} must declare a DoD`);
-
-  const dependencyClause = description.match(
-    /\bDepends on: (none|`TASK-\d{3}`(?:, `TASK-\d{3}`)*)\./,
+export function validatePlanPolicy(plan, changelog) {
+  assert.match(
+    plan,
+    /^# Investor App Implementation Plan$/m,
+    "PLAN.md must keep its implementation-plan heading",
   );
-  assert(dependencyClause, `${id} must declare direct dependencies`);
+  for (const guidance of requiredPlanGuidance) {
+    assert(
+      plan.includes(guidance),
+      `PLAN.md must keep workflow guidance containing: ${guidance}`,
+    );
+  }
 
-  const dependencies = [
-    ...dependencyClause[1].matchAll(/TASK-\d{3}/g),
-  ].map(([dependency]) => dependency);
-  assert(!dependencies.includes(id), `${id} cannot depend on itself`);
+  const checkedTaskLines = plan.match(/^- \[[xX]\] TASK-/gm) ?? [];
   assert.equal(
-    new Set(dependencies).size,
-    dependencies.length,
-    `${id} repeats a dependency`,
+    checkedTaskLines.length,
+    0,
+    "Completed tasks must move from PLAN.md to CHANGELOG.md",
   );
 
-  openTasks.set(id, dependencies);
-}
+  const openTasks = new Map();
+  const planTaskPattern = /^- \[ \] (TASK-\d{3}): (.+)$/gm;
+  const uncheckedTaskLines = plan.match(/^- \[ \] TASK-/gm) ?? [];
 
-assert(openTasks.size > 0, "PLAN.md must contain at least one open task");
-assert.equal(
-  openTasks.size,
-  uncheckedTaskLines.length,
-  "Every unchecked TASK line must use the stable PLAN task format",
-);
+  for (const match of plan.matchAll(planTaskPattern)) {
+    const [, id, description] = match;
+    assert(!openTasks.has(id), `${id} is duplicated in PLAN.md`);
+    assert(description.includes(". DoD: "), `${id} must declare a DoD`);
 
-const completedTaskIds = [
-  ...changelog.matchAll(/^- \*\*(TASK-\d{3}):\*\*/gm),
-].map((match) => match[1]);
-const completedTasks = new Set(completedTaskIds);
-assert.equal(
-  completedTasks.size,
-  completedTaskIds.length,
-  "A TASK heading is duplicated in CHANGELOG.md",
-);
-const knownTasks = new Set([...openTasks.keys(), ...completedTasks]);
+    const dependencyClause = description.match(
+      /\bDepends on: (none|`TASK-\d{3}`(?:, `TASK-\d{3}`)*)\./,
+    );
+    assert(dependencyClause, `${id} must declare direct dependencies`);
 
-for (const [id, dependencies] of openTasks) {
-  assert(!completedTasks.has(id), `${id} is both open and completed`);
-  for (const dependency of dependencies) {
-    assert(knownTasks.has(dependency), `${id} references unknown ${dependency}`);
+    const dependencies = [
+      ...dependencyClause[1].matchAll(/TASK-\d{3}/g),
+    ].map(([dependency]) => dependency);
+    assert(!dependencies.includes(id), `${id} cannot depend on itself`);
+    assert.equal(
+      new Set(dependencies).size,
+      dependencies.length,
+      `${id} repeats a dependency`,
+    );
+
+    openTasks.set(id, dependencies);
   }
-}
 
-const visiting = new Set();
-const visited = new Set();
+  assert.equal(
+    openTasks.size,
+    uncheckedTaskLines.length,
+    "Every unchecked TASK line must use the stable PLAN task format",
+  );
 
-function visit(id, path = []) {
-  if (visited.has(id)) return;
-  assert(!visiting.has(id), `PLAN.md dependency cycle: ${[...path, id].join(" -> ")}`);
+  const completedTaskIds = [
+    ...changelog.matchAll(/^- \*\*(TASK-\d{3}):\*\*/gm),
+  ].map((match) => match[1]);
+  const completedTasks = new Set(completedTaskIds);
+  assert.equal(
+    completedTasks.size,
+    completedTaskIds.length,
+    "A TASK heading is duplicated in CHANGELOG.md",
+  );
+  const knownTasks = new Set([...openTasks.keys(), ...completedTasks]);
 
-  visiting.add(id);
-  for (const dependency of openTasks.get(id) ?? []) {
-    if (openTasks.has(dependency)) visit(dependency, [...path, id]);
+  for (const [id, dependencies] of openTasks) {
+    assert(!completedTasks.has(id), `${id} is both open and completed`);
+    for (const dependency of dependencies) {
+      assert(knownTasks.has(dependency), `${id} references unknown ${dependency}`);
+    }
   }
-  visiting.delete(id);
-  visited.add(id);
+
+  const visiting = new Set();
+  const visited = new Set();
+
+  function visit(id, path = []) {
+    if (visited.has(id)) return;
+    assert(
+      !visiting.has(id),
+      `PLAN.md dependency cycle: ${[...path, id].join(" -> ")}`,
+    );
+
+    visiting.add(id);
+    for (const dependency of openTasks.get(id) ?? []) {
+      if (openTasks.has(dependency)) visit(dependency, [...path, id]);
+    }
+    visiting.delete(id);
+    visited.add(id);
+  }
+
+  for (const id of openTasks.keys()) visit(id);
+
+  return openTasks.size;
 }
 
-for (const id of openTasks.keys()) visit(id);
+export async function checkPlanFiles() {
+  const [plan, changelog] = await Promise.all([
+    readFile(new URL("PLAN.md", root), "utf8"),
+    readFile(new URL("CHANGELOG.md", root), "utf8"),
+  ]);
+  const openTaskCount = validatePlanPolicy(plan, changelog);
 
-console.log(`PLAN.md dependency graph is valid (${openTasks.size} open tasks).`);
+  console.log(
+    `PLAN.md dependency graph is valid (${openTaskCount} open tasks).`,
+  );
+}
+
+if (
+  process.argv[1] &&
+  pathToFileURL(process.argv[1]).href === import.meta.url
+) {
+  await checkPlanFiles();
+}

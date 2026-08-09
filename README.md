@@ -79,7 +79,7 @@ npm run validate
 
 ## Planning Workflow
 
-Before repository-affecting implementation, add or amend one unchecked `PLAN.md` task. Keep tasks small: one primitive, route group, security control, UI flow, storage contract, or narrowly bounded proof per task. Record only direct dependencies. Ready tasks may proceed concurrently in isolated branches and Git worktrees, with one focused task per worktree. Completed tasks move to `CHANGELOG.md` with evidence and are removed from `PLAN.md`.
+Before repository-affecting implementation, add or amend one unchecked `PLAN.md` task. Keep tasks small: one primitive, route group, security control, UI flow, storage contract, or narrowly bounded proof per task. Record only direct dependencies. Ready tasks may proceed concurrently in isolated branches and Git worktrees, with one focused task per worktree. Completed tasks move to `CHANGELOG.md` with evidence and are removed from `PLAN.md`; zero open tasks is the valid completed state.
 
 ## License
 

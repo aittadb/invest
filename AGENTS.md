@@ -68,6 +68,8 @@ Before repository-affecting implementation, add or amend an unchecked root `PLAN
 - records a concrete external blocker separately when one exists;
 - is topologically ordered when that improves readability without implying serial execution.
 
+An empty `PLAN.md` task graph is the valid completed state; keep its heading and workflow guidance even when no unchecked tasks remain.
+
 A task dependency is justified only when the dependent task cannot meet its DoD without consuming the prerequisite's contract, implementation, or validated proof. Similar subject matter, preferred merge order, shared infrastructure, or possible future integration do not by themselves create a dependency. Keep sibling domain modules and repositories behind narrow interfaces so independent lanes remain independently testable.
 
 Every task whose dependencies are complete and which has no external blocker may proceed concurrently. Keep one task in focus per agent worktree, not one task globally. Use isolated branches and Git worktrees, prefer disjoint file ownership, validate each task independently, and integrate complete commits in dependency order. The integrating branch owns the authoritative `PLAN.md` removal and `CHANGELOG.md` evidence update when parallel workers would otherwise race on those shared ledgers.
