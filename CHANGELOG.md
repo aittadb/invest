@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-043:** Add the create-your-instance quick start. DoD: the README opening includes a compact `@Sites` prompt that interviews one question at a time, separates reusable behavior from runtime campaign settings, requests a decision review, and requires approval before building or publishing without embedding reference-campaign defaults.
+
+  Acceptance evidence: the README now opens with a copy-ready `@Sites` prompt linking this repository. It requests compact one-question-at-a-time interviewing, configurable instance data, the core campaign and trust decisions, a decision review, private initial creation, and explicit approval before public publication. The prompt contains no reference-campaign defaults; the Markdown diff check and AGENTS size guard pass.
+
 - **TASK-041:** Externalize per-instance Sites binding metadata. DoD: reusable source tracks only an inert hosting example, each deployment keeps its real `.openai/hosting.json` ignored and local, builds fall back safely for clean checkouts, packaging still requires an explicit active binding, and tests prove production and acceptance identifiers cannot enter normal source diffs.
 
   Acceptance evidence: the real production binding is no longer tracked, `.openai/hosting.example.json` contains only null placeholders, and the instance-boundary check fails if `.openai/hosting.json` enters the index. A build without the active binding passes and omits deployment metadata, while `npm run sites:package` fails closed until an exact active project identifier is restored. Runtime instance values remain in ignored local or hosted configuration.

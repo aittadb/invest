@@ -4,6 +4,18 @@ Investor App is a configurable ChatGPT Sites application for publishing a privat
 
 The approved baseline is [docs/AittaDB-Investor-App-Specification.md](docs/AittaDB-Investor-App-Specification.md). This repository is the app workflow layer. Persistent production data is expected to live in [AittaDB](https://github.com/aittadb/aittadb), not in campaign-specific source files or browser storage.
 
+## Create Your Instance
+
+Open [this repository](https://github.com/aittadb/invest) in ChatGPT, add the `@Sites` tag, and use this quick-start prompt:
+
+```text
+@Sites Create my own Investor App instance from https://github.com/aittadb/invest.
+
+Interview me with one compact question at a time. Offer 2-4 clear options when useful, mark one as recommended, and accept free-text answers. Cover the non-binding legal boundary, audience and countries, public campaign, investor and founder paths, company and financial information, private information package, owner, privacy, branding, and launch readiness.
+
+Keep campaign names, owner identity, hostnames, targets, countries, branding, content, and phase rules in instance configuration, never reusable source. Before building, show a short review of confirmed settings, assumptions, unresolved decisions, and legal questions. Ask me to approve it, then build the site privately and ask again before public publication.
+```
+
 ## Status
 
 The reusable Investor App software is experimental. Its public AittaDB development instance is available at [invest.aittadb.com](https://invest.aittadb.com); that hostname and its campaign content are deployment configuration, not application defaults. The instance is not production-ready while authenticated workflows and production persistence remain unfinished.
