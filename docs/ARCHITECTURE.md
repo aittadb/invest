@@ -150,6 +150,10 @@ An adapter instance is already bound to one backend credential and grant set. Fo
 
 Manual notification templates remain private and bounded. Copy evidence means only that an owner copied a template, while a separate owner-entered marker records reported delivery outside the app. Neither state implies automated email delivery, and public errors use fixed projections that omit credentials, notes, template content, and internal causes.
 
+`DevelopmentInMemoryAuditRepository` appends one immutable allowlisted event per retry-stable operation and exposes finite adapter pagination. `DevelopmentInMemoryManualNotificationRepository` atomically compare-and-sets one private current notification with each immutable revision under one operation ID. Copy evidence appends independently from the single owner-entered sent marker, so neither action implies the other.
+
+Notification keys are one-way derived, stored records are reconstructed through the bounded domain transitions, and every prior revision is verified before current state is returned. Audit detail cannot retain export contents or arbitrary fields, while notification templates never enter public failure projections. These repositories are deterministic development proof, not production storage.
+
 ### Amount and aggregate display configuration
 
 `domain/amount-aggregate-configuration.ts` requires an explicit currency, integer minor-unit minimum, positive increment, optional maximum, and public visibility choice. No deployment inherits a currency, amount boundary, or aggregate policy from reusable source.
