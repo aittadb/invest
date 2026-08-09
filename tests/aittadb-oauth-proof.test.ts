@@ -318,6 +318,13 @@ test("credential-bearing failures expose no causes or credential values", async 
   }
 });
 
+test("configuration rejects an extractable transaction cookie key", async () => {
+  await assert.rejects(
+    createHarness({ cookieKeyExtractable: true }),
+    publicFailure("service_unavailable"),
+  );
+});
+
 type ObservedRequest = Readonly<{
   url: string;
   authorization: string | null;
@@ -336,13 +343,14 @@ async function createHarness(
     now?: () => Date;
     failAt?: "discovery" | "token" | "introspection";
     fetchFailure?: Error;
+    cookieKeyExtractable?: boolean;
   }> = {},
 ) {
   const key = await crypto.subtle.importKey(
     "raw",
     Uint8Array.from({ length: 32 }, (_, index) => index + 1),
     "AES-GCM",
-    false,
+    options.cookieKeyExtractable ?? false,
     ["encrypt", "decrypt"],
   );
   const requests: ObservedRequest[] = [];

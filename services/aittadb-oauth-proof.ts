@@ -288,6 +288,7 @@ function validateConfiguration(
   if (
     !(input.transactionCookieKey instanceof CryptoKey) ||
     input.transactionCookieKey.algorithm.name !== "AES-GCM" ||
+    input.transactionCookieKey.extractable ||
     !input.transactionCookieKey.usages.includes("encrypt") ||
     !input.transactionCookieKey.usages.includes("decrypt") ||
     typeof input.fetch !== "function" ||
