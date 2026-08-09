@@ -88,6 +88,12 @@ Setup readiness is distinct from open or closed state: configuration may be comp
 
 An adapter instance is already bound to one backend credential and grant set. Foreign and missing records therefore have the same read and mutation shape, while fixed public failures contain no keys, values, or credentials. The reusable contract harness runs unchanged against deterministic fakes and production adapters and deliberately checks authorization, duplicate creation, stale revision, atomic rollback, disclosure, idempotency, and pagination behavior.
 
+### Audit and manual notifications
+
+`domain/audit-notification.ts` accepts only closed, allowlisted audit detail. Human actors are attributed by trusted identity subject, system activity is explicit, and operation IDs make append intent retry-addressable. Export evidence records an export class but never its content; notification evidence references a private notification record instead of copying its template.
+
+Manual notification templates remain private and bounded. Copy evidence means only that an owner copied a template, while a separate owner-entered marker records reported delivery outside the app. Neither state implies automated email delivery, and public errors use fixed projections that omit credentials, notes, template content, and internal causes.
+
 ## Storage plan
 
 Development can use a deterministic in-memory/test adapter. Production must use an AittaDB-compatible adapter and pass the same contract tests.

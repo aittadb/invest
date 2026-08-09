@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-011:** Define audit and manual-notification contracts. Depends on: `TASK-004`. DoD: audit event shape, actor attribution policy, notification-template, copied-versus-sent distinction, export event, and redaction rules are typed and documented; tests cover audit append intent, manual sent-marker behavior, and no credential or private-note fields in public errors.
+
+  Acceptance evidence: `domain/audit-notification.ts` defines trusted-subject actor attribution, retry-addressed immutable append intents, allowlisted resource/export/notification detail, bounded private templates, distinct copy evidence and owner-entered sent markers, and an explicit redaction policy. Four focused tests cover frozen audit evidence, export events without payload retention, retry-stable copy and sent transitions, bounded templates, owner-only markers, and fixed public errors that exclude credentials and private notes. Full `npm run validate` passes with 67 tests.
+
 - **TASK-012:** Define the `StorageAdapter` contract suite. Depends on: `TASK-004`. DoD: adapter interface, transaction/idempotency expectations, pagination boundary, compare-and-set requirement, non-disclosing failure shape, and shared contract-test harness are documented and typed; tests run against a minimal fake adapter proving the harness detects authorization, duplicate, drift, and disclosure failures.
 
   Acceptance evidence: `domain/storage-adapter.ts` defines a credential-bound adapter with finite pages, bounded atomic transactions, compare-and-set revisions, replay-safe operation IDs, JSON documents, and fixed non-disclosing failures. `tests/support/storage-adapter-contract.ts` is a reusable typed behavioral harness. Five tests run it against a conforming minimal fake and deliberately faulty authorization, duplicate, stale-write, and disclosure variants, proving those violations are detected rather than merely exercising a happy path. Full `npm run validate` passes with 67 tests.
