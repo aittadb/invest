@@ -76,6 +76,12 @@ Money constructors reject floating-point, unsafe-integer, negative, and configur
 
 The first version requires acceptance. A material version replaces the required acceptance hash; a non-material version inherits the preceding requirement. This propagation prevents a later editorial save from bypassing an earlier material version that a participant has not accepted. Acceptance records derive version and hash evidence from the trusted snapshot rather than client input.
 
+### Development content repositories
+
+`InMemoryPackageVersionRepository` and `InMemoryAcknowledgmentRepository` compose over a deterministic development/test `StorageAdapter`; neither is production storage. Package appends atomically create an immutable version and compare-and-set the current-version head. Reads reconstruct each snapshot through the package parser and verify stored content and required-acceptance hashes before returning private content.
+
+Acknowledgment records are keyed to the authenticated participant subject through a one-way storage identifier. The caller cannot provide the stored subject, content hash, or required-acceptance hash; those values derive from the trusted package snapshot. New evidence accepts only the current version, while idempotent retries may re-read their original immutable version. Missing identity, foreign records, denied grants, and absent records remain non-disclosing through the credential-bound adapter.
+
 ### Participant profile and consent
 
 `domain/participant-profile.ts` keeps the authenticated subject and account-email label identity-bound while exposing an explicit policy for participant-editable, registration-only, withdraw-only, request-only, and system-managed fields. Required process messages are independent from optional marketing consent.
