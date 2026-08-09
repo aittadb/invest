@@ -13,8 +13,12 @@ import {
   type ManualNotificationTemplate,
 } from "../domain/audit-notification.ts";
 import {
+  parseActorSubject,
   parseStableId,
+  parseTimestamp,
+  type ActorSubject,
   type StableId,
+  type Timestamp,
 } from "../domain/foundation.ts";
 import {
   StorageFailure,
@@ -145,6 +149,17 @@ export type MarkManualNotificationSentRequest = Readonly<{
   marker: unknown;
 }>;
 
+export type AuditedManualNotificationActivityRequest = Readonly<{
+  operationId: unknown;
+  notificationId: unknown;
+  expectedRevision: unknown;
+  ownerSubject: unknown;
+  occurredAt: unknown;
+}>;
+
+export type AuditedManualNotificationMutationResult =
+  ManualNotificationMutationResult & Readonly<{ auditEvent: AuditEvent }>;
+
 export type ManualNotificationListRequest = Readonly<{
   limit: number;
   cursor?: StorageCursor;
@@ -170,6 +185,20 @@ export interface ManualNotificationRepository {
   markSent(
     request: MarkManualNotificationSentRequest,
   ): Promise<ManualNotificationMutationResult>;
+}
+
+export interface AtomicManualNotificationActivityRepository {
+  readonly activityConsistency: "atomic-notification-audit";
+  get(id: unknown): Promise<ManualNotificationSnapshot | null>;
+  list(
+    request: ManualNotificationListRequest,
+  ): Promise<ManualNotificationPage>;
+  recordCopyWithAudit(
+    request: AuditedManualNotificationActivityRequest,
+  ): Promise<AuditedManualNotificationMutationResult>;
+  markSentWithAudit(
+    request: AuditedManualNotificationActivityRequest,
+  ): Promise<AuditedManualNotificationMutationResult>;
 }
 
 /** Deterministic development repository with no state outside its adapter. */
@@ -225,9 +254,12 @@ export class DevelopmentInMemoryAuditRepository implements AuditRepository {
  * revisions are both stored so delayed retries can rebuild the original write.
  */
 export class DevelopmentInMemoryManualNotificationRepository
-  implements ManualNotificationRepository
+  implements
+    ManualNotificationRepository,
+    AtomicManualNotificationActivityRepository
 {
   readonly storageKind = "development-in-memory" as const;
+  readonly activityConsistency = "atomic-notification-audit" as const;
 
   readonly #storage: StorageAdapter;
 
@@ -336,6 +368,72 @@ export class DevelopmentInMemoryManualNotificationRepository
     );
   }
 
+  async recordCopyWithAudit(
+    request: AuditedManualNotificationActivityRequest,
+  ): Promise<AuditedManualNotificationMutationResult> {
+    return this.#applyAuditedActivity(request, "template-copied");
+  }
+
+  async markSentWithAudit(
+    request: AuditedManualNotificationActivityRequest,
+  ): Promise<AuditedManualNotificationMutationResult> {
+    return this.#applyAuditedActivity(request, "sent-marked");
+  }
+
+  async #applyAuditedActivity(
+    request: AuditedManualNotificationActivityRequest,
+    activity: "template-copied" | "sent-marked",
+  ): Promise<AuditedManualNotificationMutationResult> {
+    const operationId = requiredOperationId(request.operationId);
+    const notificationId = requiredNotificationId(request.notificationId);
+    const expectedRevision = requiredExpectedRevision(request.expectedRevision);
+    const ownerSubject = requiredOwnerSubject(request.ownerSubject);
+    const occurredAt = requiredOccurredAt(request.occurredAt);
+    const base = await this.#readMutationBase(notificationId, expectedRevision);
+    const changed = activity === "template-copied"
+      ? recordManualNotificationCopy(base.record, {
+          id: await activityEvidenceId<"manual-notification-copy">(
+            "notification-copy",
+            operationId,
+          ),
+          copiedAt: occurredAt,
+          copiedBy: { type: "owner", subject: ownerSubject },
+        })
+      : markManualNotificationSent(base.record, {
+          id: await activityEvidenceId<"manual-notification-sent-marker">(
+            "notification-sent",
+            operationId,
+          ),
+          sentAt: occurredAt,
+          sentBy: { type: "owner", subject: ownerSubject },
+        });
+    if (!changed.ok) invalidRequest();
+    if (changed.value === base.record) throw new StorageFailure("CONFLICT");
+
+    const auditEvent = await manualNotificationAuditEvent(
+      operationId,
+      notificationId,
+      ownerSubject,
+      occurredAt,
+      activity,
+    );
+    const preparedAudit = prepareAuditAppend({
+      type: "append-audit-event",
+      event: auditEvent,
+    });
+    if (preparedAudit.operationId !== operationId) unavailable();
+    const result = await this.#write(
+      Object.freeze({
+        revision: expectedRevision + 1,
+        record: changed.value,
+      }),
+      expectedRevision,
+      operationId,
+      preparedAudit,
+    );
+    return Object.freeze({ ...result, auditEvent });
+  }
+
   async #readMutationBase(
     id: ManualNotificationId,
     expectedRevision: number,
@@ -362,6 +460,7 @@ export class DevelopmentInMemoryManualNotificationRepository
     snapshot: ManualNotificationSnapshot,
     expectedRevision: number | null,
     operationId: StorageOperationId,
+    preparedAudit: PreparedAuditAppend | null = null,
   ): Promise<ManualNotificationMutationResult> {
     if (snapshot.revision !== (expectedRevision === null ? 1 : expectedRevision + 1)) {
       unavailable();
@@ -385,11 +484,15 @@ export class DevelopmentInMemoryManualNotificationRepository
           expectedRevision: null,
           value,
         },
+        ...(preparedAudit === null ? [] : [preparedAudit.mutation]),
       ],
     });
     const currentRecord = result.records[0];
     const historyRecord = result.records[1];
     if (!currentRecord || !historyRecord) unavailable();
+    if (preparedAudit !== null) {
+      verifyPreparedAuditAppend(preparedAudit, result.records[2]);
+    }
 
     const current = await decodeNotificationSnapshot(
       currentRecord,
@@ -717,6 +820,36 @@ async function hashedStorageId(namespace: string, value: string): Promise<string
   return `${namespace}:${hexadecimal}`;
 }
 
+async function activityEvidenceId<Entity extends string>(
+  namespace: string,
+  operationId: StorageOperationId,
+): Promise<StableId<Entity>> {
+  return requiredStableId<Entity>(await hashedStorageId(namespace, operationId));
+}
+
+async function manualNotificationAuditEvent(
+  operationId: StorageOperationId,
+  notificationId: ManualNotificationId,
+  ownerSubject: ActorSubject,
+  occurredAt: Timestamp,
+  activity: "template-copied" | "sent-marked",
+): Promise<AuditEvent> {
+  return Object.freeze({
+    id: await activityEvidenceId<"audit-event">(
+      "notification-audit",
+      operationId,
+    ),
+    operationId: requiredStableId<"audit-operation">(operationId),
+    occurredAt,
+    actor: Object.freeze({ type: "owner", subject: ownerSubject }),
+    detail: Object.freeze({
+      kind: "manual-notification",
+      notificationId,
+      activity,
+    }),
+  });
+}
+
 function requiredStorageKey(collection: StorageCollection, id: unknown): StorageKey {
   const parsed = parseStorageKey(collection, id);
   if (!parsed.ok) unavailable();
@@ -731,6 +864,18 @@ function storageCollection(value: string): StorageCollection {
 
 function requiredOperationId(value: unknown): StorageOperationId {
   const parsed = parseStorageOperationId(value);
+  if (!parsed.ok) invalidRequest();
+  return parsed.value;
+}
+
+function requiredOwnerSubject(value: unknown): ActorSubject {
+  const parsed = parseActorSubject(value);
+  if (!parsed.ok) invalidRequest();
+  return parsed.value;
+}
+
+function requiredOccurredAt(value: unknown): Timestamp {
+  const parsed = parseTimestamp(value);
   if (!parsed.ok) invalidRequest();
   return parsed.value;
 }

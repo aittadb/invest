@@ -329,6 +329,109 @@ test("development notification repository passes the reusable contract", async (
   );
 });
 
+test("manual notification copy and sent activity commit separate audit evidence", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const repository = new DevelopmentInMemoryManualNotificationRepository(storage);
+  await repository.create({
+    operationId: "notification-operation:activity-create",
+    template: templateInput("notification:activity"),
+  });
+
+  const copyRequest = {
+    operationId: "notification-operation:activity-copy",
+    notificationId: "notification:activity",
+    expectedRevision: 1,
+    ownerSubject: OWNER.subject,
+    occurredAt: COPIED_AT,
+  };
+  const copied = await repository.recordCopyWithAudit(copyRequest);
+  assert.equal(copied.revision, 2);
+  assert.equal(copied.record.copyEvidence.length, 1);
+  assert.equal(copied.record.sentMarker, null);
+  assert.deepEqual(copied.auditEvent.detail, {
+    kind: "manual-notification",
+    notificationId: "notification:activity",
+    activity: "template-copied",
+  });
+
+  const sentRequest = {
+    operationId: "notification-operation:activity-sent",
+    notificationId: "notification:activity",
+    expectedRevision: 2,
+    ownerSubject: OWNER.subject,
+    occurredAt: SENT_AT,
+  };
+  const sent = await repository.markSentWithAudit(sentRequest);
+  assert.equal(sent.revision, 3);
+  assert.equal(sent.record.copyEvidence.length, 1);
+  assert.equal(sent.record.sentMarker?.sentAt, SENT_AT);
+  assert.deepEqual(sent.auditEvent.detail, {
+    kind: "manual-notification",
+    notificationId: "notification:activity",
+    activity: "sent-marked",
+  });
+
+  const auditPage = await new DevelopmentInMemoryAuditRepository(storage).list({
+    limit: 10,
+  });
+  assert.deepEqual(
+    auditPage.items.map((event) => event.detail).sort((left, right) =>
+      JSON.stringify(left).localeCompare(JSON.stringify(right))
+    ),
+    [copied.auditEvent.detail, sent.auditEvent.detail].sort((left, right) =>
+      JSON.stringify(left).localeCompare(JSON.stringify(right))
+    ),
+  );
+  const delayedCopyReplay = await new DevelopmentInMemoryManualNotificationRepository(
+    storage,
+  ).recordCopyWithAudit(copyRequest);
+  assert.deepEqual(delayedCopyReplay, { ...copied, replayed: true });
+  assert.equal((await new DevelopmentInMemoryAuditRepository(storage).list({
+    limit: 10,
+  })).items.length, 2);
+
+  await expectStorageFailure(
+    () => repository.recordCopyWithAudit({
+      ...copyRequest,
+      occurredAt: "2026-04-01T09:01:30.000Z",
+    }),
+    "CONFLICT",
+  );
+});
+
+test("manual notification activity failure changes neither history nor audit", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const repository = new DevelopmentInMemoryManualNotificationRepository(storage);
+  await repository.create({
+    operationId: "notification-operation:atomic-create",
+    template: templateInput("notification:atomic-activity"),
+  });
+  const failing = new DevelopmentInMemoryManualNotificationRepository(
+    new RejectAuditMutationAdapter(storage),
+  );
+
+  await expectStorageFailure(
+    () => failing.markSentWithAudit({
+      operationId: "notification-operation:atomic-sent",
+      notificationId: "notification:atomic-activity",
+      expectedRevision: 1,
+      ownerSubject: OWNER.subject,
+      occurredAt: SENT_AT,
+    }),
+    "UNAVAILABLE",
+  );
+  const unchanged = await repository.get("notification:atomic-activity");
+  assert.equal(unchanged?.revision, 1);
+  assert.equal(unchanged?.record.sentMarker, null);
+  assert.deepEqual(
+    (await new DevelopmentInMemoryAuditRepository(storage).list({ limit: 10 }))
+      .items,
+    [],
+  );
+});
+
 test("repositories reject non-allowlisted evidence without serializing secrets", async () => {
   const state = new MemoryStorageState();
   const storage = new DeterministicMemoryStorageAdapter(state, true);
@@ -552,6 +655,33 @@ class MemoryStorageState {
     string,
     Readonly<{ fingerprint: string; result: StorageTransactionResult }>
   >();
+}
+
+class RejectAuditMutationAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    if (request.mutations.some((mutation) =>
+      mutation.type === "put" && mutation.value.kind === "audit-event"
+    )) {
+      throw new StorageFailure("UNAVAILABLE");
+    }
+    return this.#delegate.transact(request);
+  }
 }
 
 class DeterministicMemoryStorageAdapter implements StorageAdapter {
