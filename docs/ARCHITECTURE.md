@@ -112,6 +112,12 @@ Manual notification templates remain private and bounded. Copy evidence means on
 
 Public totals render only when configured for non-zero visibility and the sanitized total is positive. The public projection is closed to amount, currency, bounded display label, and qualifier, so participant identities, counts, notes, moderation state, and private totals cannot enter it.
 
+### Development campaign repository
+
+`DevelopmentInMemoryCampaignRepository` persists one explicitly configured campaign setup through a supplied development/test `StorageAdapter`. It does not retain separate process-local state, so recreating the repository over the same adapter proves the persistence boundary. A setup contains the validated public presentation, one or more explicit phases, and explicit amount and aggregate-display policy; the parser supplies no campaign, country, path, currency, or visibility default.
+
+Each save atomically compare-and-sets the current setup and creates an immutable revision record under one retry-stable operation ID. History is bounded and cursor-paged. The adapter remains credential-bound, so unauthorized reads and lists have the same shape as missing state. This repository and deterministic adapter fixtures are development proof only; production still requires the AittaDB implementation and the same behavioral contract.
+
 ## Storage plan
 
 Development can use a deterministic in-memory/test adapter. Production must use an AittaDB-compatible adapter and pass the same contract tests.
