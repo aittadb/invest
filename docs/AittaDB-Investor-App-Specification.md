@@ -1,7 +1,7 @@
 # Investor App Public Use Cases
 
-Status: public implementation baseline  
-Reference source repository: `https://github.com/aittadb/invest`  
+Status: public implementation baseline
+Reference source repository: `https://github.com/aittadb/invest`
 Database/server reference: `https://github.com/aittadb/aittadb`
 
 ## Purpose
