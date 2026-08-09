@@ -1,6 +1,9 @@
 import type { ApplicationRouteHandler } from "../contracts.ts";
 import { composeRouteHandlers } from "./compose.ts";
-import { handleParticipantHomeRoutes } from "./participant-home.ts";
+import {
+  createParticipantHomeRouteHandler,
+  type ParticipantRouteCapabilities,
+} from "./participant-home.ts";
 
 export {
   createFounderInterestRouteHandler,
@@ -13,11 +16,13 @@ export {
 } from "./investment-interest.ts";
 
 export function createParticipantRouteHandler(
-  resourceHandlers: readonly ApplicationRouteHandler[] = [
-    handleParticipantHomeRoutes,
-  ],
+  resourceHandlers: readonly ApplicationRouteHandler[] = [],
+  capabilities: ParticipantRouteCapabilities = {},
 ): ApplicationRouteHandler {
-  return composeRouteHandlers(resourceHandlers);
+  return composeRouteHandlers([
+    createParticipantHomeRouteHandler(capabilities),
+    ...resourceHandlers,
+  ]);
 }
 
 export const handleParticipantRoutes = createParticipantRouteHandler();

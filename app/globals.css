@@ -834,6 +834,12 @@ footer {
   margin-top: 24px;
 }
 
+.participant-workflow-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
 .participant-package--resource .participant-package-detail .text-link {
   display: inline-block;
   margin-top: 24px;

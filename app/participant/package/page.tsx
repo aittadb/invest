@@ -6,6 +6,9 @@ import { headers } from "next/headers";
 import { getOwnerUser } from "@/app/owner-auth";
 import { requireParticipantAccess } from "@/app/participant-auth";
 import { chatGPTSignOutPath } from "@/domain/auth-navigation";
+import { participantWorkflowAccess } from "@/domain/participant-home-resource";
+import { FOUNDER_INTEREST_PATH } from "@/domain/participant-founder-interest-resource";
+import { INVESTMENT_INTEREST_PATH } from "@/domain/participant-investment-interest-resource";
 import {
   PARTICIPANT_HOME_PATH,
   PRIVATE_PACKAGE_PATH,
@@ -14,6 +17,12 @@ import {
   campaignFromRuntimeHeader,
   CAMPAIGN_CONFIGURATION_HEADER,
 } from "@/http/runtime-campaign";
+import {
+  hasParticipantFounderInterest,
+  hasParticipantInvestmentInterests,
+  PARTICIPANT_FOUNDER_INTEREST_HEADER,
+  PARTICIPANT_INVESTMENT_INTERESTS_HEADER,
+} from "@/http/runtime-capabilities";
 
 export const dynamic = "force-dynamic";
 
@@ -32,6 +41,17 @@ export default async function PrivatePackage() {
   const campaign = campaignFromRuntimeHeader(
     requestHeaders.get(CAMPAIGN_CONFIGURATION_HEADER),
   );
+  const {
+    founderInterest: founderInterestAvailable,
+    investmentInterests: investmentInterestsAvailable,
+  } = participantWorkflowAccess(participant, {
+    founderInterest: hasParticipantFounderInterest(
+      requestHeaders.get(PARTICIPANT_FOUNDER_INTEREST_HEADER),
+    ),
+    investmentInterests: hasParticipantInvestmentInterests(
+      requestHeaders.get(PARTICIPANT_INVESTMENT_INTERESTS_HEADER),
+    ),
+  });
 
   return (
     <div className="participant-page">
@@ -42,6 +62,12 @@ export default async function PrivatePackage() {
         <nav aria-label="Participant navigation">
           <Link href="/">View campaign</Link>
           <Link href={PARTICIPANT_HOME_PATH}>Your participation</Link>
+          {founderInterestAvailable ? (
+            <Link href={FOUNDER_INTEREST_PATH}>Founder interest</Link>
+          ) : null}
+          {investmentInterestsAvailable ? (
+            <Link href={INVESTMENT_INTEREST_PATH}>Investment interests</Link>
+          ) : null}
           {owner ? <Link href="/owner">Manage campaign</Link> : null}
           <a href={chatGPTSignOutPath("/")}>Sign out</a>
         </nav>

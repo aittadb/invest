@@ -5,14 +5,23 @@ import { headers } from "next/headers";
 import { getOwnerUser } from "@/app/owner-auth";
 import { requireParticipantAccess } from "@/app/participant-auth";
 import { chatGPTSignOutPath } from "@/domain/auth-navigation";
+import { participantWorkflowAccess } from "@/domain/participant-home-resource";
 import {
   PARTICIPANT_HOME_PATH,
   PRIVATE_PACKAGE_PATH,
 } from "@/domain/participant-navigation";
+import { FOUNDER_INTEREST_PATH } from "@/domain/participant-founder-interest-resource";
+import { INVESTMENT_INTEREST_PATH } from "@/domain/participant-investment-interest-resource";
 import {
   campaignFromRuntimeHeader,
   CAMPAIGN_CONFIGURATION_HEADER,
 } from "@/http/runtime-campaign";
+import {
+  hasParticipantFounderInterest,
+  hasParticipantInvestmentInterests,
+  PARTICIPANT_FOUNDER_INTEREST_HEADER,
+  PARTICIPANT_INVESTMENT_INTERESTS_HEADER,
+} from "@/http/runtime-capabilities";
 
 export const dynamic = "force-dynamic";
 
@@ -29,6 +38,17 @@ export default async function ParticipantHome() {
     requestHeaders.get(CAMPAIGN_CONFIGURATION_HEADER),
   );
   const currentPackage = participant.currentPackage;
+  const {
+    founderInterest: founderInterestAvailable,
+    investmentInterests: investmentInterestsAvailable,
+  } = participantWorkflowAccess(participant, {
+    founderInterest: hasParticipantFounderInterest(
+      requestHeaders.get(PARTICIPANT_FOUNDER_INTEREST_HEADER),
+    ),
+    investmentInterests: hasParticipantInvestmentInterests(
+      requestHeaders.get(PARTICIPANT_INVESTMENT_INTERESTS_HEADER),
+    ),
+  });
 
   return (
     <div className="participant-page">
@@ -40,6 +60,12 @@ export default async function ParticipantHome() {
           <Link href="/">View campaign</Link>
           {currentPackage ? (
             <Link href={PRIVATE_PACKAGE_PATH}>Information package</Link>
+          ) : null}
+          {founderInterestAvailable ? (
+            <Link href={FOUNDER_INTEREST_PATH}>Founder interest</Link>
+          ) : null}
+          {investmentInterestsAvailable ? (
+            <Link href={INVESTMENT_INTEREST_PATH}>Investment interests</Link>
           ) : null}
           {owner ? <Link href="/owner">Manage campaign</Link> : null}
           <a href={chatGPTSignOutPath("/")}>Sign out</a>
@@ -85,6 +111,41 @@ export default async function ParticipantHome() {
             </div>
           </dl>
         </section>
+
+        {founderInterestAvailable || investmentInterestsAvailable ? (
+          <section
+            className="participant-package"
+            aria-labelledby="participant-interests-title"
+          >
+            <div>
+              <p className="section-kicker">Your interests</p>
+              <h2 id="participant-interests-title">
+                Continue your pre-registration
+              </h2>
+            </div>
+            <div className="participant-package-detail">
+              <p>
+                Review or update the non-binding interests associated with this
+                account.
+              </p>
+              <div className="participant-workflow-actions">
+                {founderInterestAvailable ? (
+                  <Link className="button button--quiet" href={FOUNDER_INTEREST_PATH}>
+                    Founder interest
+                  </Link>
+                ) : null}
+                {investmentInterestsAvailable ? (
+                  <Link
+                    className="button button--primary"
+                    href={INVESTMENT_INTEREST_PATH}
+                  >
+                    Investment interests
+                  </Link>
+                ) : null}
+              </div>
+            </div>
+          </section>
+        ) : null}
 
         <section
           className="participant-package"

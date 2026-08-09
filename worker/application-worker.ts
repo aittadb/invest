@@ -25,7 +25,13 @@ import {
   dispatchApplicationRoute,
 } from "./routes/application.ts";
 import { handlePublicRoutes } from "./routes/public.ts";
-import { handleParticipantRoutes } from "./routes/participant.ts";
+import {
+  createFounderInterestRouteHandler,
+  createInvestmentInterestRouteHandler,
+  createParticipantRouteHandler,
+  type FounderInterestRouteDependencies,
+  type InvestmentInterestRouteDependencies,
+} from "./routes/participant.ts";
 import { createOwnerRouteHandler } from "./routes/owner.ts";
 import {
   createOwnerPackageRouteHandler,
@@ -42,6 +48,8 @@ export type ApplicationWorkerDependencies = Readonly<{
   dispatchRoute?: ApplicationRouteHandler;
   ownerPackage?: OwnerPackageRouteDependencies;
   ownerIndicationModeration?: OwnerIndicationModerationRouteDependencies;
+  participantFounderInterest?: FounderInterestRouteDependencies;
+  participantInvestmentInterests?: InvestmentInterestRouteDependencies;
 }>;
 
 export function createApplicationWorker(
@@ -58,11 +66,38 @@ export function createApplicationWorker(
   const ownerIndicationModerationAvailable =
     dependencies.dispatchRoute === undefined &&
     dependencies.ownerIndicationModeration !== undefined;
+  const participantFounderInterestAvailable =
+    dependencies.dispatchRoute === undefined &&
+    dependencies.participantFounderInterest !== undefined;
+  const participantInvestmentInterestsAvailable =
+    dependencies.dispatchRoute === undefined &&
+    dependencies.participantInvestmentInterests !== undefined;
+  const hasInjectedRoutes = ownerPackageAvailable ||
+    ownerIndicationModerationAvailable ||
+    participantFounderInterestAvailable ||
+    participantInvestmentInterestsAvailable;
   const dispatchRoute = dependencies.dispatchRoute ??
-    (dependencies.ownerPackage || dependencies.ownerIndicationModeration
+    (hasInjectedRoutes
       ? createApplicationRouteDispatcher({
           public: handlePublicRoutes,
-          participant: handleParticipantRoutes,
+          participant: createParticipantRouteHandler(
+            [
+              ...(dependencies.participantFounderInterest
+                ? [createFounderInterestRouteHandler(
+                    dependencies.participantFounderInterest,
+                  )]
+                : []),
+              ...(dependencies.participantInvestmentInterests
+                ? [createInvestmentInterestRouteHandler(
+                    dependencies.participantInvestmentInterests,
+                  )]
+                : []),
+            ],
+            {
+              founderInterest: participantFounderInterestAvailable,
+              investmentInterests: participantInvestmentInterestsAvailable,
+            },
+          ),
           owner: createOwnerRouteHandler(
             [
               ...(dependencies.ownerPackage
@@ -106,6 +141,8 @@ export function createApplicationWorker(
             participantAccess,
             ownerPackageAvailable,
             ownerIndicationModerationAvailable,
+            participantFounderInterestAvailable,
+            participantInvestmentInterestsAvailable,
           ),
           env,
           executionContext,
@@ -142,6 +179,8 @@ function withRuntimeConfiguration(
   participantAccess: AuthorizedParticipantAccess | null,
   ownerPackageWorkspaceAvailable: boolean,
   ownerIndicationModerationAvailable: boolean,
+  participantFounderInterestAvailable: boolean,
+  participantInvestmentInterestsAvailable: boolean,
 ): Request {
   return withRuntimeCapabilities(
     withRuntimeParticipantAccess(
@@ -157,6 +196,8 @@ function withRuntimeConfiguration(
     {
       ownerPackageWorkspace: ownerPackageWorkspaceAvailable,
       ownerIndicationModeration: ownerIndicationModerationAvailable,
+      participantFounderInterest: participantFounderInterestAvailable,
+      participantInvestmentInterests: participantInvestmentInterestsAvailable,
     },
   );
 }

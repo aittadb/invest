@@ -134,6 +134,70 @@ test("public and participant documents project only authorized capabilities", ()
   assert.equal(privatePackage.data.change_summary, "Private current package");
 });
 
+test("participant documents expose only configured and permitted interest workflows", () => {
+  const both = authorizedParticipant("both");
+  const bothHome = createParticipantHomeDocument(
+    "https://campaign.example/participant",
+    both,
+    syntheticPublicCampaign.name,
+    { founderInterest: true, investmentInterests: true },
+  );
+  assert.deepEqual(
+    bothHome.actions.map((action) => action.name),
+    [
+      "read-private-package",
+      "open-founder-interest",
+      "open-investment-interests",
+      "sign-out",
+    ],
+  );
+  assert.ok(bothHome.links.some((link) => link.rel.includes("founder-interest")));
+  assert.ok(
+    bothHome.links.some((link) => link.rel.includes("investment-interests")),
+  );
+
+  const founderHome = createParticipantHomeDocument(
+    "https://campaign.example/participant",
+    authorizedParticipant("founder"),
+    syntheticPublicCampaign.name,
+    { founderInterest: true, investmentInterests: true },
+  );
+  assert.deepEqual(
+    founderHome.actions.map((action) => action.name),
+    ["read-private-package", "open-founder-interest", "sign-out"],
+  );
+
+  const investorPackage = createPrivatePackageDocument(
+    "https://campaign.example/participant/package",
+    authorizedParticipant("investor"),
+    { founderInterest: true, investmentInterests: true },
+  );
+  assert.ok(investorPackage);
+  assert.deepEqual(
+    investorPackage.actions.map((action) => action.name),
+    ["open-participant-home", "open-investment-interests", "sign-out"],
+  );
+
+  const deletionRequested = {
+    ...both,
+    accountStatus: "deletion-requested" as const,
+  };
+  const inactiveHome = createParticipantHomeDocument(
+    "https://campaign.example/participant",
+    deletionRequested,
+    syntheticPublicCampaign.name,
+    { founderInterest: true, investmentInterests: true },
+  );
+  assert.deepEqual(
+    inactiveHome.actions.map((action) => action.name),
+    ["read-private-package", "sign-out"],
+  );
+  assert.doesNotMatch(
+    JSON.stringify(inactiveHome),
+    /founder-interest|investment-interests/u,
+  );
+});
+
 test("repository projection reads package acknowledgment only for a registered participant", async () => {
   const alice = account("oidc:alice", "alice@example.test");
   const registeredAt = parseTimestamp("2026-08-09T08:00:00.000Z");
@@ -233,4 +297,23 @@ function actorSubject(value: string) {
   const parsed = parseActorSubject(value);
   assert(parsed.ok);
   return parsed.value;
+}
+
+function authorizedParticipant(
+  declaredInterest: "founder" | "investor" | "both",
+) {
+  const alice = account("oidc:alice", "alice@example.test");
+  const state = authorizationState(alice.subject);
+  const participant = authorizeParticipantAccess(
+    alice,
+    {
+      ...state,
+      profile: {
+        ...state.profile,
+        declaredInterest,
+      },
+    },
+  );
+  assert.ok(participant);
+  return participant;
 }

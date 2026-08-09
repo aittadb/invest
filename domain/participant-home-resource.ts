@@ -24,6 +24,8 @@ import {
   PARTICIPANT_HOME_PATH,
   PRIVATE_PACKAGE_PATH,
 } from "./participant-navigation.ts";
+import { FOUNDER_INTEREST_PATH } from "./participant-founder-interest-resource.ts";
+import { INVESTMENT_INTEREST_PATH } from "./participant-investment-interest-resource.ts";
 import {
   INVESTOR_APP_API_VERSION,
   type HypermediaLink,
@@ -103,6 +105,12 @@ export type PrivatePackageDocument = Readonly<{
   actions: readonly HypermediaAction[];
 }>;
 
+export type ParticipantHomeCapabilities = Readonly<{
+  manageCampaign?: boolean;
+  founderInterest?: boolean;
+  investmentInterests?: boolean;
+}>;
+
 /**
  * Binds repository-derived participant and package state to one trusted account.
  * A foreign or malformed projection is indistinguishable from missing state.
@@ -177,10 +185,14 @@ export function createParticipantHomeDocument(
   requestUrl: string,
   participant: AuthorizedParticipantAccess,
   campaignName: string | null,
-  capabilities: Readonly<{ manageCampaign?: boolean }> = {},
+  capabilities: ParticipantHomeCapabilities = {},
 ): ParticipantHomeDocument {
   const absolute = (href: string) => new URL(href, requestUrl).href;
   const currentPackage = participant.currentPackage;
+  const { founderInterest, investmentInterests } = participantWorkflowAccess(
+    participant,
+    capabilities,
+  );
 
   return {
     api_version: INVESTOR_APP_API_VERSION,
@@ -209,6 +221,15 @@ export function createParticipantHomeDocument(
       ...(currentPackage === null
         ? []
         : [{ rel: ["private-package"], href: absolute(PRIVATE_PACKAGE_PATH) }]),
+      ...(founderInterest
+        ? [{ rel: ["founder-interest"], href: absolute(FOUNDER_INTEREST_PATH) }]
+        : []),
+      ...(investmentInterests
+        ? [{
+          rel: ["investment-interests"],
+          href: absolute(INVESTMENT_INTEREST_PATH),
+        }]
+        : []),
     ],
     actions: [
       ...(currentPackage === null
@@ -225,6 +246,20 @@ export function createParticipantHomeDocument(
             absolute("/owner"),
           )]
         : []),
+      ...(founderInterest
+        ? [safeAction(
+            "open-founder-interest",
+            "Founder interest",
+            absolute(FOUNDER_INTEREST_PATH),
+          )]
+        : []),
+      ...(investmentInterests
+        ? [safeAction(
+            "open-investment-interests",
+            "Investment interests",
+            absolute(INVESTMENT_INTEREST_PATH),
+          )]
+        : []),
       safeAction(
         "sign-out",
         "Sign out",
@@ -237,11 +272,15 @@ export function createParticipantHomeDocument(
 export function createPrivatePackageDocument(
   requestUrl: string,
   participant: AuthorizedParticipantAccess,
-  capabilities: Readonly<{ manageCampaign?: boolean }> = {},
+  capabilities: ParticipantHomeCapabilities = {},
 ): PrivatePackageDocument | null {
   const currentPackage = participant.currentPackage;
   if (currentPackage === null) return null;
   const absolute = (href: string) => new URL(href, requestUrl).href;
+  const { founderInterest, investmentInterests } = participantWorkflowAccess(
+    participant,
+    capabilities,
+  );
 
   return {
     api_version: INVESTOR_APP_API_VERSION,
@@ -257,6 +296,15 @@ export function createPrivatePackageDocument(
       { rel: ["self", "private-package"], href: absolute(PRIVATE_PACKAGE_PATH) },
       { rel: ["participant-home"], href: absolute(PARTICIPANT_HOME_PATH) },
       { rel: ["campaign"], href: absolute("/") },
+      ...(founderInterest
+        ? [{ rel: ["founder-interest"], href: absolute(FOUNDER_INTEREST_PATH) }]
+        : []),
+      ...(investmentInterests
+        ? [{
+          rel: ["investment-interests"],
+          href: absolute(INVESTMENT_INTEREST_PATH),
+        }]
+        : []),
     ],
     actions: [
       safeAction(
@@ -269,6 +317,20 @@ export function createPrivatePackageDocument(
             "manage-campaign",
             "Manage campaign",
             absolute("/owner"),
+          )]
+        : []),
+      ...(founderInterest
+        ? [safeAction(
+            "open-founder-interest",
+            "Founder interest",
+            absolute(FOUNDER_INTEREST_PATH),
+          )]
+        : []),
+      ...(investmentInterests
+        ? [safeAction(
+            "open-investment-interests",
+            "Investment interests",
+            absolute(INVESTMENT_INTEREST_PATH),
           )]
         : []),
       safeAction(
@@ -351,6 +413,22 @@ function safeAction(name: string, title: string, href: string): HypermediaAction
     requestMediaType: "text/html",
     fields: [],
   }));
+}
+
+export function participantWorkflowAccess(
+  participant: AuthorizedParticipantAccess,
+  capabilities: ParticipantHomeCapabilities,
+): Readonly<{ founderInterest: boolean; investmentInterests: boolean }> {
+  const active = participant.accountStatus === "active";
+  return {
+    founderInterest: active && capabilities.founderInterest === true &&
+      (participant.declaredInterest === "founder" ||
+        participant.declaredInterest === "both"),
+    investmentInterests:
+      active && capabilities.investmentInterests === true &&
+      (participant.declaredInterest === "investor" ||
+        participant.declaredInterest === "both"),
+  };
 }
 
 function validDisplayName(value: unknown): value is string {

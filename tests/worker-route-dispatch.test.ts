@@ -254,6 +254,35 @@ test("participant resources preserve authentication, ownership, and negotiation"
   assert.equal(html.headers.get("vary"), "Origin, Accept");
 });
 
+test("participant route composition advertises only injected workflow handlers", async () => {
+  const handler = createParticipantRouteHandler(
+    [],
+    { founderInterest: true, investmentInterests: true },
+  );
+  const response = requiredResponse(
+    await handler(
+      routeContext("https://campaign.example/participant", {
+        requestHeaders: { accept: "application/json" },
+        actor: actor("participant-subject", "participant@example.com"),
+        participantAccess: participantAccess(
+          "participant-subject",
+          "participant@example.com",
+        ),
+      }),
+    ),
+  );
+  const document = await response.json();
+  assert.deepEqual(
+    document.actions.map((action: { name: string }) => action.name),
+    [
+      "read-private-package",
+      "open-founder-interest",
+      "open-investment-interests",
+      "sign-out",
+    ],
+  );
+});
+
 test("owner routes preserve authentication, authorization, and representation behavior", async () => {
   const anonymous = requiredResponse(
     await handleOwnerRoutes(
