@@ -1,6 +1,7 @@
 import { access, cp, mkdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Plugin } from "vite";
+import { stageSitesMigrations } from "./sites-migrations.ts";
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -27,7 +28,7 @@ export function sites(): Plugin {
     async closeBundle() {
       const outputDirectory = resolve(root, "dist", ".openai");
       const hostingConfig = resolve(root, ".openai", "hosting.json");
-      const drizzleSource = resolve(root, "drizzle");
+      const migrationSource = resolve(root, "db", "migrations");
 
       await rm(outputDirectory, { recursive: true, force: true });
       await mkdir(outputDirectory, { recursive: true });
@@ -35,11 +36,11 @@ export function sites(): Plugin {
       if (await exists(hostingConfig)) {
         await cp(hostingConfig, resolve(outputDirectory, "hosting.json"));
       }
-      if (await exists(drizzleSource)) {
-        await cp(drizzleSource, resolve(outputDirectory, "drizzle"), {
-          recursive: true,
-        });
-      }
+      await stageSitesMigrations({
+        activeHostingConfig: hostingConfig,
+        sourceDirectory: migrationSource,
+        outputDirectory: resolve(outputDirectory, "drizzle"),
+      });
     },
   };
 }
