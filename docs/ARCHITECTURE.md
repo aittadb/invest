@@ -94,6 +94,12 @@ An account-deletion request records intent but does not call indication or found
 
 Founder applications do not import, create, mutate, or gate investment indications. An account may therefore hold either record type or both, and application services compose them only when a participant-facing resource needs both projections.
 
+### Investment indications
+
+`domain/investment-indication.ts` defines personal and company indication records as framework-independent immutable revisions. Currency and amount boundaries come from deployment configuration, while package acceptance comes from the trusted current package and acknowledgment repository; neither can be supplied as an authoritative client field. Company uniqueness uses normalized registration country and an injectable country-aware identifier normalizer, and occupied keys return only a fixed conflict.
+
+Participants can edit or withdraw active indications and reactivate withdrawn indications after satisfying the current package requirement. The configured owner can reject an active indication with a bounded participant-visible reason. Each transition appends a full immutable history snapshot, and participant capability projections include only transitions valid in the current lifecycle without exposing owner identity.
+
 ### Phase and country eligibility
 
 `domain/phase-configuration.ts` requires explicit phase identity, state, participation paths, and country policy. It supplies no built-in country, path, or campaign default. Country codes pass through the shared normalizer before duplicate and allow or deny evaluation.
