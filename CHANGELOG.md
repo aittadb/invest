@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-047:** Extract modular application route dispatch. Depends on: `TASK-022`, `TASK-028`. DoD: the Worker delegates public, participant, and owner resource requests through narrow route-handler boundaries; adding one resource does not require editing a sibling resource handler; existing root, owner, content-negotiation, image, runtime-header, and fallback behavior remains covered and unchanged.
+
+  Acceptance evidence: `worker/application-worker.ts` owns runtime normalization plus image and application fallback dispatch, while public, participant, and owner resource handlers compose through narrow response-or-null contracts under `worker/routes/`. A participant resource can be added to its route group without modifying either sibling handler. Five focused tests cover group isolation, root and owner negotiation, authentication and non-disclosure, HTML `Vary` behavior, image separation, fallback rendering, and unchanged runtime headers. Full `npm run validate` passes with 67 tests.
+
 - **TASK-040:** Define amount and public-aggregate display configuration. Depends on: `TASK-004`. DoD: currency, integer minor-unit minimum, increment, optional maximum, aggregate visibility, and sanitized display contracts are framework-independent with boundary and invalid-configuration tests.
 
   Acceptance evidence: `domain/amount-aggregate-configuration.ts` strictly parses an explicit three-letter currency, integer minor-unit minimum and positive increment, optional maximum, and hidden or non-zero public aggregate policy without defaults. Its public projection contains only amount, currency, bounded safe label, and qualifier. Seven focused tests cover complete and hidden configuration, missing and unknown fields, invalid currency and numeric boundaries, configured increments, unsafe display text, zero suppression, and exclusion of private fields. Full `npm run validate` passes with 67 tests.

@@ -28,6 +28,12 @@ HTML links and forms and JSON links and actions must be projections of the same 
 
 The public campaign resource is the signed-out base state. A valid participant session may extend it with private-package and self-service controls. Owner controls require a separate owner authorization decision; ordinary sign-in never implies ownership.
 
+### Modular route dispatch
+
+The Worker normalizes trusted runtime configuration and identity once, then passes a narrow request context through independently composed public, participant, and owner route groups. Each handler either returns the complete response for a resource it owns or returns `null` without changing sibling state. Shared representation helpers own only response serialization and headers; feature authorization and projection remain inside the owning route group and its domain services.
+
+Participant resources compose inside the participant group, and owner resources compose inside the owner group. Adding a resource therefore changes its owning group without requiring edits to a sibling handler. Image optimization remains outside application-resource dispatch, while unmatched requests continue to the framework renderer with the same normalized runtime headers.
+
 ## Domain modules
 
 The specification expects these narrow boundaries:
