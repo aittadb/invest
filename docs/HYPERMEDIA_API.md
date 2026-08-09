@@ -128,6 +128,16 @@ Create and edit accept bounded expertise, intended contribution, configured prim
 
 The route obtains a participant-bound application service from an injected factory. The trusted route or mutation actor selects that factory; body fields cannot select a subject. Founder mutations call only the founder repository, so an account's investment indications are neither prerequisites nor side effects.
 
+## Owner Investment-Indication Moderation
+
+`GET /owner/investment-indications` exposes a bounded owner-only collection with opaque review identifiers. It accepts only `page_size`, bounded from 1 through 100, and an optional opaque `cursor`. Summary data includes indication kind, lifecycle, amount, currency, revision, update time, and manual-notification state; internal indication identifiers and participant subjects do not enter collection links.
+
+`GET /owner/investment-indications/{review-id}` exposes the permitted private detail and immutable transition history to the configured owner. An active indication backed by the required strong repository capability advertises `reject-investment-indication`. The `POST` action carries a hidden server-issued `operation-id`, hidden `expected-revision`, and one participant-visible multiline `reason` bounded to 500 characters. HTML forms and version `0.1` hypermedia actions derive from the same contract, and JSON clients receive CSRF discovery in the designated response header only while a mutation is available.
+
+Rejection is terminal. One atomic repository operation must persist the rejected indication revision, remove its active aggregate contribution, update the aggregate snapshot, append closed owner audit evidence, and create a bounded manual-notification template for the participant. Stable retries return the original result; stale decisions fail their revision precondition; a failed transaction changes none of the four histories. If the repository cannot advertise `atomic-indication-aggregate-audit-notification`, the detail remains readable but has no reject action and direct mutation fails closed.
+
+Anonymous requests receive the authentication transition, while every authenticated non-owner and missing review identifier uses the non-disclosing not-found surface. Collection and detail responses are private, non-cacheable, use the canonical deployment origin, and never infer authorization from an omitted or present control.
+
 ## Owner Activity Resources
 
 `GET /owner/audit-events` exposes a finite owner-only collection of allowlisted

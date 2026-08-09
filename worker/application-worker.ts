@@ -31,12 +31,17 @@ import {
   createOwnerPackageRouteHandler,
   type OwnerPackageRouteDependencies,
 } from "./routes/owner-package.ts";
+import {
+  createOwnerIndicationModerationRouteHandler,
+  type OwnerIndicationModerationRouteDependencies,
+} from "./routes/owner-indication-moderation.ts";
 
 export type ApplicationWorkerDependencies = Readonly<{
   fetchApplication: ApplicationFetcher;
   fetchOptimizedImage: ImageFetcher;
   dispatchRoute?: ApplicationRouteHandler;
   ownerPackage?: OwnerPackageRouteDependencies;
+  ownerIndicationModeration?: OwnerIndicationModerationRouteDependencies;
 }>;
 
 export function createApplicationWorker(
@@ -50,14 +55,29 @@ export function createApplicationWorker(
 }> {
   const ownerPackageAvailable = dependencies.dispatchRoute === undefined &&
     dependencies.ownerPackage !== undefined;
+  const ownerIndicationModerationAvailable =
+    dependencies.dispatchRoute === undefined &&
+    dependencies.ownerIndicationModeration !== undefined;
   const dispatchRoute = dependencies.dispatchRoute ??
-    (dependencies.ownerPackage
+    (dependencies.ownerPackage || dependencies.ownerIndicationModeration
       ? createApplicationRouteDispatcher({
           public: handlePublicRoutes,
           participant: handleParticipantRoutes,
           owner: createOwnerRouteHandler(
-            [createOwnerPackageRouteHandler(dependencies.ownerPackage)],
-            { managePackage: true },
+            [
+              ...(dependencies.ownerPackage
+                ? [createOwnerPackageRouteHandler(dependencies.ownerPackage)]
+                : []),
+              ...(dependencies.ownerIndicationModeration
+                ? [createOwnerIndicationModerationRouteHandler(
+                    dependencies.ownerIndicationModeration,
+                  )]
+                : []),
+            ],
+            {
+              managePackage: ownerPackageAvailable,
+              indicationModeration: ownerIndicationModerationAvailable,
+            },
           ),
         })
       : dispatchApplicationRoute);
@@ -85,6 +105,7 @@ export function createApplicationWorker(
             env,
             participantAccess,
             ownerPackageAvailable,
+            ownerIndicationModerationAvailable,
           ),
           env,
           executionContext,
@@ -120,6 +141,7 @@ function withRuntimeConfiguration(
   env: InvestorAppEnv,
   participantAccess: AuthorizedParticipantAccess | null,
   ownerPackageWorkspaceAvailable: boolean,
+  ownerIndicationModerationAvailable: boolean,
 ): Request {
   return withRuntimeCapabilities(
     withRuntimeParticipantAccess(
@@ -132,7 +154,10 @@ function withRuntimeConfiguration(
       ),
       participantAccess,
     ),
-    { ownerPackageWorkspace: ownerPackageWorkspaceAvailable },
+    {
+      ownerPackageWorkspace: ownerPackageWorkspaceAvailable,
+      ownerIndicationModeration: ownerIndicationModerationAvailable,
+    },
   );
 }
 

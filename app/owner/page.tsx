@@ -9,7 +9,9 @@ import {
   CAMPAIGN_CONFIGURATION_HEADER,
 } from "../../http/runtime-campaign";
 import {
+  hasOwnerIndicationModeration,
   hasOwnerPackageWorkspace,
+  OWNER_INDICATION_MODERATION_HEADER,
   OWNER_PACKAGE_WORKSPACE_HEADER,
 } from "../../http/runtime-capabilities";
 
@@ -29,6 +31,9 @@ export default async function OwnerHome() {
   const packageWorkspaceAvailable = hasOwnerPackageWorkspace(
     requestHeaders.get(OWNER_PACKAGE_WORKSPACE_HEADER),
   );
+  const indicationModerationAvailable = hasOwnerIndicationModeration(
+    requestHeaders.get(OWNER_INDICATION_MODERATION_HEADER),
+  );
   const setupState = campaign ? "Configured" : "Setup required";
   const publicationState = campaign
     ? campaign.published
@@ -46,6 +51,9 @@ export default async function OwnerHome() {
           <Link href="/">View campaign</Link>
           {packageWorkspaceAvailable ? (
             <Link href="/owner/package">Information package</Link>
+          ) : null}
+          {indicationModerationAvailable ? (
+            <Link href="/owner/investment-indications">Investment indications</Link>
           ) : null}
           <a href={chatGPTSignOutPath("/")}>Sign out</a>
         </nav>

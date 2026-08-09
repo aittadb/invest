@@ -277,12 +277,22 @@ export type InvestmentIndicationParsingOptions = Readonly<{
   companyIdentifier?: CompanyIdentifierOptions;
 }>;
 
-const MAX_IDENTIFIER_INPUT_LENGTH = 256;
-const MAX_IDENTIFIER_LENGTH = 128;
-const MAX_NAME_LENGTH = 200;
-const MAX_AVAILABILITY_LENGTH = 500;
-const MAX_NOTE_LENGTH = 4_000;
-const MAX_REJECTION_REASON_LENGTH = 500;
+export const INVESTMENT_INDICATION_LIMITS = Object.freeze({
+  identifierInputLength: 256,
+  identifierLength: 128,
+  nameLength: 200,
+  availabilityLength: 500,
+  noteLength: 4_000,
+  rejectionReasonLength: 500,
+});
+
+const MAX_IDENTIFIER_INPUT_LENGTH = INVESTMENT_INDICATION_LIMITS.identifierInputLength;
+const MAX_IDENTIFIER_LENGTH = INVESTMENT_INDICATION_LIMITS.identifierLength;
+const MAX_NAME_LENGTH = INVESTMENT_INDICATION_LIMITS.nameLength;
+const MAX_AVAILABILITY_LENGTH = INVESTMENT_INDICATION_LIMITS.availabilityLength;
+const MAX_NOTE_LENGTH = INVESTMENT_INDICATION_LIMITS.noteLength;
+const MAX_REJECTION_REASON_LENGTH =
+  INVESTMENT_INDICATION_LIMITS.rejectionReasonLength;
 
 const PERSONAL_FIELD_KEYS = new Set([
   "kind",

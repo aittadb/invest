@@ -28,6 +28,7 @@ export type OwnerHomeCapabilities = Readonly<{
   aggregateReconciliation?: boolean;
   auditNotificationHistory?: boolean;
   managePackage?: boolean;
+  indicationModeration?: boolean;
 }>;
 
 export function createOwnerHomeDocument(
@@ -93,6 +94,12 @@ export function createOwnerHomeDocument(
           },
         ]
         : []),
+      ...(capabilities.indicationModeration
+        ? [{
+          rel: ["investment-indications"],
+          href: absolute("/owner/investment-indications"),
+        }]
+        : []),
       ...packageLinks,
     ],
     actions: [
@@ -124,6 +131,16 @@ export function createOwnerHomeDocument(
             fields: [],
           },
         ]
+        : []),
+      ...(capabilities.indicationModeration
+        ? [{
+          name: "review-investment-indications",
+          title: "Review investment indications",
+          href: absolute("/owner/investment-indications"),
+          method: "GET" as const,
+          type: "text/html" as const,
+          fields: [],
+        }]
         : []),
     ],
   };
