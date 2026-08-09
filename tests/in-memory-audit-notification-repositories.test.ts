@@ -320,6 +320,10 @@ export async function verifyManualNotificationRepositoryContract(
 }
 
 test("development audit repository passes the reusable contract", async () => {
+  const repository = new DevelopmentInMemoryAuditRepository(
+    new DeterministicMemoryStorageAdapter(new MemoryStorageState(), true),
+  );
+  assert.equal(repository.appendConsistency, "atomic-immutable-audit");
   await verifyAuditRepositoryContract(() => createAuditFixture());
 });
 

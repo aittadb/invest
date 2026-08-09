@@ -13,10 +13,12 @@ import {
   hasOwnerCampaignEditorCapability,
   hasOwnerIndicationModeration,
   hasOwnerPackageWorkspace,
+  hasOwnerReviewExports,
   OWNER_AITTADB_CONNECTION_HEADER,
   OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER,
   OWNER_INDICATION_MODERATION_HEADER,
   OWNER_PACKAGE_WORKSPACE_HEADER,
+  OWNER_REVIEW_EXPORTS_HEADER,
 } from "../../http/runtime-capabilities";
 
 export const dynamic = "force-dynamic";
@@ -44,6 +46,9 @@ export default async function OwnerHome() {
   const canEditCampaign = hasOwnerCampaignEditorCapability(
     requestHeaders.get(OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER),
   );
+  const reviewExportsAvailable = hasOwnerReviewExports(
+    requestHeaders.get(OWNER_REVIEW_EXPORTS_HEADER),
+  );
   const setupState = campaign ? "Configured" : "Setup required";
   const publicationState = campaign
     ? campaign.published
@@ -68,6 +73,9 @@ export default async function OwnerHome() {
           ) : null}
           {aittadbConnectionAvailable ? (
             <Link href="/owner/aittadb-connection">AittaDB connection</Link>
+          ) : null}
+          {reviewExportsAvailable ? (
+            <Link href="/owner/exports">Review exports</Link>
           ) : null}
           <a href={chatGPTSignOutPath("/")}>Sign out</a>
         </nav>

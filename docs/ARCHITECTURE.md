@@ -241,6 +241,65 @@ trusted owner identity, mutation guard, operation IDs, clock, repositories, and
 CSRF provider as injected dependencies, so reusable source contains no owner,
 hostname, credential, or campaign-specific value.
 
+### Owner review exports
+
+`services/owner-review-export.ts` builds private owner downloads from injected
+campaign, package, participant, indication, founder, and aggregate read
+contracts. The owner-wide record reader receives explicit per-record and
+nested-history bounds and is finite and cursor-paged. A single configured row
+budget covers all review collections, every page request stays within the
+storage page boundary, and repeated or empty continuation cursors fail closed.
+The service visits one page and encodes one record at a time into a bounded
+transient chunk set. Per-record bytes, nested histories, total encoded bytes,
+and the supported deployment maxima are checked before any response becomes a
+download; the complete source collections and one monolithic JSON string are
+never materialized by the service. UTF-8 accounting accepts the remaining byte
+budget and stops at the first over-budget code point; CSV quoting, formula
+detection, and JSON escaping flush bounded string segments instead of scanning
+or copying an entire hostile field first.
+
+The review CSV contains one explicitly projected current row per participant
+profile, investment indication, or founder application. Every cell is quoted;
+leading spreadsheet formula characters are prefixed with a literal apostrophe,
+including when preceded by whitespace. The JSON document is a versioned,
+current-state backup. It allowlists current campaign setup, package content,
+profiles, indication and founder histories, and private aggregate state while
+excluding storage keys, repository operation identifiers, credentials, audit
+history, and implementation details.
+
+Export generation requires the explicit `atomic-immutable-audit` repository
+capability. The owner, canonical resource URL, export class, and guarded request
+operation ID deterministically address the audit event. The service fully
+validates and bounds the transient encoded chunks, then atomically appends and
+verifies one closed `export-created` event before it returns those chunks to the
+route. Once that deterministic event exists, the operation is consumed: any
+replay, including after an ambiguous append response, returns a fixed conflict
+before source reads or another append. A fresh server-issued operation creates
+distinct evidence. A missing capability, append failure, or mismatched append
+result returns no download bytes. The audit detail records only `review-csv` or
+`json-backup`; export content and content fingerprints are never persisted as
+export or audit records.
+
+`GET /owner/exports` provides equivalent private HTML forms and hypermedia POST
+actions, plus CSRF discovery through an owner-private response header. Export
+POSTs pass the shared trusted-session, exact-origin, CSRF, exact-field, and
+operation-ID guard and return the attachment directly. GET requests to the file
+paths are side-effect-free and advertise POST as the allowed method. Download
+responses use fixed safe filenames, attachment disposition, exact media types,
+`private, no-store` and legacy cache defenses, same-origin resource policy, and
+content-type sniffing protection. Anonymous requests receive authentication
+recovery, foreign authenticated callers receive a fixed not-found response, and
+authorization runs before CSRF discovery, source reads, or audit identity work.
+
+An `export-created` event means the server generated and authorized the bounded
+attachment before making its response stream available. It does not claim that
+the client received every byte: cancellation or connection loss leaves the
+generation event intact, and the consumed operation then returns a fixed
+conflict. The owner must obtain a fresh operation ID to generate another file.
+The JSON artifact is a sequential current-state projection, not a
+transactionally consistent cross-repository or complete historical recovery
+snapshot.
+
 ### Amount and aggregate display configuration
 
 `domain/amount-aggregate-configuration.ts` requires an explicit currency, integer minor-unit minimum, positive increment, optional maximum, and public visibility choice. No deployment inherits a currency, amount boundary, or aggregate policy from reusable source.

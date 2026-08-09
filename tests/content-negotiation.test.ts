@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { negotiateRepresentation } from "../http/content-negotiation.ts";
+import {
+  acceptsMediaType,
+  negotiateRepresentation,
+} from "../http/content-negotiation.ts";
 
 test("content negotiation defaults browsers and wildcards to HTML", () => {
   assert.deepEqual(negotiateRepresentation(null), { kind: "html" });
@@ -41,4 +44,15 @@ test("content negotiation rejects unsupported explicit versions and media", () =
   assert.deepEqual(negotiateRepresentation("application/xml"), {
     kind: "not-acceptable",
   });
+});
+
+test("download media negotiation honors exact exclusions and wildcards", () => {
+  assert.equal(acceptsMediaType(null, "text/csv"), true);
+  assert.equal(acceptsMediaType("text/*;q=0.5", "text/csv"), true);
+  assert.equal(acceptsMediaType("*/*", "application/json"), true);
+  assert.equal(acceptsMediaType("image/png", "application/json"), false);
+  assert.equal(
+    acceptsMediaType("text/csv;q=0, */*;q=1", "text/csv"),
+    false,
+  );
 });

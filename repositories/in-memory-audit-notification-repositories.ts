@@ -92,6 +92,15 @@ export interface AuditRepository {
   list(request: AuditListRequest): Promise<AuditEventPage>;
 }
 
+/**
+ * Audit append capability required before private export bytes may be exposed.
+ * A successful append is an immutable, retry-safe storage transaction whose
+ * returned event has been verified against the submitted intent.
+ */
+export interface GuaranteedAuditAppendRepository extends AuditRepository {
+  readonly appendConsistency: "atomic-immutable-audit";
+}
+
 export function prepareAuditAppend(intent: unknown): PreparedAuditAppend {
   const parsed = parseAuditAppendIntent(intent);
   if (!parsed.ok) invalidRequest();
@@ -202,8 +211,11 @@ export interface AtomicManualNotificationActivityRepository {
 }
 
 /** Deterministic development repository with no state outside its adapter. */
-export class DevelopmentInMemoryAuditRepository implements AuditRepository {
+export class DevelopmentInMemoryAuditRepository
+  implements GuaranteedAuditAppendRepository
+{
   readonly storageKind = "development-in-memory" as const;
+  readonly appendConsistency = "atomic-immutable-audit" as const;
 
   readonly #storage: StorageAdapter;
 

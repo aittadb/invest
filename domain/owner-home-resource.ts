@@ -32,6 +32,7 @@ export type OwnerHomeCapabilities = Readonly<{
   managePackage?: boolean;
   indicationModeration?: boolean;
   aittadbConnection?: boolean;
+  reviewExports?: boolean;
 }>;
 
 export function createOwnerHomeDocument(
@@ -115,6 +116,9 @@ export function createOwnerHomeDocument(
           href: absolute(OWNER_OAUTH_PROOF_PATH),
         }]
         : []),
+      ...(capabilities.reviewExports
+        ? [{ rel: ["review-exports"], href: absolute("/owner/exports") }]
+        : []),
       ...packageLinks,
     ],
     actions: [
@@ -166,6 +170,18 @@ export function createOwnerHomeDocument(
           type: "text/html" as const,
           fields: [],
         }]
+        : []),
+      ...(capabilities.reviewExports
+        ? [
+          {
+            name: "open-review-exports",
+            title: "Review exports",
+            href: absolute("/owner/exports"),
+            method: "GET" as const,
+            type: "text/html" as const,
+            fields: [],
+          },
+        ]
         : []),
     ],
   };

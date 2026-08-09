@@ -207,6 +207,46 @@ Every mutation requires a trusted owner subject, exact configured origin, curren
 
 `createApplicationWorker` can accept a trusted campaign-workspace composition containing the owner repository, public projection reader, mutation guard, readiness check, and CSRF/operation capabilities. This object enters only through explicit dependency or resolver injection. It is deliberately not part of `InvestorAppEnv`, cannot be supplied as a scalar Sites runtime value, and does not prove that production AittaDB persistence has been installed. The production Worker entry injects no workspace and therefore remains fail-closed. Without the composition, campaign editor routes and runtime controls remain absent. Public requests use only the separately injected public presentation reader and never call privileged setup reads.
 
+## Owner Review Exports
+
+`GET /owner/exports` is the private export workspace. HTML and version `0.1`
+hypermedia JSON come from one owner-authorized resource and expose the same two
+CSRF-protected actions:
+
+- `download-review-csv` posts a server-issued `operation-id` to
+  `/owner/exports/review.csv`; and
+- `download-json-backup` posts a server-issued `operation-id` to
+  `/owner/exports/backup.json`.
+
+The POST returns its attachment directly after the shared owner, exact-origin,
+CSRF, and exact-body checks pass. A GET to either attachment URI is
+side-effect-free and returns `405`; it does not read private repositories or
+append audit evidence. HTML forms and JSON actions derive from the same action
+contracts, while the CSRF proof stays in its transport header or hidden form
+field rather than entering the hypermedia document.
+
+The output-specific resources accept their declared media type, a matching type
+wildcard, or `*/*`; unsupported media returns `406` before source data is read.
+The CSV contains current participant, investment-indication, and founder review
+rows. The JSON file is a versioned current-state projection of campaign setup,
+information-package content, those review records, and private aggregate state.
+Both formats bound page size, total records, history entries per record,
+serialized bytes per record, total bytes, and encoding memory. A violated bound
+returns `413` before attachment headers or partial content. Successful responses
+use fixed non-campaign filenames and private no-store headers.
+
+Every successful export generation has one verified immutable `export-created`
+audit event committed before its byte stream is exposed. The event contains the
+export class and trusted owner subject, never a content fingerprint, source URL,
+filename, row, backup document, participant field, package content, or backend
+identifier. The audit fact records generation, not browser delivery or receipt.
+
+An operation with existing audit evidence is single-use. Its replay returns
+`409` before source repositories are read or another audit append is attempted,
+whether or not current data changed; the owner must discover a fresh
+server-issued operation ID. Pagination-integrity or guaranteed-audit failures
+return a fixed private error without partial content.
+
 ## Identity and Authorization
 
 The signed-out campaign document contains only public state and sign-in transitions. A valid participant session can add links and actions for the private package and that participant's records. The participant decision starts with a parsed trusted account and a credential-bound state reader; query, form, JSON, and client-supplied participant headers cannot assert the subject or package grant. An owner session can add owner operations only after a separate owner authorization decision.

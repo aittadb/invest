@@ -70,6 +70,39 @@ export function negotiateRepresentation(
     : { kind: "not-acceptable" };
 }
 
+/** Evaluate one explicit download representation against an HTTP Accept value. */
+export function acceptsMediaType(
+  acceptHeader: string | null,
+  offeredMediaType: string,
+): boolean {
+  if (!acceptHeader?.trim()) return true;
+  const offered = offeredMediaType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  const separator = offered.indexOf("/");
+  if (separator < 1 || separator === offered.length - 1) return false;
+  const offeredType = offered.slice(0, separator);
+
+  const matches = parseAcceptHeader(acceptHeader)
+    .map((range) => {
+      if (range.mediaType === offered) return { range, specificity: 2 };
+      if (range.mediaType === `${offeredType}/*`) {
+        return { range, specificity: 1 };
+      }
+      if (range.mediaType === "*/*") return { range, specificity: 0 };
+      return null;
+    })
+    .filter((candidate) => candidate !== null);
+  if (matches.length === 0) return false;
+
+  const highestSpecificity = Math.max(
+    ...matches.map((candidate) => candidate.specificity),
+  );
+  return matches.some(
+    (candidate) =>
+      candidate.specificity === highestSpecificity &&
+      candidate.range.quality > 0,
+  );
+}
+
 function parseAcceptHeader(header: string): readonly MediaRange[] {
   return splitHeaderValue(header, ",").map((rawRange, order) => {
     const [rawMediaType = "", ...rawParameters] = splitHeaderValue(

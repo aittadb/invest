@@ -55,6 +55,10 @@ import {
   createOwnerOAuthProofRouteHandler,
   type OwnerOAuthProofRouteDependencies,
 } from "./routes/owner-oauth-proof.ts";
+import {
+  createOwnerReviewExportRouteHandler,
+  type OwnerReviewExportRouteDependencies,
+} from "./routes/owner-review-exports.ts";
 import { handlePublicRoutes } from "./routes/public.ts";
 
 export type ApplicationWorkerDependencies = Readonly<{
@@ -63,6 +67,7 @@ export type ApplicationWorkerDependencies = Readonly<{
   dispatchRoute?: ApplicationRouteHandler;
   ownerPackage?: OwnerPackageRouteDependencies;
   ownerIndicationModeration?: OwnerIndicationModerationRouteDependencies;
+  ownerReviewExports?: OwnerReviewExportRouteDependencies;
   participantFounderInterest?: FounderInterestRouteDependencies;
   participantInvestmentInterests?: InvestmentInterestRouteDependencies;
   ownerOAuthProof?: OwnerOAuthProofRouteDependencies;
@@ -86,6 +91,8 @@ export function createApplicationWorker(
   const ownerIndicationModerationAvailable =
     dependencies.dispatchRoute === undefined &&
     dependencies.ownerIndicationModeration !== undefined;
+  const ownerReviewExportsAvailable = dependencies.dispatchRoute === undefined &&
+    dependencies.ownerReviewExports !== undefined;
   const participantFounderInterestAvailable =
     dependencies.dispatchRoute === undefined &&
     dependencies.participantFounderInterest !== undefined;
@@ -136,6 +143,8 @@ export function createApplicationWorker(
               ownerPackageWorkspace: normalApplication && ownerPackageAvailable,
               ownerIndicationModeration:
                 normalApplication && ownerIndicationModerationAvailable,
+              ownerReviewExports:
+                normalApplication && ownerReviewExportsAvailable,
               participantFounderInterest:
                 normalApplication && participantFounderInterestAvailable,
               participantInvestmentInterests:
@@ -154,6 +163,7 @@ export function createApplicationWorker(
 
       const hasInjectedRoutes = ownerPackageAvailable ||
         ownerIndicationModerationAvailable ||
+        ownerReviewExportsAvailable ||
         participantFounderInterestAvailable ||
         participantInvestmentInterestsAvailable ||
         campaignEditorAvailable ||
@@ -166,6 +176,7 @@ export function createApplicationWorker(
               {
                 ownerPackageAvailable,
                 ownerIndicationModerationAvailable,
+                ownerReviewExportsAvailable,
                 participantFounderInterestAvailable,
                 participantInvestmentInterestsAvailable,
                 campaignEditorAvailable,
@@ -198,6 +209,7 @@ export function createApplicationWorker(
 type InjectedRouteAvailability = Readonly<{
   ownerPackageAvailable: boolean;
   ownerIndicationModerationAvailable: boolean;
+  ownerReviewExportsAvailable: boolean;
   participantFounderInterestAvailable: boolean;
   participantInvestmentInterestsAvailable: boolean;
   campaignEditorAvailable: boolean;
@@ -239,6 +251,11 @@ function createInjectedRouteDispatcher(
               dependencies.ownerIndicationModeration,
             )]
           : []),
+        ...(dependencies.ownerReviewExports
+          ? [createOwnerReviewExportRouteHandler(
+              dependencies.ownerReviewExports,
+            )]
+          : []),
         ...(campaignWorkspace
           ? [createOwnerCampaignEditorRouteHandler(campaignWorkspace)]
           : []),
@@ -249,6 +266,7 @@ function createInjectedRouteDispatcher(
       {
         managePackage: available.ownerPackageAvailable,
         indicationModeration: available.ownerIndicationModerationAvailable,
+        reviewExports: available.ownerReviewExportsAvailable,
         campaignEditor: available.campaignEditorAvailable,
         aittadbConnection: available.ownerOAuthProofAvailable,
       },
@@ -268,6 +286,7 @@ function withRuntimeConfiguration(
   capabilities: Readonly<{
     ownerPackageWorkspace: boolean;
     ownerIndicationModeration: boolean;
+    ownerReviewExports: boolean;
     participantFounderInterest: boolean;
     participantInvestmentInterests: boolean;
     ownerCampaignEditor: boolean;
