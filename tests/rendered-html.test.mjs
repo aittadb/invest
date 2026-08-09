@@ -16,6 +16,7 @@ async function render(
   headers = { accept: "text/html" },
   url = "http://localhost/",
   appBaseUrl,
+  ownerEmail,
 ) {
   const worker = await loadWorker();
 
@@ -25,6 +26,7 @@ async function render(
     }),
     {
       APP_BASE_URL: appBaseUrl,
+      OWNER_EMAIL: ownerEmail,
       ASSETS: {
         fetch: async () => new Response("Not found", { status: 404 }),
       },
@@ -87,6 +89,90 @@ test("HTML metadata falls back to each deployment request origin", async () => {
 
   assert.match(firstHtml, /<link rel="canonical" href="https:\/\/first\.example\/?"/i);
   assert.match(secondHtml, /<link rel="canonical" href="https:\/\/second\.example\/?"/i);
+});
+
+test("only the configured owner receives campaign management navigation", async () => {
+  const ownerHeaders = {
+    accept: "text/html",
+    "oai-authenticated-user-id": "owner-subject",
+    "oai-authenticated-user-email": "owner@example.com",
+  };
+  const foreignHeaders = {
+    accept: "text/html",
+    "oai-authenticated-user-id": "foreign-subject",
+    "oai-authenticated-user-email": "foreign@example.com",
+  };
+
+  const ownerHtml = await (
+    await render(ownerHeaders, "https://campaign.example/", undefined, "owner@example.com")
+  ).text();
+  const foreignHtml = await (
+    await render(foreignHeaders, "https://campaign.example/", undefined, "owner@example.com")
+  ).text();
+
+  assert.match(ownerHtml, /href="\/owner"[^>]*>Manage campaign</i);
+  assert.doesNotMatch(foreignHtml, />Manage campaign</i);
+
+  const ownerJsonResponse = await render(
+    { ...ownerHeaders, accept: "application/json" },
+    "https://campaign.example/",
+    undefined,
+    "owner@example.com",
+  );
+  const ownerDocument = await ownerJsonResponse.json();
+  assert.ok(
+    ownerDocument.actions.some((action) => action.name === "manage-campaign"),
+  );
+});
+
+test("the owner resource enforces equivalent HTML and JSON authorization", async () => {
+  const ownerHeaders = {
+    accept: "text/html",
+    "oai-authenticated-user-id": "owner-subject",
+    "oai-authenticated-user-email": "OWNER@example.com",
+  };
+
+  const ownerHtmlResponse = await render(
+    ownerHeaders,
+    "https://campaign.example/owner",
+    undefined,
+    "owner@example.com",
+  );
+  assert.equal(ownerHtmlResponse.status, 200);
+  assert.match(await ownerHtmlResponse.text(), /<h1>Campaign setup<\/h1>/i);
+
+  const ownerJsonResponse = await render(
+    { ...ownerHeaders, accept: "application/json" },
+    "https://campaign.example/owner",
+    undefined,
+    "owner@example.com",
+  );
+  assert.equal(ownerJsonResponse.status, 200);
+  const ownerDocument = await ownerJsonResponse.json();
+  assert.equal(ownerDocument.type, "owner-home");
+  assert.equal(ownerDocument.data.email, "OWNER@example.com");
+
+  const anonymousResponse = await render(
+    { accept: "application/json" },
+    "https://campaign.example/owner",
+    undefined,
+    "owner@example.com",
+  );
+  assert.equal(anonymousResponse.status, 401);
+  assert.equal((await anonymousResponse.json()).data.code, "authentication_required");
+
+  const foreignResponse = await render(
+    {
+      accept: "application/json",
+      "oai-authenticated-user-id": "foreign-subject",
+      "oai-authenticated-user-email": "foreign@example.com",
+    },
+    "https://campaign.example/owner",
+    undefined,
+    "owner@example.com",
+  );
+  assert.equal(foreignResponse.status, 404);
+  assert.equal((await foreignResponse.json()).data.code, "not_found");
 });
 
 test("the root resource negotiates equivalent public hypermedia JSON", async () => {

@@ -7,11 +7,18 @@ import {
   INVESTOR_APP_API_VERSION,
   INVESTOR_APP_MEDIA_TYPE,
 } from "../domain/public-campaign-resource";
+import {
+  createOwnerAuthenticationRequiredDocument,
+  createOwnerHomeDocument,
+} from "../domain/owner-home-resource";
+import { isConfiguredOwner } from "../domain/owner-identity";
 import { withAppOrigin } from "../http/app-origin";
 import { negotiateRepresentation } from "../http/content-negotiation";
+import { withRuntimeOwner } from "../http/runtime-owner";
 
 interface Env {
   APP_BASE_URL?: string;
+  OWNER_EMAIL?: string;
   ASSETS: {
     fetch(request: Request): Promise<Response>;
   };
@@ -38,12 +45,16 @@ interface ExecutionContext {
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const actor = authenticatedActor(request);
+    const isOwner = isConfiguredOwner(actor?.email, env.OWNER_EMAIL);
 
     if (request.method === "GET" && url.pathname === "/") {
       const representation = negotiateRepresentation(request.headers.get("accept"));
 
       if (representation.kind === "hypermedia-json") {
-        return hypermediaResponse(createPublicCampaignDocument(request.url));
+        return hypermediaResponse(
+          createPublicCampaignDocument(request.url, { manageCampaign: isOwner }),
+        );
       }
 
       if (representation.kind === "not-acceptable") {
@@ -51,7 +62,37 @@ const worker = {
       }
 
       const htmlResponse = await handler.fetch(
-        withAppOrigin(request, env.APP_BASE_URL),
+        withRuntimeConfiguration(request, env),
+        env,
+        ctx,
+      );
+      return withAcceptVary(htmlResponse);
+    }
+
+    if (request.method === "GET" && url.pathname === "/owner") {
+      const representation = negotiateRepresentation(request.headers.get("accept"));
+
+      if (representation.kind === "not-acceptable") {
+        return notAcceptableResponse(request.url);
+      }
+
+      if (representation.kind === "hypermedia-json") {
+        if (!actor) {
+          return hypermediaResponse(
+            createOwnerAuthenticationRequiredDocument(request.url),
+            401,
+          );
+        }
+
+        if (!isOwner) {
+          return resourceNotFoundResponse(request.url);
+        }
+
+        return hypermediaResponse(createOwnerHomeDocument(request.url, actor));
+      }
+
+      const htmlResponse = await handler.fetch(
+        withRuntimeConfiguration(request, env),
         env,
         ctx,
       );
@@ -69,15 +110,32 @@ const worker = {
       }, allowedWidths);
     }
 
-    return handler.fetch(withAppOrigin(request, env.APP_BASE_URL), env, ctx);
+    return handler.fetch(withRuntimeConfiguration(request, env), env, ctx);
   },
 };
 
-function hypermediaResponse(document: unknown): Response {
+function hypermediaResponse(document: unknown, status = 200): Response {
   return new Response(JSON.stringify(document), {
-    status: 200,
+    status,
     headers: representationHeaders(),
   });
+}
+
+function resourceNotFoundResponse(requestUrl: string): Response {
+  return hypermediaResponse(
+    {
+      api_version: INVESTOR_APP_API_VERSION,
+      type: "error",
+      id: "not-found",
+      data: {
+        code: "not_found",
+        message: "The requested resource was not found.",
+      },
+      links: [{ rel: ["self"], href: new URL(requestUrl).href }],
+      actions: [],
+    },
+    404,
+  );
 }
 
 function notAcceptableResponse(requestUrl: string): Response {
@@ -125,6 +183,25 @@ function withAcceptVary(response: Response): Response {
     statusText: response.statusText,
     headers,
   });
+}
+
+function withRuntimeConfiguration(request: Request, env: Env): Request {
+  return withRuntimeOwner(withAppOrigin(request, env.APP_BASE_URL), env.OWNER_EMAIL);
+}
+
+function authenticatedActor(
+  request: Request,
+): Readonly<{ userId: string; email: string; displayName: string }> | null {
+  const userId = request.headers.get("oai-authenticated-user-id")?.trim();
+  const email = request.headers.get("oai-authenticated-user-email")?.trim();
+
+  if (!userId || !email) return null;
+
+  return {
+    userId,
+    email,
+    displayName: email,
+  };
 }
 
 export default worker;

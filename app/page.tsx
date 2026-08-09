@@ -3,6 +3,7 @@ import Image from "next/image";
 
 import { aittaDbPublicCampaign } from "@/campaigns/aittadb-public";
 import { publicCampaignActions } from "@/domain/public-campaign-resource";
+import { getOwnerUser } from "@/app/owner-auth";
 
 export const metadata: Metadata = {
   title: "AittaDB investment pre-registration",
@@ -10,7 +11,8 @@ export const metadata: Metadata = {
     "Learn about AittaDB and share non-binding interest as an investor or potential founder.",
 };
 
-export default function Home() {
+export default async function Home() {
+  const owner = await getOwnerUser();
   const signInPath = publicCampaignActions.signIn.href;
   const investorPath = publicCampaignActions.investor.href;
   const founderPath = publicCampaignActions.founder.href;
@@ -36,8 +38,8 @@ export default function Home() {
             <a href="#process">Process</a>
             <a href="#risks">Before you continue</a>
           </nav>
-          <a className="button button--quiet" href={signInPath}>
-            Sign in
+          <a className="button button--quiet" href={owner ? "/owner" : signInPath}>
+            {owner ? "Manage campaign" : "Sign in"}
           </a>
         </div>
       </header>

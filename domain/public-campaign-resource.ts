@@ -22,12 +22,12 @@ export const publicCampaignActions = {
   },
 } as const;
 
-type HypermediaLink = Readonly<{
+export type HypermediaLink = Readonly<{
   rel: readonly string[];
   href: string;
 }>;
 
-type HypermediaAction = Readonly<{
+export type HypermediaAction = Readonly<{
   name: string;
   title: string;
   method: "GET";
@@ -57,6 +57,7 @@ export type PublicCampaignDocument = Readonly<{
 
 export function createPublicCampaignDocument(
   requestUrl: string,
+  capabilities: Readonly<{ manageCampaign?: boolean }> = {},
 ): PublicCampaignDocument {
   const absolute = (href: string) => new URL(href, requestUrl).href;
 
@@ -83,12 +84,26 @@ export function createPublicCampaignDocument(
         href: "https://github.com/aittadb/aittadb",
       },
     ],
-    actions: Object.values(publicCampaignActions).map((action) => ({
-      ...action,
-      method: "GET",
-      href: absolute(action.href),
-      type: "text/html",
-      fields: [],
-    })),
+    actions: [
+      ...Object.values(publicCampaignActions).map((action) => ({
+        ...action,
+        method: "GET" as const,
+        href: absolute(action.href),
+        type: "text/html" as const,
+        fields: [] as const,
+      })),
+      ...(capabilities.manageCampaign
+        ? [
+            {
+              name: "manage-campaign",
+              title: "Manage campaign",
+              method: "GET" as const,
+              href: absolute("/owner"),
+              type: "text/html" as const,
+              fields: [] as const,
+            },
+          ]
+        : []),
+    ],
   };
 }

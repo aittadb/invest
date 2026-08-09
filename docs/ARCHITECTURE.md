@@ -12,6 +12,8 @@ Deployments provide trusted runtime configuration for the canonical app origin, 
 
 `APP_BASE_URL` is instance configuration, never a source default. The worker validates it as an HTTP(S) origin and replaces an internal request header before rendering metadata. When it is absent or invalid, the current request origin is used. This lets the same Investor App source serve unrelated deployments without inheriting another instance's hostname.
 
+`OWNER_EMAIL` configures the single version-one owner for one deployment. The worker validates and overwrites the internal owner header, and every owner HTML or JSON request separately compares the trusted Sites identity email with that configured value. Anonymous requests enter Sites sign-in; authenticated non-owners receive a generic denial. A later persisted owner subject may replace the email bootstrap after the production identity adapter is available.
+
 ## Resource representations
 
 Application URLs identify resources rather than HTML-only pages. `Accept: text/html` selects the human interface. `Accept: application/vnd.aittadb-invest+json; version=0.1` selects the versioned hypermedia contract, and `application/json` is a compatibility representation. Representation selection never uses `User-Agent`.

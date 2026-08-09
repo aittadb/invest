@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-028:** Configure one runtime owner identity and owner home. DoD: `OWNER_EMAIL` is validated as instance configuration, signed-out owner requests enter Sites sign-in, foreign signed-in users receive a non-disclosing denial, the matching owner can open `/owner`, root HTML and hypermedia expose owner navigation only to that actor, and focused tests cover all three identities.
+
+  Acceptance evidence: the worker validates `OWNER_EMAIL`, replaces any client-supplied internal owner header, and independently authorizes owner HTML and JSON requests. `/owner` redirects anonymous browser requests through Sites sign-in, returns a generic denial to foreign identities, and presents an owner workspace only to the matching actor. The root resource adds `Manage campaign` in HTML and hypermedia only for that owner. Focused normalization, spoofing, anonymous, foreign-user, matching-owner, and representation-parity tests pass; `npm run validate` passes with 21 tests.
+
 - **TASK-027:** Bind canonical metadata to the runtime app origin. DoD: `APP_BASE_URL` is validated as instance configuration with a request-origin fallback, no deployment hostname becomes a software default, HTML metadata receives the resolved origin through a worker-owned request header, focused tests prove distinct deployments produce distinct canonical and social URLs, and the AittaDB Sites instance is configured and verified separately.
 
   Acceptance evidence: `http/app-origin.ts` validates and normalizes optional per-instance origins, falls back to the current request origin, and replaces client-supplied internal origin headers. The metadata renderer consumes only the worker-owned value. Generic tests prove configured and fallback behavior across distinct example hosts; `npm run validate` passes with 16 tests and `AGENTS.md` remains below 32,000 bytes. Separately, the AittaDB Sites instance has `APP_BASE_URL=https://invest.aittadb.com`, and Sites reports its custom-domain routing and TLS active.
@@ -31,6 +35,14 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 ### Retired Planning Umbrellas
 
 These entries were removed because their scopes could not finish independently. Their preservation here does not claim that the underlying product work is complete; each retirement mapping identifies the focused current-plan replacements.
+
+- **TASK-005:** Define campaign and phase configuration contracts. DoD: campaign identity, publication state, phase status, country eligibility, amount-rule, aggregate-display, and setup-completion contracts are typed and documented; tests cover unpublished/public visibility, restricted-country eligibility, amount minimum/increment validation, and no campaign-specific defaults.
+
+  Retirement mapping: Replaced by `TASK-029`, `TASK-039`, and `TASK-040`.
+
+- **TASK-026:** Add the owner campaign workspace. DoD: authorized owners receive setup, package, participant, indication, founder-application, reconciliation, export, audit, and manual-notification navigation based only on currently allowed actions; non-owners receive no owner links or state; every owner HTML control has an equivalent hypermedia action and focused authorization tests.
+
+  Retirement mapping: Replaced by `TASK-028` and `TASK-032` through `TASK-038`.
 
 - **TASK-002:** Define the framework-independent domain model and repository interfaces. DoD: campaign, phase, content version, participant, acknowledgment, indication, founder application, aggregate, audit, notification, and storage-adapter contracts are documented and typed; no framework or AittaDB HTTP details leak into domain types; focused unit tests cover money integer handling and initial validation boundaries.
 
