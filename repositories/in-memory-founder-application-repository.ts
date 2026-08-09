@@ -20,13 +20,16 @@ import {
   type Timestamp,
 } from "../domain/foundation.ts";
 import {
+  MAX_STORAGE_PAGE_SIZE,
   StorageFailure,
+  assertStorageListBoundary,
   parseStorageCollection,
   parseStorageKey,
   parseStorageOperationId,
   storageKeyString,
   type StorageAdapter,
   type StorageCollection,
+  type StorageCursor,
   type StorageDocument,
   type StorageKey,
   type StorageOperationId,
@@ -90,6 +93,29 @@ export interface FounderApplicationRepository {
   withdraw(
     request: WithdrawFounderApplicationRequest,
   ): Promise<FounderApplicationMutationResult<WithdrawnFounderApplication>>;
+}
+
+export type FounderApplicationReviewItem = Readonly<{
+  reviewId: string;
+  application: FounderApplication;
+}>;
+
+export type FounderApplicationReviewListRequest = Readonly<{
+  limit: number;
+  cursor?: StorageCursor;
+}>;
+
+export type FounderApplicationReviewPage = Readonly<{
+  items: readonly FounderApplicationReviewItem[];
+  nextCursor: StorageCursor | null;
+}>;
+
+/** Configured-owner read contract over all current founder applications. */
+export interface FounderApplicationReviewRepository {
+  list(
+    request: FounderApplicationReviewListRequest,
+  ): Promise<FounderApplicationReviewPage>;
+  get(reviewId: unknown): Promise<FounderApplicationReviewItem | null>;
 }
 
 type ParsedMutationRequest = Readonly<{
@@ -271,26 +297,12 @@ export class DevelopmentInMemoryFounderApplicationRepository
     application: FounderApplication,
     subject: ActorSubject,
   ): Promise<void> {
-    for (let revision = 1; revision <= application.revision; revision += 1) {
-      const key = await applicationHistoryKey(subject, application.id, revision);
-      const record = await this.#storage.read(key);
-      if (record === null) unavailable();
-      const historical = await decodeStoredApplication(
-        record,
-        key,
-        "history",
-        subject,
-        application.id,
-        revision,
-        this.#contributionAreaChoices,
-      );
-      if (
-        canonicalJson(historyDocument(historical.application.history)) !==
-        canonicalJson(historyDocument(application.history.slice(0, revision)))
-      ) {
-        unavailable();
-      }
-    }
+    await verifyImmutableApplicationHistory(
+      this.#storage,
+      application,
+      subject,
+      this.#contributionAreaChoices,
+    );
   }
 
   async #replayIfKnown(
@@ -417,6 +429,182 @@ export class DevelopmentInMemoryFounderApplicationRepository
       result.replayed,
     );
   }
+}
+
+/**
+ * Development owner-review projection over the same adapter records.
+ * Opaque review IDs keep applicant subjects out of owner navigation URLs.
+ */
+export class DevelopmentInMemoryFounderApplicationReviewRepository
+implements FounderApplicationReviewRepository {
+  readonly storageKind = "development-in-memory" as const;
+
+  readonly #storage: StorageAdapter;
+  readonly #permitted: boolean;
+  readonly #contributionAreaChoices: readonly ContributionAreaChoice[];
+
+  constructor(
+    storage: StorageAdapter,
+    authenticatedSubject: ActorSubject | null,
+    configuredOwnerSubject: ActorSubject,
+    contributionAreaChoices: readonly ContributionAreaChoice[],
+  ) {
+    this.#storage = storage;
+    const ownerSubject = requiredActorSubject(configuredOwnerSubject);
+    const actorSubject = authenticatedSubject === null
+      ? null
+      : requiredActorSubject(authenticatedSubject);
+    this.#permitted = actorSubject === ownerSubject;
+
+    const parsedChoices = parseContributionAreaChoices(contributionAreaChoices);
+    if (!parsedChoices.ok) invalidRequest();
+    this.#contributionAreaChoices = parsedChoices.value;
+  }
+
+  async list(
+    request: FounderApplicationReviewListRequest,
+  ): Promise<FounderApplicationReviewPage> {
+    if (!this.#permitted) {
+      return Object.freeze({ items: Object.freeze([]), nextCursor: null });
+    }
+    const storageRequest = {
+      collection: CURRENT_APPLICATIONS,
+      limit: request.limit,
+      ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
+    };
+    assertStorageListBoundary(storageRequest);
+    const page = await this.#storage.list(storageRequest);
+    const items = await Promise.all(
+      page.items.map((record) => this.#decodeReviewItem(record)),
+    );
+    return Object.freeze({
+      items: Object.freeze(items),
+      nextCursor: page.nextCursor,
+    });
+  }
+
+  async get(reviewId: unknown): Promise<FounderApplicationReviewItem | null> {
+    if (!this.#permitted) return null;
+    const expectedReviewId = requiredReviewId(reviewId);
+    const cursors = new Set<string>();
+    let cursor: StorageCursor | undefined;
+
+    while (true) {
+      const page = await this.#storage.list({
+        collection: CURRENT_APPLICATIONS,
+        limit: MAX_STORAGE_PAGE_SIZE,
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+      for (const record of page.items) {
+        const item = await this.#decodeReviewItem(record);
+        if (item.reviewId === expectedReviewId) return item;
+      }
+      if (page.nextCursor === null) return null;
+      if (cursors.has(page.nextCursor)) unavailable();
+      cursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    }
+  }
+
+  async #decodeReviewItem(
+    record: StorageRecord,
+  ): Promise<FounderApplicationReviewItem> {
+    const coordinates = storedApplicationCoordinates(record.value);
+    const expectedKey = await currentApplicationKey(
+      coordinates.subject,
+      coordinates.id,
+    );
+    const stored = await decodeStoredApplication(
+      record,
+      expectedKey,
+      "current",
+      coordinates.subject,
+      coordinates.id,
+      null,
+      this.#contributionAreaChoices,
+    );
+    await verifyImmutableApplicationHistory(
+      this.#storage,
+      stored.application,
+      coordinates.subject,
+      this.#contributionAreaChoices,
+    );
+    return Object.freeze({
+      reviewId: await founderReviewId(
+        coordinates.subject,
+        coordinates.id,
+      ),
+      application: stored.application,
+    });
+  }
+}
+
+async function verifyImmutableApplicationHistory(
+  storage: StorageAdapter,
+  application: FounderApplication,
+  subject: ActorSubject,
+  choices: readonly ContributionAreaChoice[],
+): Promise<void> {
+  for (let revision = 1; revision <= application.revision; revision += 1) {
+    const key = await applicationHistoryKey(subject, application.id, revision);
+    const record = await storage.read(key);
+    if (record === null) unavailable();
+    const historical = await decodeStoredApplication(
+      record,
+      key,
+      "history",
+      subject,
+      application.id,
+      revision,
+      choices,
+    );
+    if (
+      canonicalJson(historyDocument(historical.application.history)) !==
+      canonicalJson(historyDocument(application.history.slice(0, revision)))
+    ) {
+      unavailable();
+    }
+  }
+}
+
+function storedApplicationCoordinates(
+  value: StorageDocument,
+): Readonly<{ subject: ActorSubject; id: FounderApplicationId }> {
+  const source = objectRecord(value);
+  const application = objectRecord(source?.application);
+  const subject = parseActorSubject(application?.applicantSubject);
+  const id = parseStableId<"founder-application">(application?.id);
+  if (!subject.ok || !id.ok) unavailable();
+  return Object.freeze({ subject: subject.value, id: id.value });
+}
+
+async function founderReviewId(
+  subject: ActorSubject,
+  id: FounderApplicationId,
+): Promise<string> {
+  let digest: ArrayBuffer;
+  try {
+    digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(`founder-review\u0000${subject}\u0000${id}`),
+    );
+  } catch {
+    unavailable();
+  }
+  const hexadecimal = [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `founder-review:${hexadecimal}`;
+}
+
+function requiredReviewId(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    !/^founder-review:[0-9a-f]{64}$/.test(value)
+  ) {
+    invalidRequest();
+  }
+  return value;
 }
 
 function parseCreateRequest(

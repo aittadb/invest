@@ -112,6 +112,10 @@ Founder applications do not import, create, mutate, or gate investment indicatio
 
 Each mutation atomically compare-and-sets the current application and creates an immutable cumulative-history revision. Stored snapshots are reconstructed by replaying the domain transitions, verified against their operation fingerprint and storage revision, and compared with every prior immutable history prefix before use. The repository has no investment-indication import or side effect.
 
+`DevelopmentInMemoryFounderApplicationReviewRepository` reads those same current records only when its trusted actor is the configured owner. It reconstructs and verifies each application plus immutable history before returning a review page, and derives the detail-route identifier from a one-way hash of applicant subject and application ID. Applicant subjects therefore remain absent from owner navigation URLs and all review representations.
+
+The owner review collection and detail handlers project one resource model into HTML or hypermedia JSON at the same URI. Anonymous requests receive authentication-required without private data, every authenticated non-owner receives the same not-found surface before repository access, and the owner home advertises review only when the route group supplies that capability. Production wiring still requires an authorized persistent founder review repository.
+
 ### Investment indications
 
 `domain/investment-indication.ts` defines personal and company indication records as framework-independent immutable revisions. Currency and amount boundaries come from deployment configuration, while package acceptance comes from the trusted current package and acknowledgment repository; neither can be supplied as an authoritative client field. Company uniqueness uses normalized registration country and an injectable country-aware identifier normalizer, and occupied keys return only a fixed conflict.

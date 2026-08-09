@@ -28,6 +28,7 @@ import {
   type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
 import {
+  DevelopmentInMemoryFounderApplicationReviewRepository,
   DevelopmentInMemoryFounderApplicationRepository,
   type CreateFounderApplicationRequest,
   type EditFounderApplicationRequest,
@@ -37,6 +38,7 @@ import {
 
 const ALICE_SUBJECT = actorSubject("issuer.invalid/subject:alice");
 const BOB_SUBJECT = actorSubject("issuer.invalid/subject:bob");
+const OWNER_SUBJECT = actorSubject("issuer.invalid/subject:owner");
 const APPLICATION_ID = applicationId("founder-application:alice");
 
 const contributionAreaChoices = choices([
@@ -310,6 +312,67 @@ test("current records are checked against immutable adapter history", async () =
     () => repository(adapter, ALICE_SUBJECT).get(APPLICATION_ID),
     "UNAVAILABLE",
   );
+});
+
+test("configured owner can page and inspect opaque founder review records", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true);
+  const alice = repository(adapter, ALICE_SUBJECT);
+  const bob = repository(adapter, BOB_SUBJECT);
+  const aliceApplication = await alice.create(createRequest());
+  await bob.create({
+    ...createRequest(),
+    operationId: "founder-operation:bob-create",
+    id: "founder-application:bob",
+    historyEntryId: "founder-history:bob-create",
+    fields: fields({ note: "Bob private note." }),
+  });
+
+  const owner = new DevelopmentInMemoryFounderApplicationReviewRepository(
+    adapter,
+    OWNER_SUBJECT,
+    OWNER_SUBJECT,
+    contributionAreaChoices,
+  );
+  const firstPage = await owner.list({ limit: 1 });
+  assert.equal(firstPage.items.length, 1);
+  assert.notEqual(firstPage.nextCursor, null);
+  const secondPage = await owner.list({
+    limit: 1,
+    ...(firstPage.nextCursor ? { cursor: firstPage.nextCursor } : {}),
+  });
+  assert.equal(secondPage.items.length, 1);
+  assert.equal(secondPage.nextCursor, null);
+
+  const allItems = [...firstPage.items, ...secondPage.items];
+  assert.equal(new Set(allItems.map((item) => item.reviewId)).size, 2);
+  for (const item of allItems) {
+    assert.match(item.reviewId, /^founder-review:[0-9a-f]{64}$/);
+    assert.equal(item.reviewId.includes(item.application.applicantSubject), false);
+    assert.equal(Object.isFrozen(item), true);
+  }
+  const aliceReview = allItems.find(
+    (item) => item.application.id === APPLICATION_ID,
+  );
+  assert.notEqual(aliceReview, undefined);
+  if (aliceReview === undefined) return;
+  assert.deepEqual(await owner.get(aliceReview.reviewId), aliceReview);
+  assert.deepEqual(aliceReview.application, aliceApplication.snapshot);
+
+  for (const actor of [BOB_SUBJECT, null]) {
+    const foreign = new DevelopmentInMemoryFounderApplicationReviewRepository(
+      adapter,
+      actor,
+      OWNER_SUBJECT,
+      contributionAreaChoices,
+    );
+    assert.deepEqual(await foreign.list({ limit: 10 }), {
+      items: [],
+      nextCursor: null,
+    });
+    assert.equal(await foreign.get(aliceReview.reviewId), null);
+    assert.equal(await foreign.get("malformed-review-id"), null);
+  }
 });
 
 test("founder repository has no investment-indication dependency", async () => {

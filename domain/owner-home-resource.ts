@@ -22,10 +22,15 @@ export type OwnerHomeDocument = Readonly<{
   actions: readonly HypermediaAction[];
 }>;
 
+export type OwnerHomeCapabilities = Readonly<{
+  founderApplicationReview?: boolean;
+}>;
+
 export function createOwnerHomeDocument(
   requestUrl: string,
   owner: Readonly<{ displayName: string; email: string }>,
   campaign: PublicCampaignConfiguration | null,
+  capabilities: OwnerHomeCapabilities = {},
 ): OwnerHomeDocument {
   const absolute = (href: string) => new URL(href, requestUrl).href;
 
@@ -47,6 +52,12 @@ export function createOwnerHomeDocument(
     links: [
       { rel: ["self"], href: absolute("/owner") },
       { rel: ["campaign"], href: absolute("/") },
+      ...(capabilities.founderApplicationReview
+        ? [{
+          rel: ["founder-applications"],
+          href: absolute("/owner/founder-applications"),
+        }]
+        : []),
     ],
     actions: [
       {
