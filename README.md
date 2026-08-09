@@ -36,6 +36,12 @@ The current scaffold intentionally does not declare local D1 or R2 bindings in `
 
 Each application URI supports equivalent human HTML and versioned hypermedia JSON selected through `Accept`. See [docs/HYPERMEDIA_API.md](docs/HYPERMEDIA_API.md) for the media type, document structure, authorization rules, and route definition of done.
 
+### AittaDB OAuth proof status
+
+The source includes an optionally injected, owner-only confidential Authorization Code with PKCE boundary for development verification. The default production Worker does not install it and contains no OAuth client, secret, cookie key, hostname, owner, or scope default. See [docs/AITTADB_OAUTH_PROOF.md](docs/AITTADB_OAUTH_PROOF.md) for its route and hosted-secret contract.
+
+TASK-030 remains open. As observed on August 9, 2026, [aittadb.com](https://aittadb.com/) reports `features.oauthApps=false`, and its [discovery document](https://aittadb.com/.well-known/openid-configuration) does not advertise authorization, token, or introspection endpoints. This commit is injected callback infrastructure only, not hosted proof.
+
 ## Repository Files
 
 - `AGENTS.md`: authoritative agent and contributor rules. Keep below 32,000 bytes.
@@ -46,6 +52,7 @@ Each application URI supports equivalent human HTML and versioned hypermedia JSO
 - `docs/ARCHITECTURE.md`: app architecture and storage boundary.
 - `docs/STYLE_GUIDE.md`: UI and HTML/CSS guidance.
 - `docs/HYPERMEDIA_API.md`: same-URI HTML and hypermedia JSON contract.
+- `docs/AITTADB_OAUTH_PROOF.md`: injected OAuth development-proof boundary and remaining hosted acceptance.
 - `.env.example`: runtime setting names with inert placeholder values.
 - `.openai/hosting.example.json`: inert Sites binding shape for clean checkouts.
 

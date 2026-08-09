@@ -183,6 +183,16 @@ When an investment-interest JSON representation advertises at least one mutation
 
 Investment-interest reads and writes are separate injected capabilities. Reads require only participant-owned `get` and `listOwned` operations. Every write requires `AtomicParticipantInvestmentInterestMutationPort` with the explicit `atomic-indication-aggregate-audit` guarantee: the new indication revision, aggregate projection, allowlisted audit transition, and idempotent retry result are committed together or none are changed. The participant service rejects weaker mutation persistence during composition and validates the closed result before returning it.
 
+## Owner AittaDB Connection Proof
+
+`GET /owner/aittadb-connection` is an optionally injected owner-only resource. When exact issuer discovery satisfies the configured confidential Authorization Code, S256, introspection, and storage-scope contract, both HTML and version `0.1` JSON advertise `verify-aittadb-connection` as a `POST` action with no feature fields. HTML adds the shared hidden CSRF transport value; JSON returns that proof only in the designated response header.
+
+The POST independently requires configured-owner identity, exact origin, trusted owner session, and CSRF before discovery. Its `303` enters the standards-defined AittaDB authorization endpoint. The protocol redirect transports OAuth state and a PKCE challenge as required, but application documents never serialize those values.
+
+`GET /owner/aittadb-connection/callback` is the standards-required Authorization Code redirect handler. It consumes the exact encrypted transaction cookie and state, atomically claims a one-way replay fingerprint, performs confidential token exchange and introspection, and returns only `owner-aittadb-connection-result`. Success and failure resources omit all callback query parameters and credentials. The cookie is cleared on success, failure, denial, unsupported representation, and wrong method where possible. It is a protocol exception that consumes one-time artifacts and records closed proof; it is not advertised as an application mutation action. The ordinary connection-resource GET never initiates or mutates the flow.
+
+The default Worker does not inject this route. Its presence proves only that hosted configuration deliberately supplied the capability; every request still enforces owner authorization. See `docs/AITTADB_OAUTH_PROOF.md` for the hosted boundary and remaining live proof.
+
 ## Identity and Authorization
 
 The signed-out campaign document contains only public state and sign-in transitions. A valid participant session can add links and actions for the private package and that participant's records. The participant decision starts with a parsed trusted account and a credential-bound state reader; query, form, JSON, and client-supplied participant headers cannot assert the subject or package grant. An owner session can add owner operations only after a separate owner authorization decision.

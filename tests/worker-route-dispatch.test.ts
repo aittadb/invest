@@ -9,7 +9,10 @@ import type {
 } from "../worker/contracts.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
 import { createApplicationRouteDispatcher } from "../worker/routes/application.ts";
-import { handleOwnerRoutes } from "../worker/routes/owner.ts";
+import {
+  createOwnerRouteHandler,
+  handleOwnerRoutes,
+} from "../worker/routes/owner.ts";
 import { handleParticipantHomeRoutes } from "../worker/routes/participant-home.ts";
 import { createParticipantRouteHandler } from "../worker/routes/participant.ts";
 import { handlePublicRoutes } from "../worker/routes/public.ts";
@@ -347,6 +350,25 @@ test("owner routes preserve authentication, authorization, and representation be
   );
   assert.equal(await html.text(), "owner html");
   assert.equal(html.headers.get("vary"), "Origin, Accept");
+});
+
+test("owner home advertises the injected AittaDB connection resource", async () => {
+  const handler = createOwnerRouteHandler([], { aittadbConnection: true });
+  const response = requiredResponse(await handler(
+    routeContext("https://campaign.example/owner", {
+      requestHeaders: { accept: "application/json" },
+      actor: actor("owner-subject", "owner@example.com"),
+      isOwner: true,
+    }),
+  ));
+  const document = await response.json();
+  assert.ok(document.links.some((link: { rel: string[]; href: string }) =>
+    link.rel.includes("aittadb-connection") &&
+    link.href === "https://campaign.example/owner/aittadb-connection"
+  ));
+  assert.ok(document.actions.some((action: { name: string }) =>
+    action.name === "review-aittadb-connection"
+  ));
 });
 
 test("the Worker keeps image dispatch separate from application fallback", async () => {

@@ -9,8 +9,10 @@ import {
   CAMPAIGN_CONFIGURATION_HEADER,
 } from "../../http/runtime-campaign";
 import {
+  hasOwnerAittaDBConnection,
   hasOwnerIndicationModeration,
   hasOwnerPackageWorkspace,
+  OWNER_AITTADB_CONNECTION_HEADER,
   OWNER_INDICATION_MODERATION_HEADER,
   OWNER_PACKAGE_WORKSPACE_HEADER,
 } from "../../http/runtime-capabilities";
@@ -34,6 +36,9 @@ export default async function OwnerHome() {
   const indicationModerationAvailable = hasOwnerIndicationModeration(
     requestHeaders.get(OWNER_INDICATION_MODERATION_HEADER),
   );
+  const aittadbConnectionAvailable = hasOwnerAittaDBConnection(
+    requestHeaders.get(OWNER_AITTADB_CONNECTION_HEADER),
+  );
   const setupState = campaign ? "Configured" : "Setup required";
   const publicationState = campaign
     ? campaign.published
@@ -54,6 +59,9 @@ export default async function OwnerHome() {
           ) : null}
           {indicationModerationAvailable ? (
             <Link href="/owner/investment-indications">Investment indications</Link>
+          ) : null}
+          {aittadbConnectionAvailable ? (
+            <Link href="/owner/aittadb-connection">AittaDB connection</Link>
           ) : null}
           <a href={chatGPTSignOutPath("/")}>Sign out</a>
         </nav>

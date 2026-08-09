@@ -41,6 +41,10 @@ import {
   createOwnerIndicationModerationRouteHandler,
   type OwnerIndicationModerationRouteDependencies,
 } from "./routes/owner-indication-moderation.ts";
+import {
+  createOwnerOAuthProofRouteHandler,
+  type OwnerOAuthProofRouteDependencies,
+} from "./routes/owner-oauth-proof.ts";
 
 export type ApplicationWorkerDependencies = Readonly<{
   fetchApplication: ApplicationFetcher;
@@ -50,6 +54,7 @@ export type ApplicationWorkerDependencies = Readonly<{
   ownerIndicationModeration?: OwnerIndicationModerationRouteDependencies;
   participantFounderInterest?: FounderInterestRouteDependencies;
   participantInvestmentInterests?: InvestmentInterestRouteDependencies;
+  ownerOAuthProof?: OwnerOAuthProofRouteDependencies;
 }>;
 
 export function createApplicationWorker(
@@ -72,10 +77,13 @@ export function createApplicationWorker(
   const participantInvestmentInterestsAvailable =
     dependencies.dispatchRoute === undefined &&
     dependencies.participantInvestmentInterests !== undefined;
+  const ownerOAuthProofAvailable = dependencies.dispatchRoute === undefined &&
+    dependencies.ownerOAuthProof !== undefined;
   const hasInjectedRoutes = ownerPackageAvailable ||
     ownerIndicationModerationAvailable ||
     participantFounderInterestAvailable ||
-    participantInvestmentInterestsAvailable;
+    participantInvestmentInterestsAvailable ||
+    ownerOAuthProofAvailable;
   const dispatchRoute = dependencies.dispatchRoute ??
     (hasInjectedRoutes
       ? createApplicationRouteDispatcher({
@@ -108,10 +116,16 @@ export function createApplicationWorker(
                     dependencies.ownerIndicationModeration,
                   )]
                 : []),
+              ...(dependencies.ownerOAuthProof
+                ? [createOwnerOAuthProofRouteHandler(
+                    dependencies.ownerOAuthProof,
+                  )]
+                : []),
             ],
             {
               managePackage: ownerPackageAvailable,
               indicationModeration: ownerIndicationModerationAvailable,
+              aittadbConnection: ownerOAuthProofAvailable,
             },
           ),
         })
@@ -143,6 +157,7 @@ export function createApplicationWorker(
             ownerIndicationModerationAvailable,
             participantFounderInterestAvailable,
             participantInvestmentInterestsAvailable,
+            ownerOAuthProofAvailable,
           ),
           env,
           executionContext,
@@ -181,6 +196,7 @@ function withRuntimeConfiguration(
   ownerIndicationModerationAvailable: boolean,
   participantFounderInterestAvailable: boolean,
   participantInvestmentInterestsAvailable: boolean,
+  ownerOAuthProofAvailable: boolean,
 ): Request {
   return withRuntimeCapabilities(
     withRuntimeParticipantAccess(
@@ -198,6 +214,7 @@ function withRuntimeConfiguration(
       ownerIndicationModeration: ownerIndicationModerationAvailable,
       participantFounderInterest: participantFounderInterestAvailable,
       participantInvestmentInterests: participantInvestmentInterestsAvailable,
+      ownerAittadbConnection: ownerOAuthProofAvailable,
     },
   );
 }

@@ -1,0 +1,519 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  createAittaDBOAuthProofService,
+  OAuthProofFailure,
+  type AittaDBOAuthProofDependencies,
+  type AittaDBOAuthProofMetadata,
+  type OAuthTransactionClaim,
+} from "../services/aittadb-oauth-proof.ts";
+
+const ISSUER = "https://database.example.test";
+const CALLBACK =
+  "https://campaign.example.test/owner/aittadb-connection/callback";
+const CLIENT_ID = "confidential-client";
+const CLIENT_SECRET = "hosted-client-secret";
+const ACCESS_TOKEN = "private-access-token";
+const AUTHORIZATION_CODE = "one-time-authorization-code";
+const OWNER_SUBJECT = "owner-subject";
+const AITTADB_SUBJECT = "11111111-1111-4111-8111-111111111111";
+const ACCESS_TOKEN_ID = "22222222-2222-4222-8222-222222222222";
+const REQUESTED_SCOPES = ["storage.read", "storage.write"] as const;
+const NOW = new Date("2026-08-09T12:00:00.000Z");
+const NOW_SECONDS = Math.floor(NOW.valueOf() / 1_000);
+
+test("confidential Authorization Code with PKCE validates discovery, token, and introspection", async () => {
+  const harness = await createHarness();
+  const start = await harness.service.begin(OWNER_SUBJECT);
+  const authorization = new URL(start.authorizationUrl);
+
+  assert.equal(authorization.origin, ISSUER);
+  assert.equal(authorization.pathname, "/authorize");
+  assert.equal(authorization.searchParams.get("response_type"), "code");
+  assert.equal(authorization.searchParams.get("client_id"), CLIENT_ID);
+  assert.equal(authorization.searchParams.get("redirect_uri"), CALLBACK);
+  assert.equal(
+    authorization.searchParams.get("scope"),
+    REQUESTED_SCOPES.join(" "),
+  );
+  assert.equal(authorization.searchParams.get("code_challenge_method"), "S256");
+  assert.match(authorization.searchParams.get("state") ?? "", /^[\w-]{43}$/u);
+  assert.match(
+    authorization.searchParams.get("code_challenge") ?? "",
+    /^[\w-]{43}$/u,
+  );
+  assert.equal(authorization.searchParams.has("nonce"), false);
+  assert.equal(authorization.searchParams.has("offline_access"), false);
+  assert.match(start.setCookie, /^__Host-investor_app_aittadb_oauth=/u);
+  assert.match(start.setCookie, /; Path=\//u);
+  assert.match(start.setCookie, /; Max-Age=300/u);
+  assert.match(start.setCookie, /; Secure/u);
+  assert.match(start.setCookie, /; HttpOnly/u);
+  assert.match(start.setCookie, /; SameSite=Lax/u);
+  assert.doesNotMatch(start.setCookie, /Domain=/iu);
+  assert.doesNotMatch(start.setCookie, new RegExp(CLIENT_SECRET, "u"));
+  assert.doesNotMatch(start.setCookie, /[.]?[A-Za-z0-9_-]*one-time/iu);
+
+  const state = authorization.searchParams.get("state");
+  assert.ok(state);
+  assert.doesNotMatch(start.setCookie, new RegExp(escapeRegExp(state), "u"));
+  assert.doesNotMatch(
+    start.setCookie,
+    new RegExp(escapeRegExp(deterministicToken(128)), "u"),
+  );
+  const proof = await harness.service.complete(
+    OWNER_SUBJECT,
+    `${CALLBACK}?code=${encodeURIComponent(AUTHORIZATION_CODE)}&state=${encodeURIComponent(state)}`,
+    cookieHeader(start.setCookie),
+  );
+
+  assert.deepEqual(proof, {
+    ownerSubject: OWNER_SUBJECT,
+    issuer: ISSUER,
+    audience: CLIENT_ID,
+    scopes: REQUESTED_SCOPES,
+    verifiedAt: NOW.toISOString(),
+    tokenExpiresAt: new Date((NOW_SECONDS + 3_600) * 1_000).toISOString(),
+  });
+  assert.deepEqual(harness.proofs, [proof]);
+  assert.equal(harness.claims.length, 1);
+  assert.match(harness.claims[0]?.fingerprint ?? "", /^[\w-]{43}$/u);
+  assert.equal(harness.requests.length, 4);
+
+  const tokenRequest = harness.requests[2];
+  assert.equal(tokenRequest?.url, `${ISSUER}/oauth/token`);
+  assert.equal(
+    tokenRequest?.authorization,
+    `Basic ${btoa(`${CLIENT_ID}:${CLIENT_SECRET}`)}`,
+  );
+  assert.deepEqual(tokenRequest?.body, {
+    grant_type: "authorization_code",
+    code: AUTHORIZATION_CODE,
+    redirect_uri: CALLBACK,
+    code_verifier: deterministicToken(128),
+  });
+  const introspectionRequest = harness.requests[3];
+  assert.equal(introspectionRequest?.url, `${ISSUER}/oauth/introspect`);
+  assert.equal(introspectionRequest?.authorization, tokenRequest?.authorization);
+  assert.deepEqual(introspectionRequest?.body, {
+    token: ACCESS_TOKEN,
+    token_type_hint: "access_token",
+  });
+
+  const serializedProof = JSON.stringify(proof);
+  for (const secret of [
+    CLIENT_SECRET,
+    ACCESS_TOKEN,
+    AUTHORIZATION_CODE,
+    deterministicToken(128),
+    state,
+  ]) {
+    assert.doesNotMatch(serializedProof, new RegExp(escapeRegExp(secret), "u"));
+  }
+});
+
+test("discovery must advertise the exact confidential S256 authorization path", async (t) => {
+  const valid = discoveryDocument();
+  const cases: readonly [string, Record<string, unknown>][] = [
+    ["issuer", { ...valid, issuer: "https://foreign.example.test" }],
+    ["authorization endpoint", { ...valid, authorization_endpoint: `${ISSUER}/other` }],
+    ["token endpoint", { ...valid, token_endpoint: `${ISSUER}/other` }],
+    ["introspection endpoint", { ...valid, introspection_endpoint: `${ISSUER}/other` }],
+    ["authorization code grant", { ...valid, grant_types_supported: ["refresh_token"] }],
+    ["code response", { ...valid, response_types_supported: ["token"] }],
+    ["S256", { ...valid, code_challenge_methods_supported: ["plain"] }],
+    ["confidential authentication", { ...valid, token_endpoint_auth_methods_supported: ["none"] }],
+    ["requested scopes", { ...valid, scopes_supported: ["storage.read"] }],
+  ];
+
+  for (const [name, discovery] of cases) {
+    await t.test(name, async () => {
+      const harness = await createHarness({ discovery });
+      assert.equal(await harness.service.availability(), false);
+      await assert.rejects(
+        harness.service.begin(OWNER_SUBJECT),
+        publicFailure("service_unavailable"),
+      );
+      assert.equal(harness.requests.length, 2);
+      assert.equal(harness.claims.length, 0);
+      assert.equal(harness.proofs.length, 0);
+    });
+  }
+});
+
+test("discovery, token, and introspection bodies are bounded and strictly parsed", async (t) => {
+  await t.test("oversized discovery", async () => {
+    const harness = await createHarness({
+      discoveryResponse: jsonResponse(
+        { padding: "x".repeat(17_000) },
+      ),
+    });
+    assert.equal(await harness.service.availability(), false);
+  });
+
+  await t.test("malformed discovery", async () => {
+    const harness = await createHarness({
+      discoveryResponse: new Response("{", {
+        headers: { "content-type": "application/json" },
+      }),
+    });
+    await assert.rejects(
+      harness.service.begin(OWNER_SUBJECT),
+      publicFailure("service_unavailable"),
+    );
+  });
+
+  for (const [name, responseKey, response] of [
+    ["oversized token", "tokenResponse", jsonResponse({ padding: "x".repeat(17_000) })],
+    ["malformed token", "tokenResponse", jsonResponse({ access_token: ACCESS_TOKEN })],
+    ["oversized introspection", "introspectionResponse", jsonResponse({ padding: "x".repeat(17_000) })],
+    ["malformed introspection", "introspectionResponse", jsonResponse({ active: true })],
+  ] as const) {
+    await t.test(name, async () => {
+      const harness = await createHarness({ [responseKey]: response });
+      const callback = await startedCallback(harness);
+      await assert.rejects(
+        harness.service.complete(
+          OWNER_SUBJECT,
+          callback.url,
+          callback.cookie,
+        ),
+        publicFailure("service_unavailable"),
+      );
+      assert.equal(harness.proofs.length, 0);
+    });
+  }
+});
+
+test("callback rejects mismatch, expiry, replay, and provider errors before credential work", async (t) => {
+  await t.test("state mismatch", async () => {
+    const harness = await createHarness();
+    const callback = await startedCallback(harness);
+    await assert.rejects(
+      harness.service.complete(
+        OWNER_SUBJECT,
+        `${CALLBACK}?code=${AUTHORIZATION_CODE}&state=${"x".repeat(43)}`,
+        callback.cookie,
+      ),
+      publicFailure("invalid_callback"),
+    );
+    assert.equal(harness.requests.length, 1);
+    assert.equal(harness.claims.length, 0);
+  });
+
+  await t.test("expired transaction", async () => {
+    let current = NOW;
+    const harness = await createHarness({ now: () => current });
+    const callback = await startedCallback(harness);
+    current = new Date(NOW.valueOf() + 301_000);
+    await assert.rejects(
+      harness.service.complete(OWNER_SUBJECT, callback.url, callback.cookie),
+      publicFailure("invalid_callback"),
+    );
+    assert.equal(harness.requests.length, 1);
+    assert.equal(harness.claims.length, 0);
+  });
+
+  await t.test("different owner subject", async () => {
+    const harness = await createHarness();
+    const callback = await startedCallback(harness);
+    await assert.rejects(
+      harness.service.complete("replacement-owner", callback.url, callback.cookie),
+      publicFailure("invalid_callback"),
+    );
+    assert.equal(harness.requests.length, 1);
+    assert.equal(harness.claims.length, 0);
+  });
+
+  await t.test("replayed transaction", async () => {
+    const harness = await createHarness();
+    const callback = await startedCallback(harness);
+    await harness.service.complete(OWNER_SUBJECT, callback.url, callback.cookie);
+    const requestsAfterSuccess = harness.requests.length;
+    await assert.rejects(
+      harness.service.complete(OWNER_SUBJECT, callback.url, callback.cookie),
+      publicFailure("invalid_callback"),
+    );
+    assert.equal(harness.requests.length, requestsAfterSuccess);
+    assert.equal(harness.proofs.length, 1);
+  });
+
+  await t.test("provider callback error", async () => {
+    const harness = await createHarness();
+    const callback = await startedCallback(harness);
+    const state = new URL(callback.url).searchParams.get("state");
+    assert.ok(state);
+    await assert.rejects(
+      harness.service.complete(
+        OWNER_SUBJECT,
+        `${CALLBACK}?error=access_denied&state=${encodeURIComponent(state)}`,
+        callback.cookie,
+      ),
+      publicFailure("invalid_callback"),
+    );
+    assert.equal(harness.requests.length, 1);
+    assert.equal(harness.claims.length, 1);
+  });
+});
+
+test("introspection rejects inactive, wrong-client, expired, and wrong-scope access tokens", async (t) => {
+  const cases: readonly [string, Record<string, unknown>][] = [
+    ["inactive", { active: false }],
+    ["wrong client", introspectionDocument({ aud: "foreign-client" })],
+    ["expired", introspectionDocument({ exp: NOW_SECONDS })],
+    ["wrong scope", introspectionDocument({ scope: "storage.read storage.delete" })],
+    ["noninteger issued-at", introspectionDocument({ iat: "now" })],
+    ["future issued-at", introspectionDocument({ iat: NOW_SECONDS + 61 })],
+    ["noninteger not-before", introspectionDocument({ nbf: "now" })],
+    ["future not-before", introspectionDocument({ nbf: NOW_SECONDS + 1 })],
+    ["noncanonical subject", introspectionDocument({ sub: "local-user" })],
+    ["noncanonical token ID", introspectionDocument({ jti: "token-id" })],
+  ];
+
+  for (const [name, introspection] of cases) {
+    await t.test(name, async () => {
+      const harness = await createHarness({ introspection });
+      const callback = await startedCallback(harness);
+      await assert.rejects(
+        harness.service.complete(
+          OWNER_SUBJECT,
+          callback.url,
+          callback.cookie,
+        ),
+        publicFailure("service_unavailable"),
+      );
+      assert.equal(harness.proofs.length, 0);
+    });
+  }
+});
+
+test("credential-bearing failures expose no causes or credential values", async () => {
+  const secretMessage = [
+    CLIENT_SECRET,
+    ACCESS_TOKEN,
+    AUTHORIZATION_CODE,
+    deterministicToken(128),
+  ].join(" ");
+  const harness = await createHarness({
+    failAt: "token",
+    fetchFailure: new Error(secretMessage),
+  });
+  const callback = await startedCallback(harness);
+  let failure: unknown;
+  try {
+    await harness.service.complete(
+      OWNER_SUBJECT,
+      callback.url,
+      callback.cookie,
+    );
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure instanceof OAuthProofFailure);
+  const serialized = `${failure.name} ${failure.message} ${String(failure.stack)}`;
+  assert.equal("cause" in failure, false);
+  for (const secret of secretMessage.split(" ")) {
+    assert.doesNotMatch(serialized, new RegExp(escapeRegExp(secret), "u"));
+  }
+});
+
+type ObservedRequest = Readonly<{
+  url: string;
+  authorization: string | null;
+  body: Readonly<Record<string, string>>;
+}>;
+
+type Harness = Awaited<ReturnType<typeof createHarness>>;
+
+async function createHarness(
+  options: Readonly<{
+    discovery?: Record<string, unknown>;
+    introspection?: Record<string, unknown>;
+    discoveryResponse?: Response;
+    tokenResponse?: Response;
+    introspectionResponse?: Response;
+    now?: () => Date;
+    failAt?: "discovery" | "token" | "introspection";
+    fetchFailure?: Error;
+  }> = {},
+) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    Uint8Array.from({ length: 32 }, (_, index) => index + 1),
+    "AES-GCM",
+    false,
+    ["encrypt", "decrypt"],
+  );
+  const requests: ObservedRequest[] = [];
+  const claims: OAuthTransactionClaim[] = [];
+  const claimed = new Set<string>();
+  const proofs: AittaDBOAuthProofMetadata[] = [];
+  let randomCall = 0;
+  const fetch = async (request: Request): Promise<Response> => {
+    const body = request.method === "POST"
+      ? Object.fromEntries(new URLSearchParams(await request.clone().text()))
+      : {};
+    requests.push({
+      url: request.url,
+      authorization: request.headers.get("authorization"),
+      body,
+    });
+    const kind = request.url.endsWith("/.well-known/openid-configuration")
+      ? "discovery"
+      : request.url.endsWith("/oauth/token")
+        ? "token"
+        : "introspection";
+    if (options.failAt === kind) throw options.fetchFailure ?? new Error("private");
+    if (kind === "discovery") {
+      return options.discoveryResponse ?? jsonResponse(
+        options.discovery ?? discoveryDocument(),
+      );
+    }
+    if (kind === "token") {
+      return options.tokenResponse ?? jsonResponse(tokenDocument());
+    }
+    return options.introspectionResponse ?? jsonResponse(
+      options.introspection ?? introspectionDocument(),
+    );
+  };
+  const dependencies: AittaDBOAuthProofDependencies = {
+    issuer: ISSUER,
+    clientId: CLIENT_ID,
+    clientSecret: CLIENT_SECRET,
+    callbackUri: CALLBACK,
+    allowedStorageScopes: [
+      "storage.read",
+      "storage.write",
+      "storage.delete",
+    ],
+    requestedStorageScopes: REQUESTED_SCOPES,
+    transactionCookieKey: key,
+    transactionTtlSeconds: 300,
+    transactionClaimStore: {
+      async claim(claim) {
+        claims.push(claim);
+        if (claimed.has(claim.fingerprint)) return false;
+        claimed.add(claim.fingerprint);
+        return true;
+      },
+    },
+    resultSink: {
+      async recordVerifiedProof(proof) {
+        proofs.push(proof);
+      },
+    },
+    fetch,
+    now: options.now ?? (() => NOW),
+    randomBytes(length) {
+      randomCall += 1;
+      return Uint8Array.from(
+        { length },
+        (_, index) => (randomCall * 64 + index) % 256,
+      );
+    },
+  };
+  return {
+    service: createAittaDBOAuthProofService(dependencies),
+    requests,
+    claims,
+    proofs,
+  };
+}
+
+async function startedCallback(harness: Harness) {
+  const start = await harness.service.begin(OWNER_SUBJECT);
+  const state = new URL(start.authorizationUrl).searchParams.get("state");
+  assert.ok(state);
+  return {
+    url: `${CALLBACK}?code=${AUTHORIZATION_CODE}&state=${encodeURIComponent(state)}`,
+    cookie: cookieHeader(start.setCookie),
+  };
+}
+
+function discoveryDocument(): Record<string, unknown> {
+  return {
+    issuer: ISSUER,
+    authorization_endpoint: `${ISSUER}/authorize`,
+    token_endpoint: `${ISSUER}/oauth/token`,
+    introspection_endpoint: `${ISSUER}/oauth/introspect`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: [
+      "none",
+      "client_secret_basic",
+      "client_secret_post",
+    ],
+    scopes_supported: [
+      "openid",
+      "offline_access",
+      "storage.read",
+      "storage.write",
+      "storage.delete",
+    ],
+  };
+}
+
+function tokenDocument(): Record<string, unknown> {
+  return {
+    access_token: ACCESS_TOKEN,
+    token_type: "Bearer",
+    expires_in: 3_600,
+    scope: REQUESTED_SCOPES.join(" "),
+  };
+}
+
+function introspectionDocument(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    active: true,
+    iss: ISSUER,
+    sub: AITTADB_SUBJECT,
+    aud: CLIENT_ID,
+    exp: NOW_SECONDS + 3_600,
+    iat: NOW_SECONDS,
+    nbf: NOW_SECONDS,
+    jti: ACCESS_TOKEN_ID,
+    scope: REQUESTED_SCOPES.join(" "),
+    token_use: "access",
+    ...overrides,
+  };
+}
+
+function jsonResponse(value: unknown): Response {
+  return new Response(JSON.stringify(value), {
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+function cookieHeader(setCookie: string): string {
+  return setCookie.split(";", 1)[0] ?? "";
+}
+
+function deterministicToken(seed: number): string {
+  const bytes = Uint8Array.from(
+    { length: 32 },
+    (_, index) => (seed + index) % 256,
+  );
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
+
+function publicFailure(code: string) {
+  return (error: unknown): boolean => {
+    assert.ok(error instanceof OAuthProofFailure);
+    assert.equal(error.code, code);
+    assert.equal("cause" in error, false);
+    return true;
+  };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}

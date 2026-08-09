@@ -18,6 +18,14 @@ Deployments provide trusted runtime configuration for the canonical app origin, 
 
 The repository tracks only `.openai/hosting.example.json`. Each production, acceptance, or local deployment keeps its exact Sites project binding in ignored `.openai/hosting.json` state. Clean checkouts can build against the inert example, while Sites packaging explicitly requires an active binding.
 
+### Injected AittaDB OAuth proof
+
+`services/aittadb-oauth-proof.ts` is a Worker-compatible confidential Authorization Code and S256 PKCE boundary for a development connection proof. Issuer, client credentials, exact callback, allowed and requested storage scopes, AES-GCM cookie key, durable replay-claim store, closed result sink, fetch, clock, randomness, and lifetime are constructor inputs. The service discovers exact AittaDB endpoints before initiation and callback, bounds every protocol response, and validates introspection against AittaDB's active access-token claim contract. Credentials and transaction secrets never enter result metadata or exception causes.
+
+`worker/routes/owner-oauth-proof.ts` owns `/owner/aittadb-connection` and its callback. The owner-only GET capability, CSRF-protected POST form, and hypermedia action share one domain resource; direct requests still enforce configured-owner identity, origin, session, and CSRF independently. Callback resources clear the host-only encrypted transaction cookie and never reflect query parameters. Anonymous and foreign callers are denied before discovery or credential exchange.
+
+The route is optional application-worker composition. `worker/index.ts` installs no OAuth proof dependencies, so normal production source remains fail-closed. A hosted composition must supply a durable claim store and result sink in addition to secret/config values. Source validation is not hosted proof, and TASK-030 remains open while the configured AittaDB deployment advertises OAuth Apps as disabled. See `docs/AITTADB_OAUTH_PROOF.md`.
+
 ## Resource representations
 
 Application URLs identify resources rather than HTML-only pages. `Accept: text/html` selects the human interface. `Accept: application/vnd.aittadb-invest+json; version=0.1` selects the versioned hypermedia contract, and `application/json` is a compatibility representation. Representation selection never uses `User-Agent`.

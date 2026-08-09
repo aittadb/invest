@@ -7,6 +7,7 @@ import {
 } from "./public-campaign-resource.ts";
 import { defineAction, toHypermediaAction } from "./hypermedia-action.ts";
 import type { PublicCampaignConfiguration } from "./public-campaign-configuration.ts";
+import { OWNER_OAUTH_PROOF_PATH } from "./owner-oauth-proof-resource.ts";
 
 export type OwnerHomeDocument = Readonly<{
   api_version: typeof INVESTOR_APP_API_VERSION;
@@ -29,6 +30,7 @@ export type OwnerHomeCapabilities = Readonly<{
   auditNotificationHistory?: boolean;
   managePackage?: boolean;
   indicationModeration?: boolean;
+  aittadbConnection?: boolean;
 }>;
 
 export function createOwnerHomeDocument(
@@ -100,6 +102,12 @@ export function createOwnerHomeDocument(
           href: absolute("/owner/investment-indications"),
         }]
         : []),
+      ...(capabilities.aittadbConnection
+        ? [{
+          rel: ["aittadb-connection"],
+          href: absolute(OWNER_OAUTH_PROOF_PATH),
+        }]
+        : []),
       ...packageLinks,
     ],
     actions: [
@@ -137,6 +145,16 @@ export function createOwnerHomeDocument(
           name: "review-investment-indications",
           title: "Review investment indications",
           href: absolute("/owner/investment-indications"),
+          method: "GET" as const,
+          type: "text/html" as const,
+          fields: [],
+        }]
+        : []),
+      ...(capabilities.aittadbConnection
+        ? [{
+          name: "review-aittadb-connection",
+          title: "Review AittaDB connection",
+          href: absolute(OWNER_OAUTH_PROOF_PATH),
           method: "GET" as const,
           type: "text/html" as const,
           fields: [],

@@ -22,7 +22,11 @@ If exposure is suspected, do not echo or paste the value. Escalate privately wit
 - Public aggregate output must never disclose participant counts, identities, notes, private fields, or database structure unless explicitly configured and reviewed by the specification.
 - Private package, profile, indication, founder, owner, and export responses should use non-cacheable headers.
 - No visitor analytics or non-essential cookies in version one.
+- The optional AittaDB OAuth proof keeps issuer/client/scope configuration server-side and client secret plus AES-GCM cookie material in hosted secret storage. Its short-lived host-only transaction cookie is encrypted and authenticated; replay is rejected through an injected durable atomic claim store, never process memory or browser storage.
+- OAuth callback responses must not reflect query parameters. Access tokens, refresh tokens, authorization codes, PKCE verifiers, OAuth state, client secrets, cookie plaintext, AittaDB token subjects/IDs, and credential-bearing causes must not enter responses, logs, persistence, or proof metadata. The standards-required outbound authorization redirect is the only transport for state and the PKCE challenge.
 
 ## Publication Blockers
 
 Production publication is blocked until the configured backend supports the required authorization, consistency, listing, pagination, quota, and non-disclosure behavior and the production adapter passes contract and end-to-end tests.
+
+TASK-030 additionally remains open until an authorized acceptance deployment advertises the required OAuth endpoints, a least-privilege confidential client is installed through hosted configuration, and the complete owner callback proof succeeds without credential disclosure. The source-only injected callback infrastructure is not live evidence.
