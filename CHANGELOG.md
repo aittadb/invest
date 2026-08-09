@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-042:** Create a separate acceptance Sites instance. DoD: a new owner-only Sites project is bound in an isolated worktree, receives only synthetic campaign configuration plus the configured development owner, deploys the exact validated source, remains separate from production data and access, and is ready for a later `invest-test.aittadb.com` custom domain.
+
+  Acceptance evidence: a second Sites project was created once and bound only inside a detached acceptance worktree. Version 1 packages commit `0a0f1e2` exactly, uses the synthetic Northstar Robotics fixture and the current Sites owner as its development owner, and deployed successfully behind owner-only ChatGPT sign-in. Browser verification reached both the published campaign and authorized owner workspace. No production campaign value, storage binding, access grant, or custom domain is shared; the instance is ready for a later `invest-test.aittadb.com` domain. External visitor invitations are disabled in the current Sites workspace, so acceptance access remains limited to the Sites owner.
+
 - **TASK-043:** Add the create-your-instance quick start. DoD: the README opening includes a compact `@Sites` prompt that interviews one question at a time, separates reusable behavior from runtime campaign settings, requests a decision review, and requires approval before building or publishing without embedding reference-campaign defaults.
 
   Acceptance evidence: the README now opens with a copy-ready `@Sites` prompt linking this repository. It requests compact one-question-at-a-time interviewing, configurable instance data, the core campaign and trust decisions, a decision review, private initial creation, and explicit approval before public publication. The prompt contains no reference-campaign defaults; the Markdown diff check and AGENTS size guard pass.
