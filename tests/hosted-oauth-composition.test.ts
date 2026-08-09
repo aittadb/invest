@@ -57,7 +57,8 @@ test("hosted Worker composition completes and persists the scoped OAuth proof", 
   const providerRequests: Request[] = [];
   let randomCall = 0;
   const resolver = createHostedOwnerOAuthProofResolver({
-    fetch: async (request) => {
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
       providerRequests.push(request.clone());
       if (request.url === `${ISSUER}/.well-known/openid-configuration`) {
         return jsonResponse({

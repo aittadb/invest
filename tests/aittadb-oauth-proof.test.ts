@@ -479,7 +479,11 @@ async function createHarness(
   const proofs: AittaDBOAuthProofMetadata[] = [];
   const availabilityFailures: string[] = [];
   let randomCall = 0;
-  const fetch = async (request: Request): Promise<Response> => {
+  const fetch = async (
+    input: string,
+    init: RequestInit,
+  ): Promise<Response> => {
+    const request = new Request(input, init);
     const body = request.method === "POST"
       ? Object.fromEntries(new URLSearchParams(await request.clone().text()))
       : {};

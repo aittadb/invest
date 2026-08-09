@@ -427,7 +427,8 @@ async function routeHarness() {
         proofs += 1;
       },
     },
-    async fetch(request) {
+    async fetch(input, init) {
+      const request = new Request(input, init);
       networkRequests.push(request.url);
       if (request.url.endsWith("/.well-known/openid-configuration")) {
         return jsonResponse({

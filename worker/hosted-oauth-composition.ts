@@ -38,7 +38,7 @@ export function createHostedOwnerOAuthProofResolver(
 ): HostedOwnerOAuthProofResolver {
   const now = dependencies.now ?? (() => new Date());
   const randomBytes = dependencies.randomBytes ?? secureRandomBytes;
-  const providerFetch = dependencies.fetch ?? ((request) => fetch(request));
+  const providerFetch = dependencies.fetch ?? ((input, init) => fetch(input, init));
   const availabilityFailureObserver = dependencies.availabilityFailureObserver ??
     reportHostedOAuthAvailabilityFailure;
   const cache = new WeakMap<InvestorAppEnv, Promise<OwnerOAuthProofRouteDependencies | null>>();

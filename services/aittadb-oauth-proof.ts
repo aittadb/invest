@@ -21,7 +21,10 @@ const STORAGE_SCOPES = new Set([
 export const DEFAULT_OAUTH_TRANSACTION_COOKIE =
   "__Host-investor_app_aittadb_oauth";
 
-export type AittaDBOAuthFetch = (request: Request) => Promise<Response>;
+export type AittaDBOAuthFetch = (
+  input: string,
+  init: RequestInit,
+) => Promise<Response>;
 export type OAuthRandomBytes = (length: number) => Uint8Array;
 export type OAuthAvailabilityFailurePhase =
   | "request"
@@ -144,6 +147,11 @@ type Discovery = Readonly<{
   authorizationEndpoint: string;
   tokenEndpoint: string;
   introspectionEndpoint: string;
+}>;
+
+type OAuthHttpRequest = Readonly<{
+  url: string;
+  init: RequestInit;
 }>;
 
 type Transaction = Readonly<{
@@ -360,23 +368,16 @@ async function discover(
   config: ValidatedConfiguration,
   report?: OAuthAvailabilityFailureObserver,
 ): Promise<Discovery> {
-  let request: Request;
-  try {
-    request = new Request(
-      `${config.issuer}/.well-known/openid-configuration`,
-      {
+  const document = await fetchJson(
+    config,
+    {
+      url: `${config.issuer}/.well-known/openid-configuration`,
+      init: {
         method: "GET",
         headers: { Accept: "application/json", "Cache-Control": "no-cache" },
         redirect: "manual",
       },
-    );
-  } catch {
-    report?.("request");
-    unavailable();
-  }
-  const document = await fetchJson(
-    config,
-    request,
+    },
     DISCOVERY_MAX_BYTES,
     report,
   );
@@ -528,8 +529,8 @@ function confidentialRequest(
   url: string,
   config: ValidatedConfiguration,
   body: URLSearchParams,
-): Request {
-  return new Request(url, {
+): OAuthHttpRequest {
+  const init: RequestInit = {
     method: "POST",
     headers: {
       Accept: "application/json",
@@ -539,18 +540,22 @@ function confidentialRequest(
     },
     body,
     redirect: "manual",
+  };
+  return Object.freeze({
+    url,
+    init,
   });
 }
 
 async function fetchJson(
   config: ValidatedConfiguration,
-  request: Request,
+  request: OAuthHttpRequest,
   maxBytes: number,
   report?: OAuthAvailabilityFailureObserver,
 ): Promise<Record<string, unknown>> {
   let response: Response;
   try {
-    response = await config.fetch(request);
+    response = await config.fetch(request.url, request.init);
   } catch {
     report?.("fetch");
     unavailable();
