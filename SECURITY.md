@@ -15,6 +15,9 @@ If exposure is suspected, do not echo or paste the value. Escalate privately wit
 - Production storage uses the configured AittaDB-compatible adapter only.
 - Owner setup must prevent first-user takeover and bind authorization to a stable backend identity.
 - Every server route must enforce authorization independently.
+- Browser mutation identity comes only from the trusted session resolver, never request-supplied actor fields or untrusted headers.
+- Browser mutations require an exact configured origin, an unexpired session, an expiring server-verified CSRF proof, and a bounded supported body before feature code runs.
+- Store only CSRF token hashes in session state. Never log or return raw CSRF tokens, session values, submitted private fields, or guard failure causes.
 - Public aggregate output must never disclose participant counts, identities, notes, private fields, or database structure unless explicitly configured and reviewed by the specification.
 - Private package, profile, indication, founder, owner, and export responses should use non-cacheable headers.
 - No visitor analytics or non-essential cookies in version one.

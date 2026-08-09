@@ -34,6 +34,12 @@ The public campaign resource is the signed-out base state. A valid participant s
 
 Hypermedia and form models project from the same validated action. A form-compatible `GET` uses query fields; a mutation uses body fields and form encoding. Native forms submit `POST` with an explicit effective-method field when the semantic method is `PUT`, `PATCH`, or `DELETE`. JSON-only, path-driven, or header-driven actions remain valid hypermedia controls but cannot be projected as native forms. Route implementations must support the advertised encodings and normalize any form method before invoking the same security, validation, and domain operation.
 
+### Browser mutation boundary
+
+`http/mutation-security.ts` is a generic precondition guard for session-authenticated browser mutations. Identity enters only through an injected trusted session resolver; request headers and body fields cannot assert a participant or owner. The guard validates the trusted subject and session expiry, requires an exact deployment-configured `Origin`, checks an expiring random CSRF token against its server-held SHA-256 hash in constant time, and reads JSON or form bodies incrementally under configured byte and field limits.
+
+The result contains only the verified actor, normalized mutation method, media type, and parsed body. A form-encoded `POST` may carry the shared effective-method field for `PUT`, `PATCH`, or `DELETE`; JSON uses the actual HTTP method. Hidden transport fields are removed before feature parsing. Fixed public errors never include identity, token, origin, submitted fields, or internal causes. The owning route must still enforce role, resource ownership, lifecycle, input schema, revision, idempotency, and audit rules.
+
 ### Modular route dispatch
 
 The Worker normalizes trusted runtime configuration and identity once, then passes a narrow request context through independently composed public, participant, and owner route groups. Each handler either returns the complete response for a resource it owns or returns `null` without changing sibling state. Shared representation helpers own only response serialization and headers; feature authorization and projection remain inside the owning route group and its domain services.
