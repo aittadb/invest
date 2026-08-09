@@ -1,9 +1,14 @@
 import type { PublicCampaignConfiguration } from "../domain/public-campaign-configuration.ts";
+import type {
+  AuthorizedParticipantAccess,
+  ParticipantAccessStateReader,
+} from "../domain/participant-home-resource.ts";
 
 export interface InvestorAppEnv {
   APP_BASE_URL?: string;
   CAMPAIGN_CONFIG_JSON?: string;
   OWNER_EMAIL?: string;
+  PARTICIPANT_ACCESS?: ParticipantAccessStateReader;
   ASSETS: {
     fetch(request: Request): Promise<Response>;
   };
@@ -33,8 +38,10 @@ export type AuthenticatedActor = Readonly<{
 export type ApplicationRouteContext = Readonly<{
   request: Request;
   url: URL;
+  resourceUrl: string;
   actor: AuthenticatedActor | null;
   isOwner: boolean;
+  participantAccess: AuthorizedParticipantAccess | null;
   campaign: PublicCampaignConfiguration | null;
   renderApplication(): Promise<Response>;
 }>;

@@ -74,6 +74,36 @@ The public campaign resource currently has this shape:
 
 `data` contains the state visible to the current caller. Links use stable semantic `rel` values and server-supplied targets. Actions use stable semantic names and describe only transitions available now.
 
+## Participant Resources
+
+A subject-authorized participant extends `GET /` with the `participant-home`
+link relation and `open-participant-home` action. When a current package is
+available to that subject, the root also includes the `private-package` link
+relation and `read-private-package` action. These controls replace signed-out
+registration actions for that caller. A separately authorized owner-participant
+also retains `manage-campaign`.
+
+`GET /participant` has resource type `participant-home`. Its `data` contains the
+authorized account label, declared interest and participation context, account
+status, public campaign name, and a bounded current-package status projection.
+The resource links back to the public campaign and, when available, to
+`/participant/package`. Its currently supported actions are
+`read-private-package`, `manage-campaign` for a separately authorized owner, and
+`sign-out`.
+
+`GET /participant/package` has resource type `private-package` and exposes the
+current version's bounded status metadata: creation time, change summary,
+material-change flag, and whether renewed acknowledgment is required. It links
+to the participant home and campaign. Package sections and acknowledgment
+mutations remain governed by their own content and mutation contracts; this
+resource does not infer package body content from public campaign input.
+
+Both participant URIs negotiate HTML and version `0.1` hypermedia JSON. A
+signed-out JSON request receives `401 authentication_required`; an authenticated
+subject without matching participant state receives the same generic `404`
+shape as a missing record. Unsupported explicit versions return `406` before a
+representation is selected.
+
 Mutation actions will also declare their request media type and typed fields. Fields can describe body, path, query, or header location; required state; sensitivity; current or default value; allowed choices; and length, numeric, or byte constraints.
 
 Framework-independent action definitions are the common source for machine controls and browser forms. Version `0.1` supports `GET`, `POST`, `PUT`, `PATCH`, and `DELETE`, plus `text/html`, `application/x-www-form-urlencoded`, and `application/json` action types. String, integer, boolean, and choice fields are bounded before publication, and sensitive fields never include advertised current or default values.
@@ -84,7 +114,7 @@ Browser mutation forms also receive a server-generated hidden CSRF proof. The re
 
 ## Identity and Authorization
 
-The signed-out campaign document contains only public state and sign-in transitions. A valid participant session can add links and actions for the private package and that participant's records. An owner session can add owner operations only after a separate owner authorization decision.
+The signed-out campaign document contains only public state and sign-in transitions. A valid participant session can add links and actions for the private package and that participant's records. The participant decision starts with a parsed trusted account and a credential-bound state reader; query, form, JSON, and client-supplied participant headers cannot assert the subject or package grant. An owner session can add owner operations only after a separate owner authorization decision.
 
 Omitting a control is not authorization. Every target independently enforces identity, actor role, resource ownership, workflow state, same-origin and CSRF rules for browser mutations, and input validation. Inaccessible foreign records use the same non-disclosing response as missing records.
 

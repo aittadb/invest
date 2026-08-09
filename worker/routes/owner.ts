@@ -26,24 +26,24 @@ export function createOwnerHomeRouteHandler(
     );
 
     if (representation.kind === "not-acceptable") {
-      return notAcceptableResponse(context.request.url);
+      return notAcceptableResponse(context.resourceUrl);
     }
 
     if (representation.kind === "hypermedia-json") {
       if (!context.actor) {
         return hypermediaResponse(
-          createOwnerAuthenticationRequiredDocument(context.request.url),
+          createOwnerAuthenticationRequiredDocument(context.resourceUrl),
           401,
         );
       }
 
       if (!context.isOwner) {
-        return resourceNotFoundResponse(context.request.url);
+        return resourceNotFoundResponse(context.resourceUrl);
       }
 
       return hypermediaResponse(
         createOwnerHomeDocument(
-          context.request.url,
+          context.resourceUrl,
           context.actor,
           context.campaign,
           capabilities,

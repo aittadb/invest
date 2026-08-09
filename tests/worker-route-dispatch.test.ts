@@ -10,6 +10,7 @@ import type {
 import { createApplicationWorker } from "../worker/application-worker.ts";
 import { createApplicationRouteDispatcher } from "../worker/routes/application.ts";
 import { handleOwnerRoutes } from "../worker/routes/owner.ts";
+import { handleParticipantHomeRoutes } from "../worker/routes/participant-home.ts";
 import { createParticipantRouteHandler } from "../worker/routes/participant.ts";
 import { handlePublicRoutes } from "../worker/routes/public.ts";
 import { APP_ORIGIN_HEADER } from "../http/app-origin.ts";
@@ -18,6 +19,20 @@ import {
   CAMPAIGN_CONFIGURATION_HEADER,
 } from "../http/runtime-campaign.ts";
 import { OWNER_EMAIL_HEADER } from "../http/runtime-owner.ts";
+import {
+  participantAccessFromRuntimeHeader,
+  PARTICIPANT_ACCESS_HEADER,
+} from "../http/runtime-participant.ts";
+import {
+  authorizeParticipantAccess,
+  type ParticipantAuthorizationState,
+} from "../domain/participant-home-resource.ts";
+import {
+  parseActorSubject,
+  parseStableId,
+  parseTimestamp,
+} from "../domain/foundation.ts";
+import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
 
 const executionContext: WorkerExecutionContext = {
@@ -106,6 +121,137 @@ test("public routes preserve root negotiation and HTML Vary behavior", async () 
     routeContext("https://campaign.example/about"),
   );
   assert.equal(nonRoot, null);
+});
+
+test("public routes add only the authorized participant capabilities", async () => {
+  const access = participantAccess("participant-subject", "participant@example.com");
+  const response = requiredResponse(
+    await handlePublicRoutes(
+      routeContext("https://campaign.example/", {
+        requestHeaders: { accept: "application/json" },
+        actor: actor("participant-subject", "participant@example.com"),
+        participantAccess: access,
+      }),
+    ),
+  );
+  const document = await response.json();
+  assert.deepEqual(
+    document.actions.map((action: { name: string }) => action.name),
+    ["open-participant-home", "read-private-package"],
+  );
+  assert.ok(
+    document.links.some((link: { rel: string[] }) =>
+      link.rel.includes("participant-home")
+    ),
+  );
+  assert.ok(
+    document.links.some((link: { rel: string[] }) =>
+      link.rel.includes("private-package")
+    ),
+  );
+
+  const visitor = requiredResponse(
+    await handlePublicRoutes(
+      routeContext("https://campaign.example/", {
+        requestHeaders: { accept: "application/json" },
+      }),
+    ),
+  );
+  assert.doesNotMatch(
+    JSON.stringify(await visitor.json()),
+    /participant-home|private-package|participant@example\.com/u,
+  );
+});
+
+test("participant resources preserve authentication, ownership, and negotiation", async () => {
+  const anonymous = requiredResponse(
+    await handleParticipantHomeRoutes(
+      routeContext("https://campaign.example/participant", {
+        requestHeaders: { accept: "application/json" },
+      }),
+    ),
+  );
+  assert.equal(anonymous.status, 401);
+  assert.equal((await anonymous.json()).data.code, "authentication_required");
+
+  const foreign = requiredResponse(
+    await handleParticipantHomeRoutes(
+      routeContext("https://campaign.example/participant", {
+        requestHeaders: { accept: "application/json" },
+        actor: actor("foreign-subject", "foreign@example.com"),
+      }),
+    ),
+  );
+  assert.equal(foreign.status, 404);
+  assert.equal((await foreign.json()).data.code, "not_found");
+
+  const access = participantAccess("participant-subject", "participant@example.com");
+  const participant = requiredResponse(
+    await handleParticipantHomeRoutes(
+      routeContext("https://campaign.example/participant", {
+        requestHeaders: { accept: "application/json" },
+        actor: actor("participant-subject", "participant@example.com"),
+        participantAccess: access,
+      }),
+    ),
+  );
+  assert.equal(participant.status, 200);
+  const participantDocument = await participant.json();
+  assert.equal(participantDocument.type, "participant-home");
+  assert.equal(participantDocument.data.account_email, "participant@example.com");
+
+  const privatePackage = requiredResponse(
+    await handleParticipantHomeRoutes(
+      routeContext("https://campaign.example/participant/package", {
+        requestHeaders: { accept: "application/json" },
+        actor: actor("participant-subject", "participant@example.com"),
+        participantAccess: access,
+      }),
+    ),
+  );
+  assert.equal(privatePackage.status, 200);
+  assert.equal((await privatePackage.json()).type, "private-package");
+
+  const ownerParticipant = requiredResponse(
+    await handleParticipantHomeRoutes(
+      routeContext("https://campaign.example/participant", {
+        requestHeaders: { accept: "application/json" },
+        actor: actor("participant-subject", "participant@example.com"),
+        participantAccess: access,
+        isOwner: true,
+      }),
+    ),
+  );
+  assert.ok(
+    (await ownerParticipant.json()).actions.some(
+      (action: { name: string }) => action.name === "manage-campaign",
+    ),
+  );
+
+  const unsupported = requiredResponse(
+    await handleParticipantHomeRoutes(
+      routeContext("https://campaign.example/participant", {
+        requestHeaders: {
+          accept: "application/vnd.aittadb-invest+json; version=9.0",
+        },
+      }),
+    ),
+  );
+  assert.equal(unsupported.status, 406);
+
+  const html = requiredResponse(
+    await handleParticipantHomeRoutes(
+      routeContext("https://campaign.example/participant", {
+        requestHeaders: { accept: "text/html" },
+        actor: actor("participant-subject", "participant@example.com"),
+        participantAccess: access,
+        renderApplication: async () =>
+          new Response("participant html", { headers: { Vary: "Origin" } }),
+      }),
+    ),
+  );
+  assert.equal(await html.text(), "participant html");
+  assert.equal(html.headers.get("vary"), "Origin, Accept");
 });
 
 test("owner routes preserve authentication, authorization, and representation behavior", async () => {
@@ -246,6 +392,88 @@ test("application rendering receives the same normalized runtime headers", async
     ),
     syntheticPublicCampaign,
   );
+  assert.equal(
+    renderedRequest.headers.get(PARTICIPANT_ACCESS_HEADER),
+    null,
+  );
+});
+
+test("the Worker resolves participant state from the trusted actor and replaces spoofed state", async () => {
+  const renderedRequests: Request[] = [];
+  const worker = createApplicationWorker({
+    fetchApplication: async (request) => {
+      renderedRequests.push(request);
+      return new Response("rendered");
+    },
+    fetchOptimizedImage: async () => new Response("image"),
+  });
+  const state = participantAuthorizationState("participant-subject");
+  const env = testEnvironment({
+    PARTICIPANT_ACCESS: {
+      read: async (account) => {
+        assert.equal(account.subject, "participant-subject");
+        assert.equal(account.accountEmailLabel, "participant@example.com");
+        return state;
+      },
+    },
+  });
+
+  await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: {
+        "oai-authenticated-user-id": "participant-subject",
+        "oai-authenticated-user-email": "participant@example.com",
+        [PARTICIPANT_ACCESS_HEADER]: JSON.stringify({
+          subject: "spoofed-subject",
+          email: "spoofed@example.com",
+        }),
+      },
+    }),
+    env,
+    executionContext,
+  );
+  const authorized = participantAccessFromRuntimeHeader(
+    renderedRequests[0]?.headers.get(PARTICIPANT_ACCESS_HEADER) ?? null,
+  );
+  assert.ok(authorized);
+  assert.equal(authorized.subject, "participant-subject");
+  assert.equal(authorized.email, "participant@example.com");
+
+  await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: {
+        "oai-authenticated-user-id": "foreign-subject",
+        "oai-authenticated-user-email": "foreign@example.com",
+        [PARTICIPANT_ACCESS_HEADER]: JSON.stringify(authorized),
+      },
+    }),
+    testEnvironment({
+      PARTICIPANT_ACCESS: {
+        read: async () => state,
+      },
+    }),
+    executionContext,
+  );
+  assert.equal(
+    renderedRequests[1]?.headers.get(PARTICIPANT_ACCESS_HEADER),
+    null,
+  );
+
+  await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: {
+        "oai-authenticated-user-id": "participant-subject",
+        "oai-authenticated-user-email": "participant@example.com",
+        [PARTICIPANT_ACCESS_HEADER]: JSON.stringify(authorized),
+      },
+    }),
+    testEnvironment(),
+    executionContext,
+  );
+  assert.equal(
+    renderedRequests[2]?.headers.get(PARTICIPANT_ACCESS_HEADER),
+    null,
+  );
 });
 
 function routeContext(
@@ -254,14 +482,17 @@ function routeContext(
     requestHeaders?: HeadersInit;
     actor?: ApplicationRouteContext["actor"];
     isOwner?: boolean;
+    participantAccess?: ApplicationRouteContext["participantAccess"];
     renderApplication?: () => Promise<Response>;
   }> = {},
 ): ApplicationRouteContext {
   return {
     request: new Request(url, { headers: overrides.requestHeaders }),
     url: new URL(url),
+    resourceUrl: url,
     actor: overrides.actor ?? null,
     isOwner: overrides.isOwner ?? false,
+    participantAccess: overrides.participantAccess ?? null,
     campaign: syntheticPublicCampaign,
     renderApplication:
       overrides.renderApplication ?? (async () => new Response("html")),
@@ -282,6 +513,52 @@ function recordingHandler(
 function requiredResponse(response: Response | null): Response {
   assert.ok(response);
   return response;
+}
+
+function actor(userId: string, email: string) {
+  return { userId, email, displayName: email };
+}
+
+function participantAccess(userId: string, email: string) {
+  const account = parseParticipantAccount({
+    subject: userId,
+    accountEmailLabel: email,
+  });
+  assert(account.ok);
+  const access = authorizeParticipantAccess(
+    account.value,
+    participantAuthorizationState(userId),
+  );
+  assert(access);
+  return access;
+}
+
+function participantAuthorizationState(
+  userId: string,
+): ParticipantAuthorizationState {
+  const subject = parseActorSubject(userId);
+  const id = parseStableId<"package-version">("package-version:current");
+  const createdAt = parseTimestamp("2026-08-09T09:00:00.000Z");
+  assert(subject.ok);
+  assert(id.ok);
+  assert(createdAt.ok);
+
+  return {
+    profile: {
+      subject: subject.value,
+      displayName: "Private Participant Name",
+      declaredInterest: "both",
+      participationContext: "company",
+      accountDeletionRequested: false,
+    },
+    currentPackage: {
+      id: id.value,
+      createdAt: createdAt.value,
+      changeSummary: "Confidential allocation discussion",
+      materialChange: true,
+      requiresCurrentAcceptance: true,
+    },
+  };
 }
 
 function testEnvironment(

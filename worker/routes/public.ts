@@ -18,14 +18,20 @@ export const handlePublicRoutes: ApplicationRouteHandler = async (context) => {
 
   if (representation.kind === "hypermedia-json") {
     return hypermediaResponse(
-      createPublicCampaignDocument(context.request.url, context.campaign, {
+      createPublicCampaignDocument(context.resourceUrl, context.campaign, {
         manageCampaign: context.isOwner,
+        participant: context.participantAccess
+          ? {
+              privatePackage:
+                context.participantAccess.currentPackage !== null,
+            }
+          : undefined,
       }),
     );
   }
 
   if (representation.kind === "not-acceptable") {
-    return notAcceptableResponse(context.request.url);
+    return notAcceptableResponse(context.resourceUrl);
   }
 
   return withAcceptVary(await context.renderApplication());

@@ -5,6 +5,10 @@ import {
   toHypermediaAction,
   type HypermediaAction,
 } from "./hypermedia-action.ts";
+import {
+  PARTICIPANT_HOME_PATH,
+  PRIVATE_PACKAGE_PATH,
+} from "./participant-navigation.ts";
 
 export type { HypermediaAction } from "./hypermedia-action.ts";
 
@@ -44,11 +48,41 @@ export function participationPath(
 export function createPublicCampaignDocument(
   requestUrl: string,
   configuration: PublicCampaignConfiguration | null,
-  capabilities: Readonly<{ manageCampaign?: boolean }> = {},
+  capabilities: Readonly<{
+    manageCampaign?: boolean;
+    participant?: Readonly<{ privatePackage: boolean }>;
+  }> = {},
 ): PublicCampaignDocument {
   const absolute = (href: string) => new URL(href, requestUrl).href;
   const manageAction = capabilities.manageCampaign
     ? [action("manage-campaign", "Manage campaign", absolute("/owner"))]
+    : [];
+  const participantLinks: readonly HypermediaLink[] = capabilities.participant
+    ? [
+        {
+          rel: ["participant-home"],
+          href: absolute(PARTICIPANT_HOME_PATH),
+        },
+        ...(capabilities.participant.privatePackage
+          ? [{ rel: ["private-package"], href: absolute(PRIVATE_PACKAGE_PATH) }]
+          : []),
+      ]
+    : [];
+  const authenticatedActions = capabilities.participant
+    ? [
+        action(
+          "open-participant-home",
+          "View your participation",
+          absolute(PARTICIPANT_HOME_PATH),
+        ),
+        ...(capabilities.participant.privatePackage
+          ? [action(
+              "read-private-package",
+              "Read information package",
+              absolute(PRIVATE_PACKAGE_PATH),
+            )]
+          : []),
+      ]
     : [];
 
   if (!configuration || !configuration.published) {
@@ -67,12 +101,15 @@ export function createPublicCampaignDocument(
         participation_paths: [],
         interest_is_binding: false,
       },
-      links: [{ rel: ["self"], href: absolute("/") }],
-      actions: manageAction,
+      links: [
+        { rel: ["self"], href: absolute("/") },
+        ...participantLinks,
+      ],
+      actions: [...authenticatedActions, ...manageAction],
     };
   }
 
-  const participantActions = configuration.status === "open"
+  const visitorActions = !capabilities.participant && configuration.status === "open"
     ? [
         action(
           "sign-in",
@@ -112,8 +149,9 @@ export function createPublicCampaignDocument(
         rel: link.rel,
         href: absolute(link.href),
       })),
+      ...participantLinks,
     ],
-    actions: [...participantActions, ...manageAction],
+    actions: [...visitorActions, ...authenticatedActions, ...manageAction],
   };
 }
 

@@ -1,6 +1,13 @@
 import { isConfiguredOwner } from "../domain/owner-identity.ts";
+import {
+  authorizeParticipantAccess,
+  type AuthorizedParticipantAccess,
+  type ParticipantAccessStateReader,
+} from "../domain/participant-home-resource.ts";
+import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import { parsePublicCampaignConfiguration } from "../domain/public-campaign-configuration.ts";
-import { withAppOrigin } from "../http/app-origin.ts";
+import { resolveAppOrigin, withAppOrigin } from "../http/app-origin.ts";
+import { withRuntimeParticipantAccess } from "../http/runtime-participant.ts";
 import { withRuntimeCampaign } from "../http/runtime-campaign.ts";
 import { withRuntimeOwner } from "../http/runtime-owner.ts";
 import type {
@@ -33,14 +40,22 @@ export function createApplicationWorker(
   return {
     async fetch(request, env, executionContext) {
       const url = new URL(request.url);
+      const resourceUrl = canonicalResourceUrl(
+        url,
+        resolveAppOrigin(request.url, env.APP_BASE_URL),
+      );
       const actor = authenticatedActor(request);
       const isOwner = isConfiguredOwner(actor?.email, env.OWNER_EMAIL);
       const campaign = parsePublicCampaignConfiguration(
         env.CAMPAIGN_CONFIG_JSON,
       );
+      const participantAccess = await resolveParticipantAccess(
+        actor,
+        env.PARTICIPANT_ACCESS,
+      );
       const renderApplication = () =>
         dependencies.fetchApplication(
-          withRuntimeConfiguration(request, env),
+          withRuntimeConfiguration(request, env, participantAccess),
           env,
           executionContext,
         );
@@ -48,8 +63,10 @@ export function createApplicationWorker(
       const routeResponse = await dispatchRoute({
         request,
         url,
+        resourceUrl,
         actor,
         isOwner,
+        participantAccess,
         campaign,
         renderApplication,
       });
@@ -64,14 +81,44 @@ export function createApplicationWorker(
   };
 }
 
+function canonicalResourceUrl(url: URL, appOrigin: string): string {
+  return new URL(`${url.pathname}${url.search}`, `${appOrigin}/`).href;
+}
+
 function withRuntimeConfiguration(
   request: Request,
   env: InvestorAppEnv,
+  participantAccess: AuthorizedParticipantAccess | null,
 ): Request {
-  return withRuntimeCampaign(
-    withRuntimeOwner(withAppOrigin(request, env.APP_BASE_URL), env.OWNER_EMAIL),
-    env.CAMPAIGN_CONFIG_JSON,
+  return withRuntimeParticipantAccess(
+    withRuntimeCampaign(
+      withRuntimeOwner(withAppOrigin(request, env.APP_BASE_URL), env.OWNER_EMAIL),
+      env.CAMPAIGN_CONFIG_JSON,
+    ),
+    participantAccess,
   );
+}
+
+async function resolveParticipantAccess(
+  actor: AuthenticatedActor | null,
+  reader: ParticipantAccessStateReader | undefined,
+): Promise<AuthorizedParticipantAccess | null> {
+  if (actor === null || reader === undefined) return null;
+
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (!account.ok) return null;
+
+  try {
+    return authorizeParticipantAccess(
+      account.value,
+      await reader.read(account.value),
+    );
+  } catch {
+    return null;
+  }
 }
 
 function authenticatedActor(request: Request): AuthenticatedActor | null {

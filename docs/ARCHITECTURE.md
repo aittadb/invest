@@ -28,6 +28,23 @@ HTML links and forms and JSON links and actions must be projections of the same 
 
 The public campaign resource is the signed-out base state. A valid participant session may extend it with private-package and self-service controls. Owner controls require a separate owner authorization decision; ordinary sign-in never implies ownership.
 
+`domain/participant-home-resource.ts` binds a narrow profile and current-package
+projection to the case-sensitive subject parsed from the trusted session.
+`services/participant-access.ts` composes only the subject-bound participant,
+package, and acknowledgment read contracts; it does not accept identity,
+campaign, owner, hostname, or package state from browser input. Missing state,
+foreign subjects, malformed projections, and reader failures fail closed before
+private capabilities are constructed.
+
+The Worker makes that authorization decision once for a request. JSON routes
+consume the authorized projection directly. HTML rendering receives the same
+bounded projection through an internal header that the Worker always deletes or
+replaces, then React rechecks its subject against the trusted rendered session.
+The header carries participant-home and package-status data only, never package
+Markdown, credentials, notes, or unrelated participant records. `/participant`
+and `/participant/package` independently negotiate and enforce access; an
+advertised root control is not itself an authorization grant.
+
 ### Action capability contracts
 
 `domain/hypermedia-action.ts` is the route-independent source for safe navigation and mutation capabilities. Definitions use bounded stable names, safe targets, explicit methods and request media types, and bounded string, integer, boolean, or choice fields. Sensitive fields cannot advertise a current or default value. An availability gate constructs an action only when the current caller and resource state permit its transition, but target routes must still enforce authorization and state independently.

@@ -20,6 +20,7 @@ async function render(
   appBaseUrl,
   ownerEmail,
   campaignConfiguration = syntheticPublicCampaign,
+  participantAuthorizationState,
 ) {
   const worker = await loadWorker();
   const serializedCampaign =
@@ -37,6 +38,12 @@ async function render(
       APP_BASE_URL: appBaseUrl,
       CAMPAIGN_CONFIG_JSON: serializedCampaign,
       OWNER_EMAIL: ownerEmail,
+      PARTICIPANT_ACCESS:
+        participantAuthorizationState === undefined
+          ? undefined
+          : {
+              read: async () => participantAuthorizationState,
+            },
       ASSETS: {
         fetch: async () => new Response("Not found", { status: 404 }),
       },
@@ -96,6 +103,23 @@ test("HTML metadata uses the configured runtime origin", async () => {
   assert.match(html, /https:\/\/invest\.example\.com\/campaign-social\.png/i);
 });
 
+test("hypermedia application links use the configured runtime origin", async () => {
+  const response = await render(
+    { accept: "application/json" },
+    "https://sites-host.example/",
+    "https://invest.example.com",
+  );
+  const document = await response.json();
+
+  assert.equal(
+    document.links.find((link) => link.rel.includes("self")).href,
+    "https://invest.example.com/",
+  );
+  for (const action of document.actions) {
+    assert.equal(new URL(action.href).origin, "https://invest.example.com");
+  }
+});
+
 test("HTML metadata falls back to each deployment request origin", async () => {
   const firstHtml = await (
     await render({ accept: "text/html" }, "https://first.example/")
@@ -140,6 +164,239 @@ test("only the configured owner receives campaign management navigation", async 
   assert.ok(
     ownerDocument.actions.some((action) => action.name === "manage-campaign"),
   );
+});
+
+test("an authorized participant receives equivalent root HTML and JSON capabilities", async () => {
+  const participantHeaders = {
+    accept: "text/html",
+    "oai-authenticated-user-id": "participant-subject",
+    "oai-authenticated-user-email": "participant@example.com",
+  };
+  const state = participantState("participant-subject");
+
+  const html = await (
+    await render(
+      participantHeaders,
+      "https://campaign.example/",
+      undefined,
+      undefined,
+      syntheticPublicCampaign,
+      state,
+    )
+  ).text();
+  assert.match(html, /href="\/participant"[^>]*>\s*My participation/i);
+  assert.match(html, /href="\/participant\/package"/i);
+  assert.doesNotMatch(html, /href="\/signin-with-chatgpt/i);
+  assert.doesNotMatch(
+    html,
+    /participant@example\.com|Private Participant|Confidential package update/i,
+  );
+
+  const jsonResponse = await render(
+    { ...participantHeaders, accept: "application/json" },
+    "https://campaign.example/",
+    undefined,
+    undefined,
+    syntheticPublicCampaign,
+    state,
+  );
+  const document = await jsonResponse.json();
+  assert.deepEqual(
+    document.actions.map((action) => action.name),
+    ["open-participant-home", "read-private-package"],
+  );
+  assert.ok(document.links.some((link) => link.rel.includes("participant-home")));
+  assert.ok(document.links.some((link) => link.rel.includes("private-package")));
+  assert.doesNotMatch(
+    JSON.stringify(document),
+    /participant@example\.com|Private Participant|Confidential package update/i,
+  );
+  assertCapabilityHrefsAppear(html, document);
+});
+
+test("participant home and package status negotiate from the same authorized state", async () => {
+  const participantHeaders = {
+    accept: "text/html",
+    "oai-authenticated-user-id": "participant-subject",
+    "oai-authenticated-user-email": "participant@example.com",
+  };
+  const state = participantState("participant-subject");
+
+  const homeHtmlResponse = await render(
+    participantHeaders,
+    "https://campaign.example/participant",
+    undefined,
+    undefined,
+    syntheticPublicCampaign,
+    state,
+  );
+  assert.equal(homeHtmlResponse.status, 200);
+  const homeHtml = await homeHtmlResponse.text();
+  assert.match(
+    homeHtml,
+    /<h1>Welcome,\s*(?:<!-- -->)?\s*Private Participant<\/h1>/i,
+  );
+  assert.match(homeHtml, /participant@example\.com/i);
+  assert.match(homeHtml, /Confidential package update/i);
+  assert.match(homeHtml, /href="\/participant\/package"/i);
+
+  const homeJsonResponse = await render(
+    { ...participantHeaders, accept: "application/json" },
+    "https://campaign.example/participant",
+    undefined,
+    undefined,
+    syntheticPublicCampaign,
+    state,
+  );
+  assert.equal(homeJsonResponse.status, 200);
+  const homeDocument = await homeJsonResponse.json();
+  assert.equal(homeDocument.type, "participant-home");
+  assert.equal(homeDocument.data.account_email, "participant@example.com");
+  assert.equal(
+    homeDocument.data.current_package.change_summary,
+    "Confidential package update",
+  );
+  assertCapabilityHrefsAppear(homeHtml, homeDocument);
+
+  const packageHtmlResponse = await render(
+    participantHeaders,
+    "https://campaign.example/participant/package",
+    undefined,
+    undefined,
+    syntheticPublicCampaign,
+    state,
+  );
+  assert.equal(packageHtmlResponse.status, 200);
+  const packageHtml = await packageHtmlResponse.text();
+  assert.match(packageHtml, /<h1>Information package<\/h1>/i);
+  assert.match(packageHtml, /Confidential package update/i);
+
+  const packageJsonResponse = await render(
+    { ...participantHeaders, accept: "application/json" },
+    "https://campaign.example/participant/package",
+    undefined,
+    undefined,
+    syntheticPublicCampaign,
+    state,
+  );
+  assert.equal(packageJsonResponse.status, 200);
+  const packageDocument = await packageJsonResponse.json();
+  assert.equal(packageDocument.type, "private-package");
+  assert.equal(packageDocument.data.change_summary, "Confidential package update");
+  assertCapabilityHrefsAppear(packageHtml, packageDocument);
+});
+
+test("signed-out, foreign, and missing participant state disclose no private capability", async () => {
+  const signedOut = await render(
+    { accept: "application/json" },
+    "https://campaign.example/participant",
+  );
+  assert.equal(signedOut.status, 401);
+  assert.doesNotMatch(await signedOut.text(), /Private Participant|Confidential package/i);
+
+  const actorHeaders = {
+    accept: "text/html",
+    "oai-authenticated-user-id": "participant-subject",
+    "oai-authenticated-user-email": "participant@example.com",
+  };
+  for (const state of [participantState("foreign-subject"), null]) {
+    const rootHtml = await (
+      await render(
+        actorHeaders,
+        "https://campaign.example/",
+        undefined,
+        undefined,
+        syntheticPublicCampaign,
+        state,
+      )
+    ).text();
+    assert.doesNotMatch(rootHtml, /href="\/participant(?:"|\/)/i);
+    assert.doesNotMatch(rootHtml, /Private Participant|Confidential package/i);
+
+    const rootJsonResponse = await render(
+      { ...actorHeaders, accept: "application/json" },
+      "https://campaign.example/",
+      undefined,
+      undefined,
+      syntheticPublicCampaign,
+      state,
+    );
+    const rootDocument = await rootJsonResponse.json();
+    assert.equal(
+      rootDocument.links.some((link) =>
+        link.rel.includes("participant-home") || link.rel.includes("private-package")
+      ),
+      false,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(rootDocument),
+      /Private Participant|Confidential package|foreign-subject/i,
+    );
+
+    const homeJsonResponse = await render(
+      { ...actorHeaders, accept: "application/json" },
+      "https://campaign.example/participant",
+      undefined,
+      undefined,
+      syntheticPublicCampaign,
+      state,
+    );
+    assert.equal(homeJsonResponse.status, 404);
+    assert.doesNotMatch(
+      await homeJsonResponse.text(),
+      /Private Participant|Confidential package|foreign-subject/i,
+    );
+
+    const homeHtmlResponse = await render(
+      actorHeaders,
+      "https://campaign.example/participant",
+      undefined,
+      undefined,
+      syntheticPublicCampaign,
+      state,
+    );
+    assert.equal(homeHtmlResponse.status, 404);
+    assert.doesNotMatch(
+      await homeHtmlResponse.text(),
+      /Private Participant|Confidential package|foreign-subject/i,
+    );
+  }
+});
+
+test("owner and participant capabilities coexist without conflating roles", async () => {
+  const headers = {
+    accept: "text/html",
+    "oai-authenticated-user-id": "owner-subject",
+    "oai-authenticated-user-email": "owner@example.com",
+  };
+  const state = participantState("owner-subject");
+  const html = await (
+    await render(
+      headers,
+      "https://campaign.example/",
+      undefined,
+      "owner@example.com",
+      syntheticPublicCampaign,
+      state,
+    )
+  ).text();
+  assert.match(html, /href="\/participant"[^>]*>\s*My participation/i);
+  assert.match(html, /href="\/owner"[^>]*>\s*Manage campaign/i);
+
+  const jsonResponse = await render(
+    { ...headers, accept: "application/json" },
+    "https://campaign.example/",
+    undefined,
+    "owner@example.com",
+    syntheticPublicCampaign,
+    state,
+  );
+  const document = await jsonResponse.json();
+  assert.deepEqual(
+    document.actions.map((action) => action.name),
+    ["open-participant-home", "read-private-package", "manage-campaign"],
+  );
+  assertCapabilityHrefsAppear(html, document);
 });
 
 test("the owner resource enforces equivalent HTML and JSON authorization", async () => {
@@ -284,3 +541,44 @@ test("absent, invalid, and unpublished campaign configuration stays generic", as
     assert.deepEqual(document.actions, []);
   }
 });
+
+function participantState(subject) {
+  return {
+    profile: {
+      subject,
+      displayName: "Private Participant",
+      declaredInterest: "both",
+      participationContext: "company",
+      accountDeletionRequested: false,
+    },
+    currentPackage: {
+      id: "package-version:current",
+      createdAt: "2026-08-09T09:00:00.000Z",
+      changeSummary: "Confidential package update",
+      materialChange: true,
+      requiresCurrentAcceptance: true,
+    },
+  };
+}
+
+function assertCapabilityHrefsAppear(html, document) {
+  for (const action of document.actions) {
+    const pathname = new URL(action.href).pathname;
+    assert.match(html, new RegExp(`href=["']${escapeRegExp(pathname)}`));
+  }
+  for (const link of document.links) {
+    if (
+      link.rel.includes("self") ||
+      (!link.rel.includes("participant-home") &&
+        !link.rel.includes("private-package"))
+    ) {
+      continue;
+    }
+    const pathname = new URL(link.href).pathname;
+    assert.match(html, new RegExp(`href=["']${escapeRegExp(pathname)}`));
+  }
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}

@@ -3,7 +3,12 @@
 import { headers } from "next/headers";
 
 import { getOwnerUser } from "@/app/owner-auth";
+import { getParticipantAccess } from "@/app/participant-auth";
 import { chatGPTSignInPath } from "@/domain/auth-navigation";
+import {
+  PARTICIPANT_HOME_PATH,
+  PRIVATE_PACKAGE_PATH,
+} from "@/domain/participant-navigation";
 import { participationPath } from "@/domain/public-campaign-resource";
 import {
   campaignFromRuntimeHeader,
@@ -18,12 +23,21 @@ export default async function Home() {
     requestHeaders.get(CAMPAIGN_CONFIGURATION_HEADER),
   );
   const owner = await getOwnerUser();
+  const participant = await getParticipantAccess();
 
   if (!campaign || !campaign.published) {
-    return <UnavailableCampaign canManage={owner !== null} />;
+    return (
+      <UnavailableCampaign
+        canManage={owner !== null}
+        participant={participant}
+      />
+    );
   }
 
   const signInPath = chatGPTSignInPath("/");
+  const participantPrimaryPath = participant?.currentPackage
+    ? PRIVATE_PACKAGE_PATH
+    : PARTICIPANT_HOME_PATH;
 
   return (
     <div className="campaign-page" id="top">
@@ -46,9 +60,23 @@ export default async function Home() {
               </a>
             ))}
           </nav>
-          <a className="button button--quiet" href={owner ? "/owner" : signInPath}>
-            {owner ? "Manage campaign" : "Sign in"}
-          </a>
+          <div className="header-actions">
+            {participant ? (
+              <a className="button button--quiet" href={PARTICIPANT_HOME_PATH}>
+                My participation
+              </a>
+            ) : null}
+            {owner ? (
+              <a className="button button--quiet" href="/owner">
+                Manage campaign
+              </a>
+            ) : null}
+            {!participant && !owner ? (
+              <a className="button button--quiet" href={signInPath}>
+                Sign in
+              </a>
+            ) : null}
+          </div>
         </div>
       </header>
 
@@ -75,8 +103,15 @@ export default async function Home() {
               <p className="hero-intro">{campaign.hero.invitation}</p>
               {campaign.status === "open" ? (
                 <div className="hero-actions">
-                  <a className="button button--primary" href={signInPath}>
-                    {campaign.hero.primaryActionLabel}
+                  <a
+                    className="button button--primary"
+                    href={participant ? participantPrimaryPath : signInPath}
+                  >
+                    {participant
+                      ? participant.currentPackage
+                        ? "Read information package"
+                        : "View your participation"
+                      : campaign.hero.primaryActionLabel}
                   </a>
                   {campaign.hero.secondaryAction ? (
                     <a
@@ -122,8 +157,13 @@ export default async function Home() {
                   <h3>{path.title}</h3>
                   <p>{path.description}</p>
                   {campaign.status === "open" ? (
-                    <a className="text-link" href={participationPath(path.kind)}>
-                      {path.actionLabel}
+                    <a
+                      className="text-link"
+                      href={participant
+                        ? PARTICIPANT_HOME_PATH
+                        : participationPath(path.kind)}
+                    >
+                      {participant ? "View your participation" : path.actionLabel}
                     </a>
                   ) : null}
                 </article>
@@ -226,8 +266,13 @@ export default async function Home() {
               <h2 id="closing-title">{campaign.closing.title}</h2>
             </div>
             {campaign.status === "open" ? (
-              <a className="button button--primary" href={signInPath}>
-                {campaign.closing.actionLabel}
+              <a
+                className="button button--primary"
+                href={participant ? PARTICIPANT_HOME_PATH : signInPath}
+              >
+                {participant
+                  ? "View your participation"
+                  : campaign.closing.actionLabel}
               </a>
             ) : null}
           </div>
@@ -260,14 +305,42 @@ export default async function Home() {
   );
 }
 
-function UnavailableCampaign({ canManage }: Readonly<{ canManage: boolean }>) {
+function UnavailableCampaign({
+  canManage,
+  participant,
+}: Readonly<{
+  canManage: boolean;
+  participant: Awaited<ReturnType<typeof getParticipantAccess>>;
+}>) {
   return (
     <div className="campaign-unavailable">
       <header>
         <span className="brand">Investor App</span>
-        <a className="button button--quiet" href={canManage ? "/owner" : chatGPTSignInPath("/owner")}>
-          {canManage ? "Manage campaign" : "Owner sign in"}
-        </a>
+        <div className="header-actions">
+          {participant ? (
+            <a className="button button--quiet" href={PARTICIPANT_HOME_PATH}>
+              My participation
+            </a>
+          ) : null}
+          {participant?.currentPackage ? (
+            <a className="button button--quiet" href={PRIVATE_PACKAGE_PATH}>
+              Information package
+            </a>
+          ) : null}
+          {canManage ? (
+            <a className="button button--quiet" href="/owner">
+              Manage campaign
+            </a>
+          ) : null}
+          {!participant && !canManage ? (
+            <a
+              className="button button--quiet"
+              href={chatGPTSignInPath("/owner")}
+            >
+              Owner sign in
+            </a>
+          ) : null}
+        </div>
       </header>
       <main>
         <p className="section-kicker">Investment pre-registration</p>
