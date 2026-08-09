@@ -82,6 +82,12 @@ Founder applications do not import, create, mutate, or gate investment indicatio
 
 Setup readiness is distinct from open or closed state: configuration may be complete while a phase is closed. Participation is accepted only when the phase is open, setup is complete, the requested path is enabled, and the normalized country satisfies the configured rule.
 
+### Storage adapter contract
+
+`domain/storage-adapter.ts` defines bounded JSON records, finite cursor pages, and atomic transactions with compare-and-set revisions and idempotent operation IDs. Replaying identical work returns its original result; reusing an operation ID for different work fails. Transaction limits and duplicate keys are rejected before mutation.
+
+An adapter instance is already bound to one backend credential and grant set. Foreign and missing records therefore have the same read and mutation shape, while fixed public failures contain no keys, values, or credentials. The reusable contract harness runs unchanged against deterministic fakes and production adapters and deliberately checks authorization, duplicate creation, stale revision, atomic rollback, disclosure, idempotency, and pagination behavior.
+
 ## Storage plan
 
 Development can use a deterministic in-memory/test adapter. Production must use an AittaDB-compatible adapter and pass the same contract tests.

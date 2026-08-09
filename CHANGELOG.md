@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-012:** Define the `StorageAdapter` contract suite. Depends on: `TASK-004`. DoD: adapter interface, transaction/idempotency expectations, pagination boundary, compare-and-set requirement, non-disclosing failure shape, and shared contract-test harness are documented and typed; tests run against a minimal fake adapter proving the harness detects authorization, duplicate, drift, and disclosure failures.
+
+  Acceptance evidence: `domain/storage-adapter.ts` defines a credential-bound adapter with finite pages, bounded atomic transactions, compare-and-set revisions, replay-safe operation IDs, JSON documents, and fixed non-disclosing failures. `tests/support/storage-adapter-contract.ts` is a reusable typed behavioral harness. Five tests run it against a conforming minimal fake and deliberately faulty authorization, duplicate, stale-write, and disclosure variants, proving those violations are detected rather than merely exercising a happy path. Full `npm run validate` passes with 67 tests.
+
 - **TASK-039:** Define phase and country-eligibility configuration. Depends on: `TASK-004`. DoD: phase identity, open/closed state, enabled participation paths, country normalization, allow/deny rules, and setup-completion checks are framework-independent and tested without campaign defaults.
 
   Acceptance evidence: `domain/phase-configuration.ts` strictly parses stable phase identity, explicit open or closed state, canonical enabled participation paths, and normalized allow or deny country rules without supplying deployment defaults. Setup readiness and participation eligibility remain separate projections. Eight focused tests cover complete and missing setup, malformed and unknown fields, duplicate normalized countries and paths, injected country normalization, allow and deny behavior, phase state, and path eligibility. Full `npm run validate` passes with 46 tests.
