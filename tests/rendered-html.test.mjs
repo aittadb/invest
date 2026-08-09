@@ -22,19 +22,21 @@ async function render() {
   );
 }
 
-test("server-renders the initial investor app scaffold", async () => {
+test("server-renders the signed-out AittaDB pre-registration landing page", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>Investor App Initial Version<\/title>/i);
-  assert.match(html, /Initial implementation scaffold/);
-  assert.match(
+  assert.match(html, /<title>AittaDB investment pre-registration<\/title>/i);
+  assert.match(html, /Pre-registration open/);
+  assert.match(html, /Register your interest/);
+  assert.match(html, /Investor interest/);
+  assert.match(html, /Founder interest/);
+  assert.match(html, /Interest now\. Decisions later\./);
+  assert.doesNotMatch(
     html,
-    /Campaign access stays closed until setup and storage are real/,
+    /Initial implementation scaffold|Product areas to build next|Repository contract|ChatGPT Sites application|features to build/i,
   );
-  assert.match(html, /Campaign decisions are runtime data/);
-  assert.match(html, /AittaDB server/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
 });

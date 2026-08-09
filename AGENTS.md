@@ -37,12 +37,16 @@ Production persistence must use AittaDB. Browser storage, process memory, local 
 ## Sites and UI Rules
 
 - Build actual product screens, not marketing placeholders.
-- Keep the first viewport about Investor App itself and the current campaign state.
+- The signed-out root is the current campaign's public pre-registration landing page. Authenticated participant and owner capabilities extend the resource only after server-side identity and role checks.
+- Write visible copy for the current visitor, participant, or owner. Never render prompts, task IDs, repository plans, implementation status, stack names, architecture notes, or "features to build" as product copy; those belong in `PLAN.md`, `CHANGELOG.md`, and developer docs.
+- Keep the first viewport about the campaign and the participant's decision, not Investor App as a software product.
 - Use semantic HTML, one clear `h1`, labels for inputs, visible focus states, stable dimensions, and responsive layouts that do not overlap.
 - Use restrained 6-8px radii, clear contrast, no third-party runtime fonts, no trackers, no external client scripts, and no decorative stock imagery.
 - Keep letter spacing at `0`. Do not scale body text with viewport width.
 - HTML and JSON/API behavior must use the same server-side authorization and validation. Hidden browser controls are never a security boundary.
 - Use page-specific CSS classes; avoid broad global selectors that could break generated or embedded tool UIs.
+
+Every application URI is a resource, not an HTML-only page. Use `Accept` for representation selection: human HTML and versioned hypermedia JSON must come from the same authorization, validation, domain, and repository services. JSON `data`, `links`, and currently available `actions` must match the state, links, forms, and buttons visible to the same caller in HTML. Never select by `User-Agent`. Explicit unsupported media-type versions return `406`; standards-defined OAuth/OIDC responses keep their protocol formats.
 
 ## Planning Workflow
 

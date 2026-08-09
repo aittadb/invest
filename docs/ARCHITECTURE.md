@@ -10,6 +10,16 @@ The initial repository uses the Sites Vinext starter with React server component
 
 Deployments provide trusted runtime configuration for the canonical app origin, configured identity provider, storage adapter, owner setup, sessions, and anti-forgery protection. Secrets are managed as runtime configuration, not as campaign content.
 
+## Resource representations
+
+Application URLs identify resources rather than HTML-only pages. `Accept: text/html` selects the human interface. `Accept: application/vnd.aittadb-invest+json; version=0.1` selects the versioned hypermedia contract, and `application/json` is a compatibility representation. Representation selection never uses `User-Agent`.
+
+Hypermedia documents contain `api_version`, resource `type`, `id`, `data`, semantic `links`, and currently available `actions`. An action declares its stable name, human title, method, target, request media type, and typed fields. An unavailable or unauthorized transition is omitted and remains independently rejected if submitted directly.
+
+HTML links and forms and JSON links and actions must be projections of the same authorized domain resource. They share validation, mutation, error, and repository behavior. Explicit unsupported vendor-media versions return `406 Not Acceptable`, and negotiated responses include `Vary: Accept`. OAuth/OIDC endpoints retain their standards-defined response formats where a hypermedia envelope would break interoperability.
+
+The public campaign resource is the signed-out base state. A valid participant session may extend it with private-package and self-service controls. Owner controls require a separate owner authorization decision; ordinary sign-in never implies ownership.
+
 ## Domain modules
 
 The specification expects these narrow boundaries:

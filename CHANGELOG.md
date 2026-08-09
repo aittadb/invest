@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-021:** Build the signed-out public landing for the active AittaDB investment pre-registration. DoD: the root route addresses prospective investors and founders, presents public AittaDB facts, investor and founder paths, the non-binding process and risks, and a real sign-in action; it uses checked-in AittaDB brand artwork, is responsive and accessible, contains no developer-facing prompts or roadmap copy, and has focused rendered-output tests.
+
+  Acceptance evidence: the root route now presents the active public pre-registration with audience-facing investor and founder paths, an actual Sites sign-in transition, public product facts, process, risk disclosures, and no repository or implementation-summary copy. The responsive layout uses AittaDB's checked-in public mark and boundary artwork plus a campaign-specific social card. The rendered-output test asserts the campaign experience and rejects the former scaffold language. The private-content scan and `npm run validate` pass; `AGENTS.md` remains below its 32,000-byte limit.
+
 - **TASK-020:** Bind the initial scaffold to one ChatGPT Sites project. DoD: the Sites project is created exactly once, its returned project identifier is persisted unchanged alongside null logical storage bindings, site metadata identifies Investor App, and no runtime secret, access-policy, or custom-domain change is bundled into the binding.
 
   Acceptance evidence: one owner-only Sites project was created with the Investor App title and description, and the returned opaque identifier is stored unchanged in `.openai/hosting.json` with `d1` and `r2` still null. Runtime environment, access policy, and custom domains were left unchanged. `npm run validate` passes for the bound source.
