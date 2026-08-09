@@ -106,6 +106,12 @@ Each write atomically compare-and-sets the current profile and creates an immuta
 
 Founder applications do not import, create, mutate, or gate investment indications. An account may therefore hold either record type or both, and application services compose them only when a participant-facing resource needs both projections.
 
+### Development founder repository
+
+`DevelopmentInMemoryFounderApplicationRepository` binds current and history storage keys to the trusted applicant subject and composes only through a development/test `StorageAdapter`. Create, edit, and withdrawal call the founder domain transitions with deployment-supplied contribution choices. The subject is never accepted from mutation input, and foreign, anonymous, denied, and missing records remain observationally equivalent.
+
+Each mutation atomically compare-and-sets the current application and creates an immutable cumulative-history revision. Stored snapshots are reconstructed by replaying the domain transitions, verified against their operation fingerprint and storage revision, and compared with every prior immutable history prefix before use. The repository has no investment-indication import or side effect.
+
 ### Investment indications
 
 `domain/investment-indication.ts` defines personal and company indication records as framework-independent immutable revisions. Currency and amount boundaries come from deployment configuration, while package acceptance comes from the trusted current package and acknowledgment repository; neither can be supplied as an authoritative client field. Company uniqueness uses normalized registration country and an injectable country-aware identifier normalizer, and occupied keys return only a fixed conflict.
