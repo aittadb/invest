@@ -164,6 +164,25 @@ their notification revision and distinct allowlisted audit event through the
 same atomic repository capability; the route fails closed if that capability is
 not present.
 
+## Participant Investment Interest
+
+`/participant/investment-interests` is the authenticated participant's collection. `/participant/investment-interests/{id}` is one participant-owned indication. Both URIs negotiate native HTML and versioned hypermedia JSON from the same capability models, authorization decision, validation, and repository services. Collection data includes bounded current summaries; item data includes the current personal or company fields and immutable revision history without participant subjects, owner identity, acknowledgment hashes, or storage keys.
+
+The collection may expose:
+
+- `create-personal-investment-interest` with `POST` when personal creation is permitted, no personal indication is currently active, and the current package acknowledgment is valid; and
+- `create-company-investment-interest` with `POST` when company creation and current acknowledgment are permitted.
+
+An active item may expose `edit-investment-interest` with `PATCH` when the current package acknowledgment is valid and `withdraw-investment-interest` with `DELETE`. A withdrawn item may expose `reactivate-investment-interest` with `POST` when renewed acknowledgment and deployment policy permit it. A rejected item exposes no participant mutation action.
+
+Create and edit use exact kind-specific fields. Personal fields are residence country, configured integer-minor-unit amount, availability period, and optional note. Company fields additionally include company name, registration country, normalized local identifier, representative name, and an explicit authority declaration. Every mutation carries a server-issued `operation-id`; item mutations also carry `expected-revision`, and withdrawal or reactivation requires explicit confirmation. Kind, operation, revision, CSRF, and method-override controls are never authorization boundaries.
+
+The trusted participant selects an injected request-scoped service. Browser input cannot select a subject, package version, acknowledgment, currency, indication ID, permission policy, or timestamp. Company uniqueness conflicts use one fixed response and do not reveal the occupied identifier, record, or participant. Canonical links and action targets derive from deployment `context.resourceUrl`, not the request hostname or a committed instance hostname.
+
+When an investment-interest JSON representation advertises at least one mutation action, its response carries a validated participant-bound CSRF proof in the header named by `MUTATION_CSRF_HEADER`. This applies to initial discovery and to the current resource returned after create, edit, withdrawal, or reactivation. A JSON client echoes that value in the same named request header. The proof and header name are not fields in the hypermedia document; responses with no mutation action omit the proof header. HTML forms obtain the same validated proof and submit it only through their hidden CSRF transport field. If a valid proof cannot be issued, the route fails closed instead of advertising unusable actions.
+
+Investment-interest reads and writes are separate injected capabilities. Reads require only participant-owned `get` and `listOwned` operations. Every write requires `AtomicParticipantInvestmentInterestMutationPort` with the explicit `atomic-indication-aggregate-audit` guarantee: the new indication revision, aggregate projection, allowlisted audit transition, and idempotent retry result are committed together or none are changed. The participant service rejects weaker mutation persistence during composition and validates the closed result before returning it.
+
 ## Identity and Authorization
 
 The signed-out campaign document contains only public state and sign-in transitions. A valid participant session can add links and actions for the private package and that participant's records. The participant decision starts with a parsed trusted account and a credential-bound state reader; query, form, JSON, and client-supplied participant headers cannot assert the subject or package grant. An owner session can add owner operations only after a separate owner authorization decision.

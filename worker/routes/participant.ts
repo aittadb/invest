@@ -7,6 +7,11 @@ export {
   type FounderInterestRouteDependencies,
 } from "./founder-interest.ts";
 
+export {
+  createInvestmentInterestRouteHandler,
+  type InvestmentInterestRouteDependencies,
+} from "./investment-interest.ts";
+
 export function createParticipantRouteHandler(
   resourceHandlers: readonly ApplicationRouteHandler[] = [
     handleParticipantHomeRoutes,
