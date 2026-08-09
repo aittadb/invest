@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-040:** Define amount and public-aggregate display configuration. Depends on: `TASK-004`. DoD: currency, integer minor-unit minimum, increment, optional maximum, aggregate visibility, and sanitized display contracts are framework-independent with boundary and invalid-configuration tests.
+
+  Acceptance evidence: `domain/amount-aggregate-configuration.ts` strictly parses an explicit three-letter currency, integer minor-unit minimum and positive increment, optional maximum, and hidden or non-zero public aggregate policy without defaults. Its public projection contains only amount, currency, bounded safe label, and qualifier. Seven focused tests cover complete and hidden configuration, missing and unknown fields, invalid currency and numeric boundaries, configured increments, unsafe display text, zero suppression, and exclusion of private fields. Full `npm run validate` passes with 67 tests.
+
 - **TASK-011:** Define audit and manual-notification contracts. Depends on: `TASK-004`. DoD: audit event shape, actor attribution policy, notification-template, copied-versus-sent distinction, export event, and redaction rules are typed and documented; tests cover audit append intent, manual sent-marker behavior, and no credential or private-note fields in public errors.
 
   Acceptance evidence: `domain/audit-notification.ts` defines trusted-subject actor attribution, retry-addressed immutable append intents, allowlisted resource/export/notification detail, bounded private templates, distinct copy evidence and owner-entered sent markers, and an explicit redaction policy. Four focused tests cover frozen audit evidence, export events without payload retention, retry-stable copy and sent transitions, bounded templates, owner-only markers, and fixed public errors that exclude credentials and private notes. Full `npm run validate` passes with 67 tests.

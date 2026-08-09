@@ -94,6 +94,12 @@ An adapter instance is already bound to one backend credential and grant set. Fo
 
 Manual notification templates remain private and bounded. Copy evidence means only that an owner copied a template, while a separate owner-entered marker records reported delivery outside the app. Neither state implies automated email delivery, and public errors use fixed projections that omit credentials, notes, template content, and internal causes.
 
+### Amount and aggregate display configuration
+
+`domain/amount-aggregate-configuration.ts` requires an explicit currency, integer minor-unit minimum, positive increment, optional maximum, and public visibility choice. No deployment inherits a currency, amount boundary, or aggregate policy from reusable source.
+
+Public totals render only when configured for non-zero visibility and the sanitized total is positive. The public projection is closed to amount, currency, bounded display label, and qualifier, so participant identities, counts, notes, moderation state, and private totals cannot enter it.
+
 ## Storage plan
 
 Development can use a deterministic in-memory/test adapter. Production must use an AittaDB-compatible adapter and pass the same contract tests.
