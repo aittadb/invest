@@ -135,6 +135,29 @@ export function explicitCampaignSetup(
         qualifier: "Self-declared, unverified, and non-binding.",
       },
     },
+    campaignPolicy: {
+      founderContributionChoices: [
+        { id: "area:engineering", label: "Engineering" },
+        { id: "area:product", label: "Product" },
+      ],
+      notices: {
+        legalBoundary:
+          "This registration records interest and is not a securities offer.",
+        nonBindingInterest:
+          "No payment, allocation, reservation, or commitment is created.",
+        privacyContact: {
+          label: "Northstar privacy contact",
+          href: "https://northstar.example/privacy",
+        },
+        retention:
+          "The published privacy notice explains retention and deletion handling.",
+      },
+      publicationReadiness: {
+        publicPresentationReviewed: true,
+        legalNoticesReviewed: true,
+        privacyAndRetentionReviewed: true,
+      },
+    },
   };
 }
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { parseAmountAggregateConfiguration } from "../domain/amount-aggregate-configuration.ts";
+import { parseCampaignSetupPolicy } from "../domain/campaign-setup-policy.ts";
 import {
   parseAuditAppendIntent,
   type AuditAppendIntent,
@@ -62,6 +63,7 @@ import {
   type OwnerReviewExportPageRequest,
 } from "../services/owner-review-export.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
+import { explicitCampaignSetup } from "./support/campaign-repository-contract.ts";
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
 import { createOwnerReviewExportRouteHandler } from "../worker/routes/owner-review-exports.ts";
 import { createOwnerRouteHandler } from "../worker/routes/owner.ts";
@@ -1010,6 +1012,7 @@ function createCampaign(): CampaignSetupRevision {
       publicCampaign: syntheticPublicCampaign,
       phases: Object.freeze([phase.value]),
       amountAggregate: configuredAmounts(),
+      campaignPolicy: configuredCampaignPolicy(),
     }),
   });
 }
@@ -1030,6 +1033,15 @@ function configuredAmounts() {
   });
   assert.equal(parsed.ok, true);
   if (!parsed.ok) throw new Error("Invalid amount fixture.");
+  return parsed.value;
+}
+
+function configuredCampaignPolicy() {
+  const parsed = parseCampaignSetupPolicy(
+    explicitCampaignSetup().campaignPolicy,
+  );
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) throw new Error("Invalid campaign policy fixture.");
   return parsed.value;
 }
 

@@ -54,6 +54,7 @@ test("setup parsing requires every deployment choice and supplies no defaults", 
     { code: "required", path: "setup.publicCampaign" },
     { code: "required", path: "setup.phases" },
     { code: "required", path: "setup.amountAggregate" },
+    { code: "required", path: "setup.campaignPolicy" },
   ]);
 
   const noPhase = parseCampaignSetup({
@@ -113,27 +114,59 @@ test("setup revisions and their adapter records remain immutable", async () => {
     operationId: "campaign-operation:immutable-update",
     recordedAt: SECOND_SAVE,
     expectedRevision: 1,
-    setup: explicitSetup({
-      campaignName: "Northstar Systems",
-      phaseState: "closed",
-    }),
+    setup: (() => {
+      const setup = explicitSetup({
+        campaignName: "Northstar Systems",
+        phaseState: "closed",
+      });
+      return {
+        ...setup,
+        campaignPolicy: {
+          ...setup.campaignPolicy,
+          notices: {
+            ...setup.campaignPolicy.notices,
+            retention: "Updated synthetic retention notice.",
+          },
+        },
+      };
+    })(),
   }));
 
   assert.equal(Object.isFrozen(first), true);
   assert.equal(Object.isFrozen(first.setup), true);
   assert.equal(Object.isFrozen(first.setup.phases), true);
   assert.equal(Object.isFrozen(first.setup.phases[0]?.countryEligibility), true);
+  assert.equal(Object.isFrozen(first.setup.campaignPolicy), true);
+  assert.equal(
+    Object.isFrozen(first.setup.campaignPolicy.founderContributionChoices),
+    true,
+  );
   assert.equal(first.setup.publicCampaign.name, syntheticPublicCampaign.name);
   assert.equal(second.setup.publicCampaign.name, "Northstar Systems");
+  assert.notEqual(
+    first.setup.campaignPolicy.notices.retention,
+    second.setup.campaignPolicy.notices.retention,
+  );
 
   const history = await repository.listSetupHistory({ limit: 10 });
   assert.deepEqual(history.items.map((item) => ({
     revision: item.revision,
     name: item.setup.publicCampaign.name,
     state: item.setup.phases[0]?.state,
+    retention: item.setup.campaignPolicy.notices.retention,
   })), [
-    { revision: 1, name: syntheticPublicCampaign.name, state: "open" },
-    { revision: 2, name: "Northstar Systems", state: "closed" },
+    {
+      revision: 1,
+      name: syntheticPublicCampaign.name,
+      state: "open",
+      retention: explicitSetup().campaignPolicy.notices.retention,
+    },
+    {
+      revision: 2,
+      name: "Northstar Systems",
+      state: "closed",
+      retention: "Updated synthetic retention notice.",
+    },
   ]);
   assert.equal(Object.isFrozen(history), true);
   assert.equal(Object.isFrozen(history.items), true);
@@ -240,7 +273,14 @@ test("public projection reads expose only published presentation state", async (
     expectedRevision: null,
     setup: explicitSetup(),
   }));
-  assert.deepEqual(await publicReader.readPublishedCampaign(), syntheticPublicCampaign);
+  const publicCampaign = await publicReader.readPublishedCampaign();
+  assert.deepEqual(publicCampaign, syntheticPublicCampaign);
+  assert.equal(
+    JSON.stringify(publicCampaign).includes(
+      explicitSetup().campaignPolicy.notices.legalBoundary,
+    ),
+    false,
+  );
 
   await owner.saveSetupWithAudit({
     operationId: "campaign-operation:public-projection-unpublish",

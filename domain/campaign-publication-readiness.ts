@@ -1,8 +1,10 @@
 import { checkPhaseSetup } from "./phase-configuration.ts";
+import { checkCampaignSetupPolicy } from "./campaign-setup-policy.ts";
 import type { CampaignSetup } from "../repositories/in-memory-campaign-repository.ts";
 
 export type CampaignPublicationReadinessBlocker =
   | "phase-setup-incomplete"
+  | "campaign-policy-incomplete"
   | "deployment-not-ready";
 
 export type CampaignPublicationReadiness = Readonly<{
@@ -22,6 +24,9 @@ export async function assessCampaignPublicationReadiness(
   const blockers: CampaignPublicationReadinessBlocker[] = [];
   if (setup.phases.some((phase) => !checkPhaseSetup(phase).complete)) {
     blockers.push("phase-setup-incomplete");
+  }
+  if (!checkCampaignSetupPolicy(setup.campaignPolicy, setup.phases).complete) {
+    blockers.push("campaign-policy-incomplete");
   }
   let deploymentReady = false;
   try {

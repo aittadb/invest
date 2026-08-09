@@ -11,6 +11,10 @@ import {
 } from "../domain/foundation.ts";
 import type { AuditEvent } from "../domain/audit-notification.ts";
 import {
+  parseCampaignSetupPolicy,
+  type CampaignSetupPolicy,
+} from "../domain/campaign-setup-policy.ts";
+import {
   parsePhaseConfiguration,
   type PhaseConfiguration,
 } from "../domain/phase-configuration.ts";
@@ -35,7 +39,7 @@ import {
   verifyPreparedAuditAppend,
 } from "./in-memory-audit-notification-repositories.ts";
 
-const CAMPAIGN_SETUP_SCHEMA_VERSION = 1;
+const CAMPAIGN_SETUP_SCHEMA_VERSION = 2;
 const MAX_CAMPAIGN_PHASES = 32;
 const CURRENT_SETUP_KEY = storageKey("campaign-setup-current", "configured-campaign");
 const HISTORY_COLLECTION = storageKey(
@@ -51,7 +55,12 @@ const PUBLIC_PRESENTATION_KEY = storageKey(
   "configured-campaign",
 );
 
-const SETUP_KEYS = new Set(["publicCampaign", "phases", "amountAggregate"]);
+const SETUP_KEYS = new Set([
+  "publicCampaign",
+  "phases",
+  "amountAggregate",
+  "campaignPolicy",
+]);
 const STORED_REVISION_KEYS = new Set([
   "kind",
   "schemaVersion",
@@ -72,6 +81,7 @@ export type CampaignSetup = Readonly<{
   publicCampaign: PublicCampaignConfiguration;
   phases: readonly PhaseConfiguration[];
   amountAggregate: AmountAggregateConfiguration;
+  campaignPolicy: CampaignSetupPolicy;
 }>;
 
 /** One immutable campaign setup revision. */
@@ -449,19 +459,26 @@ export function parseCampaignSetup(
   const publicCampaign = parsePublicCampaign(source, issues);
   const phases = parsePhases(source, issues);
   const amountAggregate = parseAmountAggregate(source, issues);
+  const campaignPolicy = parseCampaignPolicy(source, issues);
 
   if (
     issues.length > 0 ||
     publicCampaign === null ||
     phases === null ||
-    amountAggregate === null
+    amountAggregate === null ||
+    campaignPolicy === null
   ) {
     return { ok: false, issues };
   }
 
   return {
     ok: true,
-    value: deepFreeze({ publicCampaign, phases, amountAggregate }),
+    value: deepFreeze({
+      publicCampaign,
+      phases,
+      amountAggregate,
+      campaignPolicy,
+    }),
   };
 }
 
@@ -543,6 +560,29 @@ function parseAmountAggregate(
   }
 
   const result = parseAmountAggregateConfiguration(source.amountAggregate);
+  if (!result.ok) {
+    issues.push(
+      ...result.issues.map((issue) => ({
+        ...issue,
+        path: `${path}${issue.path ? `.${issue.path}` : ""}`,
+      })),
+    );
+    return null;
+  }
+  return result.value;
+}
+
+function parseCampaignPolicy(
+  source: Record<string, unknown>,
+  issues: ValidationIssue[],
+): CampaignSetupPolicy | null {
+  const path = "setup.campaignPolicy";
+  if (!Object.hasOwn(source, "campaignPolicy")) {
+    issues.push({ code: "required", path });
+    return null;
+  }
+
+  const result = parseCampaignSetupPolicy(source.campaignPolicy);
   if (!result.ok) {
     issues.push(
       ...result.issues.map((issue) => ({
