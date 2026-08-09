@@ -53,9 +53,10 @@ export function createOwnerOAuthProofRouteHandler(
     }
 
     const callback = context.url.pathname === OWNER_OAUTH_CALLBACK_PATH;
-    const responseResourceUrl = callback
-      ? new URL(OWNER_OAUTH_CALLBACK_PATH, context.resourceUrl).href
-      : context.resourceUrl;
+    const responseResourceUrl = new URL(
+      callback ? OWNER_OAUTH_CALLBACK_PATH : OWNER_OAUTH_PROOF_PATH,
+      context.resourceUrl,
+    ).href;
     const appOrigin = new URL(responseResourceUrl).origin;
     const finish = (response: Response) =>
       callback

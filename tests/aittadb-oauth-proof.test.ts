@@ -212,6 +212,27 @@ test("availability reports one fixed non-secret discovery failure phase", async 
       { failAt: "discovery", fetchFailure: new Error(CLIENT_SECRET) },
     ],
     [
+      "status_redirect",
+      {
+        discoveryResponse: new Response(CLIENT_SECRET, {
+          status: 302,
+          headers: { location: `${ISSUER}/private?token=${ACCESS_TOKEN}` },
+        }),
+      },
+    ],
+    [
+      "status_unauthorized",
+      { discoveryResponse: new Response(CLIENT_SECRET, { status: 401 }) },
+    ],
+    [
+      "status_not_found",
+      { discoveryResponse: new Response(CLIENT_SECRET, { status: 404 }) },
+    ],
+    [
+      "status_rate_limited",
+      { discoveryResponse: new Response(CLIENT_SECRET, { status: 429 }) },
+    ],
+    [
       "status_server",
       {
         discoveryResponse: new Response(CLIENT_SECRET, {
@@ -219,6 +240,10 @@ test("availability reports one fixed non-secret discovery failure phase", async 
           headers: { "content-type": "application/json" },
         }),
       },
+    ],
+    [
+      "status_other",
+      { discoveryResponse: new Response(CLIENT_SECRET, { status: 418 }) },
     ],
     [
       "content_type",
@@ -236,6 +261,30 @@ test("availability reports one fixed non-secret discovery failure phase", async 
             "content-length": "20000",
             "content-type": "application/json",
           },
+        }),
+      },
+    ],
+    [
+      "body",
+      {
+        discoveryResponse: new Response(null, {
+          headers: { "content-type": "application/json" },
+        }),
+      },
+    ],
+    [
+      "body_size",
+      {
+        discoveryResponse: new Response("x".repeat(16_385), {
+          headers: { "content-type": "application/json" },
+        }),
+      },
+    ],
+    [
+      "encoding",
+      {
+        discoveryResponse: new Response(Uint8Array.of(0xc3, 0x28), {
+          headers: { "content-type": "application/json" },
         }),
       },
     ],
@@ -260,8 +309,18 @@ test("availability reports one fixed non-secret discovery failure phase", async 
       assert.equal(await harness.service.availability(), false);
       assert.deepEqual(harness.availabilityFailures, [expected]);
       const evidence = JSON.stringify(harness.availabilityFailures);
-      assert.equal(evidence.includes(CLIENT_SECRET), false);
-      assert.equal(evidence.includes(ISSUER), false);
+      for (const forbidden of [
+        CLIENT_SECRET,
+        CLIENT_ID,
+        ISSUER,
+        TRANSPORT_ORIGIN,
+        CALLBACK,
+        OWNER_SUBJECT,
+        AUTHORIZATION_CODE,
+        ACCESS_TOKEN,
+      ]) {
+        assert.equal(evidence.includes(forbidden), false);
+      }
     });
   }
 
@@ -293,6 +352,139 @@ test("provider redirects are returned manually and rejected without following", 
   assert.equal(harness.requests[0]?.redirect, "manual");
   assert.equal(harness.requests[0]?.authorization, null);
   assert.equal(harness.requests[0]?.cookie, null);
+});
+
+test("discovery, token, and introspection require exact HTTP 200", async (t) => {
+  await t.test("unexpected discovery success status", async () => {
+    const harness = await createHarness({
+      discoveryResponse: jsonResponse(discoveryDocument(), { status: 201 }),
+    });
+
+    assert.equal(await harness.service.availability(), false);
+    assert.deepEqual(harness.availabilityFailures, ["status_other"]);
+    assert.equal(harness.requests.length, 1);
+    assert.equal(harness.proofs.length, 0);
+  });
+
+  await t.test("unexpected token success status", async () => {
+    const harness = await createHarness({
+      tokenResponse: jsonResponse(tokenDocument(), { status: 202 }),
+    });
+    const callback = await startedCallback(harness);
+
+    await assert.rejects(
+      harness.service.complete(
+        OWNER_SUBJECT,
+        callback.url,
+        callback.cookie,
+      ),
+      publicFailure("service_unavailable"),
+    );
+    assert.equal(harness.requests.length, 3);
+    assert.equal(harness.proofs.length, 0);
+  });
+
+  await t.test("unexpected introspection success status", async () => {
+    const harness = await createHarness({
+      introspectionResponse: jsonResponse(introspectionDocument(), {
+        status: 206,
+      }),
+    });
+    const callback = await startedCallback(harness);
+
+    await assert.rejects(
+      harness.service.complete(
+        OWNER_SUBJECT,
+        callback.url,
+        callback.cookie,
+      ),
+      publicFailure("service_unavailable"),
+    );
+    assert.equal(harness.requests.length, 4);
+    assert.equal(harness.proofs.length, 0);
+  });
+});
+
+test("provider JSON Content-Type uses one exact parsed media type", async (t) => {
+  for (const contentType of [
+    "application/json",
+    "APPLICATION/JSON",
+    "application/json ; charset = utf-8",
+    'application/json;charset="utf-8"',
+    'application/json; charset=UTF-8; profile="schema,version=1"',
+  ]) {
+    await t.test(`accepts ${contentType}`, async () => {
+      const harness = await createHarness({
+        discoveryResponse: jsonResponse(discoveryDocument(), {
+          headers: { "content-type": contentType },
+        }),
+      });
+
+      assert.equal(await harness.service.availability(), true);
+      assert.deepEqual(harness.availabilityFailures, []);
+    });
+  }
+
+  for (const contentType of [
+    "application/jsonp",
+    "application/json-seq",
+    "application/json, application/json",
+    "application/json; charset=utf-8; CHARSET=utf-8",
+    "application/json; charset",
+    "application/json; charset=",
+    'application/json; charset="utf-8',
+    "application/json; charset=utf-8, text/plain",
+    "application /json",
+    "application/json; charset=(utf-8)",
+    "application/json;",
+    "application/json; =utf-8",
+  ]) {
+    await t.test(`rejects ${contentType}`, async () => {
+      const harness = await createHarness({
+        discoveryResponse: jsonResponse(discoveryDocument(), {
+          headers: { "content-type": contentType },
+        }),
+      });
+
+      assert.equal(await harness.service.availability(), false);
+      assert.deepEqual(harness.availabilityFailures, ["content_type"]);
+      assert.equal(
+        JSON.stringify(harness.availabilityFailures).includes(contentType),
+        false,
+      );
+    });
+  }
+
+  for (const [name, responseKey, contentType] of [
+    ["token JSON lookalike", "tokenResponse", "application/jsonp"],
+    [
+      "introspection JSON sequence",
+      "introspectionResponse",
+      "application/json-seq",
+    ],
+  ] as const) {
+    await t.test(name, async () => {
+      const document = responseKey === "tokenResponse"
+        ? tokenDocument()
+        : introspectionDocument();
+      const harness = await createHarness({
+        [responseKey]: jsonResponse(document, {
+          headers: { "content-type": contentType },
+        }),
+      });
+      const callback = await startedCallback(harness);
+
+      await assert.rejects(
+        harness.service.complete(
+          OWNER_SUBJECT,
+          callback.url,
+          callback.cookie,
+        ),
+        publicFailure("service_unavailable"),
+      );
+      assert.equal(harness.proofs.length, 0);
+    });
+  }
 });
 
 test("discovery, token, and introspection bodies are bounded and strictly parsed", async (t) => {
@@ -661,10 +853,12 @@ function introspectionDocument(
   };
 }
 
-function jsonResponse(value: unknown): Response {
-  return new Response(JSON.stringify(value), {
-    headers: { "content-type": "application/json; charset=utf-8" },
-  });
+function jsonResponse(value: unknown, init: ResponseInit = {}): Response {
+  const headers = new Headers(init.headers);
+  if (!headers.has("content-type")) {
+    headers.set("content-type", "application/json; charset=utf-8");
+  }
+  return new Response(JSON.stringify(value), { ...init, headers });
 }
 
 function cookieHeader(setCookie: string): string {

@@ -150,6 +150,66 @@ test("connection CSP rejects malformed or compound injected authorization origin
   }
 });
 
+test("owner connection errors never reflect request query values", async (t) => {
+  const query = new URLSearchParams({
+    code: AUTHORIZATION_CODE,
+    credential: CLIENT_SECRET,
+    identity: OWNER_SUBJECT,
+    cause: `${ISSUER}/private?token=${ACCESS_TOKEN}`,
+  });
+  const requestUrl = `${ORIGIN}${OWNER_OAUTH_PROOF_PATH}?${query}`;
+  const cases = [
+    ["owner hypermedia", { accept: HYPERMEDIA }, 400],
+    ["owner HTML", { accept: "text/html" }, 400],
+    [
+      "anonymous",
+      { accept: HYPERMEDIA, actor: null, isOwner: false },
+      401,
+    ],
+    [
+      "non-owner",
+      {
+        accept: HYPERMEDIA,
+        actor: {
+          userId: "foreign-subject",
+          email: "foreign@example.test",
+          displayName: "Foreign",
+        },
+        isOwner: false,
+      },
+      404,
+    ],
+    ["unsupported representation", { accept: "application/xml" }, 406],
+  ] as const;
+
+  for (const [name, options, expectedStatus] of cases) {
+    await t.test(name, async () => {
+      const harness = await routeHarness();
+      const response = requiredResponse(await harness.handler(context(
+        requestUrl,
+        options,
+      )));
+      const surface = `${await response.clone().text()}\n${
+        [...response.headers].map(([header, value]) => `${header}: ${value}`)
+          .join("\n")
+      }`;
+
+      assert.equal(response.status, expectedStatus);
+      assert.equal(harness.networkRequests.length, 0);
+      assert.equal(surface.includes(`?${query}`), false);
+      for (const forbidden of [
+        AUTHORIZATION_CODE,
+        CLIENT_SECRET,
+        OWNER_SUBJECT,
+        ACCESS_TOKEN,
+        encodeURIComponent(CLIENT_SECRET),
+      ]) {
+        assert.equal(surface.includes(forbidden), false);
+      }
+    });
+  }
+});
+
 test("initiation requires the configured owner, exact origin, and CSRF before discovery", async () => {
   const anonymousHarness = await routeHarness();
   const anonymous = requiredResponse(await anonymousHarness.handler(context(

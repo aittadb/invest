@@ -316,19 +316,84 @@ test("hosted availability evidence is fixed and credential-free", async (t) => {
   }
 
   const database = migratedDatabase(t);
-  const observed: OAuthAvailabilityFailurePhase[] = [];
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...values: unknown[]) => {
+    warnings.push(values);
+  });
+  let providerCalls = 0;
   const resolver = createHostedOwnerOAuthProofResolver({
     async fetch() {
+      providerCalls += 1;
       throw new Error(`${CLIENT_SECRET} ${ISSUER}`);
     },
-    availabilityFailureObserver(phase) {
-      observed.push(phase);
-    },
   });
-  const capability = await resolver(configuredEnvironment(database));
-  assert.ok(capability);
-  assert.equal(await capability.oauth.availability(), false);
-  assert.deepEqual(observed, ["fetch"]);
+  const env = configuredEnvironment(database);
+  const fallbackRequests: Request[] = [];
+  const worker = createApplicationWorker({
+    fetchApplication: async (request) => {
+      fallbackRequests.push(request);
+      return new Response("fallback");
+    },
+    fetchOptimizedImage: async () => new Response("image"),
+    resolveOwnerOAuthProof: resolver,
+  });
+
+  const anonymous = await worker.fetch(
+    new Request(CONNECTION, { headers: { accept: HYPERMEDIA } }),
+    env,
+    executionContext,
+  );
+  assert.equal(anonymous.status, 401);
+  assert.equal(providerCalls, 0);
+  assert.deepEqual(warnings, []);
+
+  const foreignHeaders = new Headers({ accept: HYPERMEDIA });
+  foreignHeaders.set("oai-authenticated-user-id", "foreign-subject");
+  foreignHeaders.set("oai-authenticated-user-email", "foreign@example.test");
+  const foreign = await worker.fetch(
+    new Request(CONNECTION, { headers: foreignHeaders }),
+    env,
+    executionContext,
+  );
+  assert.equal(foreign.status, 404);
+  assert.equal(providerCalls, 0);
+  assert.deepEqual(warnings, []);
+
+  const owner = await worker.fetch(
+    ownerRequest(CONNECTION, { headers: { accept: HYPERMEDIA } }),
+    env,
+    executionContext,
+  );
+  const ownerSurface = `${await owner.clone().text()}\n${
+    [...owner.headers].map(([name, value]) => `${name}: ${value}`).join("\n")
+  }`;
+  assert.equal(owner.status, 200);
+  assert.equal((await owner.json()).data.availability, "unavailable");
+  assert.equal(providerCalls, 1);
+  assert.deepEqual(warnings, [[hostedOAuthAvailabilityEvidence("fetch")]]);
+  assert.equal(fallbackRequests.length, 0);
+  const warningSurface = JSON.stringify(warnings);
+  for (const forbidden of [
+    CLIENT_SECRET,
+    CLIENT_ID,
+    ISSUER,
+    CALLBACK,
+    OWNER_EMAIL,
+    OWNER_SUBJECT,
+    hostedOAuthAvailabilityEvidence("fetch"),
+  ]) {
+    assert.equal(ownerSurface.includes(forbidden), false);
+  }
+  for (const forbidden of [
+    CLIENT_SECRET,
+    CLIENT_ID,
+    ISSUER,
+    CALLBACK,
+    OWNER_EMAIL,
+    OWNER_SUBJECT,
+  ]) {
+    assert.equal(warningSurface.includes(forbidden), false);
+  }
 });
 
 test("the production entry point installs the fail-closed OAuth resolver", () => {

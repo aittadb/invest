@@ -4,6 +4,7 @@ import { OWNER_OAUTH_CALLBACK_PATH } from "../domain/owner-oauth-proof-resource.
 const DISCOVERY_MAX_BYTES = 16_384;
 const TOKEN_MAX_BYTES = 16_384;
 const INTROSPECTION_MAX_BYTES = 16_384;
+const CONTENT_TYPE_MAX_LENGTH = 1_024;
 const CALLBACK_MAX_LENGTH = 8_192;
 const COOKIE_HEADER_MAX_LENGTH = 8_192;
 const COOKIE_VALUE_MAX_LENGTH = 4_096;
@@ -571,13 +572,12 @@ async function fetchJson(
     report?.("fetch");
     unavailable();
   }
-  if (!response.ok) {
-    report?.(availabilityStatusPhase(response.status));
+  const status = response.status;
+  if (status !== 200) {
+    report?.(availabilityStatusPhase(status));
     unavailable();
   }
-  if (!response.headers.get("content-type")?.toLowerCase().startsWith(
-    "application/json",
-  )) {
+  if (!isJsonMediaType(response.headers.get("content-type"))) {
     report?.("content_type");
     unavailable();
   }
@@ -594,6 +594,119 @@ async function fetchJson(
     unavailable();
   }
   return parsed;
+}
+
+function isJsonMediaType(value: string | null): boolean {
+  if (
+    value === null ||
+    value.length < 1 ||
+    value.length > CONTENT_TYPE_MAX_LENGTH
+  ) {
+    return false;
+  }
+
+  let index = skipOptionalWhitespace(value, 0);
+  const type = readHttpToken(value, index);
+  if (type === null) return false;
+  index = type.next;
+  if (value[index] !== "/") return false;
+  index += 1;
+  const subtype = readHttpToken(value, index);
+  if (subtype === null) return false;
+  index = subtype.next;
+  if (
+    type.value.toLowerCase() !== "application" ||
+    subtype.value.toLowerCase() !== "json"
+  ) {
+    return false;
+  }
+
+  const parameterNames = new Set<string>();
+  while (true) {
+    index = skipOptionalWhitespace(value, index);
+    if (index === value.length) return true;
+    if (value[index] !== ";") return false;
+    index = skipOptionalWhitespace(value, index + 1);
+
+    const name = readHttpToken(value, index);
+    if (name === null) return false;
+    index = skipOptionalWhitespace(value, name.next);
+    if (value[index] !== "=") return false;
+    index = skipOptionalWhitespace(value, index + 1);
+
+    const parameter = value[index] === '"'
+      ? readQuotedString(value, index)
+      : readHttpToken(value, index);
+    if (parameter === null) return false;
+    index = parameter.next;
+
+    const canonicalName = name.value.toLowerCase();
+    if (parameterNames.has(canonicalName)) return false;
+    parameterNames.add(canonicalName);
+  }
+}
+
+function readHttpToken(
+  value: string,
+  start: number,
+): Readonly<{ value: string; next: number }> | null {
+  let index = start;
+  while (index < value.length && isHttpTokenCharacter(value[index] ?? "")) {
+    index += 1;
+  }
+  if (index === start) return null;
+  return Object.freeze({ value: value.slice(start, index), next: index });
+}
+
+function readQuotedString(
+  value: string,
+  start: number,
+): Readonly<{ value: string; next: number }> | null {
+  let index = start + 1;
+  let decoded = "";
+  while (index < value.length) {
+    const character = value[index] ?? "";
+    const code = character.charCodeAt(0);
+    if (character === '"') {
+      return Object.freeze({ value: decoded, next: index + 1 });
+    }
+    if (character === "\\") {
+      const escaped = value[index + 1];
+      if (escaped === undefined || !isQuotedPairCharacter(escaped)) return null;
+      decoded += escaped;
+      index += 2;
+      continue;
+    }
+    if (!isQuotedTextCharacter(code)) return null;
+    decoded += character;
+    index += 1;
+  }
+  return null;
+}
+
+function skipOptionalWhitespace(value: string, start: number): number {
+  let index = start;
+  while (value[index] === " " || value[index] === "\t") index += 1;
+  return index;
+}
+
+function isHttpTokenCharacter(value: string): boolean {
+  return /^[!#$%&'*+\-.^_`|~0-9A-Za-z]$/u.test(value);
+}
+
+function isQuotedTextCharacter(code: number): boolean {
+  return code === 0x09 ||
+    code === 0x20 ||
+    code === 0x21 ||
+    code >= 0x23 && code <= 0x5b ||
+    code >= 0x5d && code <= 0x7e ||
+    code >= 0x80 && code <= 0xff;
+}
+
+function isQuotedPairCharacter(value: string): boolean {
+  const code = value.charCodeAt(0);
+  return code === 0x09 || code >= 0x20 && code <= 0x7e ||
+    code >= 0x80 && code <= 0xff;
 }
 
 function availabilityStatusPhase(
