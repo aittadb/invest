@@ -75,6 +75,7 @@ async function composeHostedOwnerOAuthProof(
     const store = new D1OAuthProofStore({ database, now });
     const oauth = createAittaDBOAuthProofService({
       issuer: configuration.issuer,
+      transportOrigin: configuration.transportOrigin,
       clientId: configuration.clientId,
       clientSecret: configuration.clientSecret,
       callbackUri: configuration.callbackUri,

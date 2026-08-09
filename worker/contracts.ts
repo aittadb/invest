@@ -9,6 +9,7 @@ import type { D1OAuthProofDatabase } from "../repositories/d1-oauth-proof-store.
 export interface InvestorAppEnv {
   APP_BASE_URL?: string;
   AITTADB_OAUTH_ISSUER?: string;
+  AITTADB_OAUTH_TRANSPORT_ORIGIN?: string;
   AITTADB_OAUTH_CLIENT_ID?: string;
   AITTADB_OAUTH_CLIENT_SECRET?: string;
   AITTADB_OAUTH_CALLBACK_URI?: string;

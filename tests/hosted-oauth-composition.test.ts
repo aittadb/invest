@@ -31,6 +31,7 @@ const APP_ORIGIN = "https://invest.example.test";
 const CALLBACK = `${APP_ORIGIN}/owner/aittadb-connection/callback`;
 const CONNECTION = `${APP_ORIGIN}/owner/aittadb-connection`;
 const ISSUER = "https://database.example.test";
+const TRANSPORT_ORIGIN = "https://database-runtime.example.test";
 const OWNER_EMAIL = "owner@example.test";
 const OWNER_SUBJECT = "sites-owner-subject";
 const CLIENT_ID = "investor-app-acceptance";
@@ -60,7 +61,10 @@ test("hosted Worker composition completes and persists the scoped OAuth proof", 
     fetch: async (input, init) => {
       const request = new Request(input, init);
       providerRequests.push(request.clone());
-      if (request.url === `${ISSUER}/.well-known/openid-configuration`) {
+      if (
+        request.url ===
+          `${TRANSPORT_ORIGIN}/.well-known/openid-configuration`
+      ) {
         return jsonResponse({
           issuer: ISSUER,
           authorization_endpoint: `${ISSUER}/authorize`,
@@ -83,7 +87,7 @@ test("hosted Worker composition completes and persists the scoped OAuth proof", 
         `Basic ${btoa(`${CLIENT_ID}:${CLIENT_SECRET}`)}`,
       );
       const body = new URLSearchParams(await request.clone().text());
-      if (request.url === `${ISSUER}/oauth/token`) {
+      if (request.url === `${TRANSPORT_ORIGIN}/oauth/token`) {
         assert.equal(body.get("grant_type"), "authorization_code");
         assert.equal(body.get("code"), AUTHORIZATION_CODE);
         assert.equal(body.get("redirect_uri"), CALLBACK);
@@ -96,7 +100,7 @@ test("hosted Worker composition completes and persists the scoped OAuth proof", 
         });
       }
 
-      assert.equal(request.url, `${ISSUER}/oauth/introspect`);
+      assert.equal(request.url, `${TRANSPORT_ORIGIN}/oauth/introspect`);
       assert.equal(body.get("token"), ACCESS_TOKEN);
       return jsonResponse({
         active: true,
@@ -120,7 +124,10 @@ test("hosted Worker composition completes and persists the scoped OAuth proof", 
       );
     },
   });
-  const env = configuredEnvironment(database);
+  const env = {
+    ...configuredEnvironment(database),
+    AITTADB_OAUTH_TRANSPORT_ORIGIN: TRANSPORT_ORIGIN,
+  };
   const firstCapability = await resolver(env);
   assert.ok(firstCapability);
   assert.equal(await resolver(env), firstCapability);

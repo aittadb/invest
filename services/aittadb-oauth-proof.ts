@@ -73,6 +73,7 @@ export interface AittaDBOAuthProofResultSink {
 
 export type AittaDBOAuthProofDependencies = Readonly<{
   issuer: string;
+  transportOrigin?: string;
   clientId: string;
   clientSecret: string;
   callbackUri: string;
@@ -128,6 +129,7 @@ export interface AittaDBOAuthProofService {
 
 type ValidatedConfiguration = Readonly<{
   issuer: string;
+  transportOrigin: string;
   authorizationEndpoint: string;
   tokenEndpoint: string;
   introspectionEndpoint: string;
@@ -311,6 +313,9 @@ function validateConfiguration(
   input: AittaDBOAuthProofDependencies,
 ): ValidatedConfiguration {
   const issuer = exactHttpsUrl(input.issuer, false);
+  const transportOrigin = input.transportOrigin === undefined
+    ? issuer
+    : exactHttpsUrl(input.transportOrigin, false);
   const callbackUri = exactHttpsUrl(input.callbackUri, true);
   const clientId = basicCredential(input.clientId, false);
   const clientSecret = basicCredential(input.clientSecret, true);
@@ -348,6 +353,7 @@ function validateConfiguration(
 
   return Object.freeze({
     issuer,
+    transportOrigin,
     authorizationEndpoint: `${issuer}/authorize`,
     tokenEndpoint: `${issuer}/oauth/token`,
     introspectionEndpoint: `${issuer}/oauth/introspect`,
@@ -376,7 +382,7 @@ async function discover(
   const document = await fetchJson(
     config,
     {
-      url: `${config.issuer}/.well-known/openid-configuration`,
+      url: `${config.transportOrigin}/.well-known/openid-configuration`,
       init: {
         method: "GET",
         headers: { Accept: "application/json", "Cache-Control": "no-cache" },
@@ -406,8 +412,8 @@ async function discover(
   }
   return Object.freeze({
     authorizationEndpoint: config.authorizationEndpoint,
-    tokenEndpoint: config.tokenEndpoint,
-    introspectionEndpoint: config.introspectionEndpoint,
+    tokenEndpoint: `${config.transportOrigin}/oauth/token`,
+    introspectionEndpoint: `${config.transportOrigin}/oauth/introspect`,
   });
 }
 

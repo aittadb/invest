@@ -11,6 +11,7 @@ import {
 } from "../services/aittadb-oauth-proof.ts";
 
 const ISSUER = "https://database.example.test";
+const TRANSPORT_ORIGIN = "https://database-runtime.example.test";
 const CALLBACK =
   "https://campaign.example.test/owner/aittadb-connection/callback";
 const CLIENT_ID = "confidential-client";
@@ -137,6 +138,42 @@ test("authorization origin is derived only from a canonical HTTPS issuer", async
       );
     });
   }
+});
+
+test("server transport can differ without changing the logical OAuth issuer", async () => {
+  const harness = await createHarness({ transportOrigin: TRANSPORT_ORIGIN });
+  assert.equal(await harness.service.availability(), true);
+  const start = await harness.service.begin(OWNER_SUBJECT);
+  assert.equal(new URL(start.authorizationUrl).origin, ISSUER);
+  const state = new URL(start.authorizationUrl).searchParams.get("state");
+  assert.ok(state);
+  const proof = await harness.service.complete(
+    OWNER_SUBJECT,
+    `${CALLBACK}?code=${AUTHORIZATION_CODE}&state=${encodeURIComponent(state)}`,
+    cookieHeader(start.setCookie),
+  );
+
+  assert.equal(proof.issuer, ISSUER);
+  assert.deepEqual(
+    harness.requests.map((request) => new URL(request.url).origin),
+    [
+      TRANSPORT_ORIGIN,
+      TRANSPORT_ORIGIN,
+      TRANSPORT_ORIGIN,
+      TRANSPORT_ORIGIN,
+      TRANSPORT_ORIGIN,
+    ],
+  );
+  assert.deepEqual(
+    harness.requests.map((request) => new URL(request.url).pathname),
+    [
+      "/.well-known/openid-configuration",
+      "/.well-known/openid-configuration",
+      "/.well-known/openid-configuration",
+      "/oauth/token",
+      "/oauth/introspect",
+    ],
+  );
 });
 
 test("discovery must advertise the exact confidential S256 authorization path", async (t) => {
@@ -463,6 +500,7 @@ async function createHarness(
     fetchFailure?: Error;
     cookieKeyExtractable?: boolean;
     issuer?: string;
+    transportOrigin?: string;
     availabilityFailureObserver?: OAuthAvailabilityFailureObserver;
   }> = {},
 ) {
@@ -514,6 +552,7 @@ async function createHarness(
   };
   const dependencies: AittaDBOAuthProofDependencies = {
     issuer: options.issuer ?? ISSUER,
+    transportOrigin: options.transportOrigin,
     clientId: CLIENT_ID,
     clientSecret: CLIENT_SECRET,
     callbackUri: CALLBACK,

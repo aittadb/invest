@@ -37,6 +37,7 @@ test("complete hosted OAuth configuration is exact and imports separate keys", a
   assert.ok(configuration);
   assert.equal(configuration.appOrigin, APP_ORIGIN);
   assert.equal(configuration.issuer, "https://storage.example.test");
+  assert.equal(configuration.transportOrigin, configuration.issuer);
   assert.equal(configuration.clientId, "investor-app-acceptance");
   assert.equal(configuration.clientSecret, "hosted-secret-value");
   assert.equal(configuration.callbackUri, CALLBACK);
@@ -60,6 +61,20 @@ test("complete hosted OAuth configuration is exact and imports separate keys", a
   assert.ok(Object.isFrozen(configuration.storageScopes));
 });
 
+test("hosted OAuth accepts one exact optional server transport origin", async () => {
+  const configuration = await parseHostedAittaDBOAuthConfiguration({
+    ...configuredEnvironment,
+    AITTADB_OAUTH_TRANSPORT_ORIGIN: "https://storage-runtime.example.test",
+  });
+
+  assert.ok(configuration);
+  assert.equal(configuration.issuer, "https://storage.example.test");
+  assert.equal(
+    configuration.transportOrigin,
+    "https://storage-runtime.example.test",
+  );
+});
+
 test("partial hosted OAuth configuration fails closed", async () => {
   for (const field of Object.keys(configuredEnvironment)) {
     if (field === "APP_BASE_URL") continue;
@@ -80,6 +95,8 @@ test("malformed hosted OAuth values fail closed without reflecting secrets", asy
     ["APP_BASE_URL", `${APP_ORIGIN}/owner`],
     ["AITTADB_OAUTH_ISSUER", "https://storage.example.test/api"],
     ["AITTADB_OAUTH_ISSUER", "https://user@storage.example.test"],
+    ["AITTADB_OAUTH_TRANSPORT_ORIGIN", "http://storage-runtime.example.test"],
+    ["AITTADB_OAUTH_TRANSPORT_ORIGIN", "https://storage-runtime.example.test/path"],
     ["AITTADB_OAUTH_CLIENT_ID", "client:with-colon"],
     ["AITTADB_OAUTH_CLIENT_SECRET", "too-short"],
     ["AITTADB_OAUTH_CLIENT_SECRET", `${secret}\n`],

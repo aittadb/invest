@@ -7,6 +7,7 @@ const STORAGE_SCOPES = [
 ] as const;
 const CONFIGURATION_FIELDS = [
   "AITTADB_OAUTH_ISSUER",
+  "AITTADB_OAUTH_TRANSPORT_ORIGIN",
   "AITTADB_OAUTH_CLIENT_ID",
   "AITTADB_OAUTH_CLIENT_SECRET",
   "AITTADB_OAUTH_CALLBACK_URI",
@@ -20,6 +21,7 @@ export type HostedOAuthStorageScope = typeof STORAGE_SCOPES[number];
 export type HostedAittaDBOAuthEnvironment = Readonly<{
   APP_BASE_URL?: unknown;
   AITTADB_OAUTH_ISSUER?: unknown;
+  AITTADB_OAUTH_TRANSPORT_ORIGIN?: unknown;
   AITTADB_OAUTH_CLIENT_ID?: unknown;
   AITTADB_OAUTH_CLIENT_SECRET?: unknown;
   AITTADB_OAUTH_CALLBACK_URI?: unknown;
@@ -31,6 +33,7 @@ export type HostedAittaDBOAuthEnvironment = Readonly<{
 export type HostedAittaDBOAuthConfiguration = Readonly<{
   appOrigin: string;
   issuer: string;
+  transportOrigin: string;
   clientId: string;
   clientSecret: string;
   callbackUri: string;
@@ -50,6 +53,10 @@ export async function parseHostedAittaDBOAuthConfiguration(
   try {
     const appOrigin = exactHttpsOrigin(environment.APP_BASE_URL);
     const issuer = exactHttpsOrigin(environment.AITTADB_OAUTH_ISSUER);
+    const transportOrigin = environment.AITTADB_OAUTH_TRANSPORT_ORIGIN ===
+        undefined
+      ? issuer
+      : exactHttpsOrigin(environment.AITTADB_OAUTH_TRANSPORT_ORIGIN);
     const clientId = exactCredential(
       environment.AITTADB_OAUTH_CLIENT_ID,
       1,
@@ -85,6 +92,7 @@ export async function parseHostedAittaDBOAuthConfiguration(
     return Object.freeze({
       appOrigin,
       issuer,
+      transportOrigin,
       clientId,
       clientSecret,
       callbackUri,
