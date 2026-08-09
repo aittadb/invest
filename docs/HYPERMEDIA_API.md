@@ -43,11 +43,13 @@ The public campaign resource currently has this shape:
 {
   "api_version": "0.1",
   "type": "investment-pre-registration",
-  "id": "aittadb",
+  "id": "northstar-robotics",
   "data": {
-    "name": "AittaDB",
-    "phase": "pre-registration",
+    "published": true,
+    "name": "Northstar Robotics",
+    "phase_label": "Investment pre-registration",
     "status": "open",
+    "status_label": "Pre-registration open",
     "participation_paths": ["investor", "founder"],
     "interest_is_binding": false
   },

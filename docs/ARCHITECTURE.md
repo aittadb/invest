@@ -14,6 +14,10 @@ Deployments provide trusted runtime configuration for the canonical app origin, 
 
 `OWNER_EMAIL` configures the single version-one owner for one deployment. The worker validates and overwrites the internal owner header, and every owner HTML or JSON request separately compares the trusted Sites identity email with that configured value. Anonymous requests enter Sites sign-in; authenticated non-owners receive a generic denial. A later persisted owner subject may replace the email bootstrap after the production identity adapter is available.
 
+`CAMPAIGN_CONFIG_JSON` supplies the public campaign presentation for one deployment. The worker validates its full structure before exposing it to React or hypermedia rendering. HTML, metadata, and JSON consume that same validated value; absent, malformed, oversized, insecure, unpublished, or otherwise invalid configuration produces a generic unavailable resource without leaking draft copy. It is an initial bootstrap input, not the eventual persistence mechanism; owner editing and publication will move behind the campaign repository.
+
+The repository tracks only `.openai/hosting.example.json`. Each production, acceptance, or local deployment keeps its exact Sites project binding in ignored `.openai/hosting.json` state. Clean checkouts can build against the inert example, while Sites packaging explicitly requires an active binding.
+
 ## Resource representations
 
 Application URLs identify resources rather than HTML-only pages. `Accept: text/html` selects the human interface. `Accept: application/vnd.aittadb-invest+json; version=0.1` selects the versioned hypermedia contract, and `application/json` is a compatibility representation. Representation selection never uses `User-Agent`.

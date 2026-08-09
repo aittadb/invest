@@ -7,6 +7,7 @@ import {
   INVESTOR_APP_API_VERSION,
   INVESTOR_APP_MEDIA_TYPE,
 } from "../domain/public-campaign-resource";
+import { parsePublicCampaignConfiguration } from "../domain/public-campaign-configuration";
 import {
   createOwnerAuthenticationRequiredDocument,
   createOwnerHomeDocument,
@@ -14,10 +15,12 @@ import {
 import { isConfiguredOwner } from "../domain/owner-identity";
 import { withAppOrigin } from "../http/app-origin";
 import { negotiateRepresentation } from "../http/content-negotiation";
+import { withRuntimeCampaign } from "../http/runtime-campaign";
 import { withRuntimeOwner } from "../http/runtime-owner";
 
 interface Env {
   APP_BASE_URL?: string;
+  CAMPAIGN_CONFIG_JSON?: string;
   OWNER_EMAIL?: string;
   ASSETS: {
     fetch(request: Request): Promise<Response>;
@@ -47,13 +50,16 @@ const worker = {
     const url = new URL(request.url);
     const actor = authenticatedActor(request);
     const isOwner = isConfiguredOwner(actor?.email, env.OWNER_EMAIL);
+    const campaign = parsePublicCampaignConfiguration(env.CAMPAIGN_CONFIG_JSON);
 
     if (request.method === "GET" && url.pathname === "/") {
       const representation = negotiateRepresentation(request.headers.get("accept"));
 
       if (representation.kind === "hypermedia-json") {
         return hypermediaResponse(
-          createPublicCampaignDocument(request.url, { manageCampaign: isOwner }),
+          createPublicCampaignDocument(request.url, campaign, {
+            manageCampaign: isOwner,
+          }),
         );
       }
 
@@ -88,7 +94,9 @@ const worker = {
           return resourceNotFoundResponse(request.url);
         }
 
-        return hypermediaResponse(createOwnerHomeDocument(request.url, actor));
+        return hypermediaResponse(
+          createOwnerHomeDocument(request.url, actor, campaign),
+        );
       }
 
       const htmlResponse = await handler.fetch(
@@ -186,7 +194,10 @@ function withAcceptVary(response: Response): Response {
 }
 
 function withRuntimeConfiguration(request: Request, env: Env): Request {
-  return withRuntimeOwner(withAppOrigin(request, env.APP_BASE_URL), env.OWNER_EMAIL);
+  return withRuntimeCampaign(
+    withRuntimeOwner(withAppOrigin(request, env.APP_BASE_URL), env.OWNER_EMAIL),
+    env.CAMPAIGN_CONFIG_JSON,
+  );
 }
 
 function authenticatedActor(

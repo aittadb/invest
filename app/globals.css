@@ -103,6 +103,20 @@ summary {
 
 .brand img {
   flex: 0 0 auto;
+  object-fit: contain;
+}
+
+.brand-monogram {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--green-pale);
+  color: var(--green-dark);
+  font-size: 0.9rem;
 }
 
 .site-header nav {
@@ -171,8 +185,18 @@ summary {
   flex-direction: column;
   isolation: isolate;
   overflow: hidden;
-  background: var(--night) url("/aittadb-investment.jpg") center 55% / cover no-repeat;
+  background: var(--night);
   color: #ffffff;
+}
+
+.hero-media {
+  position: absolute;
+  z-index: -2;
+  width: 100%;
+  height: 100%;
+  inset: 0;
+  object-fit: cover;
+  object-position: center 55%;
 }
 
 .hero-shade {
@@ -275,7 +299,7 @@ summary {
 
 .hero-facts {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   border-top: 1px solid rgba(255, 255, 255, 0.24);
 }
 
@@ -435,7 +459,7 @@ summary {
 
 .process-list {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 0;
   margin: 0;
   padding: 0;
@@ -562,6 +586,43 @@ footer {
   border-top: 1px solid #17342d;
   background: var(--night);
   color: rgba(255, 255, 255, 0.72);
+}
+
+.campaign-unavailable {
+  display: grid;
+  min-height: 100vh;
+  grid-template-rows: auto 1fr;
+  background: var(--paper);
+}
+
+.campaign-unavailable > header {
+  display: flex;
+  width: min(920px, calc(100% - 40px));
+  min-height: 68px;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 auto;
+  border-bottom: 1px solid var(--line);
+}
+
+.campaign-unavailable > main {
+  width: min(920px, calc(100% - 40px));
+  align-self: center;
+  margin: 0 auto;
+  padding: 64px 0 18vh;
+}
+
+.campaign-unavailable h1 {
+  margin: 0;
+  font-size: 3rem;
+  line-height: 1.05;
+}
+
+.campaign-unavailable main > p:last-child {
+  max-width: 580px;
+  margin: 18px 0 0;
+  color: var(--muted);
+  line-height: 1.6;
 }
 
 .owner-page {
@@ -691,8 +752,8 @@ footer {
     grid-template-columns: minmax(0, 1fr) auto;
   }
 
-  .campaign-hero {
-    background-position: 58% center;
+  .hero-media {
+    object-position: 58% center;
   }
 
   .hero-shade {
@@ -733,7 +794,10 @@ footer {
 
   .campaign-hero {
     min-height: calc(100svh - 76px);
-    background-position: 63% center;
+  }
+
+  .hero-media {
+    object-position: 63% center;
   }
 
   .hero-inner {

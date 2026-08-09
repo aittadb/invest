@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-029:** Load the public campaign presentation from runtime configuration. DoD: `CAMPAIGN_CONFIG_JSON` supplies campaign identity, public copy, sections, links, and visual URLs; invalid, absent, or unpublished configuration yields a generic unavailable resource; HTML, metadata, and hypermedia share one validated configuration; tests use only synthetic fixtures; and reusable source contains no AittaDB campaign copy or campaign artwork.
+
+  Acceptance evidence: one bounded parser now validates every public presentation field, HTTPS or root-relative media, and safe links before a worker-owned header supplies the same campaign to metadata, HTML, owner status, and hypermedia JSON. Missing, malformed, oversized, insecure, and unpublished values render a generic unavailable resource. Campaign-specific source and artwork were removed; all 25 tests use a synthetic campaign and pass under `npm run validate`. Desktop and 390px mobile browser checks showed responsive, non-overlapping layouts, and `AGENTS.md` remains below 32,000 bytes.
+
 - **TASK-028:** Configure one runtime owner identity and owner home. DoD: `OWNER_EMAIL` is validated as instance configuration, signed-out owner requests enter Sites sign-in, foreign signed-in users receive a non-disclosing denial, the matching owner can open `/owner`, root HTML and hypermedia expose owner navigation only to that actor, and focused tests cover all three identities.
 
   Acceptance evidence: the worker validates `OWNER_EMAIL`, replaces any client-supplied internal owner header, and independently authorizes owner HTML and JSON requests. `/owner` redirects anonymous browser requests through Sites sign-in, returns a generic denial to foreign identities, and presents an owner workspace only to the matching actor. The root resource adds `Manage campaign` in HTML and hypermedia only for that owner. Focused normalization, spoofing, anonymous, foreign-user, matching-owner, and representation-parity tests pass; `npm run validate` passes with 21 tests.

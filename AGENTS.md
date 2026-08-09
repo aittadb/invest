@@ -21,6 +21,8 @@ Use strict TypeScript, Vinext, React, and Cloudflare Worker-compatible ESM. Depl
 
 Required runtime settings are listed in `.env.example`. Secrets must never be returned to browsers, included in exports, committed, logged, or edited as ordinary campaign content.
 
+Keep real Sites project identifiers in ignored `.openai/hosting.json` files, one per deployment worktree. Track only `.openai/hosting.example.json`. A clean checkout may build with the inert example, but Sites packaging and publication require the exact active binding.
+
 Production persistence must use AittaDB. Browser storage, process memory, local files, direct Sites D1 tables, and temporary hosted storage are not production substitutes. Development may use a deterministic in-memory/test adapter, and the production AittaDB adapter must pass the same contract tests.
 
 ## Architecture Rules
@@ -44,6 +46,7 @@ Production persistence must use AittaDB. Browser storage, process memory, local 
 - Keep the first viewport about the campaign and the participant's decision, not Investor App as a software product.
 - Use semantic HTML, one clear `h1`, labels for inputs, visible focus states, stable dimensions, and responsive layouts that do not overlap.
 - Use restrained 6-8px radii, clear contrast, no third-party runtime fonts, no trackers, no external client scripts, and no decorative stock imagery.
+- Treat configured campaign media as owner-controlled public data. Accept only reviewed HTTPS or root-relative image URLs and account for remote-host privacy before publication.
 - Keep letter spacing at `0`. Do not scale body text with viewport width.
 - HTML and JSON/API behavior must use the same server-side authorization and validation. Hidden browser controls are never a security boundary.
 - Use page-specific CSS classes; avoid broad global selectors that could break generated or embedded tool UIs.
@@ -99,6 +102,7 @@ README must state experimental status, FSL-1.1-MIT source availability with two-
 - Lint: `npm run lint`
 - Agent instruction budget: `npm run agents:check`
 - Local validation: `npm run validate`
+- Sites package build: `npm run sites:package`
 
 Keep commands synchronized with `package.json`, CI, README, and contributor docs.
 

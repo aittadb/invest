@@ -1,8 +1,13 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { headers } from "next/headers";
 
 import { chatGPTSignOutPath } from "../chatgpt-auth";
 import { requireOwnerUser } from "../owner-auth";
+import {
+  campaignFromRuntimeHeader,
+  CAMPAIGN_CONFIGURATION_HEADER,
+} from "../../http/runtime-campaign";
 
 export const dynamic = "force-dynamic";
 
@@ -13,6 +18,16 @@ export const metadata: Metadata = {
 
 export default async function OwnerHome() {
   const owner = await requireOwnerUser("/owner");
+  const requestHeaders = await headers();
+  const campaign = campaignFromRuntimeHeader(
+    requestHeaders.get(CAMPAIGN_CONFIGURATION_HEADER),
+  );
+  const setupState = campaign ? "Configured" : "Setup required";
+  const publicationState = campaign
+    ? campaign.published
+      ? "Published"
+      : "Unpublished"
+    : "Not configured";
 
   return (
     <div className="owner-page">
@@ -27,15 +42,15 @@ export default async function OwnerHome() {
       </header>
       <main className="owner-main">
         <p className="section-kicker">Owner workspace</p>
-        <h1>Campaign setup</h1>
+        <h1>Campaign workspace</h1>
         <p className="owner-intro">
-          Configure the campaign before opening registration to participants.
+          Review the public campaign configured for this instance.
         </p>
 
         <section className="owner-status" aria-labelledby="setup-status-title">
           <div>
             <p>Current state</p>
-            <h2 id="setup-status-title">Setup required</h2>
+            <h2 id="setup-status-title">{setupState}</h2>
           </div>
           <dl>
             <div>
@@ -47,8 +62,12 @@ export default async function OwnerHome() {
               <dd>{owner.email}</dd>
             </div>
             <div>
+              <dt>Campaign</dt>
+              <dd>{campaign?.name ?? "Not configured"}</dd>
+            </div>
+            <div>
               <dt>Publication</dt>
-              <dd>Not ready</dd>
+              <dd>{publicationState}</dd>
             </div>
           </dl>
         </section>

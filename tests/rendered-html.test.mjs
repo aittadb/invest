@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
+
 let workerPromise;
 
 async function loadWorker() {
@@ -17,8 +19,15 @@ async function render(
   url = "http://localhost/",
   appBaseUrl,
   ownerEmail,
+  campaignConfiguration = syntheticPublicCampaign,
 ) {
   const worker = await loadWorker();
+  const serializedCampaign =
+    typeof campaignConfiguration === "string"
+      ? campaignConfiguration
+      : campaignConfiguration
+        ? JSON.stringify(campaignConfiguration)
+        : undefined;
 
   return worker.fetch(
     new Request(url, {
@@ -26,6 +35,7 @@ async function render(
     }),
     {
       APP_BASE_URL: appBaseUrl,
+      CAMPAIGN_CONFIG_JSON: serializedCampaign,
       OWNER_EMAIL: ownerEmail,
       ASSETS: {
         fetch: async () => new Response("Not found", { status: 404 }),
@@ -38,19 +48,20 @@ async function render(
   );
 }
 
-test("server-renders the signed-out AittaDB pre-registration landing page", async () => {
+test("server-renders a runtime-configured signed-out campaign", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   assert.match(response.headers.get("vary") ?? "", /\bAccept\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>AittaDB investment pre-registration<\/title>/i);
+  assert.match(html, /<title>Northstar Robotics pre-registration<\/title>/i);
   assert.match(html, /Pre-registration open/);
   assert.match(html, /Register your interest/);
   assert.match(html, /Investor interest/);
   assert.match(html, /Founder interest/);
   assert.match(html, /Interest now\. Decisions later\./);
+  assert.doesNotMatch(html, /AittaDB/i);
   assert.doesNotMatch(
     html,
     /Initial implementation scaffold|Product areas to build next|Repository contract|ChatGPT Sites application|features to build/i,
@@ -60,10 +71,16 @@ test("server-renders the signed-out AittaDB pre-registration landing page", asyn
 
 test("HTML metadata uses the configured runtime origin", async () => {
   const runtimeOrigin = "https://invest.example.com";
+  const campaignWithSocialImage = {
+    ...syntheticPublicCampaign,
+    socialImageUrl: "/campaign-social.png",
+  };
   const response = await render(
     { accept: "text/html" },
     "https://sites-host.example/",
     runtimeOrigin,
+    undefined,
+    campaignWithSocialImage,
   );
 
   assert.equal(response.status, 200);
@@ -76,7 +93,7 @@ test("HTML metadata uses the configured runtime origin", async () => {
     html,
     /<meta property="og:url" content="https:\/\/invest\.example\.com\/?"\s*\/?>/i,
   );
-  assert.match(html, /https:\/\/invest\.example\.com\/og\.png/i);
+  assert.match(html, /https:\/\/invest\.example\.com\/campaign-social\.png/i);
 });
 
 test("HTML metadata falls back to each deployment request origin", async () => {
@@ -139,7 +156,7 @@ test("the owner resource enforces equivalent HTML and JSON authorization", async
     "owner@example.com",
   );
   assert.equal(ownerHtmlResponse.status, 200);
-  assert.match(await ownerHtmlResponse.text(), /<h1>Campaign setup<\/h1>/i);
+  assert.match(await ownerHtmlResponse.text(), /<h1>Campaign workspace<\/h1>/i);
 
   const ownerJsonResponse = await render(
     { ...ownerHeaders, accept: "application/json" },
@@ -151,6 +168,8 @@ test("the owner resource enforces equivalent HTML and JSON authorization", async
   const ownerDocument = await ownerJsonResponse.json();
   assert.equal(ownerDocument.type, "owner-home");
   assert.equal(ownerDocument.data.email, "OWNER@example.com");
+  assert.equal(ownerDocument.data.campaign_name, "Northstar Robotics");
+  assert.equal(ownerDocument.data.publication, "published");
 
   const anonymousResponse = await render(
     { accept: "application/json" },
@@ -191,7 +210,7 @@ test("the root resource negotiates equivalent public hypermedia JSON", async () 
   const document = await response.json();
   assert.equal(document.api_version, "0.1");
   assert.equal(document.type, "investment-pre-registration");
-  assert.equal(document.data.name, "AittaDB");
+  assert.equal(document.data.name, "Northstar Robotics");
   assert.equal(document.data.status, "open");
   assert.equal(document.data.interest_is_binding, false);
   assert.deepEqual(
@@ -230,4 +249,38 @@ test("JSON selection depends on Accept and rejects unsupported versions", async 
   });
   assert.equal(unsupported.status, 406);
   assert.equal((await unsupported.json()).data.code, "not_acceptable");
+});
+
+test("absent, invalid, and unpublished campaign configuration stays generic", async () => {
+  const unpublishedCampaign = {
+    ...syntheticPublicCampaign,
+    published: false,
+  };
+
+  for (const configuration of [null, "{invalid", unpublishedCampaign]) {
+    const htmlResponse = await render(
+      { accept: "text/html" },
+      "https://campaign.example/",
+      undefined,
+      undefined,
+      configuration,
+    );
+    assert.equal(htmlResponse.status, 200);
+    const html = await htmlResponse.text();
+    assert.match(html, /<h1>Campaign unavailable<\/h1>/i);
+    assert.doesNotMatch(html, /Northstar Robotics/i);
+
+    const jsonResponse = await render(
+      { accept: "application/json" },
+      "https://campaign.example/",
+      undefined,
+      undefined,
+      configuration,
+    );
+    const document = await jsonResponse.json();
+    assert.equal(document.id, "unavailable");
+    assert.equal(document.data.published, false);
+    assert.equal(document.data.name, null);
+    assert.deepEqual(document.actions, []);
+  }
 });

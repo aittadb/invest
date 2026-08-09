@@ -5,6 +5,7 @@ import {
   type HypermediaAction,
   type HypermediaLink,
 } from "./public-campaign-resource.ts";
+import type { PublicCampaignConfiguration } from "./public-campaign-configuration.ts";
 
 export type OwnerHomeDocument = Readonly<{
   api_version: typeof INVESTOR_APP_API_VERSION;
@@ -13,7 +14,9 @@ export type OwnerHomeDocument = Readonly<{
   data: Readonly<{
     display_name: string;
     email: string;
-    setup_status: "required";
+    setup_status: "configured" | "required";
+    campaign_name: string | null;
+    publication: "published" | "unpublished" | "not-configured";
   }>;
   links: readonly HypermediaLink[];
   actions: readonly HypermediaAction[];
@@ -22,6 +25,7 @@ export type OwnerHomeDocument = Readonly<{
 export function createOwnerHomeDocument(
   requestUrl: string,
   owner: Readonly<{ displayName: string; email: string }>,
+  campaign: PublicCampaignConfiguration | null,
 ): OwnerHomeDocument {
   const absolute = (href: string) => new URL(href, requestUrl).href;
 
@@ -32,7 +36,13 @@ export function createOwnerHomeDocument(
     data: {
       display_name: owner.displayName,
       email: owner.email,
-      setup_status: "required",
+      setup_status: campaign ? "configured" : "required",
+      campaign_name: campaign?.name ?? null,
+      publication: campaign
+        ? campaign.published
+          ? "published"
+          : "unpublished"
+        : "not-configured",
     },
     links: [
       { rel: ["self"], href: absolute("/owner") },
