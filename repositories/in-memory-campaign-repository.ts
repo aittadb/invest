@@ -238,12 +238,24 @@ export class DevelopmentInMemoryCampaignRepository
     );
     if (existing === null) {
       const current = await this.readSetup();
-      assertCampaignAuditTransition(
-        current,
-        request.expectedRevision,
-        prepared.revision,
-        request.transition,
-      );
+      try {
+        assertCampaignAuditTransition(
+          current,
+          request.expectedRevision,
+          prepared.revision,
+          request.transition,
+        );
+      } catch (error) {
+        const raced = await this.findSetupByOperationId(
+          prepared.revision.operationId,
+        );
+        if (
+          raced === null ||
+          JSON.stringify(raced) !== JSON.stringify(prepared.revision)
+        ) {
+          throw error;
+        }
+      }
     }
 
     const audit = prepareAuditAppend({

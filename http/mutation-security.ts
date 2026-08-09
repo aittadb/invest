@@ -13,7 +13,7 @@ export const MUTATION_METHOD_FIELD = "_method";
 export const DEFAULT_MUTATION_BODY_BYTES = 65_536;
 export const MAX_MUTATION_BODY_BYTES = 1_048_576;
 export const DEFAULT_MUTATION_FIELDS = 64;
-export const MAX_MUTATION_FIELDS = 256;
+export const MAX_MUTATION_FIELDS = 768;
 
 export type CsrfTokenHash = string & {
   readonly [mutationSecurityBrand]: "CsrfTokenHash";

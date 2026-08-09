@@ -446,6 +446,73 @@ test("audited campaign saves commit the revision, history, and audit atomically"
   );
 });
 
+test("audited campaign repository recovers an exact operation lookup race", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true);
+  const baseRepository = new DevelopmentInMemoryCampaignRepository(adapter);
+  const initialSetup = {
+    ...explicitSetup(),
+    publicCampaign: { ...syntheticPublicCampaign, published: false },
+  };
+  await baseRepository.saveSetupWithAudit({
+    operationId: "campaign-operation:race-seed",
+    ownerSubject: "owner-subject",
+    recordedAt: FIRST_SAVE,
+    expectedRevision: null,
+    setup: initialSetup,
+    transition: "created",
+  });
+  const request = {
+    operationId: "campaign-operation:race-update",
+    ownerSubject: "owner-subject",
+    recordedAt: SECOND_SAVE,
+    expectedRevision: 1,
+    setup: {
+      ...initialSetup,
+      publicCampaign: {
+        ...initialSetup.publicCampaign,
+        name: "Concurrent Northstar",
+      },
+    },
+    transition: "updated" as const,
+  };
+
+  let readSequence = 0;
+  let concurrentSave = false;
+  const racingAdapter: StorageAdapter = {
+    read: async (key) => {
+      readSequence += 1;
+      if (readSequence === 2) {
+        concurrentSave = true;
+        const committed = await baseRepository.saveSetupWithAudit(request);
+        assert.equal(committed.replayed, false);
+      }
+      return adapter.read(key);
+    },
+    list: adapter.list.bind(adapter),
+    transact: adapter.transact.bind(adapter),
+  };
+  const repository = new DevelopmentInMemoryCampaignRepository(racingAdapter);
+  const replay = await repository.saveSetupWithAudit(request);
+
+  assert.equal(concurrentSave, true);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.campaign.revision, 2);
+  assert.equal(replay.campaign.setup.publicCampaign.name, "Concurrent Northstar");
+  assert.deepEqual(
+    (await repository.listSetupHistory({ limit: 10 })).items.map(
+      ({ revision }) => revision,
+    ),
+    [1, 2],
+  );
+  assert.equal(
+    (await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }))
+      .items.length,
+    2,
+  );
+  assert.equal((await repository.readSetup())?.revision, 2);
+});
+
 test("public projection reads expose only published presentation state", async () => {
   const state = new MemoryStorageState();
   const adapter = new DeterministicMemoryStorageAdapter(state, true);
