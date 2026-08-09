@@ -367,7 +367,7 @@ async function discover(
       {
         method: "GET",
         headers: { Accept: "application/json", "Cache-Control": "no-cache" },
-        redirect: "error",
+        redirect: "manual",
       },
     );
   } catch {
@@ -538,7 +538,7 @@ function confidentialRequest(
       "Content-Type": "application/x-www-form-urlencoded",
     },
     body,
-    redirect: "error",
+    redirect: "manual",
   });
 }
 

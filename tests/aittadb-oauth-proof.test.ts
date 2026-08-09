@@ -84,7 +84,7 @@ test("confidential Authorization Code with PKCE validates discovery, token, and 
   assert.equal(harness.requests.length, 4);
   for (const request of harness.requests) {
     assert.equal(request.cookie, null);
-    assert.equal(request.redirect, "error");
+    assert.equal(request.redirect, "manual");
   }
   assert.equal(harness.requests[0]?.authorization, null);
 
@@ -240,6 +240,22 @@ test("availability reports one fixed non-secret discovery failure phase", async 
   });
   assert.equal(await throwingObserver.service.availability(), false);
   assert.deepEqual(throwingObserver.availabilityFailures, ["contract"]);
+});
+
+test("provider redirects are returned manually and rejected without following", async () => {
+  const harness = await createHarness({
+    discoveryResponse: new Response(null, {
+      status: 302,
+      headers: { location: "https://foreign.example.test/private" },
+    }),
+  });
+
+  assert.equal(await harness.service.availability(), false);
+  assert.deepEqual(harness.availabilityFailures, ["status"]);
+  assert.equal(harness.requests.length, 1);
+  assert.equal(harness.requests[0]?.redirect, "manual");
+  assert.equal(harness.requests[0]?.authorization, null);
+  assert.equal(harness.requests[0]?.cookie, null);
 });
 
 test("discovery, token, and introspection bodies are bounded and strictly parsed", async (t) => {
