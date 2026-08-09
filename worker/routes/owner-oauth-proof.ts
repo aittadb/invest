@@ -12,12 +12,15 @@ import {
   INVESTOR_APP_API_VERSION,
 } from "../../domain/public-campaign-resource.ts";
 import { negotiateRepresentation } from "../../http/content-negotiation.ts";
+import type {
+  OwnerOAuthCsrfProof,
+  OwnerOAuthCsrfSession,
+} from "../../http/owner-oauth-csrf-session.ts";
 import {
   MUTATION_CSRF_FIELD,
   MUTATION_CSRF_HEADER,
   MutationSecurityFailure,
   toPublicMutationSecurityFailure,
-  type BrowserMutationGuard,
 } from "../../http/mutation-security.ts";
 import {
   OAuthProofFailure,
@@ -35,8 +38,7 @@ type Representation = "html" | "hypermedia-json";
 
 export type OwnerOAuthProofRouteDependencies = Readonly<{
   oauth: AittaDBOAuthProofService;
-  verifyMutation: BrowserMutationGuard;
-  csrfToken: (request: Request) => Promise<string | null>;
+  csrfSession?: OwnerOAuthCsrfSession;
 }>;
 
 export function createOwnerOAuthProofRouteHandler(
@@ -54,6 +56,7 @@ export function createOwnerOAuthProofRouteHandler(
     const responseResourceUrl = callback
       ? new URL(OWNER_OAUTH_CALLBACK_PATH, context.resourceUrl).href
       : context.resourceUrl;
+    const appOrigin = new URL(responseResourceUrl).origin;
     const finish = (response: Response) =>
       callback
         ? withClearedTransactionCookie(response, dependencies.oauth.clearCookie())
@@ -117,21 +120,26 @@ export function createOwnerOAuthProofRouteHandler(
       );
     }
     if (context.request.method === "GET") {
-      const availability = await dependencies.oauth.availability()
+      const availability = dependencies.csrfSession !== undefined &&
+          await dependencies.oauth.availability()
         ? "available"
         : "unavailable";
       const resource = createOwnerOAuthProofResource(
         responseResourceUrl,
         availability,
       );
-      let csrfToken: string | null = null;
+      let csrfProof: OwnerOAuthCsrfProof | null = null;
       if (resource.start !== null) {
         try {
-          csrfToken = await dependencies.csrfToken(context.request);
+          csrfProof = await dependencies.csrfSession?.issue(
+            context.request,
+            context.actor.userId,
+            appOrigin,
+          ) ?? null;
         } catch {
-          csrfToken = null;
+          csrfProof = null;
         }
-        if (csrfToken === null || csrfToken.length < 1 || csrfToken.length > 512) {
+        if (!isUsableCsrfProof(csrfProof)) {
           return failureResponse(
             representation,
             responseResourceUrl,
@@ -141,7 +149,7 @@ export function createOwnerOAuthProofRouteHandler(
           );
         }
       }
-      return resourceResponse(representation, resource, csrfToken);
+      return resourceResponse(representation, resource, csrfProof);
     }
     if (context.request.method !== "POST") {
       return methodNotAllowedResponse(
@@ -151,8 +159,21 @@ export function createOwnerOAuthProofRouteHandler(
       );
     }
 
+    if (dependencies.csrfSession === undefined) {
+      return failureResponse(
+        representation,
+        responseResourceUrl,
+        503,
+        "service_unavailable",
+        "The connection service is temporarily unavailable.",
+      );
+    }
     try {
-      const verified = await dependencies.verifyMutation(context.request);
+      const verified = await dependencies.csrfSession.verifyMutation(
+        context.request,
+        context.actor.userId,
+        appOrigin,
+      );
       if (
         verified.method !== "POST" ||
         verified.actor.type !== "owner" ||
@@ -183,18 +204,30 @@ export function createOwnerOAuthProofRouteHandler(
 function resourceResponse(
   representation: Representation,
   resource: OwnerOAuthProofResource,
-  csrfToken: string | null,
+  csrfProof: OwnerOAuthCsrfProof | null,
 ): Response {
   const response = representation === "hypermedia-json"
     ? withPrivateHeaders(hypermediaResponse(resource.document))
-    : privateHtmlResponse(renderConnectionResource(resource, csrfToken));
-  if (csrfToken === null) return response;
+    : privateHtmlResponse(renderConnectionResource(resource, csrfProof?.token ?? null));
+  if (csrfProof === null) return response;
   const headers = new Headers(response.headers);
-  headers.set(MUTATION_CSRF_HEADER, csrfToken);
+  headers.set(MUTATION_CSRF_HEADER, csrfProof.token);
+  headers.append("Set-Cookie", csrfProof.setCookie);
   return new Response(response.body, {
     status: response.status,
     headers,
   });
+}
+
+function isUsableCsrfProof(value: OwnerOAuthCsrfProof | null): value is OwnerOAuthCsrfProof {
+  return value !== null &&
+    typeof value.token === "string" &&
+    value.token.length >= 32 &&
+    value.token.length <= 256 &&
+    /^[A-Za-z0-9_-]+$/.test(value.token) &&
+    typeof value.setCookie === "string" &&
+    value.setCookie.length > 0 &&
+    value.setCookie.length <= 4_096;
 }
 
 function resultResponse(

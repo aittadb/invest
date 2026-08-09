@@ -5,11 +5,12 @@ import {
   OWNER_OAUTH_CALLBACK_PATH,
   OWNER_OAUTH_PROOF_PATH,
 } from "../domain/owner-oauth-proof-resource.ts";
-import { parseActorSubject, parseTimestamp } from "../domain/foundation.ts";
 import {
-  createBrowserMutationGuard,
-  hashCsrfToken,
+  MUTATION_CSRF_HEADER,
 } from "../http/mutation-security.ts";
+import {
+  createOwnerOAuthCsrfSession,
+} from "../http/owner-oauth-csrf-session.ts";
 import {
   OWNER_AITTADB_CONNECTION_HEADER,
 } from "../http/runtime-capabilities.ts";
@@ -38,7 +39,7 @@ const OWNER_SUBJECT = "owner-subject";
 const AITTADB_SUBJECT = "11111111-1111-4111-8111-111111111111";
 const ACCESS_TOKEN_ID = "22222222-2222-4222-8222-222222222222";
 const OWNER_EMAIL = "owner@example.test";
-const CSRF = "csrf-proof-token-with-enough-entropy";
+const CSRF = deterministicToken(192);
 const NOW = new Date("2026-08-09T12:00:00.000Z");
 const NOW_SECONDS = Math.floor(NOW.valueOf() / 1_000);
 const HYPERMEDIA = "application/vnd.aittadb-invest+json; version=0.1";
@@ -49,23 +50,40 @@ const executionContext: WorkerExecutionContext = {
 };
 
 test("owner connection HTML form and hypermedia action share one capability", async () => {
-  const harness = await routeHarness();
-  const html = requiredResponse(await harness.handler(context(
+  const htmlHarness = await routeHarness();
+  const html = requiredResponse(await htmlHarness.handler(context(
     `${ORIGIN}${OWNER_OAUTH_PROOF_PATH}`,
     { accept: "text/html" },
   )));
   assert.equal(html.status, 200);
-  assert.equal(html.headers.get("x-investor-app-csrf"), CSRF);
+  const htmlCsrf = requiredHeader(html, MUTATION_CSRF_HEADER);
+  const htmlCookie = cookieHeader(requiredHeader(html, "set-cookie"));
   const htmlBody = await html.text();
   assert.match(htmlBody, /<h1>AittaDB connection<\/h1>/u);
   assert.match(
     htmlBody,
     new RegExp(`action="${ORIGIN}${OWNER_OAUTH_PROOF_PATH}" method="post"`, "u"),
   );
-  assert.match(htmlBody, new RegExp(`name="_csrf" value="${CSRF}"`, "u"));
+  assert.match(htmlBody, new RegExp(`name="_csrf" value="${htmlCsrf}"`, "u"));
   assert.match(htmlBody, />Verify connection<\/button>/u);
+  assertOwnerCsrfCookie(requiredHeader(html, "set-cookie"));
+  const htmlStart = requiredResponse(await htmlHarness.handler(context(
+    `${ORIGIN}${OWNER_OAUTH_PROOF_PATH}`,
+    {
+      method: "POST",
+      headers: {
+        accept: "text/html",
+        cookie: htmlCookie,
+        origin: ORIGIN,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: `_csrf=${encodeURIComponent(htmlCsrf)}`,
+    },
+  )));
+  assert.equal(htmlStart.status, 303);
 
-  const json = requiredResponse(await harness.handler(context(
+  const jsonHarness = await routeHarness();
+  const json = requiredResponse(await jsonHarness.handler(context(
     `${ORIGIN}${OWNER_OAUTH_PROOF_PATH}`,
     { accept: HYPERMEDIA },
   )));
@@ -81,7 +99,23 @@ test("owner connection HTML form and hypermedia action share one capability", as
     type: "application/x-www-form-urlencoded",
     fields: [],
   }]);
-  assert.equal(json.headers.get("x-investor-app-csrf"), CSRF);
+  const jsonCsrf = requiredHeader(json, MUTATION_CSRF_HEADER);
+  assertOwnerCsrfCookie(requiredHeader(json, "set-cookie"));
+  const jsonStart = requiredResponse(await jsonHarness.handler(context(
+    `${ORIGIN}${OWNER_OAUTH_PROOF_PATH}`,
+    {
+      method: "POST",
+      headers: {
+        accept: HYPERMEDIA,
+        cookie: cookieHeader(requiredHeader(json, "set-cookie")),
+        origin: ORIGIN,
+        "content-type": "application/json",
+        [MUTATION_CSRF_HEADER]: jsonCsrf,
+      },
+      body: JSON.stringify({}),
+    },
+  )));
+  assert.equal(jsonStart.status, 303);
   assertPrivateResponse(html);
   assertPrivateResponse(json);
 });
@@ -107,23 +141,17 @@ test("initiation requires the configured owner, exact origin, and CSRF before di
   assert.equal(foreign.status, 404);
   assert.equal(foreignHarness.networkRequests.length, 0);
 
-  for (const [name, headers, body] of [
-    [
-      "origin",
-      { accept: HYPERMEDIA, "content-type": "application/x-www-form-urlencoded" },
-      `_csrf=${encodeURIComponent(CSRF)}`,
-    ],
-    [
-      "csrf",
-      {
-        accept: HYPERMEDIA,
-        origin: ORIGIN,
-        "content-type": "application/x-www-form-urlencoded",
-      },
-      "_csrf=wrong-token",
-    ],
-  ] as const) {
+  for (const name of ["origin", "csrf"] as const) {
     const harness = await routeHarness();
+    const headers = new Headers({
+      accept: HYPERMEDIA,
+      cookie: cookieHeader(harness.csrfProof.setCookie),
+      "content-type": "application/x-www-form-urlencoded",
+    });
+    if (name === "csrf") headers.set("origin", ORIGIN);
+    const body = name === "csrf"
+      ? "_csrf=wrong-token"
+      : `_csrf=${encodeURIComponent(CSRF)}`;
     const response = requiredResponse(await harness.handler(context(
       `${ORIGIN}${OWNER_OAUTH_PROOF_PATH}`,
       { method: "POST", headers, body },
@@ -140,6 +168,7 @@ test("initiation requires the configured owner, exact origin, and CSRF before di
       method: "POST",
       headers: {
         accept: "text/html",
+        cookie: cookieHeader(validHarness.csrfProof.setCookie),
         origin: ORIGIN,
         "content-type": "application/x-www-form-urlencoded",
       },
@@ -164,6 +193,7 @@ test("callback validates once, clears its cookie, and returns no credentials", a
       method: "POST",
       headers: {
         accept: "text/html",
+        cookie: cookieHeader(harness.csrfProof.setCookie),
         origin: ORIGIN,
         "content-type": "application/x-www-form-urlencoded",
       },
@@ -293,8 +323,41 @@ test("application worker exposes the route and trusted UI capability only when i
   );
 });
 
+test("missing CSRF capability omits initiation and rejects direct mutation", async () => {
+  const harness = await routeHarness();
+  const handler = createOwnerOAuthProofRouteHandler({ oauth: harness.service });
+  const resource = requiredResponse(await handler(context(
+    `${ORIGIN}${OWNER_OAUTH_PROOF_PATH}`,
+    { accept: HYPERMEDIA },
+  )));
+  assert.equal(resource.status, 200);
+  const document = await resource.json();
+  assert.equal(document.data.availability, "unavailable");
+  assert.deepEqual(document.actions, []);
+  assert.equal(resource.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.equal(resource.headers.get("set-cookie"), null);
+  assert.equal(harness.networkRequests.length, 0);
+
+  const direct = requiredResponse(await handler(context(
+    `${ORIGIN}${OWNER_OAUTH_PROOF_PATH}`,
+    {
+      method: "POST",
+      headers: {
+        accept: HYPERMEDIA,
+        origin: ORIGIN,
+        "content-type": "application/json",
+        [MUTATION_CSRF_HEADER]: CSRF,
+      },
+      body: JSON.stringify({}),
+    },
+  )));
+  assert.equal(direct.status, 503);
+  assert.equal((await direct.json()).data.code, "service_unavailable");
+  assert.equal(harness.networkRequests.length, 0);
+});
+
 async function routeHarness() {
-  const key = await crypto.subtle.importKey(
+  const transactionKey = await crypto.subtle.importKey(
     "raw",
     Uint8Array.from({ length: 32 }, (_, index) => index + 1),
     "AES-GCM",
@@ -316,7 +379,7 @@ async function routeHarness() {
       "storage.delete",
     ],
     requestedStorageScopes: ["storage.read", "storage.write"],
-    transactionCookieKey: key,
+    transactionCookieKey: transactionKey,
     transactionTtlSeconds: 300,
     transactionClaimStore: {
       async claim(transaction) {
@@ -390,29 +453,42 @@ async function routeHarness() {
     },
   };
   const oauth = createAittaDBOAuthProofService(oauthDependencies);
-  const ownerSubject = parseActorSubject(OWNER_SUBJECT);
-  const sessionExpiry = parseTimestamp("2026-08-09T13:00:00.000Z");
-  const csrfExpiry = parseTimestamp("2026-08-09T12:30:00.000Z");
-  assert(ownerSubject.ok);
-  assert(sessionExpiry.ok);
-  assert(csrfExpiry.ok);
-  const csrfHash = await hashCsrfToken(CSRF);
+  const csrfCookieKey = await crypto.subtle.importKey(
+    "raw",
+    Uint8Array.from({ length: 32 }, (_, index) => index + 33),
+    "AES-GCM",
+    false,
+    ["encrypt", "decrypt"],
+  );
+  let csrfRandomCall = 0;
+  const csrfSession = createOwnerOAuthCsrfSession({
+    appOrigin: ORIGIN,
+    cookieKey: csrfCookieKey,
+    now: () => NOW,
+    ttlSeconds: 300,
+    randomBytes(length) {
+      const seed = 192 + csrfRandomCall * 32;
+      csrfRandomCall += 1;
+      return Uint8Array.from(
+        { length },
+        (_, index) => (seed + index) % 256,
+      );
+    },
+  });
+  const csrfProof = await csrfSession.issue(
+    new Request(`${ORIGIN}${OWNER_OAUTH_PROOF_PATH}`),
+    OWNER_SUBJECT,
+    ORIGIN,
+  );
+  assert.equal(csrfProof.token, CSRF);
   const dependencies = {
     oauth,
-    verifyMutation: createBrowserMutationGuard({
-      allowedOrigins: [ORIGIN],
-      now: () => NOW,
-      resolveSession: async () => ({
-        actor: { type: "owner" as const, subject: ownerSubject.value },
-        expiresAt: sessionExpiry.value,
-        csrf: { tokenHash: csrfHash, expiresAt: csrfExpiry.value },
-      }),
-    }),
-    csrfToken: async () => CSRF,
+    csrfSession,
   };
   return {
     service: oauth,
     dependencies,
+    csrfProof,
     handler: createOwnerOAuthProofRouteHandler(dependencies),
     networkRequests,
     get proofs() {
@@ -502,6 +578,13 @@ function assertPrivateResponse(response: Response): void {
   assert.equal(response.headers.get("referrer-policy"), "no-referrer");
   assert.equal(response.headers.get("x-content-type-options"), "nosniff");
   assert.match(response.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/u);
+}
+
+function assertOwnerCsrfCookie(setCookie: string): void {
+  assert.match(setCookie, /Path=\/owner\/aittadb-connection/u);
+  assert.match(setCookie, /Max-Age=300/u);
+  assert.match(setCookie, /Secure; HttpOnly; SameSite=Lax/u);
+  assert.doesNotMatch(setCookie, /Domain=/iu);
 }
 
 function assertSecretsAbsent(
