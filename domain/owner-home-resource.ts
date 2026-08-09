@@ -25,6 +25,7 @@ export type OwnerHomeDocument = Readonly<{
 export type OwnerHomeCapabilities = Readonly<{
   founderApplicationReview?: boolean;
   aggregateReconciliation?: boolean;
+  auditNotificationHistory?: boolean;
 }>;
 
 export function createOwnerHomeDocument(
@@ -65,6 +66,18 @@ export function createOwnerHomeDocument(
           href: absolute("/owner/aggregate-reconciliation"),
         }]
         : []),
+      ...(capabilities.auditNotificationHistory
+        ? [
+          {
+            rel: ["audit-events"],
+            href: absolute("/owner/audit-events"),
+          },
+          {
+            rel: ["manual-notifications"],
+            href: absolute("/owner/manual-notifications"),
+          },
+        ]
+        : []),
     ],
     actions: [
       {
@@ -75,6 +88,26 @@ export function createOwnerHomeDocument(
         type: "text/html",
         fields: [],
       },
+      ...(capabilities.auditNotificationHistory
+        ? [
+          {
+            name: "review-audit-events",
+            title: "Review audit events",
+            href: absolute("/owner/audit-events"),
+            method: "GET" as const,
+            type: "text/html" as const,
+            fields: [],
+          },
+          {
+            name: "review-manual-notifications",
+            title: "Review manual notifications",
+            href: absolute("/owner/manual-notifications"),
+            method: "GET" as const,
+            type: "text/html" as const,
+            fields: [],
+          },
+        ]
+        : []),
     ],
   };
 }

@@ -1,0 +1,547 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  createManualNotificationRecord,
+  markManualNotificationSent,
+  parseManualNotificationTemplate,
+  recordManualNotificationCopy,
+  type AuditEvent,
+  type ManualNotificationRecord,
+} from "../domain/audit-notification.ts";
+import {
+  parseActorSubject,
+  parseStableId,
+  parseTimestamp,
+} from "../domain/foundation.ts";
+import type { HypermediaAction } from "../domain/hypermedia-action.ts";
+import { createOwnerHomeDocument } from "../domain/owner-home-resource.ts";
+import type {
+  OwnerAuditCollectionDocument,
+  OwnerNotificationCollectionDocument,
+  OwnerNotificationDetailDocument,
+} from "../domain/owner-audit-notification-resource.ts";
+import {
+  StorageFailure,
+  parseStorageOperationId,
+  type StorageCursor,
+  type StorageOperationId,
+} from "../domain/storage-adapter.ts";
+import {
+  MUTATION_CSRF_FIELD,
+  MUTATION_CSRF_HEADER,
+  createBrowserMutationGuard,
+  hashCsrfToken,
+} from "../http/mutation-security.ts";
+import type {
+  AuditAppendResult,
+  AuditEventPage,
+  AuditListRequest,
+  AuditedManualNotificationActivityRequest,
+  AuditedManualNotificationMutationResult,
+  ManualNotificationPage,
+  ManualNotificationSnapshot,
+} from "../repositories/in-memory-audit-notification-repositories.ts";
+import {
+  createOwnerAuditNotificationHistoryRouteHandler,
+} from "../worker/routes/owner-audit-notification-history.ts";
+import type {
+  ApplicationRouteContext,
+  AuthenticatedActor,
+} from "../worker/contracts.ts";
+
+const APP_ORIGIN = "https://instance.example";
+const INTERNAL_ORIGIN = "https://worker.internal";
+const OWNER_SUBJECT = "oidc:configured-owner";
+const OWNER_EMAIL = "owner@example.com";
+const CSRF_TOKEN = "owner_csrf_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+test("owner audit and notification collections are finite, canonical, and non-disclosing", async () => {
+  const fixture = await routeFixture();
+  fixture.audit.events.push(
+    auditEvent("audit:event-1", "audit:operation-1", "export-created"),
+    auditEvent("audit:event-2", "audit:operation-2", "resource-transition"),
+  );
+  fixture.notifications.seed(notificationRecord("notification:first", "First notice"));
+  fixture.notifications.seed(notificationRecord("notification:second", "Second notice"));
+
+  const auditResponse = await fixture.request(
+    "/owner/audit-events?page_size=1",
+    { accept: "application/json", actor: "owner" },
+  );
+  assert.equal(auditResponse.status, 200);
+  const audit = await auditResponse.json() as OwnerAuditCollectionDocument;
+  assert.equal(audit.data.items.length, 1);
+  assert.equal(audit.data.items[0]?.detail.kind, "export-created");
+  const auditNext = audit.links.find((link) => link.rel.includes("next"));
+  assert.match(auditNext?.href ?? "", /^https:\/\/instance\.example\//u);
+  assert.doesNotMatch(JSON.stringify(audit), /worker\.internal|credential|private note/iu);
+
+  const notificationResponse = await fixture.request(
+    "/owner/manual-notifications?page_size=1",
+    { accept: "application/json", actor: "owner" },
+  );
+  assert.equal(notificationResponse.status, 200);
+  const notifications = await notificationResponse.json() as OwnerNotificationCollectionDocument;
+  assert.equal(notifications.data.items.length, 1);
+  assert.equal(notifications.data.items[0]?.subject_line, "First notice");
+  assert.match(
+    notifications.links.find((link) => link.rel.includes("item"))?.href ?? "",
+    /^https:\/\/instance\.example\/owner\/manual-notifications\//u,
+  );
+
+  const html = await fixture.request(
+    "/owner/manual-notifications?page_size=1",
+    { accept: "text/html", actor: "owner" },
+  );
+  const htmlBody = await html.text();
+  assert.equal(html.status, 200);
+  assert.match(htmlBody, /First notice/u);
+  assert.doesNotMatch(htmlBody, /Second notice/u);
+
+  const badPage = await fixture.request(
+    "/owner/audit-events?page_size=101&unexpected=value",
+    { accept: "application/json", actor: "owner" },
+  );
+  assert.equal(badPage.status, 400);
+  assert.deepEqual(fixture.audit.lastListLimits, [1]);
+
+  const anonymous = await fixture.request("/owner/manual-notifications", {
+    accept: "application/json",
+    actor: "anonymous",
+  });
+  assert.equal(anonymous.status, 401);
+  const foreign = await fixture.request("/owner/manual-notifications", {
+    accept: "application/json",
+    actor: "foreign",
+  });
+  assert.equal(foreign.status, 404);
+  assert.doesNotMatch(await foreign.text(), /First notice|notification:first/u);
+
+  const home = createOwnerHomeDocument(
+    `${APP_ORIGIN}/owner`,
+    { displayName: "Owner", email: OWNER_EMAIL },
+    null,
+    { auditNotificationHistory: true },
+  );
+  assert.ok(home.links.some((link) => link.rel.includes("audit-events")));
+  assert.ok(home.links.some((link) => link.rel.includes("manual-notifications")));
+});
+
+test("notification copy and sent markers use separate guarded atomic actions", async () => {
+  const fixture = await routeFixture();
+  fixture.notifications.seed(
+    notificationRecord("notification:activity", "Private notice", "Private template body."),
+  );
+
+  const jsonResponse = await fixture.request(
+    "/owner/manual-notifications/notification%3Aactivity",
+    { accept: "application/json", actor: "owner" },
+  );
+  assert.equal(jsonResponse.status, 200);
+  assert.equal(jsonResponse.headers.get(MUTATION_CSRF_HEADER), CSRF_TOKEN);
+  let document = await jsonResponse.json() as OwnerNotificationDetailDocument;
+  assert.deepEqual(
+    document.actions.map((action) => action.name).sort(),
+    ["mark-notification-sent", "record-notification-template-copy"],
+  );
+
+  const htmlResponse = await fixture.request(
+    "/owner/manual-notifications/notification%3Aactivity",
+    { accept: "text/html", actor: "owner" },
+  );
+  const html = await htmlResponse.text();
+  assert.equal(htmlResponse.status, 200);
+  assert.equal(htmlResponse.headers.get(MUTATION_CSRF_HEADER), CSRF_TOKEN);
+  assert.deepEqual(actionNamesFromHtml(html), actionNamesFromDocument(document));
+  assert.match(html, new RegExp(`name="${MUTATION_CSRF_FIELD}" value="${CSRF_TOKEN}"`));
+
+  const copyAction = requiredAction(document, "record-notification-template-copy");
+  const rejected = await fixture.submit(copyAction, {
+    extra: "must-not-be-accepted",
+  });
+  assert.equal(rejected.status, 400);
+  assert.equal(fixture.notifications.current("notification:activity")?.revision, 1);
+
+  const crossOrigin = await fixture.submit(copyAction, {}, {
+    origin: "https://attacker.example",
+  });
+  assert.equal(crossOrigin.status, 403);
+  assert.equal(fixture.notifications.current("notification:activity")?.revision, 1);
+
+  const copied = await fixture.submit(copyAction);
+  assert.equal(copied.status, 200);
+  document = await copied.json() as OwnerNotificationDetailDocument;
+  assert.equal(document.data.revision, 2);
+  assert.equal(document.data.copy_history.length, 1);
+  assert.equal(document.data.sent_marker, null);
+  const copiedAudit = fixture.audit.events.at(-1);
+  assert.equal(copiedAudit?.detail.kind, "manual-notification");
+  assert.equal(
+    copiedAudit?.detail.kind === "manual-notification"
+      ? copiedAudit.detail.activity
+      : null,
+    "template-copied",
+  );
+
+  const sentAction = requiredAction(document, "mark-notification-sent");
+  const sent = await fixture.submit(sentAction);
+  assert.equal(sent.status, 200);
+  document = await sent.json() as OwnerNotificationDetailDocument;
+  assert.equal(document.data.revision, 3);
+  assert.equal(document.data.copy_history.length, 1);
+  assert.equal(document.data.delivery_state, "marked-sent");
+  assert.ok(document.data.sent_marker);
+  assert.equal(
+    document.actions.some((action) => action.name === "mark-notification-sent"),
+    false,
+  );
+  assert.equal(
+    document.actions.some(
+      (action) => action.name === "record-notification-template-copy",
+    ),
+    true,
+  );
+  assert.deepEqual(
+    fixture.audit.events.slice(-2).map((event) =>
+      event.detail.kind === "manual-notification" ? event.detail.activity : null
+    ),
+    ["template-copied", "sent-marked"],
+  );
+
+  const staleSent = await fixture.submit(sentAction);
+  assert.equal(staleSent.status, 412);
+  assert.equal(fixture.notifications.current("notification:activity")?.revision, 3);
+
+  const denied = await fixture.request(
+    "/owner/manual-notifications/notification%3Aactivity",
+    { accept: "application/json", actor: "foreign" },
+  );
+  assert.equal(denied.status, 404);
+  assert.doesNotMatch(await denied.text(), /Private notice|Private template body/u);
+});
+
+async function routeFixture() {
+  const audit = new FakeAuditRepository();
+  const notifications = new FakeNotificationRepository(audit);
+  const csrfHash = await hashCsrfToken(CSRF_TOKEN);
+  const guard = createBrowserMutationGuard({
+    allowedOrigins: [APP_ORIGIN],
+    now: () => new Date("2026-08-09T12:00:00.000Z"),
+    resolveSession: async () => ({
+      actor: { type: "owner", subject: actorSubject(OWNER_SUBJECT) },
+      expiresAt: timestamp("2026-08-09T13:00:00.000Z"),
+      csrf: {
+        tokenHash: csrfHash,
+        expiresAt: timestamp("2026-08-09T12:30:00.000Z"),
+      },
+    }),
+  });
+  let operation = 0;
+  let second = 0;
+  const handler = createOwnerAuditNotificationHistoryRouteHandler({
+    audit,
+    notifications,
+    verifyMutation: guard,
+    csrfToken: async () => CSRF_TOKEN,
+    issueOperationId: () => operationId(`notification-action:${++operation}`),
+    now: () => new Date(`2026-08-09T12:00:${String(second++).padStart(2, "0")}.000Z`),
+  });
+
+  const request = async (
+    path: string,
+    options: Readonly<{
+      accept: string;
+      actor: "owner" | "foreign" | "anonymous";
+    }>,
+  ): Promise<Response> => {
+    const url = new URL(path, INTERNAL_ORIGIN);
+    const request = new Request(url, {
+      headers: identityHeaders(options.accept, options.actor),
+    });
+    const response = await handler(routeContext(request, options.actor));
+    assert.ok(response);
+    return response;
+  };
+
+  const submit = async (
+    action: HypermediaAction,
+    extras: Readonly<Record<string, string>> = {},
+    options: Readonly<{ origin?: string }> = {},
+  ): Promise<Response> => {
+    const body = new URLSearchParams();
+    for (const field of action.fields) {
+      const value = field.value ?? field.default;
+      if (value !== undefined) body.set(field.name, String(value));
+    }
+    for (const [key, value] of Object.entries(extras)) body.set(key, value);
+    body.set(MUTATION_CSRF_FIELD, CSRF_TOKEN);
+    const request = new Request(action.href, {
+      method: "POST",
+      headers: {
+        ...identityHeaders("application/json", "owner"),
+        "content-type": "application/x-www-form-urlencoded",
+        origin: options.origin ?? APP_ORIGIN,
+      },
+      body,
+    });
+    const response = await handler(routeContext(request, "owner"));
+    assert.ok(response);
+    return response;
+  };
+
+  return { audit, notifications, request, submit };
+}
+
+class FakeAuditRepository {
+  readonly events: AuditEvent[] = [];
+  readonly lastListLimits: number[] = [];
+
+  async append(): Promise<AuditAppendResult> {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+
+  async get(id: unknown): Promise<AuditEvent | null> {
+    return this.events.find((event) => event.id === id) ?? null;
+  }
+
+  async list(request: AuditListRequest): Promise<AuditEventPage> {
+    this.lastListLimits.push(request.limit);
+    const offset = cursorOffset(request.cursor);
+    const items = this.events.slice(offset, offset + request.limit);
+    const next = offset + items.length < this.events.length
+      ? cursor(offset + items.length)
+      : null;
+    return Object.freeze({ items: Object.freeze(items), nextCursor: next });
+  }
+}
+
+class FakeNotificationRepository {
+  readonly activityConsistency = "atomic-notification-audit" as const;
+  readonly #audit: FakeAuditRepository;
+  readonly #records = new Map<string, ManualNotificationSnapshot>();
+
+  constructor(audit: FakeAuditRepository) {
+    this.#audit = audit;
+  }
+
+  seed(record: ManualNotificationRecord): void {
+    this.#records.set(record.template.id, Object.freeze({ revision: 1, record }));
+  }
+
+  current(id: string): ManualNotificationSnapshot | null {
+    return this.#records.get(id) ?? null;
+  }
+
+  async get(id: unknown): Promise<ManualNotificationSnapshot | null> {
+    return typeof id === "string" ? this.current(id) : null;
+  }
+
+  async list(request: Readonly<{ limit: number; cursor?: StorageCursor }>): Promise<ManualNotificationPage> {
+    const values = [...this.#records.values()];
+    const offset = cursorOffset(request.cursor);
+    const items = values.slice(offset, offset + request.limit);
+    const next = offset + items.length < values.length
+      ? cursor(offset + items.length)
+      : null;
+    return Object.freeze({ items: Object.freeze(items), nextCursor: next });
+  }
+
+  async recordCopyWithAudit(
+    request: AuditedManualNotificationActivityRequest,
+  ): Promise<AuditedManualNotificationMutationResult> {
+    return this.#activity(request, "template-copied");
+  }
+
+  async markSentWithAudit(
+    request: AuditedManualNotificationActivityRequest,
+  ): Promise<AuditedManualNotificationMutationResult> {
+    return this.#activity(request, "sent-marked");
+  }
+
+  async #activity(
+    request: AuditedManualNotificationActivityRequest,
+    activity: "template-copied" | "sent-marked",
+  ): Promise<AuditedManualNotificationMutationResult> {
+    const id = String(request.notificationId);
+    const current = this.#records.get(id);
+    if (current === undefined) throw new StorageFailure("NOT_FOUND");
+    if (request.expectedRevision !== current.revision) {
+      throw new StorageFailure("PRECONDITION_FAILED");
+    }
+    const operation = operationId(request.operationId);
+    const occurredAt = timestamp(request.occurredAt);
+    const owner = actorSubject(request.ownerSubject);
+    const changed = activity === "template-copied"
+      ? recordManualNotificationCopy(current.record, {
+          id: stableId<"manual-notification-copy">(`copy:${operation}`),
+          copiedAt: occurredAt,
+          copiedBy: { type: "owner", subject: owner },
+        })
+      : markManualNotificationSent(current.record, {
+          id: stableId<"manual-notification-sent-marker">(`sent:${operation}`),
+          sentAt: occurredAt,
+          sentBy: { type: "owner", subject: owner },
+        });
+    if (!changed.ok) throw new StorageFailure("INVALID_REQUEST");
+    const snapshot = Object.freeze({
+      revision: current.revision + 1,
+      record: changed.value,
+    });
+    this.#records.set(id, snapshot);
+    const event: AuditEvent = Object.freeze({
+      id: stableId<"audit-event">(`audit:${operation}`),
+      operationId: stableId<"audit-operation">(operation),
+      occurredAt,
+      actor: Object.freeze({ type: "owner", subject: owner }),
+      detail: Object.freeze({
+        kind: "manual-notification",
+        notificationId: stableId<"manual-notification">(id),
+        activity,
+      }),
+    });
+    this.#audit.events.push(event);
+    return Object.freeze({ ...snapshot, replayed: false, auditEvent: event });
+  }
+}
+
+function routeContext(
+  request: Request,
+  actorKind: "owner" | "foreign" | "anonymous",
+): ApplicationRouteContext {
+  const url = new URL(request.url);
+  const actor = actorKind === "anonymous"
+    ? null
+    : authenticatedActor(
+        actorKind === "owner" ? OWNER_SUBJECT : "oidc:foreign",
+        actorKind === "owner" ? OWNER_EMAIL : "foreign@example.com",
+      );
+  return {
+    request,
+    url,
+    resourceUrl: new URL(`${url.pathname}${url.search}`, `${APP_ORIGIN}/`).href,
+    actor,
+    isOwner: actorKind === "owner",
+    participantAccess: null,
+    campaign: null,
+    renderApplication: async () => new Response("fallback"),
+  };
+}
+
+function identityHeaders(
+  accept: string,
+  actor: "owner" | "foreign" | "anonymous",
+): HeadersInit {
+  if (actor === "anonymous") return { accept };
+  return {
+    accept,
+    "oai-authenticated-user-id": actor === "owner" ? OWNER_SUBJECT : "oidc:foreign",
+    "oai-authenticated-user-email": actor === "owner" ? OWNER_EMAIL : "foreign@example.com",
+  };
+}
+
+function authenticatedActor(userId: string, email: string): AuthenticatedActor {
+  return { userId, email, displayName: email };
+}
+
+function notificationRecord(
+  id: string,
+  subjectLine: string,
+  body = "Bounded notification body.",
+): ManualNotificationRecord {
+  const parsed = parseManualNotificationTemplate({
+    id,
+    purposeId: `purpose:${id}`,
+    recipientSubject: "oidc:participant",
+    relatedResource: {
+      type: "investment-indication",
+      id: `resource:${id}`,
+    },
+    subjectLine,
+    body,
+    generatedAt: "2026-08-09T10:00:00.000Z",
+    generatedBy: { type: "owner", subject: OWNER_SUBJECT },
+  });
+  assert(parsed.ok);
+  return createManualNotificationRecord(parsed.value);
+}
+
+function auditEvent(
+  id: string,
+  operation: string,
+  kind: "export-created" | "resource-transition",
+): AuditEvent {
+  return Object.freeze({
+    id: stableId<"audit-event">(id),
+    operationId: stableId<"audit-operation">(operation),
+    occurredAt: timestamp("2026-08-09T10:00:00.000Z"),
+    actor: Object.freeze({ type: "owner", subject: actorSubject(OWNER_SUBJECT) }),
+    detail: kind === "export-created"
+      ? Object.freeze({ kind, exportType: "review-csv" })
+      : Object.freeze({
+          kind,
+          resource: Object.freeze({
+            type: "campaign" as const,
+            id: stableId<"audit-resource">("resource:campaign"),
+          }),
+          transition: "updated",
+        }),
+  });
+}
+
+function requiredAction(
+  document: OwnerNotificationDetailDocument,
+  name: string,
+): HypermediaAction {
+  const action = document.actions.find((candidate) => candidate.name === name);
+  assert.ok(action, `Missing action ${name}`);
+  return action;
+}
+
+function actionNamesFromDocument(
+  document: OwnerNotificationDetailDocument,
+): string[] {
+  return document.actions.map((action) => action.name).sort();
+}
+
+function actionNamesFromHtml(html: string): string[] {
+  return [...html.matchAll(/data-action="([a-z0-9-]+)"/g)]
+    .map((match) => match[1] ?? "")
+    .filter(Boolean)
+    .sort();
+}
+
+function actorSubject(value: unknown) {
+  const parsed = parseActorSubject(value);
+  assert(parsed.ok);
+  return parsed.value;
+}
+
+function timestamp(value: unknown) {
+  const parsed = parseTimestamp(value);
+  assert(parsed.ok);
+  return parsed.value;
+}
+
+function stableId<Entity extends string>(value: unknown) {
+  const parsed = parseStableId<Entity>(value);
+  assert(parsed.ok);
+  return parsed.value;
+}
+
+function operationId(value: unknown): StorageOperationId {
+  const parsed = parseStorageOperationId(value);
+  assert(parsed.ok);
+  return parsed.value;
+}
+
+function cursor(offset: number): StorageCursor {
+  return `offset:${offset}` as StorageCursor;
+}
+
+function cursorOffset(value: StorageCursor | undefined): number {
+  if (value === undefined) return 0;
+  const match = /^offset:(\d+)$/.exec(value);
+  if (!match) throw new StorageFailure("INVALID_REQUEST");
+  return Number(match[1]);
+}

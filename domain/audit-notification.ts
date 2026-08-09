@@ -185,9 +185,11 @@ const RESOURCE_TRANSITIONS = [
 ] as const;
 const EXPORT_TYPES = ["review-csv", "json-backup"] as const;
 const NOTIFICATION_ACTIVITIES = ["template-copied", "sent-marked"] as const;
-const MAX_NOTIFICATION_SUBJECT_LENGTH = 200;
-const MAX_NOTIFICATION_BODY_LENGTH = 20_000;
-const MAX_COPY_EVIDENCE = 64;
+export const MANUAL_NOTIFICATION_LIMITS = Object.freeze({
+  subjectLength: 200,
+  bodyLength: 20_000,
+  copyEvidence: 64,
+});
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
 
@@ -258,14 +260,14 @@ export function parseManualNotificationTemplate(
   const subjectLine = parseBoundedText(
     source.subjectLine,
     "notificationTemplate.subjectLine",
-    MAX_NOTIFICATION_SUBJECT_LENGTH,
+    MANUAL_NOTIFICATION_LIMITS.subjectLength,
     false,
   );
   if (!subjectLine.ok) return subjectLine;
   const body = parseBoundedText(
     source.body,
     "notificationTemplate.body",
-    MAX_NOTIFICATION_BODY_LENGTH,
+    MANUAL_NOTIFICATION_LIMITS.bodyLength,
     true,
   );
   if (!body.ok) return body;
@@ -327,7 +329,7 @@ export function recordManualNotificationCopy(
       ? valid(record)
       : invalid({ code: "invalid_rule", path: "copyEvidence.id" });
   }
-  if (record.copyEvidence.length >= MAX_COPY_EVIDENCE) {
+  if (record.copyEvidence.length >= MANUAL_NOTIFICATION_LIMITS.copyEvidence) {
     return invalid({ code: "out_of_range", path: "copyEvidence" });
   }
 

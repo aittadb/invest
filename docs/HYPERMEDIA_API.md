@@ -128,6 +128,32 @@ Create and edit accept bounded expertise, intended contribution, configured prim
 
 The route obtains a participant-bound application service from an injected factory. The trusted route or mutation actor selects that factory; body fields cannot select a subject. Founder mutations call only the founder repository, so an account's investment indications are neither prerequisites nor side effects.
 
+## Owner Activity Resources
+
+`GET /owner/audit-events` exposes a finite owner-only collection of allowlisted
+audit evidence. `page_size` is bounded to 1 through 100, and an opaque `cursor`
+selects the next page. Event data includes occurrence time, trusted actor type,
+and the closed resource-transition, export-class, or notification-activity
+detail. It has no field for export contents, notification templates, arbitrary
+notes, credentials, or internal causes.
+
+`GET /owner/manual-notifications` pages bounded private notification summaries.
+`GET /owner/manual-notifications/{notification-id}` exposes the selected
+template, its copy history, and its independent sent marker to the configured
+owner. The detail advertises `record-notification-template-copy` while the copy
+history limit permits another entry, and advertises `mark-notification-sent`
+only until a sent marker exists. Both are `POST` actions carrying hidden,
+server-issued `operation-id` and `expected-revision` fields.
+
+HTML and version `0.1` hypermedia JSON come from the same collection or detail
+resource. When a detail has a mutation, both representations return a validated
+CSRF proof: native forms receive a hidden field and JSON clients receive the
+designated response header. Mutation bodies accept exactly the advertised
+fields after transport values are removed. A copy action and sent action commit
+their notification revision and distinct allowlisted audit event through the
+same atomic repository capability; the route fails closed if that capability is
+not present.
+
 ## Identity and Authorization
 
 The signed-out campaign document contains only public state and sign-in transitions. A valid participant session can add links and actions for the private package and that participant's records. The participant decision starts with a parsed trusted account and a credential-bound state reader; query, form, JSON, and client-supplied participant headers cannot assert the subject or package grant. An owner session can add owner operations only after a separate owner authorization decision.

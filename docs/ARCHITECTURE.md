@@ -185,6 +185,22 @@ Manual notification templates remain private and bounded. Copy evidence means on
 
 Notification keys are one-way derived, stored records are reconstructed through the bounded domain transitions, and every prior revision is verified before current state is returned. Audit detail cannot retain export contents or arbitrary fields, while notification templates never enter public failure projections. These repositories are deterministic development proof, not production storage.
 
+The owner activity route composes two read surfaces over those repositories:
+bounded audit-event and manual-notification collections, plus one notification
+detail containing its finite copy evidence and optional sent marker. The detail
+resource is the single source for native forms and hypermedia actions. It
+advertises only transitions currently available, supplies CSRF discovery for
+both representations, accepts exact feature fields, and uses the canonical
+deployment origin for every link and redirect.
+
+Copy and sent mutations require the explicit
+`atomic-notification-audit` capability. Each transition compare-and-sets the
+notification revision and appends its corresponding closed audit event in one
+storage transaction; failure leaves both histories unchanged. The route takes
+trusted owner identity, mutation guard, operation IDs, clock, repositories, and
+CSRF provider as injected dependencies, so reusable source contains no owner,
+hostname, credential, or campaign-specific value.
+
 ### Amount and aggregate display configuration
 
 `domain/amount-aggregate-configuration.ts` requires an explicit currency, integer minor-unit minimum, positive increment, optional maximum, and public visibility choice. No deployment inherits a currency, amount boundary, or aggregate policy from reusable source.
