@@ -147,6 +147,12 @@ An account-deletion request records intent but does not call indication or found
 
 An available registration action requires a validated CSRF proof before either representation is returned. HTML carries the proof only in its hidden transport field, while JSON carries it only in `MUTATION_CSRF_HEADER`; actionless registered resources emit neither. The route enforces participant rather than owner authority, trusted actor/account equality, exact resource origin, bounds, exact fields, and fixed non-disclosing errors. It reuses the persisted registration timestamp when asking the repository to evaluate a retry, preserving exact replay and changed-retry behavior without process memory. Public HTML loads its route-specific stylesheet from the same origin under a `style-src 'self'` policy.
 
+### Participant profile self-service
+
+`domain/participant-profile-resource.ts` and `worker/routes/participant-profile.ts` project `/participant/profile` from a subject-bound profile and the trusted current-package acknowledgment status. HTML and hypermedia expose separate actions for the four editable declaration fields, optional marketing-consent withdrawal, and an account-deletion request. Identity, provider email, process acknowledgment, consent grant, deletion state, registration time, and update time remain read-only. A deletion request closes profile edits without preventing an independent outstanding marketing withdrawal.
+
+Every current stored profile is fully revalidated before clocks, operation IDs, CSRF issuance, or a repository mutation can run. Each action carries its own retry-stable operation ID and exact expected revision, and the route delegates compare-and-set history to the subject-bound participant repository. Completed withdraw-only and request-only transitions disappear from both representations. Persistent production composition remains outside this resource slice.
+
 ### Development participant repository
 
 `DevelopmentInMemoryParticipantRepository` composes through a development/test `StorageAdapter` and binds every profile key to the trusted authenticated subject through a one-way storage identifier. Registration takes identity-bound account fields only from that trusted account. Later mutations call the participant field-policy domain operations, so profile edits cannot replace subject, account email label, process acknowledgment, consent state, deletion state, or system timestamps.

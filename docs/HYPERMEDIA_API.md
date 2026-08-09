@@ -109,7 +109,20 @@ are server-derived and are never action fields. A satisfied resource exposes no
 mutation action or CSRF proof. Production navigation and persistence are added
 only when the hosted package capability is composed.
 
-All three participant URIs negotiate HTML and version `0.1` hypermedia JSON. A
+`GET /participant/profile` has resource type `participant-profile`. It reports
+the provider-managed account label, four editable participation declarations,
+required process-notice acknowledgment, independent marketing-consent and
+deletion-request states, record timestamps, revision, and the trusted current
+package acknowledgment status. Depending on current state, it exposes separate
+`update-participant-profile` `PATCH`, `withdraw-marketing-consent` `DELETE`, and
+`request-account-deletion` `POST` actions. Identity, process acknowledgment,
+consent grant, deletion system state, and timestamps never become action fields.
+Each mutation carries a server-issued operation ID and exact expected revision,
+and completed one-way actions disappear from both HTML and JSON. Production
+navigation and persistence are installed only by the hosted participant
+composition.
+
+These participant URIs negotiate HTML and version `0.1` hypermedia JSON. A
 signed-out JSON request receives `401 authentication_required`; an authenticated
 subject without matching participant state receives the same generic `404`
 shape as a missing record. Unsupported explicit versions return `406` before a
