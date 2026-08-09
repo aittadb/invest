@@ -51,13 +51,9 @@ The available owner connection HTML permits form navigation only to self and the
 
 ## Current Hosted Evidence
 
-Observed on August 9, 2026:
+The selected [acceptance AittaDB service](https://test.aittadb.com/) runs a build that supports the required Authorization Code, S256 PKCE, confidential client authentication, introspection, and storage scopes. Its live OAuth Apps feature flag and [OpenID configuration](https://test.aittadb.com/.well-known/openid-configuration) must be checked again as part of TASK-030; a provider-side `503 feature_unavailable` during the browser CSP proof showed that point-in-time deployment configuration cannot be treated as permanent evidence. The public production [AittaDB service](https://aittadb.com/) remains separate and does not need to change for acceptance testing.
 
-- The selected [acceptance AittaDB service](https://test.aittadb.com/) has OAuth Apps enabled.
-- Its [OpenID configuration](https://test.aittadb.com/.well-known/openid-configuration) advertises the exact authorization, token, and introspection endpoints, Authorization Code, S256 PKCE, confidential client authentication, and storage scopes required by this proof.
-- The public production [AittaDB service](https://aittadb.com/) remains a separate deployment and does not need to change for acceptance testing.
-
-This is provider-capability evidence only. No confidential Investor App acceptance client or successful hosted callback is claimed yet.
+No confidential Investor App acceptance client or successful hosted callback is claimed yet.
 
 ## Remaining Live Proof
 
