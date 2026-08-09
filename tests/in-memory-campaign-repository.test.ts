@@ -18,8 +18,10 @@ import {
 } from "../domain/storage-adapter.ts";
 import {
   DevelopmentInMemoryCampaignRepository,
+  DevelopmentInMemoryPublicCampaignPresentationReader,
   parseCampaignSetup,
 } from "../repositories/in-memory-campaign-repository.ts";
+import { DevelopmentInMemoryAuditRepository } from "../repositories/in-memory-audit-notification-repositories.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
 import {
   FIRST_CAMPAIGN_SAVE as FIRST_SAVE,
@@ -135,7 +137,7 @@ test("setup revisions and their adapter records remain immutable", async () => {
   ]);
   assert.equal(Object.isFrozen(history), true);
   assert.equal(Object.isFrozen(history.items), true);
-  assert.equal(state.records.size, 3);
+  assert.equal(state.records.size, 6);
 
   const reopened = new DevelopmentInMemoryCampaignRepository(adapter);
   assert.deepEqual(await reopened.readSetup(), second);
@@ -165,6 +167,176 @@ test("operation IDs are retry-stable and cannot be reused for changed setup", as
   ));
   assert.equal(conflict.code, "CONFLICT");
   assert.equal((await repository.listSetupHistory({ limit: 10 })).items.length, 1);
+});
+
+test("audited campaign saves commit the revision, history, and audit atomically", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true);
+  const repository = new DevelopmentInMemoryCampaignRepository(adapter);
+  await repository.saveSetup(saveRequest({
+    operationId: "campaign-operation:audited-seed",
+    recordedAt: FIRST_SAVE,
+    expectedRevision: null,
+    setup: explicitSetup(),
+  }));
+  const request = {
+    operationId: "campaign-operation:audited-unpublish",
+    ownerSubject: "owner-subject",
+    recordedAt: SECOND_SAVE,
+    expectedRevision: 1,
+    setup: {
+      ...explicitSetup(),
+      publicCampaign: {
+        ...syntheticPublicCampaign,
+        published: false,
+      },
+    },
+    transition: "unpublished" as const,
+  };
+
+  const first = await repository.saveSetupWithAudit(request);
+  assert.equal(first.campaign.revision, 2);
+  assert.equal(first.campaign.setup.publicCampaign.published, false);
+  assert.equal(first.replayed, false);
+  assert.deepEqual(first.auditEvent.actor, {
+    type: "owner",
+    subject: "owner-subject",
+  });
+  assert.deepEqual(first.auditEvent.detail, {
+    kind: "resource-transition",
+    resource: {
+      type: "campaign",
+      id: `campaign:${syntheticPublicCampaign.id}`,
+    },
+    transition: "unpublished",
+  });
+
+  const replay = await repository.saveSetupWithAudit(request);
+  assert.deepEqual(replay.campaign, first.campaign);
+  assert.deepEqual(replay.auditEvent, first.auditEvent);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(
+    (await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }))
+      .items,
+    [first.auditEvent],
+  );
+  assert.deepEqual(
+    (await repository.listSetupHistory({ limit: 10 })).items.map(({ revision }) =>
+      revision
+    ),
+    [1, 2],
+  );
+});
+
+test("public projection reads expose only published presentation state", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true);
+  const owner = new DevelopmentInMemoryCampaignRepository(adapter);
+  const publicReader = new DevelopmentInMemoryPublicCampaignPresentationReader(adapter);
+
+  await owner.saveSetup(saveRequest({
+    operationId: "campaign-operation:public-projection",
+    recordedAt: FIRST_SAVE,
+    expectedRevision: null,
+    setup: explicitSetup(),
+  }));
+  assert.deepEqual(await publicReader.readPublishedCampaign(), syntheticPublicCampaign);
+
+  await owner.saveSetupWithAudit({
+    operationId: "campaign-operation:public-projection-unpublish",
+    ownerSubject: "owner-subject",
+    recordedAt: SECOND_SAVE,
+    expectedRevision: 1,
+    setup: {
+      ...explicitSetup(),
+      publicCampaign: { ...syntheticPublicCampaign, published: false },
+    },
+    transition: "unpublished",
+  });
+  assert.equal(await publicReader.readPublishedCampaign(), null);
+});
+
+test("audited campaign transition labels are enforced before any atomic side effect", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true);
+  const repository = new DevelopmentInMemoryCampaignRepository(adapter);
+  const publicReader = new DevelopmentInMemoryPublicCampaignPresentationReader(adapter);
+  await repository.saveSetup(saveRequest({
+    operationId: "campaign-operation:transition-seed",
+    recordedAt: FIRST_SAVE,
+    expectedRevision: null,
+    setup: explicitSetup(),
+  }));
+  const transactionCalls = state.transactionCalls;
+
+  const failure = await captureStorageFailure(() => repository.saveSetupWithAudit({
+    operationId: "campaign-operation:mislabeled-update",
+    ownerSubject: "owner-subject",
+    recordedAt: SECOND_SAVE,
+    expectedRevision: 1,
+    setup: {
+      ...explicitSetup(),
+      publicCampaign: { ...syntheticPublicCampaign, published: false },
+    },
+    transition: "updated",
+  }));
+  assert.equal(failure.code, "INVALID_REQUEST");
+  assert.equal(state.transactionCalls, transactionCalls);
+  assert.equal(await repository.findSetupByOperationId(
+    "campaign-operation:mislabeled-update",
+  ), null);
+  assert.deepEqual(await publicReader.readPublishedCampaign(), syntheticPublicCampaign);
+  assert.equal((await repository.readSetup())?.setup.publicCampaign.published, true);
+  assert.deepEqual(
+    (await repository.listSetupHistory({ limit: 10 })).items.map(({ revision }) => revision),
+    [1],
+  );
+  assert.deepEqual(
+    await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }),
+    { items: [], nextCursor: null },
+  );
+});
+
+test("an audit write failure leaves campaign current and history unchanged", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true, true);
+  const repository = new DevelopmentInMemoryCampaignRepository(adapter);
+  const publicReader = new DevelopmentInMemoryPublicCampaignPresentationReader(adapter);
+  await repository.saveSetup(saveRequest({
+    operationId: "campaign-operation:failed-audit-seed",
+    recordedAt: FIRST_SAVE,
+    expectedRevision: null,
+    setup: explicitSetup(),
+  }));
+
+  const failure = await captureStorageFailure(() => repository.saveSetupWithAudit({
+    operationId: "campaign-operation:failed-audit-update",
+    ownerSubject: "owner-subject",
+    recordedAt: SECOND_SAVE,
+    expectedRevision: 1,
+    setup: explicitSetup({ campaignName: "Must Not Persist" }),
+    transition: "updated",
+  }));
+  assert.equal(failure.code, "UNAVAILABLE");
+  assert.equal((await repository.readSetup())?.revision, 1);
+  assert.equal(
+    (await repository.readSetup())?.setup.publicCampaign.name,
+    syntheticPublicCampaign.name,
+  );
+  assert.equal(await repository.findSetupByOperationId(
+    "campaign-operation:failed-audit-update",
+  ), null);
+  assert.deepEqual(await publicReader.readPublishedCampaign(), syntheticPublicCampaign);
+  assert.deepEqual(
+    (await repository.listSetupHistory({ limit: 10 })).items.map(({ revision }) =>
+      revision
+    ),
+    [1],
+  );
+  assert.deepEqual(
+    await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }),
+    { items: [], nextCursor: null },
+  );
 });
 
 test("stale and inaccessible records fail without disclosing campaign data", async () => {
@@ -248,10 +420,16 @@ class MemoryStorageState {
 class DeterministicMemoryStorageAdapter implements StorageAdapter {
   private readonly state: MemoryStorageState;
   private readonly permitted: boolean;
+  private readonly failAuditMutation: boolean;
 
-  constructor(state: MemoryStorageState, permitted: boolean) {
+  constructor(
+    state: MemoryStorageState,
+    permitted: boolean,
+    failAuditMutation = false,
+  ) {
     this.state = state;
     this.permitted = permitted;
+    this.failAuditMutation = failAuditMutation;
   }
 
   async read(key: StorageKey): Promise<StorageRecord | null> {
@@ -287,6 +465,14 @@ class DeterministicMemoryStorageAdapter implements StorageAdapter {
     this.state.transactionCalls += 1;
     assertStorageTransactionBoundary(request);
     if (!this.permitted) throw new StorageFailure("NOT_FOUND");
+    if (
+      this.failAuditMutation &&
+      request.mutations.some((mutation) =>
+        mutation.type === "put" && mutation.value.kind === "audit-event"
+      )
+    ) {
+      throw new StorageFailure("UNAVAILABLE");
+    }
 
     const operationKey = request.operationId as string;
     const fingerprint = JSON.stringify(request);

@@ -25,6 +25,7 @@ export type OwnerHomeDocument = Readonly<{
 }>;
 
 export type OwnerHomeCapabilities = Readonly<{
+  campaignEditor?: boolean;
   founderApplicationReview?: boolean;
   aggregateReconciliation?: boolean;
   auditNotificationHistory?: boolean;
@@ -72,6 +73,12 @@ export function createOwnerHomeDocument(
     links: [
       { rel: ["self"], href: absolute("/owner") },
       { rel: ["campaign"], href: absolute("/") },
+      ...(capabilities.campaignEditor
+        ? [{
+          rel: ["campaign-editor"],
+          href: absolute("/owner/campaign"),
+        }]
+        : []),
       ...(capabilities.founderApplicationReview
         ? [{
           rel: ["founder-applications"],

@@ -3,6 +3,7 @@ import type {
   AuthorizedParticipantAccess,
   ParticipantAccessStateReader,
 } from "../domain/participant-home-resource.ts";
+import type { RuntimeCampaignPreview } from "../http/runtime-preview.ts";
 
 export interface InvestorAppEnv {
   APP_BASE_URL?: string;
@@ -43,7 +44,13 @@ export type ApplicationRouteContext = Readonly<{
   isOwner: boolean;
   participantAccess: AuthorizedParticipantAccess | null;
   campaign: PublicCampaignConfiguration | null;
-  renderApplication(): Promise<Response>;
+  renderApplication(
+    options?: Readonly<{
+      request?: Request;
+      campaign?: PublicCampaignConfiguration | null;
+      preview?: RuntimeCampaignPreview | null;
+    }>,
+  ): Promise<Response>;
 }>;
 
 export type ApplicationRouteHandler = (

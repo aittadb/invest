@@ -37,6 +37,12 @@ import {
 } from "../domain/foundation.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
+import {
+  parseCampaignSetup,
+  type CampaignSetupRevision,
+} from "../repositories/in-memory-campaign-repository.ts";
+import { parseStorageOperationId } from "../domain/storage-adapter.ts";
+import { explicitCampaignSetup } from "./support/campaign-repository-contract.ts";
 
 const executionContext: WorkerExecutionContext = {
   waitUntil() {},
@@ -449,6 +455,62 @@ test("application rendering receives the same normalized runtime headers", async
   );
 });
 
+test("an injected public campaign reader controls the public resource and fails closed", async () => {
+  let current = storedCampaignRevision(1, false, "Repository Campaign");
+  let unavailable = false;
+  const worker = createApplicationWorker({
+    fetchApplication: async () => new Response("rendered"),
+    fetchOptimizedImage: async () => new Response("image"),
+    publicCampaignReader: {
+      readPublishedCampaign: async () => {
+        if (unavailable) throw new Error("private backend detail");
+        return current.setup.publicCampaign.published
+          ? current.setup.publicCampaign
+          : null;
+      },
+    },
+  });
+  const env = testEnvironment({
+    CAMPAIGN_CONFIG_JSON: JSON.stringify(syntheticPublicCampaign),
+  });
+
+  const draft = await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: { Accept: "application/json" },
+    }),
+    env,
+    executionContext,
+  );
+  const draftDocument = await draft.json();
+  assert.equal(draftDocument.data.published, false);
+  assert.equal(draftDocument.data.name, null);
+
+  current = storedCampaignRevision(2, true, "Repository Campaign");
+  const published = await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: { Accept: "application/json" },
+    }),
+    env,
+    executionContext,
+  );
+  const publishedDocument = await published.json();
+  assert.equal(publishedDocument.data.published, true);
+  assert.equal(publishedDocument.data.name, "Repository Campaign");
+
+  unavailable = true;
+  const failed = await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: { Accept: "application/json" },
+    }),
+    env,
+    executionContext,
+  );
+  const failedDocument = await failed.json();
+  assert.equal(failedDocument.data.published, false);
+  assert.equal(failedDocument.data.name, null);
+  assert.doesNotMatch(JSON.stringify(failedDocument), /Northstar|private backend/u);
+});
+
 test("the Worker resolves participant state from the trusted actor and replaces spoofed state", async () => {
   const renderedRequests: Request[] = [];
   const worker = createApplicationWorker({
@@ -625,5 +687,29 @@ function testEnvironment(
       },
     },
     ...overrides,
+  };
+}
+
+function storedCampaignRevision(
+  revision: number,
+  published: boolean,
+  name: string,
+): CampaignSetupRevision {
+  const operationId = parseStorageOperationId(
+    `campaign-operation:worker-revision-${revision}`,
+  );
+  const recordedAt = parseTimestamp(`2026-08-09T0${revision}:00:00.000Z`);
+  const setup = parseCampaignSetup({
+    ...explicitCampaignSetup(),
+    publicCampaign: { ...syntheticPublicCampaign, published, name },
+  });
+  assert(operationId.ok);
+  assert(recordedAt.ok);
+  assert(setup.ok);
+  return {
+    revision,
+    operationId: operationId.value,
+    recordedAt: recordedAt.value,
+    setup: setup.value,
   };
 }

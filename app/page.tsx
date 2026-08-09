@@ -1,6 +1,7 @@
 /* Runtime-configured campaign images cannot use a build-time Next image allowlist. */
 /* eslint-disable @next/next/no-img-element */
 import { headers } from "next/headers";
+import Link from "next/link";
 
 import { getOwnerUser } from "@/app/owner-auth";
 import { getParticipantAccess } from "@/app/participant-auth";
@@ -14,6 +15,10 @@ import {
   campaignFromRuntimeHeader,
   CAMPAIGN_CONFIGURATION_HEADER,
 } from "@/http/runtime-campaign";
+import {
+  campaignPreviewFromRuntimeHeader,
+  CAMPAIGN_PREVIEW_HEADER,
+} from "@/http/runtime-preview";
 
 export const dynamic = "force-dynamic";
 
@@ -21,6 +26,9 @@ export default async function Home() {
   const requestHeaders = await headers();
   const campaign = campaignFromRuntimeHeader(
     requestHeaders.get(CAMPAIGN_CONFIGURATION_HEADER),
+  );
+  const preview = campaignPreviewFromRuntimeHeader(
+    requestHeaders.get(CAMPAIGN_PREVIEW_HEADER),
   );
   const owner = await getOwnerUser();
   const participant = await getParticipantAccess();
@@ -41,6 +49,20 @@ export default async function Home() {
 
   return (
     <div className="campaign-page" id="top">
+      {preview ? (
+        <aside className="campaign-preview-banner" aria-label="Campaign preview status">
+          <p>
+            <strong>Saved draft preview</strong>
+            <span>
+              Revision {preview.sourceRevision}. The live campaign is currently {preview.sourcePublication}.
+            </span>
+          </p>
+          <nav aria-label="Preview navigation">
+            <Link href="/owner/campaign">Return to editor</Link>
+            <Link href="/">View live campaign</Link>
+          </nav>
+        </aside>
+      ) : null}
       <header className="site-header">
         <div className="header-inner">
           <a className="brand" href="#top" aria-label={`${campaign.name} home`}>

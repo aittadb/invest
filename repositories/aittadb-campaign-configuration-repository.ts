@@ -112,6 +112,17 @@ implements CampaignRepository {
     return record?.envelope.current ?? null;
   }
 
+  async findSetupByOperationId(
+    operationId: unknown,
+  ): Promise<CampaignSetupRevision | null> {
+    const parsed = parseStorageOperationId(operationId);
+    if (!parsed.ok) throw new StorageFailure("INVALID_REQUEST");
+    const record = await this.readRecord(false);
+    return record?.envelope.history.find(
+      (revision) => revision.operationId === parsed.value,
+    ) ?? null;
+  }
+
   async saveSetup(
     request: SaveCampaignSetupRequest,
   ): Promise<CampaignSetupRevision> {

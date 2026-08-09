@@ -314,7 +314,13 @@ async function routeFixture() {
     const fields: Record<string, string | number | boolean> = {};
     for (const field of action.fields) {
       const value = field.value ?? field.default;
-      if (value !== undefined) fields[field.name] = value;
+      if (
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean"
+      ) {
+        fields[field.name] = value;
+      }
     }
     Object.assign(fields, values);
     const mediaType = options.mediaType ?? "application/x-www-form-urlencoded";

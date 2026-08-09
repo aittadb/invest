@@ -26,6 +26,10 @@ export async function verifyCampaignRepositoryContract(
     items: [],
     nextCursor: null,
   });
+  assert.equal(
+    await fixture.owner.findSetupByOperationId("campaign-operation:missing"),
+    null,
+  );
 
   const create = campaignSaveRequest({
     operationId: "campaign-operation:create",
@@ -36,12 +40,20 @@ export async function verifyCampaignRepositoryContract(
   const first = await fixture.owner.saveSetup(create);
   assert.equal(first.revision, 1);
   assert.equal(first.setup.publicCampaign.name, syntheticPublicCampaign.name);
+  assert.deepEqual(
+    await fixture.owner.findSetupByOperationId("campaign-operation:create"),
+    first,
+  );
 
   const replay = await fixture.owner.saveSetup(create);
   assert.deepEqual(replay, first);
 
   const reopened = fixture.reopenOwner();
   assert.deepEqual(await reopened.readSetup(), first);
+  assert.deepEqual(
+    await reopened.findSetupByOperationId("campaign-operation:create"),
+    first,
+  );
 
   const second = await fixture.owner.saveSetup(campaignSaveRequest({
     operationId: "campaign-operation:update",
@@ -50,6 +62,10 @@ export async function verifyCampaignRepositoryContract(
     setup: explicitCampaignSetup({ campaignName: "Northstar Systems" }),
   }));
   assert.equal(second.revision, 2);
+  assert.deepEqual(
+    await fixture.owner.findSetupByOperationId("campaign-operation:update"),
+    second,
+  );
 
   const stale = await captureStorageFailure(() => fixture.owner.saveSetup(
     campaignSaveRequest({
@@ -72,6 +88,10 @@ export async function verifyCampaignRepositoryContract(
   assert.equal(secondPage.nextCursor, null);
 
   assert.equal(await fixture.outsider.readSetup(), null);
+  assert.equal(
+    await fixture.outsider.findSetupByOperationId("campaign-operation:create"),
+    null,
+  );
   assert.deepEqual(await fixture.outsider.listSetupHistory({ limit: 10 }), {
     items: [],
     nextCursor: null,

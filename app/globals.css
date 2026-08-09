@@ -39,6 +39,36 @@ body {
   font-family: system-ui, "Segoe UI", sans-serif;
 }
 
+.campaign-preview-banner {
+  display: flex;
+  min-height: 56px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 10px max(20px, calc((100% - 1200px) / 2));
+  border-bottom: 1px solid #d7c171;
+  background: #fff7cf;
+  color: #30280d;
+}
+
+.campaign-preview-banner p,
+.campaign-preview-banner nav {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 0;
+}
+
+.campaign-preview-banner span,
+.campaign-preview-banner a {
+  font-size: 0.82rem;
+}
+
+.campaign-preview-banner a {
+  color: #175f48;
+  font-weight: 760;
+}
+
 a,
 button {
   -webkit-tap-highlight-color: transparent;
@@ -1066,5 +1096,24 @@ footer {
 @media (prefers-reduced-motion: reduce) {
   html {
     scroll-behavior: auto;
+  }
+}
+
+@media (max-width: 720px) {
+  .campaign-preview-banner,
+  .campaign-preview-banner p,
+  .campaign-preview-banner nav {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .campaign-preview-banner {
+    gap: 8px;
+    padding: 12px 20px;
+  }
+
+  .campaign-preview-banner p,
+  .campaign-preview-banner nav {
+    gap: 6px;
   }
 }

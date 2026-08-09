@@ -11,6 +11,7 @@ import {
   toHypermediaAction,
   type ActionDefinition,
   type ActionField,
+  type ActionJsonValue,
   type ActionMethod,
   type TextActionField,
 } from "../domain/hypermedia-action.ts";
@@ -215,6 +216,81 @@ test("keeps JSON-only actions valid without pretending native form parity", () =
     ],
   });
   assert.throws(() => toHtmlFormAction(headerAction), ActionContractError);
+});
+
+test("projects bounded structured JSON fields without flattening their value", () => {
+  const source = {
+    name: "Northstar",
+    sections: [{ id: "opening", enabled: true }],
+  };
+  const action = defineAction({
+    name: "save-campaign",
+    title: "Save campaign",
+    method: "POST",
+    href: "/owner/campaign",
+    requestMediaType: "application/json",
+    fields: [{
+      name: "public-campaign",
+      title: "Public campaign",
+      type: "json",
+      shape: "object",
+      location: "body",
+      required: true,
+      maxBytes: 4_096,
+      value: source,
+    }],
+  });
+  source.name = "Changed after definition";
+
+  const projected = toHypermediaAction(action).fields[0];
+  assert.equal(projected?.type, "json");
+  assert.equal(projected?.json_shape, "object");
+  assert.deepEqual(projected?.value, {
+    name: "Northstar",
+    sections: [{ id: "opening", enabled: true }],
+  });
+  assert.equal(Object.isFrozen(projected?.value), true);
+  assert.throws(() => toHtmlFormAction(action), ActionContractError);
+
+  assert.throws(() => defineAction({
+    name: "save-campaign",
+    title: "Save campaign",
+    method: "POST",
+    href: "/owner/campaign",
+    requestMediaType: "application/json",
+    fields: [{
+      name: "public-campaign",
+      title: "Public campaign",
+      type: "json",
+      shape: "array",
+      location: "body",
+      required: true,
+      maxBytes: 4_096,
+      value: source,
+    }],
+  }), ActionContractError);
+
+  const cyclic: Record<string, ActionJsonValue> = {};
+  cyclic.self = cyclic;
+  for (const invalid of [new Date(), cyclic]) {
+    assert.throws(() => defineAction({
+      name: "save-campaign",
+      title: "Save campaign",
+      method: "POST",
+      href: "/owner/campaign",
+      requestMediaType: "application/json",
+      fields: [{
+        name: "public-campaign",
+        title: "Public campaign",
+        type: "json",
+        shape: "object",
+        location: "body",
+        required: true,
+        maxBytes: 4_096,
+        value: invalid as ActionJsonValue,
+      }],
+    }), ActionContractError);
+  }
 });
 
 test("projects only transitions currently allowed for this caller and state", () => {

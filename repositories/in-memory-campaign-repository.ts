@@ -3,11 +3,13 @@ import {
   type AmountAggregateConfiguration,
 } from "../domain/amount-aggregate-configuration.ts";
 import {
+  parseActorSubject,
   parseTimestamp,
   type Timestamp,
   type ValidationIssue,
   type ValidationResult,
 } from "../domain/foundation.ts";
+import type { AuditEvent } from "../domain/audit-notification.ts";
 import {
   parsePhaseConfiguration,
   type PhaseConfiguration,
@@ -28,6 +30,10 @@ import {
   type StorageOperationId,
   type StorageRecord,
 } from "../domain/storage-adapter.ts";
+import {
+  prepareAuditAppend,
+  verifyPreparedAuditAppend,
+} from "./in-memory-audit-notification-repositories.ts";
 
 const CAMPAIGN_SETUP_SCHEMA_VERSION = 1;
 const MAX_CAMPAIGN_PHASES = 32;
@@ -36,6 +42,14 @@ const HISTORY_COLLECTION = storageKey(
   "campaign-setup-history",
   "campaign-setup-revision:0000000000000001",
 ).collection;
+const OPERATION_COLLECTION = storageKey(
+  "campaign-setup-operations",
+  "campaign-operation:example",
+).collection;
+const PUBLIC_PRESENTATION_KEY = storageKey(
+  "campaign-public-presentation",
+  "configured-campaign",
+);
 
 const SETUP_KEYS = new Set(["publicCampaign", "phases", "amountAggregate"]);
 const STORED_REVISION_KEYS = new Set([
@@ -45,6 +59,12 @@ const STORED_REVISION_KEYS = new Set([
   "recordedAt",
   "operationId",
   "setup",
+]);
+const PUBLIC_PRESENTATION_KEYS = new Set([
+  "kind",
+  "schemaVersion",
+  "revision",
+  "publicCampaign",
 ]);
 
 /** All campaign-specific setup that must be supplied explicitly by a deployment. */
@@ -69,6 +89,23 @@ export type SaveCampaignSetupRequest = Readonly<{
   setup: unknown;
 }>;
 
+export type CampaignAuditTransition = "updated" | "published" | "unpublished";
+export type CampaignMutationConsistency =
+  | "atomic-campaign-audit"
+  | "unavailable";
+
+export type SaveCampaignSetupWithAuditRequest = SaveCampaignSetupRequest &
+  Readonly<{
+    ownerSubject: unknown;
+    transition: CampaignAuditTransition;
+  }>;
+
+export type AuditedCampaignSetupSaveResult = Readonly<{
+  campaign: CampaignSetupRevision;
+  auditEvent: AuditEvent;
+  replayed: boolean;
+}>;
+
 export type CampaignSetupHistoryRequest = Readonly<{
   limit: number;
   cursor?: StorageCursor;
@@ -82,10 +119,26 @@ export type CampaignSetupHistoryPage = Readonly<{
 /** Narrow one-campaign-per-deployment persistence contract. */
 export interface CampaignRepository {
   readSetup(): Promise<CampaignSetupRevision | null>;
+  findSetupByOperationId(
+    operationId: unknown,
+  ): Promise<CampaignSetupRevision | null>;
   saveSetup(request: SaveCampaignSetupRequest): Promise<CampaignSetupRevision>;
   listSetupHistory(
     request: CampaignSetupHistoryRequest,
   ): Promise<CampaignSetupHistoryPage>;
+}
+
+/** Public-only projection contract; implementations must not return setup data. */
+export interface PublicCampaignPresentationReader {
+  readPublishedCampaign(): Promise<PublicCampaignConfiguration | null>;
+}
+
+/** Campaign mutations that commit their audit evidence in the same transaction. */
+export interface AtomicCampaignAuditRepository extends CampaignRepository {
+  readonly mutationConsistency: "atomic-campaign-audit";
+  saveSetupWithAudit(
+    request: SaveCampaignSetupWithAuditRequest,
+  ): Promise<AuditedCampaignSetupSaveResult>;
 }
 
 /**
@@ -95,8 +148,10 @@ export interface CampaignRepository {
  * state through the supplied adapter. It is not production storage. Production
  * deployments must use the separately validated AittaDB campaign repository.
  */
-export class DevelopmentInMemoryCampaignRepository implements CampaignRepository {
+export class DevelopmentInMemoryCampaignRepository
+  implements AtomicCampaignAuditRepository {
   readonly storageKind = "development-in-memory" as const;
+  readonly mutationConsistency = "atomic-campaign-audit" as const;
 
   private readonly storage: StorageAdapter;
 
@@ -109,56 +164,132 @@ export class DevelopmentInMemoryCampaignRepository implements CampaignRepository
     return record === null ? null : decodeCurrentRevision(record);
   }
 
+  async findSetupByOperationId(
+    operationId: unknown,
+  ): Promise<CampaignSetupRevision | null> {
+    const parsed = parseStorageOperationId(operationId);
+    if (!parsed.ok) throw new StorageFailure("INVALID_REQUEST");
+    const record = await this.storage.read(setupOperationKey(parsed.value));
+    return record === null ? null : decodeOperationRevision(record);
+  }
+
   async saveSetup(
     request: SaveCampaignSetupRequest,
   ): Promise<CampaignSetupRevision> {
-    const operationId = parseStorageOperationId(request.operationId);
-    const recordedAt = parseTimestamp(request.recordedAt);
-    const setup = parseCampaignSetup(request.setup);
-    const nextRevision = parseNextRevision(request.expectedRevision);
-
-    if (!operationId.ok || !recordedAt.ok || !setup.ok || nextRevision === null) {
-      throw new StorageFailure("INVALID_REQUEST");
-    }
-
-    const revision = deepFreeze({
-      revision: nextRevision,
-      recordedAt: recordedAt.value,
-      operationId: operationId.value,
-      setup: setup.value,
-    });
-    const value = encodeRevision(revision);
-    const historyKey = setupHistoryKey(nextRevision);
+    const prepared = prepareCampaignSave(request);
     const result = await this.storage.transact({
-      operationId: operationId.value,
+      operationId: prepared.revision.operationId,
       mutations: [
         {
           type: "put",
           key: CURRENT_SETUP_KEY,
           expectedRevision: request.expectedRevision,
-          value,
+          value: prepared.value,
         },
         {
           type: "put",
-          key: historyKey,
+          key: prepared.historyKey,
           expectedRevision: null,
-          value,
+          value: prepared.value,
         },
+        {
+          type: "put",
+          key: prepared.operationKey,
+          expectedRevision: null,
+          value: prepared.value,
+        },
+        publicPresentationMutation(prepared, request.expectedRevision),
       ],
     });
 
-    const currentRecord = result.records[0];
-    const historyRecord = result.records[1];
-    if (!currentRecord || !historyRecord) {
-      throw new StorageFailure("UNAVAILABLE");
+    return verifyCampaignSave(
+      prepared,
+      result.records[0],
+      result.records[1],
+      result.records[2],
+      result.records[3],
+    );
+  }
+
+  async saveSetupWithAudit(
+    request: SaveCampaignSetupWithAuditRequest,
+  ): Promise<AuditedCampaignSetupSaveResult> {
+    const prepared = prepareCampaignSave(request);
+    const ownerSubject = parseActorSubject(request.ownerSubject);
+    if (!ownerSubject.ok || !isCampaignAuditTransition(request.transition)) {
+      throw new StorageFailure("INVALID_REQUEST");
+    }
+    const existing = await this.findSetupByOperationId(
+      prepared.revision.operationId,
+    );
+    if (existing === null) {
+      const current = await this.readSetup();
+      assertCampaignAuditTransition(
+        current,
+        request.expectedRevision,
+        prepared.revision,
+        request.transition,
+      );
     }
 
-    const current = decodeCurrentRevision(currentRecord);
-    const history = decodeHistoryRevision(historyRecord);
-    if (JSON.stringify(current) !== JSON.stringify(history)) {
-      throw new StorageFailure("UNAVAILABLE");
+    const audit = prepareAuditAppend({
+      type: "append-audit-event",
+      event: {
+        id: await campaignAuditEventId(prepared.revision.operationId),
+        operationId: prepared.revision.operationId,
+        occurredAt: prepared.revision.recordedAt,
+        actor: { type: "owner", subject: ownerSubject.value },
+        detail: {
+          kind: "resource-transition",
+          resource: {
+            type: "campaign",
+            id: `campaign:${prepared.revision.setup.publicCampaign.id}`,
+          },
+          transition: request.transition,
+        },
+      },
+    });
+    if (audit.operationId !== prepared.revision.operationId) {
+      throw new StorageFailure("INVALID_REQUEST");
     }
-    return current;
+
+    const result = await this.storage.transact({
+      operationId: prepared.revision.operationId,
+      mutations: [
+        {
+          type: "put",
+          key: CURRENT_SETUP_KEY,
+          expectedRevision: request.expectedRevision,
+          value: prepared.value,
+        },
+        {
+          type: "put",
+          key: prepared.historyKey,
+          expectedRevision: null,
+          value: prepared.value,
+        },
+        {
+          type: "put",
+          key: prepared.operationKey,
+          expectedRevision: null,
+          value: prepared.value,
+        },
+        publicPresentationMutation(prepared, request.expectedRevision),
+        audit.mutation,
+      ],
+    });
+
+    return deepFreeze({
+      campaign: verifyCampaignSave(
+        prepared,
+        result.records[0],
+        result.records[1],
+        result.records[2],
+        result.records[3],
+      ),
+      auditEvent: verifyPreparedAuditAppend(audit, result.records[4]),
+      replayed: result.replayed,
+    });
   }
 
   async listSetupHistory(
@@ -180,6 +311,127 @@ export class DevelopmentInMemoryCampaignRepository implements CampaignRepository
       nextCursor: page.nextCursor,
     });
   }
+}
+
+/** Development/test reader bound only to the public projection key. */
+export class DevelopmentInMemoryPublicCampaignPresentationReader
+implements PublicCampaignPresentationReader {
+  private readonly storage: Pick<StorageAdapter, "read">;
+
+  constructor(storage: Pick<StorageAdapter, "read">) {
+    this.storage = storage;
+  }
+
+  async readPublishedCampaign(): Promise<PublicCampaignConfiguration | null> {
+    const record = await this.storage.read(PUBLIC_PRESENTATION_KEY);
+    if (record === null) return null;
+    const campaign = decodePublicPresentation(record);
+    return campaign.published ? campaign : null;
+  }
+}
+
+type PreparedCampaignSave = Readonly<{
+  revision: CampaignSetupRevision;
+  value: StorageDocument;
+  historyKey: StorageKey;
+  operationKey: StorageKey;
+}>;
+
+function prepareCampaignSave(
+  request: SaveCampaignSetupRequest,
+): PreparedCampaignSave {
+  const operationId = parseStorageOperationId(request.operationId);
+  const recordedAt = parseTimestamp(request.recordedAt);
+  const setup = parseCampaignSetup(request.setup);
+  const nextRevision = parseNextRevision(request.expectedRevision);
+
+  if (!operationId.ok || !recordedAt.ok || !setup.ok || nextRevision === null) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+
+  const revision = deepFreeze({
+    revision: nextRevision,
+    recordedAt: recordedAt.value,
+    operationId: operationId.value,
+    setup: setup.value,
+  });
+  return Object.freeze({
+    revision,
+    value: encodeRevision(revision),
+    historyKey: setupHistoryKey(nextRevision),
+    operationKey: setupOperationKey(revision.operationId),
+  });
+}
+
+function verifyCampaignSave(
+  prepared: PreparedCampaignSave,
+  currentRecord: StorageRecord | null | undefined,
+  historyRecord: StorageRecord | null | undefined,
+  operationRecord: StorageRecord | null | undefined,
+  publicRecord: StorageRecord | null | undefined,
+): CampaignSetupRevision {
+  if (!currentRecord || !historyRecord || !operationRecord || !publicRecord) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+
+  const current = decodeCurrentRevision(currentRecord);
+  const history = decodeHistoryRevision(historyRecord);
+  const operation = decodeOperationRevision(operationRecord);
+  const publicCampaign = decodePublicPresentation(publicRecord);
+  if (
+    JSON.stringify(current) !== JSON.stringify(history) ||
+    JSON.stringify(current) !== JSON.stringify(operation) ||
+    JSON.stringify(current.setup.publicCampaign) !== JSON.stringify(publicCampaign) ||
+    JSON.stringify(current) !== JSON.stringify(prepared.revision)
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return current;
+}
+
+function assertCampaignAuditTransition(
+  current: CampaignSetupRevision | null,
+  expectedRevision: number | null,
+  next: CampaignSetupRevision,
+  transition: CampaignAuditTransition,
+): void {
+  if (current === null || expectedRevision === null) {
+    throw new StorageFailure("PRECONDITION_FAILED");
+  }
+  if (current.revision !== expectedRevision) {
+    throw new StorageFailure("PRECONDITION_FAILED");
+  }
+
+  const before = current.setup.publicCampaign.published;
+  const after = next.setup.publicCampaign.published;
+  const valid = transition === "updated"
+    ? before === after
+    : transition === "published"
+      ? before === false && after === true
+      : before === true && after === false;
+  if (!valid) throw new StorageFailure("INVALID_REQUEST");
+}
+
+function isCampaignAuditTransition(
+  value: unknown,
+): value is CampaignAuditTransition {
+  return value === "updated" || value === "published" || value === "unpublished";
+}
+
+async function campaignAuditEventId(operationId: StorageOperationId): Promise<string> {
+  let digest: ArrayBuffer;
+  try {
+    digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(`campaign-audit:${operationId}`),
+    );
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+  const fingerprint = [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `campaign-audit:${fingerprint}`;
 }
 
 /** Parses setup without supplying a campaign, phase, country, currency, or display default. */
@@ -351,6 +603,70 @@ function decodeHistoryRevision(record: StorageRecord): CampaignSetupRevision {
   return revision;
 }
 
+function decodeOperationRevision(record: StorageRecord): CampaignSetupRevision {
+  const revision = decodeRevision(record.value);
+  const expectedKey = setupOperationKey(revision.operationId);
+  if (
+    record.key.collection !== expectedKey.collection ||
+    record.key.id !== expectedKey.id ||
+    record.revision !== 1
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return revision;
+}
+
+function publicPresentationMutation(
+  prepared: PreparedCampaignSave,
+  expectedRevision: number | null,
+) {
+  return Object.freeze({
+    type: "put" as const,
+    key: PUBLIC_PRESENTATION_KEY,
+    expectedRevision,
+    value: encodePublicPresentation(prepared.revision),
+  });
+}
+
+function encodePublicPresentation(
+  revision: CampaignSetupRevision,
+): StorageDocument {
+  return deepFreeze({
+    kind: "campaign-public-presentation",
+    schemaVersion: CAMPAIGN_SETUP_SCHEMA_VERSION,
+    revision: revision.revision,
+    publicCampaign: revision.setup.publicCampaign,
+  });
+}
+
+function decodePublicPresentation(
+  record: StorageRecord,
+): PublicCampaignConfiguration {
+  const source = recordValue(record.value);
+  if (
+    source === null ||
+    !hasExactKeys(source, PUBLIC_PRESENTATION_KEYS) ||
+    source.kind !== "campaign-public-presentation" ||
+    source.schemaVersion !== CAMPAIGN_SETUP_SCHEMA_VERSION ||
+    !Number.isSafeInteger(source.revision) ||
+    (source.revision as number) < 1 ||
+    record.key.collection !== PUBLIC_PRESENTATION_KEY.collection ||
+    record.key.id !== PUBLIC_PRESENTATION_KEY.id ||
+    record.revision !== source.revision
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(source.publicCampaign);
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+  const campaign = parsePublicCampaignConfiguration(serialized);
+  if (campaign === null) throw new StorageFailure("UNAVAILABLE");
+  return campaign;
+}
+
 function decodeRevision(value: StorageDocument): CampaignSetupRevision {
   const source = record(value);
   if (source === null || !hasExactKeys(source, STORED_REVISION_KEYS)) {
@@ -387,6 +703,10 @@ function setupHistoryKey(revision: number): StorageKey {
   );
 }
 
+function setupOperationKey(operationId: StorageOperationId): StorageKey {
+  return storageKey(OPERATION_COLLECTION, operationId);
+}
+
 function storageKey(collection: unknown, id: unknown): StorageKey {
   const result = parseStorageKey(collection, id);
   if (!result.ok) throw new StorageFailure("INVALID_REQUEST");
@@ -418,6 +738,10 @@ function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return record(value);
 }
 
 function failure<Value = never>(

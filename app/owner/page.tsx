@@ -10,9 +10,11 @@ import {
 } from "../../http/runtime-campaign";
 import {
   hasOwnerAittaDBConnection,
+  hasOwnerCampaignEditorCapability,
   hasOwnerIndicationModeration,
   hasOwnerPackageWorkspace,
   OWNER_AITTADB_CONNECTION_HEADER,
+  OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER,
   OWNER_INDICATION_MODERATION_HEADER,
   OWNER_PACKAGE_WORKSPACE_HEADER,
 } from "../../http/runtime-capabilities";
@@ -39,6 +41,9 @@ export default async function OwnerHome() {
   const aittadbConnectionAvailable = hasOwnerAittaDBConnection(
     requestHeaders.get(OWNER_AITTADB_CONNECTION_HEADER),
   );
+  const canEditCampaign = hasOwnerCampaignEditorCapability(
+    requestHeaders.get(OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER),
+  );
   const setupState = campaign ? "Configured" : "Setup required";
   const publicationState = campaign
     ? campaign.published
@@ -54,6 +59,7 @@ export default async function OwnerHome() {
         </Link>
         <nav aria-label="Owner navigation">
           <Link href="/">View campaign</Link>
+          {canEditCampaign ? <Link href="/owner/campaign">Edit presentation</Link> : null}
           {packageWorkspaceAvailable ? (
             <Link href="/owner/package">Information package</Link>
           ) : null}
@@ -97,6 +103,13 @@ export default async function OwnerHome() {
             </div>
           </dl>
         </section>
+        {canEditCampaign ? (
+          <p className="owner-workspace-action">
+            <Link className="button button--primary" href="/owner/campaign">
+              Edit campaign presentation
+            </Link>
+          </p>
+        ) : null}
       </main>
     </div>
   );

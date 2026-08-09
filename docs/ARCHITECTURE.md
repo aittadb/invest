@@ -14,7 +14,15 @@ Deployments provide trusted runtime configuration for the canonical app origin, 
 
 `OWNER_EMAIL` configures the single version-one owner for one deployment. The worker validates and overwrites the internal owner header, and every owner HTML or JSON request separately compares the trusted Sites identity email with that configured value. Anonymous requests enter Sites sign-in; authenticated non-owners receive a generic denial. A later persisted owner subject may replace the email bootstrap after the production identity adapter is available.
 
-`CAMPAIGN_CONFIG_JSON` supplies the public campaign presentation for one deployment. The worker validates its full structure before exposing it to React or hypermedia rendering. HTML, metadata, and JSON consume that same validated value; absent, malformed, oversized, insecure, unpublished, or otherwise invalid configuration produces a generic unavailable resource without leaking draft copy. It is an initial bootstrap input, not the eventual persistence mechanism; owner editing and publication will move behind the campaign repository.
+`CAMPAIGN_CONFIG_JSON` can supply the initial public campaign presentation when
+no public presentation reader is injected. The worker validates its full
+structure before exposing it to React or hypermedia rendering. Once a public
+reader is injected, its published projection is authoritative for HTML,
+metadata, and JSON; reader absence or failure does not fall back to a stale
+bootstrap draft. The privileged owner setup repository is never used for public
+reads. Absent, malformed, oversized, insecure, unpublished, or otherwise
+unavailable configuration produces a generic public resource without leaking
+draft copy.
 
 The repository tracks only `.openai/hosting.example.json`. Each production, acceptance, or local deployment keeps its exact Sites project binding in ignored `.openai/hosting.json` state. Clean checkouts can build against the inert example, while Sites packaging explicitly requires an active binding.
 
@@ -55,7 +63,7 @@ advertised root control is not itself an authorization grant.
 
 ### Action capability contracts
 
-`domain/hypermedia-action.ts` is the route-independent source for safe navigation and mutation capabilities. Definitions use bounded stable names, safe targets, explicit methods and request media types, and bounded string, integer, boolean, or choice fields. Sensitive fields cannot advertise a current or default value. An availability gate constructs an action only when the current caller and resource state permit its transition, but target routes must still enforce authorization and state independently.
+`domain/hypermedia-action.ts` is the route-independent source for safe navigation and mutation capabilities. Definitions use bounded stable names, safe targets, explicit methods and request media types, and bounded string, integer, boolean, choice, or structured JSON fields. Sensitive fields cannot advertise a current or default value. An availability gate constructs an action only when the current caller and resource state permit its transition, but target routes must still enforce authorization and state independently.
 
 Hypermedia and form models project from the same validated action. A form-compatible `GET` uses query fields; a mutation uses body fields and form encoding. Native forms submit `POST` with an explicit effective-method field when the semantic method is `PUT`, `PATCH`, or `DELETE`. JSON-only, path-driven, or header-driven actions remain valid hypermedia controls but cannot be projected as native forms. Route implementations must support the advertised encodings and normalize any form method before invoking the same security, validation, and domain operation.
 
@@ -243,13 +251,60 @@ Public totals render only when configured for non-zero visibility and the saniti
 
 `DevelopmentInMemoryCampaignRepository` persists one explicitly configured campaign setup through a supplied development/test `StorageAdapter`. It does not retain separate process-local state, so recreating the repository over the same adapter proves the persistence boundary. A setup contains the validated public presentation, one or more explicit phases, and explicit amount and aggregate-display policy; the parser supplies no campaign, country, path, currency, or visibility default.
 
-Each save atomically compare-and-sets the current setup and creates an immutable revision record under one retry-stable operation ID. History is bounded and cursor-paged. The adapter remains credential-bound, so unauthorized reads and lists have the same shape as missing state. This repository and deterministic adapter fixtures are development proof only.
+Each save atomically compare-and-sets the current setup and creates an immutable revision record, a direct operation-index record, and a public-only presentation projection under one retry-stable operation ID. History is bounded and cursor-paged, while retries use direct operation lookup rather than scanning a history prefix. The stronger `atomic-campaign-audit` capability adds an allowlisted owner audit event to that same adapter transaction. The repository derives and verifies the `updated`, `published`, or `unpublished` transition against the prior and next publication states before commit. Replay returns the original campaign and audit evidence, while a transition mismatch or any transaction failure leaves all records unchanged. The public reader is bound only to the public projection key. The adapter remains credential-bound, so unauthorized reads and lists have the same shape as missing state. This repository and deterministic adapter fixtures are development proof only.
+
+### Owner campaign editor
+
+`services/owner-campaign-editor.ts` composes an injected atomic campaign
+repository and deployment publication-readiness checker. Presentation saves
+parse the complete public campaign contract, preserve publication plus unrelated
+phase and aggregate settings, and compare-and-set the submitted revision.
+Publish changes only the publication flag and is available only when intrinsic
+phase checks and the injected deployment readiness checks pass. Unpublish
+remains available independently so an owner can always remove a published
+presentation. Direct operation lookup recovers the original immutable revision
+and timestamp for a retry; changed reuse conflicts instead of creating a second
+audit event. The route then re-reads current state so a delayed replay cannot
+return stale capabilities.
+
+`domain/owner-campaign-editor-resource.ts` is the common capability source for
+the owner HTML forms, hypermedia actions, and saved-draft preview. It describes
+the complete bounded public campaign value as a structured JSON action field and
+exposes only transitions available in the current state. HTML projects that same
+value into labeled, repeatable controls for sections, links, facts, risks,
+funding uses, and optional media instead of exposing a raw JSON textarea. The
+route independently checks trusted owner identity, exact origin, CSRF proof,
+body and field bounds, exact feature fields, operation ID, and revision before
+calling the service. Authenticated non-owners are denied before repository
+access.
+
+The saved-draft HTML and JSON previews derive from one visitor capability model
+and expose visible draft, saved-publication, and source-revision status. HTML
+rewrites an internal render request to the public root and supplies a transient
+published projection of the stored draft, so it uses the same React campaign
+rendering without publishing or modifying data. Subsequent public requests use
+the separate public presentation reader, so a committed publish or unpublish
+changes the public resource on the next request without granting public code
+access to privileged setup data.
+
+`createApplicationWorker` accepts a trusted campaign-workspace object or resolver
+only as explicit server-side dependency injection. The object supplies the
+privileged repository, public projection reader, mutation guard, operation and
+CSRF capabilities, and readiness checker. It is deliberately absent from
+`InvestorAppEnv`: Sites runtime values are scalar and cannot configure this
+function-bearing composition. The production Worker entry injects no workspace,
+so editor routes and owner controls remain fail-closed until a real deployment
+assembly supplies one in code. This contract is useful for tests and future
+assembly, but is not evidence that production persistence is installed.
+Repositories that cannot atomically persist campaign revision, history,
+operation index, public projection, and audit evidence expose no mutation
+capability.
 
 ### AittaDB campaign repository
 
-`AittaDBCampaignConfigurationRepository` implements the same campaign contract against one explicitly configured AittaDB JSON-record URL. The record contains the current setup and its immutable retry-addressed history, and both request and response bodies have finite byte limits. The issuer origin, logical key, access-token provider, and HTTP implementation are deployment inputs; reusable source contains no production hostname, owner identity, credential, or campaign content.
+`AittaDBCampaignConfigurationRepository` implements the same campaign contract against one explicitly configured AittaDB JSON-record URL. The record contains the current setup and its immutable retry-addressed history, so operation lookup examines the complete bounded record rather than an arbitrary history prefix. Both request and response bodies have finite byte limits. The issuer origin, logical key, access-token provider, and HTTP implementation are deployment inputs; reusable source contains no production hostname, owner identity, credential, or campaign content.
 
-Before any write, the repository reads the configured issuer's OpenAPI document and requires an advertised strong `ETag` on reads and writes, `If-Match` and `If-None-Match` request fields, and `412` conflict semantics. It then creates with `If-None-Match: *` or replaces with the exact previously read strong `ETag`. Missing capability, validators, malformed or oversized representations, and unexpected write results fail closed with fixed non-disclosing errors. An AittaDB deployment that only advertises unconditional record replacement remains readable through this repository, but the repository performs no write against it.
+Before any write, the repository reads the configured issuer's OpenAPI document and requires an advertised strong `ETag` on reads and writes, `If-Match` and `If-None-Match` request fields, and `412` conflict semantics. It then creates with `If-None-Match: *` or replaces with the exact previously read strong `ETag`. Missing capability, validators, malformed or oversized representations, and unexpected write results fail closed with fixed non-disclosing errors. This adapter does not yet provide the atomic campaign, projection, and audit transaction required by the editor, so it cannot be injected as the editor mutation capability. An AittaDB deployment that only advertises unconditional record replacement remains readable through this repository, but the repository performs no write against it.
 
 ## Storage plan
 

@@ -13,6 +13,14 @@ export type ActionRequestMediaType =
 
 export type ActionFieldLocation = "path" | "query" | "header" | "body";
 
+export type ActionJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly ActionJsonValue[]
+  | Readonly<{ [key: string]: ActionJsonValue }>;
+
 type ActionFieldBase = Readonly<{
   name: string;
   title: string;
@@ -61,11 +69,21 @@ export type ChoiceActionField = ActionFieldBase &
     defaultValues?: readonly string[];
   }>;
 
+export type JsonActionField = ActionFieldBase &
+  Readonly<{
+    type: "json";
+    shape: "object" | "array" | "any";
+    maxBytes: number;
+    value?: ActionJsonValue;
+    defaultValue?: ActionJsonValue;
+  }>;
+
 export type ActionField =
   | TextActionField
   | IntegerActionField
   | BooleanActionField
-  | ChoiceActionField;
+  | ChoiceActionField
+  | JsonActionField;
 
 export type ActionDefinition = Readonly<{
   name: string;
@@ -87,14 +105,15 @@ export type HypermediaActionField = Readonly<{
   sensitive?: boolean;
   presentation?: "control" | "hidden";
   format?: TextActionField["format"];
+  json_shape?: JsonActionField["shape"];
   min_length?: number;
   max_length?: number;
   max_bytes?: number;
   minimum?: number;
   maximum?: number;
   step?: number;
-  value?: string | number | boolean;
-  default?: string | number | boolean;
+  value?: ActionJsonValue;
+  default?: ActionJsonValue;
   multiple?: boolean;
   values?: readonly string[];
   default_values?: readonly string[];
@@ -265,8 +284,34 @@ function validateField(field: ActionField): void {
     case "choice":
       validateChoiceField(field);
       return;
+    case "json":
+      validateJsonField(field);
+      return;
     default:
       fail();
+  }
+}
+
+function validateJsonField(field: JsonActionField): void {
+  if (!isIntegerWithin(field.maxBytes, 1, MAX_ACTION_FIELD_BYTES)) fail();
+  if (field.shape !== "object" && field.shape !== "array" && field.shape !== "any") {
+    fail();
+  }
+  for (const value of [field.value, field.defaultValue]) {
+    if (value === undefined) continue;
+    if (!matchesJsonShape(value, field.shape)) fail();
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(value);
+    } catch {
+      fail();
+    }
+    if (
+      serialized === undefined ||
+      new TextEncoder().encode(serialized).byteLength > field.maxBytes
+    ) {
+      fail();
+    }
   }
 }
 
@@ -424,6 +469,16 @@ function toHypermediaField(field: ActionField): HypermediaActionField {
           ? {}
           : { default_values: Object.freeze([...field.defaultValues]) }),
       });
+    case "json":
+      return Object.freeze({
+        ...common,
+        json_shape: field.shape,
+        max_bytes: field.maxBytes,
+        ...(field.value === undefined ? {} : { value: cloneJson(field.value) }),
+        ...(field.defaultValue === undefined
+          ? {}
+          : { default: cloneJson(field.defaultValue) }),
+      });
   }
 }
 
@@ -498,6 +553,8 @@ function toHtmlField(field: ActionField): HtmlFormField {
           ? {}
           : { defaultValues: Object.freeze([...field.defaultValues]) }),
       });
+    case "json":
+      throw new ActionContractError();
   }
 }
 
@@ -513,6 +570,15 @@ function freezeAction(action: ActionDefinition): ActionContract {
 }
 
 function freezeField(field: ActionField): ActionField {
+  if (field.type === "json") {
+    return Object.freeze({
+      ...field,
+      ...(field.value === undefined ? {} : { value: cloneJson(field.value) }),
+      ...(field.defaultValue === undefined
+        ? {}
+        : { defaultValue: cloneJson(field.defaultValue) }),
+    });
+  }
   if (field.type !== "choice") return Object.freeze({ ...field });
 
   return Object.freeze({
@@ -527,6 +593,81 @@ function freezeField(field: ActionField): ActionField {
       ? {}
       : { defaultValues: Object.freeze([...field.defaultValues]) }),
   });
+}
+
+function matchesJsonShape(
+  value: ActionJsonValue,
+  shape: JsonActionField["shape"],
+): boolean {
+  if (!isJsonValue(value)) return false;
+  if (shape === "array") return Array.isArray(value);
+  if (shape === "object") {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+  return true;
+}
+
+function isJsonValue(
+  value: unknown,
+  ancestors: WeakSet<object> = new WeakSet(),
+  depth = 0,
+): value is ActionJsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return true;
+  }
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object" || depth >= 64 || ancestors.has(value)) {
+    return false;
+  }
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (Object.keys(value).length !== value.length) return false;
+      for (let index = 0; index < value.length; index += 1) {
+        if (
+          !Object.hasOwn(value, index) ||
+          !isJsonValue(value[index], ancestors, depth + 1)
+        ) {
+          return false;
+        }
+      }
+      return true;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    if (Object.getOwnPropertySymbols(value).length > 0) return false;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    return Object.entries(descriptors).every(([key, descriptor]) =>
+      !hasControlCharacter(key) &&
+      descriptor.enumerable === true &&
+      Object.hasOwn(descriptor, "value") &&
+      isJsonValue(descriptor.value, ancestors, depth + 1)
+    );
+  } catch {
+    return false;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function cloneJson<Value extends ActionJsonValue>(value: Value): Value {
+  try {
+    return deepFreezeJson(JSON.parse(JSON.stringify(value)) as Value);
+  } catch {
+    fail();
+  }
+}
+
+function deepFreezeJson<Value extends ActionJsonValue>(value: Value): Value {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) {
+    return value;
+  }
+  Object.freeze(value);
+  for (const child of Object.values(value)) {
+    deepFreezeJson(child as ActionJsonValue);
+  }
+  return value;
 }
 
 function isStableName(value: unknown): value is string {

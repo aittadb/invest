@@ -193,6 +193,20 @@ The POST independently requires configured-owner identity, exact origin, trusted
 
 The default Worker does not inject this route. Its presence proves only that hosted configuration deliberately supplied the capability; every request still enforces owner authorization. See `docs/AITTADB_OAUTH_PROOF.md` for the hosted boundary and remaining live proof.
 
+## Owner Campaign Presentation
+
+`GET /owner/campaign` is the configured owner's public-presentation workspace. Its `owner-campaign-editor` document contains the current campaign revision, saved publication state, explicit publication-readiness result, mutation-consistency capability, and complete validated public campaign draft. It links to the owner home, live campaign, and `/owner/campaign/preview` when a setup exists. An authenticated non-owner gets the same generic `404` surface before the privileged campaign repository is read.
+
+When the injected repository guarantees `atomic-campaign-audit`, the resource exposes `save-campaign-presentation`. Hypermedia JSON describes a real `application/json` command with `operation-id`, `expected-revision`, and one `public-campaign` object. Native HTML renders bounded, labeled, repeatable controls for the same public campaign object; it does not expose raw JSON editing. Both transports pass through the same public-campaign parser and owner service.
+
+An unpublished campaign exposes `publish-campaign` only when every phase setup is complete and the deployment's explicit readiness capability reports ready. A published campaign always exposes `unpublish-campaign`, including when readiness later becomes false. Direct publication requests repeat the same readiness decision. Presentation saves preserve the current publication flag, phase settings, and amount/aggregate policy.
+
+Every mutation requires a trusted owner subject, exact configured origin, current CSRF proof, exact or allowlisted bounded fields, server-issued operation ID, and expected revision. The campaign revision, immutable revision history, direct operation index, public-only presentation projection, and allowlisted audit event commit in one transaction. Repository code derives and verifies `updated`, `published`, and `unpublished` from the prior and next publication states; callers cannot mislabel an audit transition. Stable retries use direct operation lookup and the route re-reads current state before returning capabilities.
+
+`GET /owner/campaign/preview` derives JSON and HTML from the same visitor capability projection. JSON reports the source revision and saved publication state with the visitor data and actions. HTML renders that campaign through the public application with owner and participant capabilities suppressed and a visible saved-revision/live-publication banner. Preview never changes repository state.
+
+`createApplicationWorker` can accept a trusted campaign-workspace composition containing the owner repository, public projection reader, mutation guard, readiness check, and CSRF/operation capabilities. This object enters only through explicit dependency or resolver injection. It is deliberately not part of `InvestorAppEnv`, cannot be supplied as a scalar Sites runtime value, and does not prove that production AittaDB persistence has been installed. The production Worker entry injects no workspace and therefore remains fail-closed. Without the composition, campaign editor routes and runtime controls remain absent. Public requests use only the separately injected public presentation reader and never call privileged setup reads.
+
 ## Identity and Authorization
 
 The signed-out campaign document contains only public state and sign-in transitions. A valid participant session can add links and actions for the private package and that participant's records. The participant decision starts with a parsed trusted account and a credential-bound state reader; query, form, JSON, and client-supplied participant headers cannot assert the subject or package grant. An owner session can add owner operations only after a separate owner authorization decision.
