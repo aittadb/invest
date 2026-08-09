@@ -70,6 +70,12 @@ The first version requires acceptance. A material version replaces the required 
 
 An account-deletion request records intent but does not call indication or founder repositories. It emits a retry-stable withdrawal intent for an application service to coordinate across those separate lanes.
 
+### Founder applications
+
+`domain/founder-application.ts` validates founder fields against deployment-supplied contribution choices and records received or withdrawn state as immutable revision snapshots. Create, edit, and withdrawal transitions are scoped to the applicant subject, while owner review remains a separate use case.
+
+Founder applications do not import, create, mutate, or gate investment indications. An account may therefore hold either record type or both, and application services compose them only when a participant-facing resource needs both projections.
+
 ## Storage plan
 
 Development can use a deterministic in-memory/test adapter. Production must use an AittaDB-compatible adapter and pass the same contract tests.

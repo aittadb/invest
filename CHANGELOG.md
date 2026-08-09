@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-009:** Define founder application contracts. Depends on: `TASK-004`. DoD: founder application fields, contribution-area choices, lifecycle state, separate-from-investment rule, and history-entry contracts are typed and documented; tests cover create/edit/withdraw behavior and the ability to have founder and investor records independently.
+
+  Acceptance evidence: `domain/founder-application.ts` defines deployment-supplied contribution choices, bounded founder fields, received and withdrawn states, applicant-owned transitions, and immutable per-revision history snapshots. HTTPS profile-link validation and stable identifiers reject unsafe or ambiguous input. Five focused tests cover configurable choices, create/edit/withdraw transitions, immutable history, stale and foreign transition rejection, terminal withdrawal, and founder records changing independently from investment records. Full `npm run validate` passes with 46 tests.
+
 - **TASK-007:** Define participant profile and consent contracts. Depends on: `TASK-004`. DoD: access-registration profile, declared interest, account email label, marketing consent, account-deletion request state, and editable-field rules are typed and documented; tests cover first-registration requirements, profile updates, consent withdrawal, and deletion-withdraws-active-interest intent.
 
   Acceptance evidence: `domain/participant-profile.ts` defines identity-bound account values, required first-registration fields, declared interest and context, explicit edit rules, process-email acknowledgment, independent marketing consent, and account-deletion state. Deletion emits a retry-stable application-service intent to withdraw active interests without importing sibling repositories. Four focused tests cover registration requirements and non-disclosing errors, participant-editable updates, idempotent consent withdrawal, and deletion intent behavior. Full `npm run validate` passes with 46 tests.
