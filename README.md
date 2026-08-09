@@ -6,7 +6,7 @@ The approved baseline is [docs/AittaDB-Investor-App-Specification.md](docs/Aitta
 
 ## Status
 
-The reusable Investor App software is experimental. Its AittaDB runtime instance is deployed for owner review at [invest.aittadb.com](https://invest.aittadb.com); that hostname is deployment configuration, not an application default. Public access remains disabled while authenticated workflows, production persistence, and campaign configuration are unfinished.
+The reusable Investor App software is experimental. Its public AittaDB development instance is available at [invest.aittadb.com](https://invest.aittadb.com); that hostname and its campaign content are deployment configuration, not application defaults. The instance is not production-ready while authenticated workflows and production persistence remain unfinished.
 
 The public source must not hard-code any reference campaign, person, country, currency, funding target, legal entity, country rule, private package content, or private campaign decision.
 
@@ -35,6 +35,7 @@ Each application URI supports equivalent human HTML and versioned hypermedia JSO
 - `docs/STYLE_GUIDE.md`: UI and HTML/CSS guidance.
 - `docs/HYPERMEDIA_API.md`: same-URI HTML and hypermedia JSON contract.
 - `.env.example`: runtime setting names with inert placeholder values.
+- `.openai/hosting.example.json`: inert Sites binding shape for clean checkouts.
 
 ## Local Development
 
@@ -51,8 +52,11 @@ npm run lint
 npm run typecheck
 npm test
 npm run build
+npm run sites:package
 npm run validate
 ```
+
+`npm run build` works from a clean checkout with the inert hosting example. Before packaging or publishing, create an ignored `.openai/hosting.json` containing the exact Sites project identifier for that deployment; `npm run sites:package` refuses to proceed without it.
 
 ## Planning Workflow
 

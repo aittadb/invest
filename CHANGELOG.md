@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-041:** Externalize per-instance Sites binding metadata. DoD: reusable source tracks only an inert hosting example, each deployment keeps its real `.openai/hosting.json` ignored and local, builds fall back safely for clean checkouts, packaging still requires an explicit active binding, and tests prove production and acceptance identifiers cannot enter normal source diffs.
+
+  Acceptance evidence: the real production binding is no longer tracked, `.openai/hosting.example.json` contains only null placeholders, and the instance-boundary check fails if `.openai/hosting.json` enters the index. A build without the active binding passes and omits deployment metadata, while `npm run sites:package` fails closed until an exact active project identifier is restored. Runtime instance values remain in ignored local or hosted configuration.
+
 - **TASK-029:** Load the public campaign presentation from runtime configuration. DoD: `CAMPAIGN_CONFIG_JSON` supplies campaign identity, public copy, sections, links, and visual URLs; invalid, absent, or unpublished configuration yields a generic unavailable resource; HTML, metadata, and hypermedia share one validated configuration; tests use only synthetic fixtures; and reusable source contains no AittaDB campaign copy or campaign artwork.
 
   Acceptance evidence: one bounded parser now validates every public presentation field, HTTPS or root-relative media, and safe links before a worker-owned header supplies the same campaign to metadata, HTML, owner status, and hypermedia JSON. Missing, malformed, oversized, insecure, and unpublished values render a generic unavailable resource. Campaign-specific source and artwork were removed; all 25 tests use a synthetic campaign and pass under `npm run validate`. Desktop and 390px mobile browser checks showed responsive, non-overlapping layouts, and `AGENTS.md` remains below 32,000 bytes.
