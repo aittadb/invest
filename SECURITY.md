@@ -13,6 +13,7 @@ If exposure is suspected, do not echo or paste the value. Escalate privately wit
 ## Application Security Boundary
 
 - Production storage uses the configured AittaDB-compatible adapter only.
+- The production storage adapter receives bearer authority only through a backend closure, follows only validated same-issuer hypermedia controls and page identities, rejects redirects and unknown mutations, snapshots data-only requests before serialization, bounds token/fetch waits plus streamed bytes, chunks, and time, cancels rejected bodies, enforces advertised record and transaction sizes, and never retains credentials, response bodies, or transport exceptions in failures.
 - Owner setup must prevent first-user takeover and bind authorization to a stable backend identity.
 - Every server route must enforce authorization independently.
 - Browser mutation identity comes only from the trusted session resolver, never request-supplied actor fields or untrusted headers.

@@ -3,7 +3,7 @@ import {
   MAX_STORAGE_TRANSACTION_MUTATIONS,
   StorageFailure,
   assertStorageListBoundary,
-  assertStorageTransactionBoundary,
+  normalizeStorageTransactionRequest,
   parseStorageKey,
   storageKeyString,
   type JsonValue,
@@ -418,11 +418,11 @@ export function parseStorageProtocolDiscovery(
 export function toStorageProtocolTransactionCommand(
   request: StorageTransactionRequest,
 ): StorageProtocolTransactionCommand {
-  assertStorageTransactionBoundary(request);
+  const snapshot = normalizeStorageTransactionRequest(request);
   const command: StorageProtocolTransactionCommand = {
     transaction: {
-      operation_id: request.operationId,
-      mutations: request.mutations.map((mutation) =>
+      operation_id: snapshot.operationId,
+      mutations: snapshot.mutations.map((mutation) =>
         mutation.type === "put"
           ? {
               type: "put",
@@ -456,6 +456,7 @@ export function parseStorageProtocolPage(
   value: unknown,
   request: Parameters<import("./storage-adapter.ts").StorageAdapter["list"]>[0],
   limits: StorageProtocolLimits,
+  expectedListHref: string,
 ): StoragePage {
   assertStorageListBoundary(request);
   const object = protocolDocument(value, "bounded-storage-records-page");
@@ -468,7 +469,18 @@ export function parseStorageProtocolPage(
   }
   const id = requiredString(object.id);
   const self = exactHttpsUrl(id);
-  if (!matchesPageUrl(self, request.collection, request.limit, request.cursor ?? null)) {
+  const expectedSelf = exactHttpsUrl(expectedListHref);
+  if (
+    self.origin !== expectedSelf.origin ||
+    self.pathname !== expectedSelf.pathname ||
+    !matchesPageUrl(
+      expectedSelf,
+      request.collection,
+      request.limit,
+      request.cursor ?? null,
+    ) ||
+    !matchesPageUrl(self, request.collection, request.limit, request.cursor ?? null)
+  ) {
     invalidProtocol();
   }
   const wireItems = requiredArray(data.items);
@@ -481,7 +493,7 @@ export function parseStorageProtocolPage(
   for (const item of items) {
     if (item.key.collection !== request.collection) invalidProtocol();
     const key = storageKeyString(item.key);
-    if (seen.has(key) || (priorId !== null && priorId.localeCompare(item.key.id) >= 0)) {
+    if (seen.has(key) || (priorId !== null && compareCodeUnits(priorId, item.key.id) >= 0)) {
       invalidProtocol();
     }
     seen.add(key);
@@ -531,12 +543,12 @@ export function parseStorageProtocolTransaction(
   request: StorageTransactionRequest,
   maxRecordBytes: number,
 ): StorageTransactionResult {
-  assertStorageTransactionBoundary(request);
+  const snapshot = normalizeStorageTransactionRequest(request);
   const object = protocolDocument(value, "bounded-storage-transaction");
   const data = requiredObject(object.data);
   if (
-    object.id !== request.operationId ||
-    data.operation_id !== request.operationId ||
+    object.id !== snapshot.operationId ||
+    data.operation_id !== snapshot.operationId ||
     typeof data.replayed !== "boolean"
   ) {
     invalidProtocol();
@@ -544,9 +556,9 @@ export function parseStorageProtocolTransaction(
   requiredArray(object.links);
   requiredArray(object.actions);
   const wireRecords = requiredArray(data.records);
-  if (wireRecords.length !== request.mutations.length) invalidProtocol();
+  if (wireRecords.length !== snapshot.mutations.length) invalidProtocol();
   const records = wireRecords.map((wireRecord, index) => {
-    const mutation = request.mutations[index];
+    const mutation = snapshot.mutations[index];
     if (mutation === undefined) invalidProtocol();
     if (mutation.type === "delete") {
       if (wireRecord !== null) invalidProtocol();
@@ -931,9 +943,13 @@ function canonicalValue(value: unknown): unknown {
   if (!isPlainObject(value)) return value;
   return Object.fromEntries(
     Object.entries(value)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => compareCodeUnits(left, right))
       .map(([key, child]) => [key, canonicalValue(child)]),
   );
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function deepFreeze<Value>(value: Value): Value {

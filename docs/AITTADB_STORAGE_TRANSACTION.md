@@ -109,8 +109,10 @@ document. A read adapter converts that response to `null`.
 
 A list request contains exactly one collection, a limit from 1 through 100, and
 an optional opaque cursor returned by the preceding page. The response contains
-only records from that collection, sorted by stable record ID, with no duplicate
-keys and no more items than requested:
+only records from that collection, sorted by stable record ID using ascending
+code-unit order, with no duplicate keys and no more items than requested.
+Stable record IDs are ASCII, so this order is independent of locale and
+database collation:
 
 ```json
 {
@@ -134,9 +136,12 @@ keys and no more items than requested:
 }
 ```
 
-When more records exist, `next_cursor` is non-null and exactly one `next` link
-contains that cursor, collection, and page size on the same origin and path.
-Clients preserve the opaque cursor and follow only the advertised transition.
+The page `id` and `self` link use the exact logical origin and path of the
+discovered list action, with only the declared collection, limit, and optional
+cursor query values. When more records exist, `next_cursor` is non-null and
+exactly one `next` link contains that cursor, collection, and page size on the
+same logical origin and path. Clients preserve the opaque cursor and follow
+only the advertised transition.
 The server binds a cursor to the credential namespace, collection, and page
 parameters. A malformed, expired, substituted, or cross-namespace cursor is an
 `invalid_request`. For a collection that is not mutated during traversal,
@@ -177,6 +182,14 @@ pre-transaction state. It then commits every record mutation and the operation
 receipt in one durable transaction. Any failure commits none of them. This
 rollback rule includes malformed input, missing grants, duplicate creation,
 stale revisions, quota rejection, and an internal commit failure.
+
+The client independently rejects any unknown mutation discriminator or extra
+mutation member before discovery. It validates the operation ID and complete
+key grammar, finite JSON tree, unique keys, and global transaction ceiling,
+copies those values once into an immutable data-only snapshot, then enforces
+the discovered per-record and transaction byte ceilings before transport.
+Serialization and response verification use that snapshot, so accessors or
+custom array behavior cannot change a validated mutation.
 
 Compare-and-set rules are closed:
 
@@ -293,7 +306,9 @@ deployment must prove:
    logs, or exceptions.
 
 `tests/aittadb-storage-protocol.test.ts` supplies the deterministic protocol
-fixture. It follows discovered targets and runs the complete existing
-`StorageAdapter` contract unchanged, then adds mixed put/delete, quota,
-pre-commit rollback, strict decoding, and raw authorization-equivalence proof.
-The fixture proves the protocol mapping; it is not production persistence.
+service and runs the production `AittaDBStorageAdapter` against it. The adapter
+follows discovered targets and runs the complete existing `StorageAdapter`
+contract unchanged, then adds mixed put/delete, quota, pre-commit rollback,
+strict decoding, transport mapping, response bounds, retry, redaction, and raw
+authorization-equivalence proof. The service proves the protocol mapping; it is
+not production persistence.

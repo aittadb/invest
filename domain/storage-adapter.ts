@@ -182,32 +182,213 @@ export function assertStorageListBoundary(request: StorageListRequest): void {
 export function assertStorageTransactionBoundary(
   request: StorageTransactionRequest,
 ): void {
-  if (
-    request.mutations.length < 1 ||
-    request.mutations.length > MAX_STORAGE_TRANSACTION_MUTATIONS
-  ) {
-    throw new StorageFailure("INVALID_REQUEST");
-  }
+  normalizeStorageTransactionRequest(request);
+}
 
-  const keys = new Set<string>();
-  for (const mutation of request.mutations) {
-    const key = storageKeyString(mutation.key);
-    if (keys.has(key)) throw new StorageFailure("INVALID_REQUEST");
-    keys.add(key);
-
+/** Parses untrusted transaction input once into an immutable data-only snapshot. */
+export function normalizeStorageTransactionRequest(
+  request: StorageTransactionRequest,
+): StorageTransactionRequest {
+  try {
+    const source = exactStorageDataRecord(request, [
+      "operationId",
+      "mutations",
+    ]);
+    const operationId = parseStorageOperationId(source.operationId);
+    if (!operationId.ok) invalidStorageRequest();
+    const candidates = storageArrayValues(source.mutations);
     if (
-      mutation.expectedRevision !== null &&
-      (!Number.isSafeInteger(mutation.expectedRevision) ||
-        mutation.expectedRevision < 1)
+      candidates.length < 1 ||
+      candidates.length > MAX_STORAGE_TRANSACTION_MUTATIONS
     ) {
-      throw new StorageFailure("INVALID_REQUEST");
+      invalidStorageRequest();
     }
-    if (mutation.type === "delete" && mutation.expectedRevision === null) {
-      throw new StorageFailure("INVALID_REQUEST");
+
+    const keys = new Set<string>();
+    const mutations: StorageMutation[] = [];
+    for (const candidate of candidates) {
+      const typeRecord = requiredStorageRecord(candidate);
+      const typeDescriptor = Object.getOwnPropertyDescriptor(typeRecord, "type");
+      if (
+        typeDescriptor === undefined ||
+        !typeDescriptor.enumerable ||
+        !("value" in typeDescriptor)
+      ) invalidStorageRequest();
+      const put = typeDescriptor.value === "put";
+      const remove = typeDescriptor.value === "delete";
+      if (!put && !remove) invalidStorageRequest();
+      const mutation = exactStorageDataRecord(
+        candidate,
+        put
+          ? ["type", "key", "expectedRevision", "value"]
+          : ["type", "key", "expectedRevision"],
+      );
+
+      const keySource = exactStorageDataRecord(mutation.key, [
+        "collection",
+        "id",
+      ]);
+      const parsedKey = parseStorageKey(keySource.collection, keySource.id);
+      if (!parsedKey.ok) invalidStorageRequest();
+      const keyIdentity = storageKeyString(parsedKey.value);
+      if (keys.has(keyIdentity)) invalidStorageRequest();
+      keys.add(keyIdentity);
+      const key = Object.freeze({ ...parsedKey.value });
+
+      const expectedRevision = mutation.expectedRevision;
+      if (
+        expectedRevision !== null &&
+        (!Number.isSafeInteger(expectedRevision) ||
+          (expectedRevision as number) < 1) ||
+        remove && expectedRevision === null
+      ) {
+        invalidStorageRequest();
+      }
+      if (put) {
+        mutations.push(Object.freeze({
+          type: "put",
+          key,
+          expectedRevision: expectedRevision as number | null,
+          value: snapshotStorageDocument(mutation.value),
+        }));
+      } else {
+        mutations.push(Object.freeze({
+          type: "delete",
+          key,
+          expectedRevision: expectedRevision as number,
+        }));
+      }
     }
+    return Object.freeze({
+      operationId: operationId.value,
+      mutations: Object.freeze(mutations),
+    });
+  } catch (error) {
+    if (error instanceof StorageFailure) throw error;
+    invalidStorageRequest();
   }
 }
 
 export function storageKeyString(key: StorageKey): string {
   return `${key.collection}/${key.id}`;
+}
+
+function snapshotStorageDocument(value: unknown): StorageDocument {
+  requiredStorageRecord(value);
+  return snapshotJsonValue(value, {
+    seen: new WeakSet<object>(),
+    nodes: 0,
+  }) as StorageDocument;
+}
+
+function snapshotJsonValue(
+  value: unknown,
+  state: { seen: WeakSet<object>; nodes: number },
+): JsonValue {
+  state.nodes += 1;
+  if (state.nodes > 65_536) invalidStorageRequest();
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) invalidStorageRequest();
+    return value;
+  }
+  if (typeof value !== "object") invalidStorageRequest();
+  if (state.seen.has(value)) invalidStorageRequest();
+  state.seen.add(value);
+
+  if (Array.isArray(value)) {
+    const candidates = storageArrayValues(value);
+    return Object.freeze(candidates.map((candidate) =>
+      snapshotJsonValue(candidate, state)
+    ));
+  }
+
+  const source = requiredStorageRecord(value);
+  const keys = Reflect.ownKeys(source);
+  if (keys.some((key) => typeof key !== "string")) invalidStorageRequest();
+  const snapshot: Record<string, JsonValue> = Object.create(null) as Record<
+    string,
+    JsonValue
+  >;
+  for (const key of keys as string[]) {
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !("value" in descriptor)
+    ) invalidStorageRequest();
+    snapshot[key] = snapshotJsonValue(descriptor.value, state);
+  }
+  return Object.freeze(snapshot);
+}
+
+function requiredStorageRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    invalidStorageRequest();
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) invalidStorageRequest();
+  return value as Record<string, unknown>;
+}
+
+function exactStorageDataRecord(
+  value: unknown,
+  expected: readonly string[],
+): Record<string, unknown> {
+  const source = requiredStorageRecord(value);
+  const keys = Reflect.ownKeys(source);
+  if (
+    keys.length !== expected.length ||
+    keys.some((key) => typeof key !== "string" || !expected.includes(key))
+  ) invalidStorageRequest();
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<
+    string,
+    unknown
+  >;
+  for (const key of expected) {
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !("value" in descriptor)
+    ) invalidStorageRequest();
+    snapshot[key] = descriptor.value;
+  }
+  return snapshot;
+}
+
+function storageArrayValues(value: unknown): readonly unknown[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    invalidStorageRequest();
+  }
+  const length = value.length;
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== length + 1 ||
+    !keys.includes("length") ||
+    keys.some((key) =>
+      typeof key !== "string" ||
+      key !== "length" &&
+        (!/^(?:0|[1-9]\d*)$/u.test(key) || Number(key) >= length)
+    )
+  ) invalidStorageRequest();
+  const snapshot: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !("value" in descriptor)
+    ) invalidStorageRequest();
+    snapshot.push(descriptor.value);
+  }
+  return snapshot;
+}
+
+function invalidStorageRequest(): never {
+  throw new StorageFailure("INVALID_REQUEST");
 }

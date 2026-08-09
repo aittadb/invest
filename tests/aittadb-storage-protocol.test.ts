@@ -10,7 +10,6 @@ import {
   parseStorageProtocolDiscovery,
   parseStorageProtocolPage,
   parseStorageProtocolRecord,
-  parseStorageProtocolTransaction,
   storageFailureFromProtocol,
   storageProtocolErrorDocument,
   storageProtocolErrorStatus,
@@ -30,13 +29,15 @@ import {
   parseStorageKey,
   parseStorageOperationId,
   storageKeyString,
-  type StorageAdapter,
   type StorageDocument,
   type StorageKey,
   type StorageRecord,
   type StorageTransactionRequest,
-  type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
+import {
+  AittaDBStorageAdapter,
+  type AittaDBStorageAdapterDependencies,
+} from "../repositories/aittadb-storage-adapter.ts";
 import {
   verifyStorageAdapterContract,
   type StorageAdapterContractFixture,
@@ -47,6 +48,7 @@ const ENTRY_HREF = `${ORIGIN}/entry/records`;
 const READ_HREF = `${ORIGIN}/resources/{collection}/{id}`;
 const LIST_HREF = `${ORIGIN}/pages/records`;
 const TRANSACT_HREF = `${ORIGIN}/operations/atomic-records`;
+const TRANSPORT_ORIGIN = "https://storage-transport.example";
 const OWNER_TOKEN = "fixture-owner-token";
 const OUTSIDER_TOKEN = "fixture-outsider-token";
 
@@ -166,6 +168,25 @@ test("idempotency compares canonical JSON while preserving mutation order", asyn
   assert.deepEqual(replay.records, first.records);
 });
 
+test("pagination uses deterministic code-unit ordering", async () => {
+  const fixture = createFixture();
+  const ids = ["sort-a", "sort-A", "sort_0", "sort-0"];
+  for (const [index, id] of ids.entries()) {
+    await fixture.owner.transact(transaction(`operation:${id}`, [
+      put(key(id), null, { index }),
+    ]));
+  }
+
+  const page = await fixture.owner.list({
+    collection: key("sort-a").collection,
+    limit: ids.length,
+  });
+  assert.deepEqual(
+    page.items.map((item) => item.key.id),
+    [...ids].sort(compareCodeUnits),
+  );
+});
+
 test("quota rejection and an injected failure roll back records and receipts", async () => {
   const fixture = createFixture({ namespaceMaxItems: 1 });
   const existing = key("quota-existing");
@@ -229,6 +250,10 @@ test("missing and unauthorized resources have identical wire failures", async ()
   assert.equal(existingRead.status, 404);
   assert.equal(missingRead.status, 404);
   assert.equal(await existingRead.text(), await missingRead.text());
+  assert.deepEqual(await fixture.outsider.list({
+    collection: existing.collection,
+    limit: 10,
+  }), { items: [], nextCursor: null });
 
   const deniedWrite = await fixture.service.fetch(TRANSACT_HREF, {
     ...bearer(OUTSIDER_TOKEN),
@@ -276,7 +301,7 @@ test("protocol decoders fail closed on oversized, malformed, or mismatched data"
     () => parseStorageProtocolPage(emptyContinuation, {
       collection: recordKey.collection,
       limit: 1,
-    }, LIMITS),
+    }, LIMITS, `${LIST_HREF}?collection=${recordKey.collection}&limit=1`),
     "UNAVAILABLE",
   );
 
@@ -293,6 +318,739 @@ test("protocol decoders fail closed on oversized, malformed, or mismatched data"
   assert.equal(forgedFailure.message.includes("private-existing"), false);
 });
 
+test("the adapter maps only backend transport while preserving logical hypermedia identity", async () => {
+  const service = new DeterministicStorageProtocolService();
+  const captured: Request[] = [];
+  let tokenCalls = 0;
+  const adapter = new AittaDBStorageAdapter({
+    issuer: ORIGIN,
+    entryHref: ENTRY_HREF,
+    transportOrigin: TRANSPORT_ORIGIN,
+    accessToken() {
+      tokenCalls += 1;
+      return OWNER_TOKEN;
+    },
+    async fetch(input, init) {
+      const request = new Request(input, init);
+      captured.push(request);
+      const physical = new URL(request.url);
+      assert.equal(physical.origin, TRANSPORT_ORIGIN);
+      const logical = new URL(physical.href);
+      const issuer = new URL(ORIGIN);
+      logical.protocol = issuer.protocol;
+      logical.host = issuer.host;
+      return service.fetch(logical.href, init);
+    },
+  });
+
+  const created = await adapter.transact(transaction("operation:transport", [
+    put(key("transport"), null, { state: "stored" }),
+  ]));
+  assert.equal(created.records[0]?.value.state, "stored");
+  assert.equal(tokenCalls, 2);
+  assert.deepEqual(
+    captured.map((request) => request.url),
+    [
+      `${TRANSPORT_ORIGIN}/entry/records`,
+      `${TRANSPORT_ORIGIN}/operations/atomic-records`,
+    ],
+  );
+  for (const request of captured) {
+    assert.equal(request.redirect, "manual");
+    assert.equal(request.headers.get("accept"), AITTADB_HYPERMEDIA_MEDIA_TYPE);
+    assert.equal(request.headers.get("authorization"), `Bearer ${OWNER_TOKEN}`);
+    assert.equal(request.headers.get("cache-control"), "no-store");
+    assert.equal(request.url.includes(OWNER_TOKEN), false);
+  }
+  assert.equal(captured[0]?.headers.get("content-type"), null);
+  assert.equal(captured[1]?.headers.get("content-type"), "application/json");
+  assert.deepEqual(service.requests, [ENTRY_HREF, TRANSACT_HREF]);
+});
+
+test("constructor accepts only explicit canonical same-issuer boundaries", () => {
+  const privateValue = "private-runtime-boundary";
+  const base: AittaDBStorageAdapterDependencies = {
+    issuer: ORIGIN,
+    entryHref: ENTRY_HREF,
+    accessToken: () => OWNER_TOKEN,
+    fetch: async () => protocolResponse(200, discoveryDocument()),
+  };
+  const cases: readonly Record<string, unknown>[] = [
+    { issuer: `${ORIGIN}/oauth` },
+    { issuer: `${ORIGIN}?${privateValue}=1` },
+    { entryHref: "https://foreign.example/entry" },
+    { entryHref: `${ENTRY_HREF}?${privateValue}=1` },
+    { transportOrigin: `${TRANSPORT_ORIGIN}/backend` },
+    { transportOrigin: `https://user@storage-transport.example` },
+    { accessToken: privateValue },
+    { fetch: privateValue },
+    { requestTimeoutMs: 9 },
+    { requestTimeoutMs: 60_001 },
+    { requestTimeoutMs: Number.NaN },
+  ];
+
+  for (const overrides of cases) {
+    assert.throws(
+      () => new AittaDBStorageAdapter({
+        ...base,
+        ...overrides,
+      } as AittaDBStorageAdapterDependencies),
+      (error: unknown) => {
+        assert.equal(
+          error instanceof StorageFailure && error.code === "UNAVAILABLE",
+          true,
+        );
+        assert.equal(String(error).includes(privateValue), false);
+        return true;
+      },
+    );
+  }
+});
+
+test("advertised actions cannot smuggle undeclared base query values", async () => {
+  const discovery = defineStorageProtocolDiscovery({
+    entryHref: ENTRY_HREF,
+    readRecordHref: `${READ_HREF}?private=transport-value`,
+    listRecordsHref: LIST_HREF,
+    transactRecordsHref: TRANSACT_HREF,
+    limits: LIMITS,
+  });
+  const harness = responseHarness([protocolResponse(200, discovery)]);
+  await assert.rejects(
+    () => harness.adapter.read(key("query-control")),
+    unavailableStorageFailure,
+  );
+  assert.equal(harness.calls(), 1);
+});
+
+test("redirects, media, declarations, streams, encoding, and JSON fail closed", async (t) => {
+  const discoveryFailures: readonly Readonly<{
+    name: string;
+    response: () => Response;
+  }>[] = [
+    {
+      name: "redirect",
+      response: () => new Response(null, {
+        status: 302,
+        headers: { location: "https://foreign.example/redirect" },
+      }),
+    },
+    {
+      name: "already followed response",
+      response: () => responseWithMetadata(
+        protocolResponse(200, discoveryDocument()),
+        { redirected: true },
+      ),
+    },
+    {
+      name: "mismatched final URL",
+      response: () => responseWithMetadata(
+        protocolResponse(200, discoveryDocument()),
+        { url: "https://foreign.example/final" },
+      ),
+    },
+    {
+      name: "wrong media type",
+      response: () => new Response(JSON.stringify(discoveryDocument()), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    },
+    {
+      name: "oversized declaration",
+      response: () => new Response("{}", {
+        status: 200,
+        headers: {
+          "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE,
+          "content-length": "65537",
+        },
+      }),
+    },
+    {
+      name: "malformed declaration",
+      response: () => new Response("{}", {
+        status: 200,
+        headers: {
+          "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE,
+          "content-length": "private",
+        },
+      }),
+    },
+    {
+      name: "oversized stream",
+      response: () => new Response("x".repeat(65_537), {
+        status: 200,
+        headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+      }),
+    },
+    {
+      name: "missing body",
+      response: () => new Response(null, {
+        status: 200,
+        headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+      }),
+    },
+    {
+      name: "locked body",
+      response: () => {
+        const response = protocolResponse(200, discoveryDocument());
+        response.body?.getReader();
+        return response;
+      },
+    },
+    {
+      name: "invalid UTF-8",
+      response: () => new Response(new Uint8Array([0xc3, 0x28]), {
+        status: 200,
+        headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+      }),
+    },
+    {
+      name: "malformed JSON",
+      response: () => new Response("{", {
+        status: 200,
+        headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+      }),
+    },
+  ];
+
+  for (const current of discoveryFailures) {
+    await t.test(current.name, async () => {
+      const harness = responseHarness([current.response()]);
+      await assert.rejects(
+        () => harness.adapter.read(key("bounded-response")),
+        unavailableStorageFailure,
+      );
+      assert.equal(harness.calls(), 1);
+    });
+  }
+
+  for (const current of [
+    {
+      name: "redirect body cancellation",
+      status: 302,
+      metadata: {},
+    },
+    {
+      name: "followed body cancellation",
+      status: 200,
+      metadata: { redirected: true },
+    },
+    {
+      name: "mismatched final URL body cancellation",
+      status: 200,
+      metadata: { url: "https://foreign.example/final" },
+    },
+  ] as const) {
+    await t.test(current.name, async () => {
+      let canceled = false;
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          canceled = true;
+        },
+      });
+      const response = responseWithMetadata(
+        new Response(body, {
+          status: current.status,
+          headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+        }),
+        current.metadata,
+      );
+      const harness = responseHarness([response]);
+      await assert.rejects(
+        () => harness.adapter.read(key("cancel-redirect-response")),
+        unavailableStorageFailure,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(canceled, true);
+    });
+  }
+
+  for (const current of [
+    {
+      name: "wrong media cancellation",
+      headers: new Headers({ "content-type": "application/json" }),
+    },
+    {
+      name: "oversized declaration cancellation",
+      headers: new Headers({
+        "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE,
+        "content-length": "65537",
+      }),
+    },
+    {
+      name: "malformed declaration cancellation",
+      headers: new Headers({
+        "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE,
+        "content-length": "private",
+      }),
+    },
+  ]) {
+    await t.test(current.name, async () => {
+      let canceled = false;
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          canceled = true;
+        },
+      });
+      const harness = responseHarness([
+        new Response(body, { status: 200, headers: current.headers }),
+      ]);
+      await assert.rejects(
+        () => harness.adapter.read(key("cancel-rejected-response")),
+        unavailableStorageFailure,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(canceled, true);
+    });
+  }
+
+  await t.test("oversized record response", async () => {
+    const maximum = LIMITS.max_record_bytes + 65_536;
+    const harness = responseHarness([
+      protocolResponse(200, discoveryDocument()),
+      new Response("{}", {
+        status: 200,
+        headers: {
+          "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE,
+          "content-length": String(maximum + 1),
+        },
+      }),
+    ]);
+    await assert.rejects(
+      () => harness.adapter.read(key("oversized-record-response")),
+      unavailableStorageFailure,
+    );
+    assert.equal(harness.calls(), 2);
+  });
+
+  await t.test("oversized error response", async () => {
+    const harness = responseHarness([
+      protocolResponse(200, discoveryDocument()),
+      new Response("x".repeat(16_385), {
+        status: 503,
+        headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+      }),
+    ]);
+    await assert.rejects(
+      () => harness.adapter.read(key("oversized-error-response")),
+      unavailableStorageFailure,
+    );
+    assert.equal(harness.calls(), 2);
+  });
+
+  await t.test("foreign page identity", async () => {
+    const request = {
+      collection: key("foreign-page").collection,
+      limit: 1,
+    } as const;
+    const foreign = new URL(
+      `https://foreign.example/pages?collection=${request.collection}&limit=1`,
+    );
+    const harness = responseHarness([
+      protocolResponse(200, discoveryDocument()),
+      protocolResponse(
+        200,
+        pageDocument(foreign, request.collection, request.limit, [], null),
+      ),
+    ]);
+    await assert.rejects(
+      () => harness.adapter.list(request),
+      unavailableStorageFailure,
+    );
+    assert.equal(harness.calls(), 2);
+  });
+
+  await t.test("unexpected decoder recursion", async () => {
+    const recordKey = key("deep-protocol-value");
+    const nested = `${"[".repeat(12_000)}null${"]".repeat(12_000)}`;
+    const body = `{"api_version":"${AITTADB_HYPERMEDIA_API_VERSION}","type":"bounded-storage-record","id":"deep","data":{"key":{"collection":"${recordKey.collection}","id":"${recordKey.id}"},"revision":1,"value":{"deep":${nested}}},"links":[],"actions":[]}`;
+    const harness = responseHarness([
+      protocolResponse(200, discoveryDocument()),
+      new Response(body, {
+        status: 200,
+        headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+      }),
+    ]);
+    await assert.rejects(
+      () => harness.adapter.read(recordKey),
+      unavailableStorageFailure,
+    );
+    assert.equal(harness.calls(), 2);
+  });
+});
+
+test("token, fetch, and streamed response work stay time and chunk bounded", async (t) => {
+  await t.test("token wait", async () => {
+    let calls = 0;
+    const adapter = new AittaDBStorageAdapter({
+      issuer: ORIGIN,
+      entryHref: ENTRY_HREF,
+      requestTimeoutMs: 10,
+      accessToken: () => new Promise<string>(() => undefined),
+      async fetch() {
+        calls += 1;
+        return protocolResponse(200, discoveryDocument());
+      },
+    });
+    await assert.rejects(
+      () => adapter.read(key("stalled-token")),
+      unavailableStorageFailure,
+    );
+    assert.equal(calls, 0);
+  });
+
+  await t.test("fetch wait", async () => {
+    const adapter = new AittaDBStorageAdapter({
+      issuer: ORIGIN,
+      entryHref: ENTRY_HREF,
+      requestTimeoutMs: 10,
+      accessToken: () => OWNER_TOKEN,
+      fetch: () => new Promise<Response>(() => undefined),
+    });
+    await assert.rejects(
+      () => adapter.read(key("stalled-fetch")),
+      unavailableStorageFailure,
+    );
+  });
+
+  await t.test("stream wait", async () => {
+    let cancelled = false;
+    const adapter = new AittaDBStorageAdapter({
+      issuer: ORIGIN,
+      entryHref: ENTRY_HREF,
+      requestTimeoutMs: 10,
+      accessToken: () => OWNER_TOKEN,
+      async fetch() {
+        return new Response(new ReadableStream<Uint8Array>({
+          pull: () => new Promise<void>(() => undefined),
+          cancel() {
+            cancelled = true;
+          },
+        }), {
+          status: 200,
+          headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+        });
+      },
+    });
+    await assert.rejects(
+      () => adapter.read(key("stalled-stream")),
+      unavailableStorageFailure,
+    );
+    assert.equal(cancelled, true);
+  });
+
+  await t.test("fragmented stream", async () => {
+    let chunks = 0;
+    let cancelled = false;
+    const adapter = new AittaDBStorageAdapter({
+      issuer: ORIGIN,
+      entryHref: ENTRY_HREF,
+      requestTimeoutMs: 1_000,
+      accessToken: () => OWNER_TOKEN,
+      async fetch() {
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            chunks += 1;
+            controller.enqueue(Uint8Array.of(0x20));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }), {
+          status: 200,
+          headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+        });
+      },
+    });
+    await assert.rejects(
+      () => adapter.read(key("fragmented-stream")),
+      unavailableStorageFailure,
+    );
+    assert.equal(chunks >= 4_097 && chunks <= 4_098, true);
+    assert.equal(cancelled, true);
+  });
+});
+
+test("failed discovery clears its cache and concurrent discovery is coalesced", async () => {
+  const service = new DeterministicStorageProtocolService();
+  let discoveryCalls = 0;
+  let tokenCalls = 0;
+  let rejectFirstDiscovery = true;
+  const adapter = new AittaDBStorageAdapter({
+    issuer: ORIGIN,
+    entryHref: ENTRY_HREF,
+    accessToken() {
+      tokenCalls += 1;
+      return OWNER_TOKEN;
+    },
+    async fetch(input, init) {
+      if (String(input) === ENTRY_HREF) {
+        discoveryCalls += 1;
+        if (rejectFirstDiscovery) {
+          rejectFirstDiscovery = false;
+          return protocolResponse(503, storageProtocolErrorDocument("unavailable"));
+        }
+      }
+      return service.fetch(input, init);
+    },
+  });
+
+  await assert.rejects(
+    () => adapter.read(key("first-discovery-failure")),
+    unavailableStorageFailure,
+  );
+  assert.equal(await adapter.read(key("retry-after-discovery-failure")), null);
+  assert.equal(discoveryCalls, 2);
+
+  const beforeConcurrentTokens = tokenCalls;
+  assert.deepEqual(
+    await Promise.all([
+      adapter.read(key("concurrent-one")),
+      adapter.read(key("concurrent-two")),
+    ]),
+    [null, null],
+  );
+  assert.equal(discoveryCalls, 2);
+  assert.equal(tokenCalls - beforeConcurrentTokens, 2);
+
+  const failureService = new DeterministicStorageProtocolService();
+  let failConcurrently = true;
+  let failureDiscoveryCalls = 0;
+  const concurrentFailure = new AittaDBStorageAdapter({
+    issuer: ORIGIN,
+    entryHref: ENTRY_HREF,
+    accessToken: () => OWNER_TOKEN,
+    async fetch(input, init) {
+      if (String(input) === ENTRY_HREF) {
+        failureDiscoveryCalls += 1;
+        if (failConcurrently) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return protocolResponse(
+            400,
+            storageProtocolErrorDocument("invalid_request"),
+          );
+        }
+      }
+      return failureService.fetch(input, init);
+    },
+  });
+  const concurrentFailures = await Promise.allSettled([
+    concurrentFailure.read(key("concurrent-failure-one")),
+    concurrentFailure.read(key("concurrent-failure-two")),
+  ]);
+  assert.equal(concurrentFailures.every((result) =>
+    result.status === "rejected" && unavailableStorageFailure(result.reason)
+  ), true);
+  assert.equal(failureDiscoveryCalls, 1);
+  failConcurrently = false;
+  assert.equal(await concurrentFailure.read(key("after-concurrent-failure")), null);
+  assert.equal(failureDiscoveryCalls, 2);
+
+  const freshService = new DeterministicStorageProtocolService();
+  let freshDiscoveryCalls = 0;
+  const fresh = new AittaDBStorageAdapter({
+    issuer: ORIGIN,
+    entryHref: ENTRY_HREF,
+    accessToken: () => OWNER_TOKEN,
+    async fetch(input, init) {
+      if (String(input) === ENTRY_HREF) freshDiscoveryCalls += 1;
+      return freshService.fetch(input, init);
+    },
+  });
+  assert.deepEqual(
+    await Promise.all([
+      fresh.read(key("coalesced-one")),
+      fresh.read(key("coalesced-two")),
+    ]),
+    [null, null],
+  );
+  assert.equal(freshDiscoveryCalls, 1);
+});
+
+test("request boundaries fail before unsafe transport and honor discovered limits", async () => {
+  let calls = 0;
+  const adapter = new AittaDBStorageAdapter({
+    issuer: ORIGIN,
+    entryHref: ENTRY_HREF,
+    accessToken: () => OWNER_TOKEN,
+    async fetch() {
+      calls += 1;
+      return protocolResponse(200, discoveryDocument());
+    },
+  });
+
+  await assert.rejects(
+    () => adapter.read({ collection: "INVALID", id: "bad id" } as StorageKey),
+    invalidStorageRequest,
+  );
+  await assert.rejects(
+    () => adapter.list({ collection: "INVALID", limit: 1 } as Parameters<typeof adapter.list>[0]),
+    invalidStorageRequest,
+  );
+  await assert.rejects(
+    () => adapter.transact({
+      operationId: "bad operation id",
+      mutations: [put(key("bad-operation"), null, { value: 1 })],
+    } as unknown as StorageTransactionRequest),
+    invalidStorageRequest,
+  );
+  const overriddenMutations = [
+    put(key("must-remain-put"), null, { value: 1 }),
+  ];
+  Object.defineProperty(overriddenMutations, "map", {
+    configurable: true,
+    value: () => [{
+      type: "delete",
+      key: key("must-remain-put"),
+      expectedRevision: 1,
+    }],
+  });
+  await assert.rejects(
+    () => adapter.transact({
+      operationId: operationId("operation:overridden-map"),
+      mutations: overriddenMutations,
+    }),
+    invalidStorageRequest,
+  );
+  let operationGetterCalls = 0;
+  const accessorRequest = Object.create(null) as Record<string, unknown>;
+  Object.defineProperties(accessorRequest, {
+    operationId: {
+      enumerable: true,
+      get() {
+        operationGetterCalls += 1;
+        return operationId("operation:accessor");
+      },
+    },
+    mutations: {
+      enumerable: true,
+      value: [put(key("accessor"), null, { value: 1 })],
+    },
+  });
+  await assert.rejects(
+    () => adapter.transact(
+      accessorRequest as unknown as StorageTransactionRequest,
+    ),
+    invalidStorageRequest,
+  );
+  assert.equal(operationGetterCalls, 0);
+  await assert.rejects(
+    () => adapter.transact({
+      operationId: operationId("operation:bad-discriminator"),
+      mutations: [{
+        type: "unexpected",
+        key: key("must-not-delete"),
+        expectedRevision: 1,
+      }],
+    } as unknown as StorageTransactionRequest),
+    invalidStorageRequest,
+  );
+  await assert.rejects(
+    () => adapter.transact({
+      operationId: operationId("operation:bad-key"),
+      mutations: [{
+        type: "delete",
+        key: { collection: "INVALID", id: "bad id" },
+        expectedRevision: 1,
+      }],
+    } as unknown as StorageTransactionRequest),
+    invalidStorageRequest,
+  );
+  await assert.rejects(
+    () => adapter.transact(transaction("operation:non-finite", [
+      put(key("non-finite"), null, { value: Number.NaN }),
+    ])),
+    invalidStorageRequest,
+  );
+  await assert.rejects(
+    () => adapter.transact(transaction("operation:global-oversize", [
+      put(key("global-oversize"), null, { value: "x".repeat(1_100_000) }),
+    ])),
+    invalidStorageRequest,
+  );
+  assert.equal(calls, 0);
+
+  await assert.rejects(
+    () => adapter.list({
+      collection: key("cursor").collection,
+      limit: 1,
+      cursor: "x".repeat(LIMITS.max_cursor_length + 1) as Parameters<
+        typeof adapter.list
+      >[0]["cursor"],
+    }),
+    invalidStorageRequest,
+  );
+  assert.equal(calls, 1);
+
+  await assert.rejects(
+    () => adapter.transact(transaction("operation:record-oversize", [
+      put(key("record-oversize"), null, { value: "x".repeat(5_000) }),
+    ])),
+    invalidStorageRequest,
+  );
+  assert.equal(calls, 1);
+
+  await assert.rejects(
+    () => adapter.transact(transaction("operation:advertised-oversize", [
+      put(key("advertised-oversize"), null, { value: "x".repeat(70_000) }),
+    ])),
+    invalidStorageRequest,
+  );
+  assert.equal(calls, 1);
+});
+
+test("tokens and private transport failures never enter adapter errors", async () => {
+  const secrets = [
+    "private-token-provider-failure",
+    "private-fetch-token",
+    "private-response-body",
+    "private invalid token",
+  ] as const;
+  const adapters = [
+    new AittaDBStorageAdapter({
+      issuer: ORIGIN,
+      entryHref: ENTRY_HREF,
+      accessToken() {
+        throw new Error(secrets[0]);
+      },
+      fetch: async () => assert.fail("Token failure must precede fetch."),
+    }),
+    new AittaDBStorageAdapter({
+      issuer: ORIGIN,
+      entryHref: ENTRY_HREF,
+      accessToken: () => secrets[1],
+      fetch: async () => {
+        throw new Error(secrets[1]);
+      },
+    }),
+    new AittaDBStorageAdapter({
+      issuer: ORIGIN,
+      entryHref: ENTRY_HREF,
+      accessToken: () => OWNER_TOKEN,
+      fetch: async () => protocolResponse(200, { private: secrets[2] }),
+    }),
+    new AittaDBStorageAdapter({
+      issuer: ORIGIN,
+      entryHref: ENTRY_HREF,
+      accessToken: () => secrets[3],
+      fetch: async () => assert.fail("Invalid bearer token must precede fetch."),
+    }),
+  ];
+
+  for (const adapter of adapters) {
+    await assert.rejects(
+      () => adapter.read(key("redaction")),
+      (error: unknown) => {
+        assert.equal(unavailableStorageFailure(error), true);
+        const serialized = `${String(error)}\n${JSON.stringify(error)}\n${JSON.stringify(adapter)}`;
+        for (const secret of secrets) assert.equal(serialized.includes(secret), false);
+        return true;
+      },
+    );
+  }
+});
+
 function contractFixture(): StorageAdapterContractFixture {
   const fixture = createFixture();
   return { owner: fixture.owner, outsider: fixture.outsider };
@@ -304,12 +1062,18 @@ function createFixture(
   const service = new DeterministicStorageProtocolService(options);
   return {
     service,
-    owner: new HypermediaProtocolAdapter(ENTRY_HREF, OWNER_TOKEN, service.fetch),
-    outsider: new HypermediaProtocolAdapter(
-      ENTRY_HREF,
-      OUTSIDER_TOKEN,
-      service.fetch,
-    ),
+    owner: new AittaDBStorageAdapter({
+      issuer: ORIGIN,
+      entryHref: ENTRY_HREF,
+      accessToken: () => OWNER_TOKEN,
+      fetch: service.fetch,
+    }),
+    outsider: new AittaDBStorageAdapter({
+      issuer: ORIGIN,
+      entryHref: ENTRY_HREF,
+      accessToken: () => OUTSIDER_TOKEN,
+      fetch: service.fetch,
+    }),
   };
 }
 
@@ -317,99 +1081,6 @@ type ProtocolFetch = (
   input: string | URL | Request,
   init?: RequestInit,
 ) => Promise<Response>;
-
-class HypermediaProtocolAdapter implements StorageAdapter {
-  readonly #entryHref: string;
-  readonly #token: string;
-  readonly #fetch: ProtocolFetch;
-  #discovery?: Promise<StorageProtocolDiscoveryDocument>;
-
-  constructor(entryHref: string, token: string, fetch: ProtocolFetch) {
-    this.#entryHref = entryHref;
-    this.#token = token;
-    this.#fetch = fetch;
-  }
-
-  async read(key: StorageKey): Promise<StorageRecord | null> {
-    const discovery = await this.discovery();
-    const control = requiredProtocolAction(discovery, "read-record");
-    const href = control.href
-      .replace("{collection}", encodeURIComponent(key.collection))
-      .replace("{id}", encodeURIComponent(key.id));
-    const response = await this.#fetch(href, bearer(this.#token));
-    const body = await responseJson(response, discovery.data.limits.max_record_bytes + 8_192);
-    if (response.status === 404) {
-      const failure = storageFailureFromProtocol(response.status, body);
-      if (failure.code === "NOT_FOUND") return null;
-      throw failure;
-    }
-    if (response.status !== 200) throw storageFailureFromProtocol(response.status, body);
-    return parseStorageProtocolRecord(
-      body,
-      key,
-      discovery.data.limits.max_record_bytes,
-    );
-  }
-
-  async list(request: Parameters<StorageAdapter["list"]>[0]) {
-    const discovery = await this.discovery();
-    const target = new URL(requiredProtocolAction(discovery, "list-records").href);
-    target.searchParams.set("collection", request.collection);
-    target.searchParams.set("limit", String(request.limit));
-    if (request.cursor !== undefined) target.searchParams.set("cursor", request.cursor);
-    const response = await this.#fetch(target, bearer(this.#token));
-    const body = await responseJson(
-      response,
-      discovery.data.limits.max_transaction_bytes,
-    );
-    if (response.status !== 200) throw storageFailureFromProtocol(response.status, body);
-    return parseStorageProtocolPage(body, request, discovery.data.limits);
-  }
-
-  async transact(
-    request: StorageTransactionRequest,
-  ): Promise<StorageTransactionResult> {
-    const discovery = await this.discovery();
-    const target = requiredProtocolAction(discovery, "transact-records").href;
-    const body = JSON.stringify(toStorageProtocolTransactionCommand(request));
-    if (byteLength(body) > discovery.data.limits.max_transaction_bytes) {
-      throw new StorageFailure("INVALID_REQUEST");
-    }
-    const response = await this.#fetch(target, {
-      ...bearer(this.#token),
-      method: "POST",
-      headers: {
-        ...bearerHeaders(this.#token),
-        "content-type": "application/json",
-      },
-      body,
-    });
-    const document = await responseJson(
-      response,
-      discovery.data.limits.max_transaction_bytes,
-    );
-    if (response.status !== 200) {
-      throw storageFailureFromProtocol(response.status, document);
-    }
-    return parseStorageProtocolTransaction(
-      document,
-      request,
-      discovery.data.limits.max_record_bytes,
-    );
-  }
-
-  private discovery(): Promise<StorageProtocolDiscoveryDocument> {
-    this.#discovery ??= (async () => {
-      const response = await this.#fetch(this.#entryHref, bearer(this.#token));
-      const body = await responseJson(response, 65_536);
-      if (response.status !== 200) {
-        throw storageFailureFromProtocol(response.status, body);
-      }
-      return parseStorageProtocolDiscovery(body, new URL(this.#entryHref).origin);
-    })();
-    return this.#discovery;
-  }
-}
 
 class DeterministicStorageProtocolService {
   readonly fetch: ProtocolFetch;
@@ -524,7 +1195,7 @@ class DeterministicStorageProtocolService {
     }
     const all = [...this.#records.values()]
       .filter((item) => item.key.collection === collection)
-      .sort((left, right) => left.key.id.localeCompare(right.key.id));
+      .sort((left, right) => compareCodeUnits(left.key.id, right.key.id));
     if (offset > all.length) return this.failure("invalid_request");
     const items = all.slice(offset, offset + limit).map(cloneRequiredRecord);
     const nextOffset = offset + items.length;
@@ -804,19 +1475,6 @@ function protocolResponse(status: number, value: unknown): Response {
   });
 }
 
-async function responseJson(response: Response, maxBytes: number): Promise<unknown> {
-  if (response.headers.get("content-type") !== AITTADB_HYPERMEDIA_MEDIA_TYPE) {
-    throw new StorageFailure("UNAVAILABLE");
-  }
-  const text = await response.text();
-  if (byteLength(text) > maxBytes) throw new StorageFailure("UNAVAILABLE");
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    throw new StorageFailure("UNAVAILABLE");
-  }
-}
-
 function requiredProtocolAction(
   document: StorageProtocolDiscoveryDocument,
   name: StorageProtocolAction["name"],
@@ -835,6 +1493,41 @@ function bearerHeaders(token: string): Record<string, string> {
     accept: AITTADB_HYPERMEDIA_MEDIA_TYPE,
     authorization: `Bearer ${token}`,
   };
+}
+
+function responseHarness(responses: readonly Response[]) {
+  const pending = [...responses];
+  let calls = 0;
+  const adapter = new AittaDBStorageAdapter({
+    issuer: ORIGIN,
+    entryHref: ENTRY_HREF,
+    accessToken: () => OWNER_TOKEN,
+    async fetch() {
+      calls += 1;
+      const next = pending.shift();
+      if (next === undefined) throw new Error("Missing synthetic response.");
+      return next;
+    },
+  });
+  return Object.freeze({ adapter, calls: () => calls });
+}
+
+function responseWithMetadata(
+  response: Response,
+  metadata: Readonly<{ redirected?: boolean; url?: string }>,
+): Response {
+  for (const [name, value] of Object.entries(metadata)) {
+    Object.defineProperty(response, name, { value });
+  }
+  return response;
+}
+
+function unavailableStorageFailure(error: unknown): boolean {
+  return error instanceof StorageFailure && error.code === "UNAVAILABLE";
+}
+
+function invalidStorageRequest(error: unknown): boolean {
+  return error instanceof StorageFailure && error.code === "INVALID_REQUEST";
 }
 
 function key(id: string): StorageKey {
@@ -901,9 +1594,13 @@ function canonicalValue(value: unknown): unknown {
   if (!plainObject(value)) return value;
   return Object.fromEntries(
     Object.entries(value)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => compareCodeUnits(left, right))
       .map(([name, child]) => [name, canonicalValue(child)]),
   );
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function byteLength(value: string): number {
