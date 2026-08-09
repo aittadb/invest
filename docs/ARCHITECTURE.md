@@ -133,6 +133,8 @@ The owner route group receives the workspace service, browser mutation guard, se
 
 Acknowledgment records are keyed to the authenticated participant subject through a one-way storage identifier. The caller cannot provide the stored subject, content hash, or required-acceptance hash; those values derive from the trusted package snapshot. New evidence accepts only the current version, while idempotent retries may re-read their original immutable version. Missing identity, foreign records, denied grants, and absent records remain non-disclosing through the credential-bound adapter.
 
+`domain/participant-package-acknowledgment-resource.ts` and `worker/routes/participant-package-acknowledgment.ts` expose that boundary as `/participant/package/acknowledgment`. One validated state model drives the private HTML form and versioned hypermedia action. The browser submits only a server-issued operation ID; the trusted participant, current immutable package, acceptance hashes, timestamp, and compare-and-set revision come from request-scoped services. Material package versions reopen the action, editorial versions retain the prior requirement, and a satisfied resource issues neither an operation ID nor a CSRF proof. The route remains an injected application resource until persistent package composition installs it.
+
 ### Participant profile and consent
 
 `domain/participant-profile.ts` keeps the authenticated subject and account-email label identity-bound while exposing an explicit policy for participant-editable, registration-only, withdraw-only, request-only, and system-managed fields. Required process messages are independent from optional marketing consent.

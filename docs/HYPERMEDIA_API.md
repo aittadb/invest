@@ -98,7 +98,18 @@ to the participant home and campaign. Package sections and acknowledgment
 mutations remain governed by their own content and mutation contracts; this
 resource does not infer package body content from public campaign input.
 
-Both participant URIs negotiate HTML and version `0.1` hypermedia JSON. A
+`GET /participant/package/acknowledgment` has resource type
+`participant-package-acknowledgment`. It reports the trusted current version,
+the configured acknowledgment text, whether the requirement is satisfied, and
+the participant's latest immutable evidence when present. When renewed
+acceptance is required, HTML and JSON expose the same
+`acknowledge-current-package` `POST` action with only a server-issued operation
+ID. Subject, package version, hashes, acceptance time, and repository revision
+are server-derived and are never action fields. A satisfied resource exposes no
+mutation action or CSRF proof. Production navigation and persistence are added
+only when the hosted package capability is composed.
+
+All three participant URIs negotiate HTML and version `0.1` hypermedia JSON. A
 signed-out JSON request receives `401 authentication_required`; an authenticated
 subject without matching participant state receives the same generic `404`
 shape as a missing record. Unsupported explicit versions return `406` before a
