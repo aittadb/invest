@@ -5,6 +5,7 @@ import {
   type HypermediaAction,
   type HypermediaLink,
 } from "./public-campaign-resource.ts";
+import { defineAction, toHypermediaAction } from "./hypermedia-action.ts";
 import type { PublicCampaignConfiguration } from "./public-campaign-configuration.ts";
 
 export type OwnerHomeDocument = Readonly<{
@@ -26,6 +27,7 @@ export type OwnerHomeCapabilities = Readonly<{
   founderApplicationReview?: boolean;
   aggregateReconciliation?: boolean;
   auditNotificationHistory?: boolean;
+  managePackage?: boolean;
 }>;
 
 export function createOwnerHomeDocument(
@@ -35,6 +37,19 @@ export function createOwnerHomeDocument(
   capabilities: OwnerHomeCapabilities = {},
 ): OwnerHomeDocument {
   const absolute = (href: string) => new URL(href, requestUrl).href;
+  const packageLinks = capabilities.managePackage
+    ? [{ rel: ["information-package"], href: absolute("/owner/package") }]
+    : [];
+  const packageActions = capabilities.managePackage
+    ? [toHypermediaAction(defineAction({
+        name: "manage-information-package",
+        title: "Manage information package",
+        href: absolute("/owner/package"),
+        method: "GET",
+        requestMediaType: "text/html",
+        fields: [],
+      }))]
+    : [];
 
   return {
     api_version: INVESTOR_APP_API_VERSION,
@@ -78,8 +93,10 @@ export function createOwnerHomeDocument(
           },
         ]
         : []),
+      ...packageLinks,
     ],
     actions: [
+      ...packageActions,
       {
         name: "sign-out",
         title: "Sign out",

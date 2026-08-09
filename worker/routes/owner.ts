@@ -66,5 +66,4 @@ export function createOwnerRouteHandler(
     ...resourceHandlers,
   ]);
 }
-
 export const handleOwnerRoutes = createOwnerRouteHandler();

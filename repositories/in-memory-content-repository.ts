@@ -35,6 +35,7 @@ export type AppendPackageVersionRequest = Readonly<{
   operationId: StorageOperationId;
   expectedRevision: number | null;
   draft: unknown;
+  mutationFingerprint?: string;
 }>;
 
 export interface PackageVersionRepository {
@@ -67,6 +68,7 @@ export interface AcknowledgmentRepository {
 type StoredPackageVersion = Readonly<{
   snapshot: PackageVersion;
   previousVersionId: StableId<"package-version"> | null;
+  mutationFingerprint: string;
 }>;
 
 const PACKAGE_VERSIONS = storageCollection("private-package-versions");
@@ -94,6 +96,7 @@ export class InMemoryPackageVersionRepository
   async append(
     request: AppendPackageVersionRequest,
   ): Promise<RepositoryMutationResult<PackageVersion>> {
+    const mutationFingerprint = await packageMutationFingerprint(request);
     const versionId = packageVersionIdFromDraft(request.draft);
     const key = packageVersionKey(versionId);
     const existing = await this.#readStoredVersion(key);
@@ -116,6 +119,7 @@ export class InMemoryPackageVersionRepository
     const versionDocument = packageVersionDocument(
       parsed,
       previousVersionId,
+      mutationFingerprint,
     );
     const headKey = packageVersionHeadKey();
     const result = await this.#storage.transact({
@@ -183,6 +187,9 @@ export class InMemoryPackageVersionRepository
     const previousVersionId = parseNullableStableId<"package-version">(
       source.previousVersionId,
     );
+    const mutationFingerprint = storedMutationFingerprint(
+      source.mutationFingerprint,
+    );
 
     const nextSeen = new Set(seen);
     nextSeen.add(record.key.id);
@@ -198,7 +205,11 @@ export class InMemoryPackageVersionRepository
       source,
       previous?.snapshot ?? null,
     );
-    return Object.freeze({ snapshot: parsed, previousVersionId });
+    return Object.freeze({
+      snapshot: parsed,
+      previousVersionId,
+      mutationFingerprint,
+    });
   }
 }
 
@@ -387,10 +398,12 @@ async function parseStoredPackageVersion(
 function packageVersionDocument(
   version: PackageVersion,
   previousVersionId: StableId<"package-version"> | null,
+  mutationFingerprint: string,
 ): StorageDocument {
   return {
     kind: "package-version",
     previousVersionId,
+    mutationFingerprint,
     id: version.id,
     createdAt: version.createdAt,
     changeSummary: version.changeSummary,
@@ -406,6 +419,51 @@ function packageVersionDocument(
     contentHash: version.contentHash,
     requiredAcceptanceHash: version.requiredAcceptanceHash,
   };
+}
+
+async function packageMutationFingerprint(
+  request: AppendPackageVersionRequest,
+): Promise<string> {
+  if (request.mutationFingerprint !== undefined) {
+    return parseMutationFingerprint(request.mutationFingerprint);
+  }
+
+  let canonical: string;
+  try {
+    canonical = JSON.stringify({
+      expectedRevision: request.expectedRevision,
+      draft: request.draft,
+    });
+  } catch {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+
+  let digest: ArrayBuffer;
+  try {
+    digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(canonical),
+    );
+  } catch {
+    unavailable();
+  }
+  return `sha256:${[...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")}`;
+}
+
+function parseMutationFingerprint(value: unknown): string {
+  if (typeof value !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value)) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+  return value;
+}
+
+function storedMutationFingerprint(value: unknown): string {
+  if (typeof value !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value)) {
+    unavailable();
+  }
+  return value;
 }
 
 function packageAcceptanceDocument(

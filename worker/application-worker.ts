@@ -1,4 +1,5 @@
 import { isConfiguredOwner } from "../domain/owner-identity.ts";
+import { parseActorSubject } from "../domain/foundation.ts";
 import {
   authorizeParticipantAccess,
   type AuthorizedParticipantAccess,
@@ -7,6 +8,7 @@ import {
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import { parsePublicCampaignConfiguration } from "../domain/public-campaign-configuration.ts";
 import { resolveAppOrigin, withAppOrigin } from "../http/app-origin.ts";
+import { withRuntimeCapabilities } from "../http/runtime-capabilities.ts";
 import { withRuntimeParticipantAccess } from "../http/runtime-participant.ts";
 import { withRuntimeCampaign } from "../http/runtime-campaign.ts";
 import { withRuntimeOwner } from "../http/runtime-owner.ts";
@@ -18,12 +20,23 @@ import type {
   InvestorAppEnv,
   WorkerExecutionContext,
 } from "./contracts.ts";
-import { dispatchApplicationRoute } from "./routes/application.ts";
+import {
+  createApplicationRouteDispatcher,
+  dispatchApplicationRoute,
+} from "./routes/application.ts";
+import { handlePublicRoutes } from "./routes/public.ts";
+import { handleParticipantRoutes } from "./routes/participant.ts";
+import { createOwnerRouteHandler } from "./routes/owner.ts";
+import {
+  createOwnerPackageRouteHandler,
+  type OwnerPackageRouteDependencies,
+} from "./routes/owner-package.ts";
 
 export type ApplicationWorkerDependencies = Readonly<{
   fetchApplication: ApplicationFetcher;
   fetchOptimizedImage: ImageFetcher;
   dispatchRoute?: ApplicationRouteHandler;
+  ownerPackage?: OwnerPackageRouteDependencies;
 }>;
 
 export function createApplicationWorker(
@@ -35,7 +48,19 @@ export function createApplicationWorker(
     context: WorkerExecutionContext,
   ): Promise<Response>;
 }> {
-  const dispatchRoute = dependencies.dispatchRoute ?? dispatchApplicationRoute;
+  const ownerPackageAvailable = dependencies.dispatchRoute === undefined &&
+    dependencies.ownerPackage !== undefined;
+  const dispatchRoute = dependencies.dispatchRoute ??
+    (dependencies.ownerPackage
+      ? createApplicationRouteDispatcher({
+          public: handlePublicRoutes,
+          participant: handleParticipantRoutes,
+          owner: createOwnerRouteHandler(
+            [createOwnerPackageRouteHandler(dependencies.ownerPackage)],
+            { managePackage: true },
+          ),
+        })
+      : dispatchApplicationRoute);
 
   return {
     async fetch(request, env, executionContext) {
@@ -55,7 +80,12 @@ export function createApplicationWorker(
       );
       const renderApplication = () =>
         dependencies.fetchApplication(
-          withRuntimeConfiguration(request, env, participantAccess),
+          withRuntimeConfiguration(
+            request,
+            env,
+            participantAccess,
+            ownerPackageAvailable,
+          ),
           env,
           executionContext,
         );
@@ -89,13 +119,20 @@ function withRuntimeConfiguration(
   request: Request,
   env: InvestorAppEnv,
   participantAccess: AuthorizedParticipantAccess | null,
+  ownerPackageWorkspaceAvailable: boolean,
 ): Request {
-  return withRuntimeParticipantAccess(
-    withRuntimeCampaign(
-      withRuntimeOwner(withAppOrigin(request, env.APP_BASE_URL), env.OWNER_EMAIL),
-      env.CAMPAIGN_CONFIG_JSON,
+  return withRuntimeCapabilities(
+    withRuntimeParticipantAccess(
+      withRuntimeCampaign(
+        withRuntimeOwner(
+          withAppOrigin(request, env.APP_BASE_URL),
+          env.OWNER_EMAIL,
+        ),
+        env.CAMPAIGN_CONFIG_JSON,
+      ),
+      participantAccess,
     ),
-    participantAccess,
+    { ownerPackageWorkspace: ownerPackageWorkspaceAvailable },
   );
 }
 
@@ -126,9 +163,11 @@ function authenticatedActor(request: Request): AuthenticatedActor | null {
   const email = request.headers.get("oai-authenticated-user-email")?.trim();
 
   if (!userId || !email) return null;
+  const subject = parseActorSubject(userId);
+  if (!subject.ok) return null;
 
   return {
-    userId,
+    userId: subject.value,
     email,
     displayName: email,
   };

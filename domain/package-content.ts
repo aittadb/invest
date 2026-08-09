@@ -60,11 +60,13 @@ export type PackageAcceptanceRecord = Readonly<{
   satisfiedRequirementHash: PackageContentHash;
 }>;
 
-const MAX_SECTIONS = 64;
-const MAX_TITLE_LENGTH = 160;
-const MAX_MARKDOWN_LENGTH = 50_000;
-const MAX_ACKNOWLEDGMENT_LENGTH = 4_000;
-const MAX_CHANGE_SUMMARY_LENGTH = 500;
+export const PACKAGE_CONTENT_LIMITS = Object.freeze({
+  sections: 64,
+  titleLength: 160,
+  markdownLength: 50_000,
+  acknowledgmentLength: 4_000,
+  changeSummaryLength: 500,
+});
 
 export function parsePackageSection(
   value: unknown,
@@ -81,7 +83,12 @@ export function parsePackageSection(
     return invalid({ code: "invalid_format", path: `${path}.order` });
   }
 
-  const title = boundedText(source.title, 1, MAX_TITLE_LENGTH, false);
+  const title = boundedText(
+    source.title,
+    1,
+    PACKAGE_CONTENT_LIMITS.titleLength,
+    false,
+  );
   if (title === null) {
     return invalid({ code: textIssue(source.title), path: `${path}.title` });
   }
@@ -125,7 +132,7 @@ export async function createPackageVersion(
   const changeSummary = boundedText(
     source.changeSummary,
     1,
-    MAX_CHANGE_SUMMARY_LENGTH,
+    PACKAGE_CONTENT_LIMITS.changeSummaryLength,
     true,
   );
   if (changeSummary === null) {
@@ -146,7 +153,10 @@ export async function createPackageVersion(
     );
   }
 
-  if (!Array.isArray(source.sections) || source.sections.length > MAX_SECTIONS) {
+  if (
+    !Array.isArray(source.sections) ||
+    source.sections.length > PACKAGE_CONTENT_LIMITS.sections
+  ) {
     return invalid({
       code: Array.isArray(source.sections) ? "out_of_range" : "invalid_type",
       path: "version.sections",
@@ -255,7 +265,10 @@ function parseSafeMarkdown(value: unknown): ValidationResult<SafeMarkdown> {
   if (typeof value !== "string") {
     return invalid({ code: "invalid_type", path: "markdown" });
   }
-  if (value.length > MAX_MARKDOWN_LENGTH || hasForbiddenControl(value, true)) {
+  if (
+    value.length > PACKAGE_CONTENT_LIMITS.markdownLength ||
+    hasForbiddenControl(value, true)
+  ) {
     return invalid({ code: "invalid_format", path: "markdown" });
   }
 
@@ -291,7 +304,12 @@ function parseSafeMarkdown(value: unknown): ValidationResult<SafeMarkdown> {
 function parseAcknowledgmentText(
   value: unknown,
 ): ValidationResult<AcknowledgmentText> {
-  const text = boundedText(value, 1, MAX_ACKNOWLEDGMENT_LENGTH, true);
+  const text = boundedText(
+    value,
+    1,
+    PACKAGE_CONTENT_LIMITS.acknowledgmentLength,
+    true,
+  );
   return text === null
     ? invalid({ code: textIssue(value), path: "acknowledgmentText" })
     : valid(text as AcknowledgmentText);

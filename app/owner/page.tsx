@@ -8,6 +8,10 @@ import {
   campaignFromRuntimeHeader,
   CAMPAIGN_CONFIGURATION_HEADER,
 } from "../../http/runtime-campaign";
+import {
+  hasOwnerPackageWorkspace,
+  OWNER_PACKAGE_WORKSPACE_HEADER,
+} from "../../http/runtime-capabilities";
 
 export const dynamic = "force-dynamic";
 
@@ -21,6 +25,9 @@ export default async function OwnerHome() {
   const requestHeaders = await headers();
   const campaign = campaignFromRuntimeHeader(
     requestHeaders.get(CAMPAIGN_CONFIGURATION_HEADER),
+  );
+  const packageWorkspaceAvailable = hasOwnerPackageWorkspace(
+    requestHeaders.get(OWNER_PACKAGE_WORKSPACE_HEADER),
   );
   const setupState = campaign ? "Configured" : "Setup required";
   const publicationState = campaign
@@ -37,6 +44,9 @@ export default async function OwnerHome() {
         </Link>
         <nav aria-label="Owner navigation">
           <Link href="/">View campaign</Link>
+          {packageWorkspaceAvailable ? (
+            <Link href="/owner/package">Information package</Link>
+          ) : null}
           <a href={chatGPTSignOutPath("/")}>Sign out</a>
         </nav>
       </header>

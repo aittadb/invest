@@ -99,6 +99,14 @@ Money constructors reject floating-point, unsafe-integer, negative, and configur
 
 The first version requires acceptance. A material version replaces the required acceptance hash; a non-material version inherits the preceding requirement. This propagation prevents a later editorial save from bypassing an earlier material version that a participant has not accepted. Acceptance records derive version and hash evidence from the trusted snapshot rather than client input.
 
+`RepositoryOwnerPackageWorkspaceService` is the narrow owner application service over `PackageVersionRepository`. It accepts a trusted owner subject, derives version and section identifiers from the retry-stable operation ID, supplies the server timestamp, applies create, edit, availability, reorder, and acknowledgment transitions to the current immutable snapshot, and delegates package validation and compare-and-set persistence to the repository. Browser input cannot choose package identifiers, timestamps, hashes, or actor attribution.
+
+The repository stores an opaque mutation fingerprint beside each immutable version record without adding it to the package snapshot or content hash. This lets the service reconstruct an exact operation after later versions exist: an identical delayed retry reaches the adapter's original transaction, while changed work under the same operation ID produces a different transaction and conflicts. New operations still require the current head revision.
+
+The owner route group receives the workspace service, browser mutation guard, session CSRF token provider, and operation-ID issuer as one injected capability. No process-memory repository is installed by the production Worker entry point. When the capability is present, the Worker supplies a replaced internal availability header to React and advertises the owner-home navigation; the header affects presentation only and is never an authorization boundary.
+
+`domain/owner-package-resource.ts` constructs one action-capability model for both owner forms and nested hypermedia controls at `/owner/package`. The preview resource at `/owner/package/preview` reads the same authorized snapshot and renders branded safe Markdown through an AST-to-HTML allowlist that cannot emit raw Markdown HTML. Both resources are private, non-cacheable, content-negotiated, and independently enforce configured-owner access.
+
 ### Development content repositories
 
 `InMemoryPackageVersionRepository` and `InMemoryAcknowledgmentRepository` compose over a deterministic development/test `StorageAdapter`; neither is production storage. Package appends atomically create an immutable version and compare-and-set the current-version head. Reads reconstruct each snapshot through the package parser and verify stored content and required-acceptance hashes before returning private content.

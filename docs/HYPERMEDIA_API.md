@@ -160,6 +160,18 @@ The signed-out campaign document contains only public state and sign-in transiti
 
 Omitting a control is not authorization. Every target independently enforces identity, actor role, resource ownership, workflow state, same-origin and CSRF rules for browser mutations, and input validation. Inaccessible foreign records use the same non-disclosing response as missing records.
 
+## Owner Information Package
+
+`GET /owner/package` is the configured owner's information-package workspace. Its `owner-information-package` document reports the current immutable version metadata, acknowledgment text, ordered section state, workspace links, and only the controls available at the current revision. Section content and controls are private and are never returned to anonymous or foreign callers.
+
+The top-level `create-package-section`, `update-package-settings`, and `preview-information-package` actions correspond to the HTML create form, settings form, and preview link. Each embedded section supplies `update-package-section`, `set-package-section-availability`, and, when another position is available, `move-package-section`. HTML forms and JSON action descriptions are projections of those same framework-independent action contracts.
+
+Every mutating action carries a server-issued `operation-id`, the current `expected-revision`, a required bounded `change-summary`, and an optional `material-change` flag. Section actions additionally carry only the fields needed for that transition. HTML keeps operation and revision values hidden, adds the session CSRF proof, and uses the shared `_method` transport field for `PATCH`; the advertised semantic method and accepted feature fields remain identical.
+
+Successful writes create a new immutable package version and return or redirect to the current workspace. An exact delayed retry returns its original repository result without replacing newer state. A changed retry conflicts, a new stale operation fails its revision precondition, and invalid or unsafe Markdown is rejected without echoing submitted private content.
+
+`GET /owner/package/preview` selects HTML or the `owner-information-package-preview` document at the same URI. Preview includes only enabled, non-empty sections from the trusted current snapshot. HTML is generated from the validated Markdown syntax tree, never from raw HTML, and shifts package headings below the page's single `h1`.
+
 ## Errors
 
 Application errors use stable codes and generic public messages. They must not include private package content, participant identity, notes, credentials, backend identifiers, or internal causes. HTML presents the same recovery links or forms supplied as JSON `links` and `actions`.
