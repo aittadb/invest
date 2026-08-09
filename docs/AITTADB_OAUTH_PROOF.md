@@ -47,6 +47,8 @@ Token and introspection requests use HTTP Basic client authentication and bounde
 
 Callback representations never reflect their query string. Private responses use `no-store`, a no-referrer policy, MIME sniffing and framing defenses, and a restrictive content security policy. The authorization redirect necessarily transports OAuth state and the PKCE challenge to the configured authorization endpoint; they are not included in application documents, result metadata, logs, or persistence.
 
+The available owner connection HTML permits form navigation only to self and the exact HTTPS authorization origin derived from the validated issuer, allowing the same-origin initiation POST to follow its provider redirect. Hypermedia JSON, POST redirects, callbacks, unavailable pages, and errors keep `form-action 'self'`; the route rejects malformed or compound origin values instead of interpolating them into the policy.
+
 ## Current Hosted Evidence
 
 Observed on August 9, 2026:

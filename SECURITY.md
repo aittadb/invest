@@ -27,6 +27,7 @@ If exposure is suspected, do not echo or paste the value. Escalate privately wit
 - A previously audited export operation is single-use and returns a fixed private conflict before source reads or another audit append. A new export requires a fresh server-issued operation ID.
 - No visitor analytics or non-essential cookies in version one.
 - The optional AittaDB OAuth proof keeps issuer/client/scope configuration server-side and client secret plus separate AES-GCM cookie material in hosted secret storage. Its short-lived host-only cookies are encrypted and authenticated; replay is rejected through a dedicated D1 atomic claim store, never process memory or browser storage. Proof persistence contains no owner-derived value and cannot be used as campaign or participant storage.
+- Only an available owner connection page may add the exact configured HTTPS OAuth authorization origin to `form-action` beside `'self'`. JSON, redirects, callbacks, unavailable pages, and errors retain a self-only form target; no wildcard, path, compound source, or unrelated origin is accepted.
 - OAuth callback responses must not reflect query parameters. Access tokens, refresh tokens, authorization codes, PKCE verifiers, OAuth state, client secrets, cookie plaintext, AittaDB token subjects/IDs, and credential-bearing causes must not enter responses, logs, persistence, or proof metadata. The standards-required outbound authorization redirect is the only transport for state and the PKCE challenge.
 
 ## Publication Blockers
