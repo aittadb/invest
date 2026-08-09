@@ -418,8 +418,10 @@ function context(
   return {
     request,
     url: new URL(request.url),
+    resourceUrl: request.url,
     actor,
     isOwner: options.isOwner ?? actor?.userId === OWNER_SUBJECT,
+    participantAccess: null,
     campaign: null,
     renderApplication: async () => new Response("application fallback"),
   };

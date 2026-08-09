@@ -208,8 +208,10 @@ function context(
       headers: { Accept: options.accept ?? "text/html" },
     }),
     url: new URL(url),
+    resourceUrl: url,
     actor,
     isOwner: options.isOwner ?? actor?.email === "owner@example.invalid",
+    participantAccess: null,
     campaign: null,
     renderApplication: async () => new Response("application fallback"),
   };
