@@ -28,6 +28,12 @@ HTML links and forms and JSON links and actions must be projections of the same 
 
 The public campaign resource is the signed-out base state. A valid participant session may extend it with private-package and self-service controls. Owner controls require a separate owner authorization decision; ordinary sign-in never implies ownership.
 
+### Action capability contracts
+
+`domain/hypermedia-action.ts` is the route-independent source for safe navigation and mutation capabilities. Definitions use bounded stable names, safe targets, explicit methods and request media types, and bounded string, integer, boolean, or choice fields. Sensitive fields cannot advertise a current or default value. An availability gate constructs an action only when the current caller and resource state permit its transition, but target routes must still enforce authorization and state independently.
+
+Hypermedia and form models project from the same validated action. A form-compatible `GET` uses query fields; a mutation uses body fields and form encoding. Native forms submit `POST` with an explicit effective-method field when the semantic method is `PUT`, `PATCH`, or `DELETE`. JSON-only, path-driven, or header-driven actions remain valid hypermedia controls but cannot be projected as native forms. Route implementations must support the advertised encodings and normalize any form method before invoking the same security, validation, and domain operation.
+
 ### Modular route dispatch
 
 The Worker normalizes trusted runtime configuration and identity once, then passes a narrow request context through independently composed public, participant, and owner route groups. Each handler either returns the complete response for a resource it owns or returns `null` without changing sibling state. Shared representation helpers own only response serialization and headers; feature authorization and projection remain inside the owning route group and its domain services.

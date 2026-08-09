@@ -1,5 +1,12 @@
 import type { PublicCampaignConfiguration } from "./public-campaign-configuration.ts";
 import { chatGPTSignInPath } from "./auth-navigation.ts";
+import {
+  defineAction,
+  toHypermediaAction,
+  type HypermediaAction,
+} from "./hypermedia-action.ts";
+
+export type { HypermediaAction } from "./hypermedia-action.ts";
 
 export const INVESTOR_APP_API_VERSION = "0.1";
 export const INVESTOR_APP_MEDIA_TYPE = "application/vnd.aittadb-invest+json";
@@ -7,15 +14,6 @@ export const INVESTOR_APP_MEDIA_TYPE = "application/vnd.aittadb-invest+json";
 export type HypermediaLink = Readonly<{
   rel: readonly string[];
   href: string;
-}>;
-
-export type HypermediaAction = Readonly<{
-  name: string;
-  title: string;
-  method: "GET";
-  href: string;
-  type: "text/html";
-  fields: readonly [];
 }>;
 
 export type PublicCampaignDocument = Readonly<{
@@ -120,14 +118,14 @@ export function createPublicCampaignDocument(
 }
 
 function action(name: string, title: string, href: string): HypermediaAction {
-  return {
+  return toHypermediaAction(defineAction({
     name,
     title,
     method: "GET",
     href,
-    type: "text/html",
+    requestMediaType: "text/html",
     fields: [],
-  };
+  }));
 }
 
 function uniqueLinks(configuration: PublicCampaignConfiguration) {
