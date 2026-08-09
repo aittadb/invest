@@ -67,12 +67,12 @@ export function createOwnerAggregateReconciliationRouteHandler(
       context.request.headers.get("accept"),
     );
     if (representation.kind === "not-acceptable") {
-      return notAcceptableResponse(context.request.url);
+      return notAcceptableResponse(context.resourceUrl);
     }
     if (context.request.method !== "GET" && context.request.method !== "POST") {
       return errorResponse(
         representation.kind,
-        context.request.url,
+        context.resourceUrl,
         405,
         "method_not_allowed",
         "This resource supports GET and POST.",
@@ -81,13 +81,13 @@ export function createOwnerAggregateReconciliationRouteHandler(
     if (context.actor === null) {
       return authenticationRequiredResponse(
         representation.kind,
-        context.request.url,
+        context.resourceUrl,
       );
     }
     if (!context.isOwner) {
       return errorResponse(
         representation.kind,
-        context.request.url,
+        context.resourceUrl,
         404,
         "not_found",
         "The requested resource was not found.",
@@ -100,7 +100,7 @@ export function createOwnerAggregateReconciliationRouteHandler(
           "atomic-aggregate-audit") {
           return errorResponse(
             representation.kind,
-            context.request.url,
+            context.resourceUrl,
             503,
             "consistency_unavailable",
             "Aggregate correction is temporarily unavailable.",
@@ -131,7 +131,7 @@ export function createOwnerAggregateReconciliationRouteHandler(
       const consistency = options.repository.correctionConsistency satisfies
         AggregateCorrectionConsistency;
       const resource = createOwnerAggregateReconciliationResource(
-        context.request.url,
+        context.resourceUrl,
         preview,
         consistency,
         operationId,
@@ -148,7 +148,7 @@ export function createOwnerAggregateReconciliationRouteHandler(
         const failure = toPublicMutationSecurityFailure(error);
         return errorResponse(
           representation.kind,
-          context.request.url,
+          context.resourceUrl,
           failure.status,
           failure.body.error.code.toLowerCase(),
           failure.body.error.message,
@@ -157,7 +157,7 @@ export function createOwnerAggregateReconciliationRouteHandler(
       const storage = storageError(error);
       return errorResponse(
         representation.kind,
-        context.request.url,
+        context.resourceUrl,
         storage.status,
         storage.code,
         storage.message,

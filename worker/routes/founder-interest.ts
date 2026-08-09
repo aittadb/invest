@@ -102,7 +102,7 @@ export function createFounderInterestRouteHandler(
       context.request.headers.get("accept"),
     );
     if (representation.kind === "not-acceptable") {
-      return notAcceptableResponse(context.request.url);
+      return notAcceptableResponse(context.resourceUrl);
     }
 
     if (context.request.method === "GET") {
@@ -111,7 +111,7 @@ export function createFounderInterestRouteHandler(
         : null;
       if (actorSubject === null) {
         return errorResponse(
-          authenticationRequiredError(context.request.url),
+          authenticationRequiredError(context.resourceUrl),
           representation.kind,
         );
       }
@@ -128,7 +128,7 @@ export function createFounderInterestRouteHandler(
         });
       } catch (error) {
         return errorResponse(
-          publicRouteError(error, context.request.url),
+          publicRouteError(error, context.resourceUrl),
           representation.kind,
         );
       }
@@ -137,7 +137,7 @@ export function createFounderInterestRouteHandler(
     if (!isMutationRequestMethod(context.request.method)) {
       const response = errorResponse(
         routeError(
-          context.request.url,
+          context.resourceUrl,
           405,
           "method_not_allowed",
           "This request method is not available for the application.",
@@ -181,7 +181,7 @@ export function createFounderInterestRouteHandler(
       });
     } catch (error) {
       return errorResponse(
-        publicRouteError(error, context.request.url),
+        publicRouteError(error, context.resourceUrl),
         representation.kind,
       );
     }
@@ -376,7 +376,7 @@ type ResourceResponseInput = Readonly<{
 async function resourceResponse(input: ResourceResponseInput): Promise<Response> {
   const state = await input.service.getState();
   const model = createFounderInterestCapabilityModel({
-    requestUrl: input.context.request.url,
+    requestUrl: input.context.resourceUrl,
     ...state,
     operationIds: {
       create: input.createOperationId(),

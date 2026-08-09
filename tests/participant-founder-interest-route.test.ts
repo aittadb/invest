@@ -460,6 +460,7 @@ function routeContext(
   return {
     request,
     url: new URL(request.url),
+    resourceUrl: request.url,
     actor: actor
       ? {
           userId: actor,
@@ -468,6 +469,7 @@ function routeContext(
         }
       : null,
     isOwner: false,
+    participantAccess: null,
     campaign: syntheticPublicCampaign,
     renderApplication: async () => {
       throw new Error("The founder route owns this resource.");

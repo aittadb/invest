@@ -33,12 +33,12 @@ export function createOwnerFounderReviewRouteHandler(
       context.request.headers.get("accept"),
     );
     if (representation.kind === "not-acceptable") {
-      return notAcceptableResponse(context.request.url);
+      return notAcceptableResponse(context.resourceUrl);
     }
     if (context.request.method !== "GET") {
       return errorResponse(
         representation.kind,
-        context.request.url,
+        context.resourceUrl,
         405,
         "method_not_allowed",
         "This resource is read-only.",
@@ -47,13 +47,13 @@ export function createOwnerFounderReviewRouteHandler(
     if (context.actor === null) {
       return authenticationRequiredResponse(
         representation.kind,
-        context.request.url,
+        context.resourceUrl,
       );
     }
     if (!context.isOwner) {
       return errorResponse(
         representation.kind,
-        context.request.url,
+        context.resourceUrl,
         404,
         "not_found",
         "The requested resource was not found.",
@@ -64,7 +64,7 @@ export function createOwnerFounderReviewRouteHandler(
       if (route.kind === "collection") {
         const request = parsePageRequest(context.url);
         const document = createOwnerFounderReviewCollectionDocument(
-          context.request.url,
+          context.resourceUrl,
           await repository.list(request),
           request.limit,
         );
@@ -77,14 +77,14 @@ export function createOwnerFounderReviewRouteHandler(
       if (item === null) {
         return errorResponse(
           representation.kind,
-          context.request.url,
+          context.resourceUrl,
           404,
           "not_found",
           "The requested resource was not found.",
         );
       }
       const document = createOwnerFounderReviewDetailDocument(
-        context.request.url,
+        context.resourceUrl,
         item,
       );
       return representation.kind === "hypermedia-json"
@@ -95,7 +95,7 @@ export function createOwnerFounderReviewRouteHandler(
         error.code === "INVALID_REQUEST";
       return errorResponse(
         representation.kind,
-        context.request.url,
+        context.resourceUrl,
         invalid ? 400 : 503,
         invalid ? "invalid_request" : "temporarily_unavailable",
         invalid
