@@ -67,6 +67,7 @@ test("owner connection HTML form and hypermedia action share one capability", as
   assert.match(htmlBody, new RegExp(`name="_csrf" value="${htmlCsrf}"`, "u"));
   assert.match(htmlBody, />Verify connection<\/button>/u);
   assertOwnerCsrfCookie(requiredHeader(html, "set-cookie"));
+  assertFormActionSources(html, ["'self'", ISSUER]);
   const htmlStart = requiredResponse(await htmlHarness.handler(context(
     `${ORIGIN}${OWNER_OAUTH_PROOF_PATH}`,
     {
@@ -81,6 +82,7 @@ test("owner connection HTML form and hypermedia action share one capability", as
     },
   )));
   assert.equal(htmlStart.status, 303);
+  assertFormActionSources(htmlStart, ["'self'"]);
 
   const jsonHarness = await routeHarness();
   const json = requiredResponse(await jsonHarness.handler(context(
@@ -116,8 +118,36 @@ test("owner connection HTML form and hypermedia action share one capability", as
     },
   )));
   assert.equal(jsonStart.status, 303);
+  assertFormActionSources(json, ["'self'"]);
+  assertFormActionSources(jsonStart, ["'self'"]);
   assertPrivateResponse(html);
   assertPrivateResponse(json);
+});
+
+test("connection CSP rejects malformed or compound injected authorization origins", async (t) => {
+  for (const authorizationOrigin of [
+    "http://database.example.test",
+    `${ISSUER}/authorize`,
+    `${ISSUER} https://foreign.example.test`,
+    "*",
+  ]) {
+    await t.test(authorizationOrigin, async () => {
+      const harness = await routeHarness();
+      const handler = createOwnerOAuthProofRouteHandler({
+        oauth: Object.freeze({
+          ...harness.service,
+          authorizationOrigin,
+        }),
+        csrfSession: harness.dependencies.csrfSession,
+      });
+      const response = requiredResponse(await handler(context(
+        `${ORIGIN}${OWNER_OAUTH_PROOF_PATH}`,
+        { accept: "text/html" },
+      )));
+      assert.equal(response.status, 200);
+      assertFormActionSources(response, ["'self'"]);
+    });
+  }
 });
 
 test("initiation requires the configured owner, exact origin, and CSRF before discovery", async () => {
@@ -182,6 +212,7 @@ test("initiation requires the configured owner, exact origin, and CSRF before di
   assert.equal(location.searchParams.get("scope"), "storage.read storage.write");
   assert.equal(location.searchParams.has("offline_access"), false);
   assert.match(requiredHeader(valid, "set-cookie"), /Secure; HttpOnly; SameSite=Lax/u);
+  assertFormActionSources(valid, ["'self'"]);
   assertSecretsAbsent(valid, await valid.clone().text());
 });
 
@@ -216,6 +247,7 @@ test("callback validates once, clears its cookie, and returns no credentials", a
   assert.equal(harness.proofs, 1);
   assert.equal(harness.networkRequests.length, 4);
   assertPrivateResponse(success);
+  assertFormActionSources(success, ["'self'"]);
   assertSecretsAbsent(success, await success.clone().text(), state);
 
   const replay = requiredResponse(await harness.handler(context(callbackUrl, {
@@ -226,6 +258,7 @@ test("callback validates once, clears its cookie, and returns no credentials", a
   assert.equal((await replay.clone().json()).data.outcome, "failed");
   assert.equal(harness.networkRequests.length, 4);
   assert.match(requiredHeader(replay, "set-cookie"), /Max-Age=0/u);
+  assertFormActionSources(replay, ["'self'"]);
   assertSecretsAbsent(replay, await replay.clone().text(), state);
 });
 
@@ -245,6 +278,7 @@ test("callback errors, anonymous callers, and foreign callers clear context with
   assert.equal(denied.status, 400);
   assert.match(requiredHeader(denied, "set-cookie"), /Max-Age=0/u);
   assert.equal(harness.networkRequests.length, requestsAfterStart);
+  assertFormActionSources(denied, ["'self'"]);
   assertSecretsAbsent(denied, await denied.clone().text(), state);
 
   for (const [actor, isOwner, status] of [
@@ -578,6 +612,21 @@ function assertPrivateResponse(response: Response): void {
   assert.equal(response.headers.get("referrer-policy"), "no-referrer");
   assert.equal(response.headers.get("x-content-type-options"), "nosniff");
   assert.match(response.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/u);
+}
+
+function assertFormActionSources(
+  response: Response,
+  expected: readonly string[],
+): void {
+  const policy = requiredHeader(response, "content-security-policy");
+  const formActions = policy
+    .split(";")
+    .map((directive) => directive.trim())
+    .filter((directive) => directive.startsWith("form-action "));
+  assert.equal(formActions.length, 1);
+  assert.deepEqual(formActions[0]?.split(/\s+/u).slice(1), expected);
+  assert.doesNotMatch(policy, /(?:^|\s)\*(?:\s|;|$)/u);
+  assert.doesNotMatch(policy, /https:\/\/foreign[.]example[.]test/u);
 }
 
 function assertOwnerCsrfCookie(setCookie: string): void {

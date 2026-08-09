@@ -149,7 +149,12 @@ export function createOwnerOAuthProofRouteHandler(
           );
         }
       }
-      return resourceResponse(representation, resource, csrfProof);
+      return resourceResponse(
+        representation,
+        resource,
+        csrfProof,
+        dependencies.oauth.authorizationOrigin,
+      );
     }
     if (context.request.method !== "POST") {
       return methodNotAllowedResponse(
@@ -205,10 +210,17 @@ function resourceResponse(
   representation: Representation,
   resource: OwnerOAuthProofResource,
   csrfProof: OwnerOAuthCsrfProof | null,
+  authorizationOrigin: string,
 ): Response {
   const response = representation === "hypermedia-json"
     ? withPrivateHeaders(hypermediaResponse(resource.document))
-    : privateHtmlResponse(renderConnectionResource(resource, csrfProof?.token ?? null));
+    : privateHtmlResponse(
+        renderConnectionResource(resource, csrfProof?.token ?? null),
+        200,
+        resource.start !== null && csrfProof !== null
+          ? authorizationOrigin
+          : undefined,
+      );
   if (csrfProof === null) return response;
   const headers = new Headers(response.headers);
   headers.set(MUTATION_CSRF_HEADER, csrfProof.token);
@@ -380,12 +392,17 @@ function privateJsonResponse(document: unknown, status: number): Response {
   return withPrivateHeaders(response);
 }
 
-function privateHtmlResponse(body: string, status = 200): Response {
+function privateHtmlResponse(
+  body: string,
+  status = 200,
+  formActionOrigin?: string,
+): Response {
   return new Response(body, {
     status,
-    headers: privateHeaders({
-      "Content-Type": "text/html; charset=utf-8",
-    }),
+    headers: privateHeaders(
+      { "Content-Type": "text/html; charset=utf-8" },
+      formActionOrigin,
+    ),
   });
 }
 
@@ -411,12 +428,19 @@ function withPrivateHeaders(response: Response): Response {
   });
 }
 
-function privateHeaders(init: HeadersInit = {}): Headers {
+function privateHeaders(
+  init: HeadersInit = {},
+  formActionOrigin?: string,
+): Headers {
   const headers = new Headers(init);
+  const externalFormOrigin = exactHttpsOrigin(formActionOrigin);
+  const formAction = externalFormOrigin === null
+    ? "'self'"
+    : `'self' ${externalFormOrigin}`;
   headers.set("Cache-Control", "private, no-store, max-age=0");
   headers.set(
     "Content-Security-Policy",
-    "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    `default-src 'none'; style-src 'self'; form-action ${formAction}; base-uri 'none'; frame-ancestors 'none'`,
   );
   headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
   headers.set("Pragma", "no-cache");
@@ -425,6 +449,25 @@ function privateHeaders(init: HeadersInit = {}): Headers {
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("X-Frame-Options", "DENY");
   return headers;
+}
+
+function exactHttpsOrigin(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  return url.protocol === "https:" &&
+      url.username === "" &&
+      url.password === "" &&
+      url.pathname === "/" &&
+      url.search === "" &&
+      url.hash === "" &&
+      url.origin === value
+    ? value
+    : null;
 }
 
 function renderConnectionResource(

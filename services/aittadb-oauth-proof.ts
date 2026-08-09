@@ -88,6 +88,7 @@ export class OAuthProofFailure extends Error {
 }
 
 export interface AittaDBOAuthProofService {
+  readonly authorizationOrigin: string;
   readonly callbackUri: string;
   readonly transactionCookieName: string;
   availability(): Promise<boolean>;
@@ -145,6 +146,7 @@ export function createAittaDBOAuthProofService(
   const config = validateConfiguration(dependencies);
 
   return Object.freeze({
+    authorizationOrigin: new URL(config.authorizationEndpoint).origin,
     callbackUri: config.callbackUri,
     transactionCookieName: config.transactionCookieName,
     async availability() {

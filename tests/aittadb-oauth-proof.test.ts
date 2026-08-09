@@ -25,6 +25,7 @@ const NOW_SECONDS = Math.floor(NOW.valueOf() / 1_000);
 
 test("confidential Authorization Code with PKCE validates discovery, token, and introspection", async () => {
   const harness = await createHarness();
+  assert.equal(harness.service.authorizationOrigin, ISSUER);
   const start = await harness.service.begin(OWNER_SUBJECT);
   const authorization = new URL(start.authorizationUrl);
 
@@ -110,6 +111,25 @@ test("confidential Authorization Code with PKCE validates discovery, token, and 
     state,
   ]) {
     assert.doesNotMatch(serializedProof, new RegExp(escapeRegExp(secret), "u"));
+  }
+});
+
+test("authorization origin is derived only from a canonical HTTPS issuer", async (t) => {
+  const harness = await createHarness();
+  assert.equal(harness.service.authorizationOrigin, ISSUER);
+
+  for (const issuer of [
+    "http://database.example.test",
+    "https://database.example.test/authorize",
+    "https://database.example.test?origin=https://foreign.example.test",
+    "https://user@database.example.test",
+  ]) {
+    await t.test(issuer, async () => {
+      await assert.rejects(
+        createHarness({ issuer }),
+        publicFailure("service_unavailable"),
+      );
+    });
   }
 });
 
@@ -344,6 +364,7 @@ async function createHarness(
     failAt?: "discovery" | "token" | "introspection";
     fetchFailure?: Error;
     cookieKeyExtractable?: boolean;
+    issuer?: string;
   }> = {},
 ) {
   const key = await crypto.subtle.importKey(
@@ -386,7 +407,7 @@ async function createHarness(
     );
   };
   const dependencies: AittaDBOAuthProofDependencies = {
-    issuer: ISSUER,
+    issuer: options.issuer ?? ISSUER,
     clientId: CLIENT_ID,
     clientSecret: CLIENT_SECRET,
     callbackUri: CALLBACK,
