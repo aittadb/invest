@@ -9,6 +9,8 @@ import {
 import {
   createAittaDBOAuthProofService,
   type AittaDBOAuthFetch,
+  type OAuthAvailabilityFailureObserver,
+  type OAuthAvailabilityFailurePhase,
 } from "../services/aittadb-oauth-proof.ts";
 import type { InvestorAppEnv } from "./contracts.ts";
 import {
@@ -23,6 +25,7 @@ export type HostedOwnerOAuthProofCompositionDependencies = Readonly<{
   fetch?: AittaDBOAuthFetch;
   now?: () => Date;
   randomBytes?: OwnerOAuthCsrfRandomBytes;
+  availabilityFailureObserver?: OAuthAvailabilityFailureObserver;
 }>;
 
 export type HostedOwnerOAuthProofResolver = (
@@ -36,6 +39,8 @@ export function createHostedOwnerOAuthProofResolver(
   const now = dependencies.now ?? (() => new Date());
   const randomBytes = dependencies.randomBytes ?? secureRandomBytes;
   const providerFetch = dependencies.fetch ?? ((request) => fetch(request));
+  const availabilityFailureObserver = dependencies.availabilityFailureObserver ??
+    reportHostedOAuthAvailabilityFailure;
   const cache = new WeakMap<InvestorAppEnv, Promise<OwnerOAuthProofRouteDependencies | null>>();
 
   return (env) => {
@@ -46,6 +51,7 @@ export function createHostedOwnerOAuthProofResolver(
       providerFetch,
       now,
       randomBytes,
+      availabilityFailureObserver,
     );
     cache.set(env, composed);
     return composed;
@@ -57,6 +63,7 @@ async function composeHostedOwnerOAuthProof(
   providerFetch: AittaDBOAuthFetch,
   now: () => Date,
   randomBytes: OwnerOAuthCsrfRandomBytes,
+  availabilityFailureObserver: OAuthAvailabilityFailureObserver,
 ): Promise<OwnerOAuthProofRouteDependencies | null> {
   const database = exactDatabase(env.OAUTH_PROOF_DB);
   if (database === null) return null;
@@ -80,6 +87,7 @@ async function composeHostedOwnerOAuthProof(
       now,
       randomBytes,
       transactionTtlSeconds: OAUTH_TRANSACTION_TTL_SECONDS,
+      availabilityFailureObserver,
     });
     const csrfSession = createOwnerOAuthCsrfSession({
       appOrigin: configuration.appOrigin,
@@ -110,4 +118,33 @@ function secureRandomBytes(length: number): Uint8Array {
   const bytes = new Uint8Array(length);
   crypto.getRandomValues(bytes);
   return bytes;
+}
+
+const HOSTED_OAUTH_AVAILABILITY_EVIDENCE: Readonly<
+  Record<OAuthAvailabilityFailurePhase, string>
+> = Object.freeze({
+  request: "investor_app.oauth.discovery.request",
+  fetch: "investor_app.oauth.discovery.fetch",
+  status: "investor_app.oauth.discovery.status",
+  content_type: "investor_app.oauth.discovery.content_type",
+  declared_size: "investor_app.oauth.discovery.declared_size",
+  body: "investor_app.oauth.discovery.body",
+  body_size: "investor_app.oauth.discovery.body_size",
+  encoding: "investor_app.oauth.discovery.encoding",
+  json: "investor_app.oauth.discovery.json",
+  document: "investor_app.oauth.discovery.document",
+  contract: "investor_app.oauth.discovery.contract",
+  internal: "investor_app.oauth.discovery.internal",
+});
+
+export function hostedOAuthAvailabilityEvidence(
+  phase: OAuthAvailabilityFailurePhase,
+): string {
+  return HOSTED_OAUTH_AVAILABILITY_EVIDENCE[phase];
+}
+
+function reportHostedOAuthAvailabilityFailure(
+  phase: OAuthAvailabilityFailurePhase,
+): void {
+  console.warn(hostedOAuthAvailabilityEvidence(phase));
 }

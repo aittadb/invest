@@ -14,6 +14,9 @@ import type {
   D1OAuthProofStatement,
   D1OAuthProofValue,
 } from "../repositories/d1-oauth-proof-store.ts";
+import type {
+  OAuthAvailabilityFailurePhase,
+} from "../services/aittadb-oauth-proof.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
 import type {
   InvestorAppEnv,
@@ -21,6 +24,7 @@ import type {
 } from "../worker/contracts.ts";
 import {
   createHostedOwnerOAuthProofResolver,
+  hostedOAuthAvailabilityEvidence,
 } from "../worker/hosted-oauth-composition.ts";
 
 const APP_ORIGIN = "https://invest.example.test";
@@ -274,6 +278,46 @@ test("absent, partial, malformed, or unbound deployments keep OAuth absent", asy
   assert.equal(providerCalls, 0);
 });
 
+test("hosted availability evidence is fixed and credential-free", async (t) => {
+  const phases: OAuthAvailabilityFailurePhase[] = [
+    "request",
+    "fetch",
+    "status",
+    "content_type",
+    "declared_size",
+    "body",
+    "body_size",
+    "encoding",
+    "json",
+    "document",
+    "contract",
+    "internal",
+  ];
+  assert.deepEqual(
+    phases.map(hostedOAuthAvailabilityEvidence),
+    phases.map((phase) => `investor_app.oauth.discovery.${phase}`),
+  );
+  const serialized = JSON.stringify(phases.map(hostedOAuthAvailabilityEvidence));
+  for (const forbidden of [CLIENT_SECRET, CLIENT_ID, ISSUER, CALLBACK, OWNER_EMAIL]) {
+    assert.equal(serialized.includes(forbidden), false);
+  }
+
+  const database = migratedDatabase(t);
+  const observed: OAuthAvailabilityFailurePhase[] = [];
+  const resolver = createHostedOwnerOAuthProofResolver({
+    async fetch() {
+      throw new Error(`${CLIENT_SECRET} ${ISSUER}`);
+    },
+    availabilityFailureObserver(phase) {
+      observed.push(phase);
+    },
+  });
+  const capability = await resolver(configuredEnvironment(database));
+  assert.ok(capability);
+  assert.equal(await capability.oauth.availability(), false);
+  assert.deepEqual(observed, ["fetch"]);
+});
+
 test("the production entry point installs only the fail-closed hosted resolver", () => {
   const entrypoint = readFileSync(
     new URL("../worker/index.ts", import.meta.url),
@@ -285,7 +329,15 @@ test("the production entry point installs only the fail-closed hosted resolver",
   );
   assert.match(entrypoint, /createHostedOwnerOAuthProofResolver\(\)/u);
   assert.match(entrypoint, /resolveOwnerOAuthProof:/u);
-  assert.doesNotMatch(`${entrypoint}\n${composition}`, /console\s*\./u);
+  assert.doesNotMatch(entrypoint, /console\s*\./u);
+  assert.match(
+    composition,
+    /console\.warn\(hostedOAuthAvailabilityEvidence\(phase\)\)/u,
+  );
+  assert.doesNotMatch(
+    composition,
+    /console\.(?:debug|error|info|log)\s*\(/u,
+  );
   assert.doesNotMatch(`${entrypoint}\n${composition}`, /aittadb\.com|chatgpt\.site/iu);
 });
 

@@ -23,6 +23,22 @@ export const DEFAULT_OAUTH_TRANSACTION_COOKIE =
 
 export type AittaDBOAuthFetch = (request: Request) => Promise<Response>;
 export type OAuthRandomBytes = (length: number) => Uint8Array;
+export type OAuthAvailabilityFailurePhase =
+  | "request"
+  | "fetch"
+  | "status"
+  | "content_type"
+  | "declared_size"
+  | "body"
+  | "body_size"
+  | "encoding"
+  | "json"
+  | "document"
+  | "contract"
+  | "internal";
+export type OAuthAvailabilityFailureObserver = (
+  phase: OAuthAvailabilityFailurePhase,
+) => void;
 
 export type OAuthTransactionClaim = Readonly<{
   fingerprint: string;
@@ -62,6 +78,7 @@ export type AittaDBOAuthProofDependencies = Readonly<{
   randomBytes: OAuthRandomBytes;
   transactionTtlSeconds: number;
   transactionCookieName?: string;
+  availabilityFailureObserver?: OAuthAvailabilityFailureObserver;
 }>;
 
 export type OAuthAuthorizationStart = Readonly<{
@@ -120,6 +137,7 @@ type ValidatedConfiguration = Readonly<{
   randomBytes: OAuthRandomBytes;
   transactionTtlSeconds: number;
   transactionCookieName: string;
+  availabilityFailureObserver?: OAuthAvailabilityFailureObserver;
 }>;
 
 type Discovery = Readonly<{
@@ -150,10 +168,21 @@ export function createAittaDBOAuthProofService(
     callbackUri: config.callbackUri,
     transactionCookieName: config.transactionCookieName,
     async availability() {
+      let reported = false;
+      const report = (phase: OAuthAvailabilityFailurePhase): void => {
+        if (reported) return;
+        reported = true;
+        try {
+          config.availabilityFailureObserver?.(phase);
+        } catch {
+          // Diagnostics must never alter the fail-closed availability result.
+        }
+      };
       try {
-        await discover(config);
+        await discover(config, report);
         return true;
       } catch {
+        report("internal");
         return false;
       }
     },
@@ -297,7 +326,9 @@ function validateConfiguration(
     typeof input.now !== "function" ||
     typeof input.randomBytes !== "function" ||
     typeof input.transactionClaimStore?.claim !== "function" ||
-    typeof input.resultSink?.recordVerifiedProof !== "function"
+    typeof input.resultSink?.recordVerifiedProof !== "function" ||
+    (input.availabilityFailureObserver !== undefined &&
+      typeof input.availabilityFailureObserver !== "function")
   ) {
     invalidConfiguration();
   }
@@ -321,19 +352,34 @@ function validateConfiguration(
     randomBytes: input.randomBytes,
     transactionTtlSeconds: input.transactionTtlSeconds,
     transactionCookieName: cookieName,
+    availabilityFailureObserver: input.availabilityFailureObserver,
   });
 }
 
-async function discover(config: ValidatedConfiguration): Promise<Discovery> {
+async function discover(
+  config: ValidatedConfiguration,
+  report?: OAuthAvailabilityFailureObserver,
+): Promise<Discovery> {
+  let request: Request;
+  try {
+    request = new Request(
+      `${config.issuer}/.well-known/openid-configuration`,
+      {
+        method: "GET",
+        headers: { Accept: "application/json", "Cache-Control": "no-cache" },
+        credentials: "omit",
+        redirect: "error",
+      },
+    );
+  } catch {
+    report?.("request");
+    unavailable();
+  }
   const document = await fetchJson(
     config,
-    new Request(`${config.issuer}/.well-known/openid-configuration`, {
-      method: "GET",
-      headers: { Accept: "application/json", "Cache-Control": "no-cache" },
-      credentials: "omit",
-      redirect: "error",
-    }),
+    request,
     DISCOVERY_MAX_BYTES,
+    report,
   );
   if (
     document.issuer !== config.issuer ||
@@ -350,6 +396,7 @@ async function discover(config: ValidatedConfiguration): Promise<Discovery> {
       stringArray(document.scopes_supported).includes(scope)
     )
   ) {
+    report?.("contract");
     unavailable();
   }
   return Object.freeze({
@@ -501,41 +548,54 @@ async function fetchJson(
   config: ValidatedConfiguration,
   request: Request,
   maxBytes: number,
+  report?: OAuthAvailabilityFailureObserver,
 ): Promise<Record<string, unknown>> {
   let response: Response;
   try {
     response = await config.fetch(request);
   } catch {
+    report?.("fetch");
     unavailable();
   }
-  if (
-    !response.ok ||
-    !response.headers.get("content-type")?.toLowerCase().startsWith(
-      "application/json",
-    )
-  ) {
+  if (!response.ok) {
+    report?.("status");
     unavailable();
   }
-  const text = await readBoundedText(response, maxBytes);
+  if (!response.headers.get("content-type")?.toLowerCase().startsWith(
+    "application/json",
+  )) {
+    report?.("content_type");
+    unavailable();
+  }
+  const text = await readBoundedText(response, maxBytes, report);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
+    report?.("json");
     unavailable();
   }
-  if (!isRecord(parsed) || Object.keys(parsed).length > 32) unavailable();
+  if (!isRecord(parsed) || Object.keys(parsed).length > 32) {
+    report?.("document");
+    unavailable();
+  }
   return parsed;
 }
 
 async function readBoundedText(
   response: Response,
   maxBytes: number,
+  report?: OAuthAvailabilityFailureObserver,
 ): Promise<string> {
   const declared = response.headers.get("content-length");
   if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > maxBytes)) {
+    report?.("declared_size");
     unavailable();
   }
-  if (response.body === null) unavailable();
+  if (response.body === null) {
+    report?.("body");
+    unavailable();
+  }
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -546,11 +606,13 @@ async function readBoundedText(
       total += next.value.byteLength;
       if (total > maxBytes) {
         await reader.cancel();
+        report?.("body_size");
         unavailable();
       }
       chunks.push(next.value);
     }
   } catch {
+    report?.("body");
     unavailable();
   }
   const bytes = new Uint8Array(total);
@@ -562,6 +624,7 @@ async function readBoundedText(
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
+    report?.("encoding");
     unavailable();
   }
 }

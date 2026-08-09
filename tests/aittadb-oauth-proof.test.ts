@@ -6,6 +6,7 @@ import {
   OAuthProofFailure,
   type AittaDBOAuthProofDependencies,
   type AittaDBOAuthProofMetadata,
+  type OAuthAvailabilityFailureObserver,
   type OAuthTransactionClaim,
 } from "../services/aittadb-oauth-proof.ts";
 
@@ -160,6 +161,80 @@ test("discovery must advertise the exact confidential S256 authorization path", 
       assert.equal(harness.proofs.length, 0);
     });
   }
+});
+
+test("availability reports one fixed non-secret discovery failure phase", async (t) => {
+  const cases = [
+    [
+      "fetch",
+      { failAt: "discovery", fetchFailure: new Error(CLIENT_SECRET) },
+    ],
+    [
+      "status",
+      {
+        discoveryResponse: new Response(CLIENT_SECRET, {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        }),
+      },
+    ],
+    [
+      "content_type",
+      {
+        discoveryResponse: new Response(CLIENT_SECRET, {
+          headers: { "content-type": "text/plain" },
+        }),
+      },
+    ],
+    [
+      "declared_size",
+      {
+        discoveryResponse: new Response("{}", {
+          headers: {
+            "content-length": "20000",
+            "content-type": "application/json",
+          },
+        }),
+      },
+    ],
+    [
+      "json",
+      {
+        discoveryResponse: new Response("{", {
+          headers: { "content-type": "application/json" },
+        }),
+      },
+    ],
+    ["document", { discoveryResponse: jsonResponse([]) }],
+    [
+      "contract",
+      { discovery: { ...discoveryDocument(), issuer: CLIENT_SECRET } },
+    ],
+  ] as const;
+
+  for (const [expected, options] of cases) {
+    await t.test(expected, async () => {
+      const harness = await createHarness(options);
+      assert.equal(await harness.service.availability(), false);
+      assert.deepEqual(harness.availabilityFailures, [expected]);
+      const evidence = JSON.stringify(harness.availabilityFailures);
+      assert.equal(evidence.includes(CLIENT_SECRET), false);
+      assert.equal(evidence.includes(ISSUER), false);
+    });
+  }
+
+  const available = await createHarness();
+  assert.equal(await available.service.availability(), true);
+  assert.deepEqual(available.availabilityFailures, []);
+
+  const throwingObserver = await createHarness({
+    discovery: { ...discoveryDocument(), issuer: "https://foreign.example.test" },
+    availabilityFailureObserver() {
+      throw new Error(CLIENT_SECRET);
+    },
+  });
+  assert.equal(await throwingObserver.service.availability(), false);
+  assert.deepEqual(throwingObserver.availabilityFailures, ["contract"]);
 });
 
 test("discovery, token, and introspection bodies are bounded and strictly parsed", async (t) => {
@@ -365,6 +440,7 @@ async function createHarness(
     fetchFailure?: Error;
     cookieKeyExtractable?: boolean;
     issuer?: string;
+    availabilityFailureObserver?: OAuthAvailabilityFailureObserver;
   }> = {},
 ) {
   const key = await crypto.subtle.importKey(
@@ -378,6 +454,7 @@ async function createHarness(
   const claims: OAuthTransactionClaim[] = [];
   const claimed = new Set<string>();
   const proofs: AittaDBOAuthProofMetadata[] = [];
+  const availabilityFailures: string[] = [];
   let randomCall = 0;
   const fetch = async (request: Request): Promise<Response> => {
     const body = request.method === "POST"
@@ -441,12 +518,17 @@ async function createHarness(
         (_, index) => (randomCall * 64 + index) % 256,
       );
     },
+    availabilityFailureObserver(phase) {
+      availabilityFailures.push(phase);
+      options.availabilityFailureObserver?.(phase);
+    },
   };
   return {
     service: createAittaDBOAuthProofService(dependencies),
     requests,
     claims,
     proofs,
+    availabilityFailures,
   };
 }
 
