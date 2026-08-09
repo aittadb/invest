@@ -10,6 +10,8 @@ The initial repository uses the Sites Vinext starter with React server component
 
 Deployments provide trusted runtime configuration for the canonical app origin, configured identity provider, storage adapter, owner setup, sessions, and anti-forgery protection. Secrets are managed as runtime configuration, not as campaign content.
 
+`APP_BASE_URL` is instance configuration, never a source default. The worker validates it as an HTTP(S) origin and replaces an internal request header before rendering metadata. When it is absent or invalid, the current request origin is used. This lets the same Investor App source serve unrelated deployments without inheriting another instance's hostname.
+
 ## Resource representations
 
 Application URLs identify resources rather than HTML-only pages. `Accept: text/html` selects the human interface. `Accept: application/vnd.aittadb-invest+json; version=0.1` selects the versioned hypermedia contract, and `application/json` is a compatibility representation. Representation selection never uses `User-Agent`.

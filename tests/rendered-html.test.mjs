@@ -12,14 +12,19 @@ async function loadWorker() {
   return workerPromise;
 }
 
-async function render(headers = { accept: "text/html" }) {
+async function render(
+  headers = { accept: "text/html" },
+  url = "http://localhost/",
+  appBaseUrl,
+) {
   const worker = await loadWorker();
 
   return worker.fetch(
-    new Request("http://localhost/", {
+    new Request(url, {
       headers,
     }),
     {
+      APP_BASE_URL: appBaseUrl,
       ASSETS: {
         fetch: async () => new Response("Not found", { status: 404 }),
       },
@@ -49,6 +54,39 @@ test("server-renders the signed-out AittaDB pre-registration landing page", asyn
     /Initial implementation scaffold|Product areas to build next|Repository contract|ChatGPT Sites application|features to build/i,
   );
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
+});
+
+test("HTML metadata uses the configured runtime origin", async () => {
+  const runtimeOrigin = "https://invest.example.com";
+  const response = await render(
+    { accept: "text/html" },
+    "https://sites-host.example/",
+    runtimeOrigin,
+  );
+
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(
+    html,
+    /<link rel="canonical" href="https:\/\/invest\.example\.com\/?"\s*\/?>/i,
+  );
+  assert.match(
+    html,
+    /<meta property="og:url" content="https:\/\/invest\.example\.com\/?"\s*\/?>/i,
+  );
+  assert.match(html, /https:\/\/invest\.example\.com\/og\.png/i);
+});
+
+test("HTML metadata falls back to each deployment request origin", async () => {
+  const firstHtml = await (
+    await render({ accept: "text/html" }, "https://first.example/")
+  ).text();
+  const secondHtml = await (
+    await render({ accept: "text/html" }, "https://second.example/")
+  ).text();
+
+  assert.match(firstHtml, /<link rel="canonical" href="https:\/\/first\.example\/?"/i);
+  assert.match(secondHtml, /<link rel="canonical" href="https:\/\/second\.example\/?"/i);
 });
 
 test("the root resource negotiates equivalent public hypermedia JSON", async () => {

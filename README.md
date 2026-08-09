@@ -6,7 +6,7 @@ The approved baseline is [docs/AittaDB-Investor-App-Specification.md](docs/Aitta
 
 ## Status
 
-Experimental initial scaffold with framework-independent domain foundation contracts. This repository is not ready for production campaign publication.
+The reusable Investor App software is experimental. Its AittaDB runtime instance is deployed for owner review at [invest.aittadb.com](https://invest.aittadb.com); that hostname is deployment configuration, not an application default. Public access remains disabled while authenticated workflows, production persistence, and campaign configuration are unfinished.
 
 The public source must not hard-code any reference campaign, person, country, currency, funding target, legal entity, country rule, private package content, or private campaign decision.
 

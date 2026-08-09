@@ -11,6 +11,7 @@ Investor App is a configurable ChatGPT Sites app for publishing a private invest
 - AittaDB provides identity, OAuth/OIDC, storage, authorization, and bounded persistence primitives. Investor workflow stays in this repository.
 - Do not hard-code any reference campaign, person, country, currency, funding target, legal entity, phase rule, package content, notice, or founder detail into reusable app code.
 - Treat the AittaDB campaign as the first production fixture, not as application defaults.
+- Treat public hostnames as deployment configuration. Never hard-code one runtime instance's hostname as an Investor App software default.
 - This app collects non-binding interest only. It must not accept money, issue shares, calculate ownership, promise allocation, sign agreements, collect formal KYC/KYB material, or present a securities offer.
 
 ## Runtime Contract

@@ -7,9 +7,11 @@ import {
   INVESTOR_APP_API_VERSION,
   INVESTOR_APP_MEDIA_TYPE,
 } from "../domain/public-campaign-resource";
+import { withAppOrigin } from "../http/app-origin";
 import { negotiateRepresentation } from "../http/content-negotiation";
 
 interface Env {
+  APP_BASE_URL?: string;
   ASSETS: {
     fetch(request: Request): Promise<Response>;
   };
@@ -48,7 +50,11 @@ const worker = {
         return notAcceptableResponse(request.url);
       }
 
-      const htmlResponse = await handler.fetch(request, env, ctx);
+      const htmlResponse = await handler.fetch(
+        withAppOrigin(request, env.APP_BASE_URL),
+        env,
+        ctx,
+      );
       return withAcceptVary(htmlResponse);
     }
 
@@ -63,7 +69,7 @@ const worker = {
       }, allowedWidths);
     }
 
-    return handler.fetch(request, env, ctx);
+    return handler.fetch(withAppOrigin(request, env.APP_BASE_URL), env, ctx);
   },
 };
 
