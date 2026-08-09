@@ -20,6 +20,11 @@ export {
   type ParticipantRegistrationRouteDependencies,
 } from "./participant-registration.ts";
 
+export {
+  createParticipantPackageReaderRouteHandler,
+  type ParticipantPackageReaderDependencies,
+} from "./participant-package-reader.ts";
+
 export function createParticipantRouteHandler(
   resourceHandlers: readonly ApplicationRouteHandler[] = [],
   capabilities: ParticipantRouteCapabilities = {},
