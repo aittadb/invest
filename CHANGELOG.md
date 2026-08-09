@@ -4,6 +4,10 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-039:** Define phase and country-eligibility configuration. Depends on: `TASK-004`. DoD: phase identity, open/closed state, enabled participation paths, country normalization, allow/deny rules, and setup-completion checks are framework-independent and tested without campaign defaults.
+
+  Acceptance evidence: `domain/phase-configuration.ts` strictly parses stable phase identity, explicit open or closed state, canonical enabled participation paths, and normalized allow or deny country rules without supplying deployment defaults. Setup readiness and participation eligibility remain separate projections. Eight focused tests cover complete and missing setup, malformed and unknown fields, duplicate normalized countries and paths, injected country normalization, allow and deny behavior, phase state, and path eligibility. Full `npm run validate` passes with 46 tests.
+
 - **TASK-009:** Define founder application contracts. Depends on: `TASK-004`. DoD: founder application fields, contribution-area choices, lifecycle state, separate-from-investment rule, and history-entry contracts are typed and documented; tests cover create/edit/withdraw behavior and the ability to have founder and investor records independently.
 
   Acceptance evidence: `domain/founder-application.ts` defines deployment-supplied contribution choices, bounded founder fields, received and withdrawn states, applicant-owned transitions, and immutable per-revision history snapshots. HTTPS profile-link validation and stable identifiers reject unsafe or ambiguous input. Five focused tests cover configurable choices, create/edit/withdraw transitions, immutable history, stale and foreign transition rejection, terminal withdrawal, and founder records changing independently from investment records. Full `npm run validate` passes with 46 tests.

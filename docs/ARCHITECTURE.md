@@ -76,6 +76,12 @@ An account-deletion request records intent but does not call indication or found
 
 Founder applications do not import, create, mutate, or gate investment indications. An account may therefore hold either record type or both, and application services compose them only when a participant-facing resource needs both projections.
 
+### Phase and country eligibility
+
+`domain/phase-configuration.ts` requires explicit phase identity, state, participation paths, and country policy. It supplies no built-in country, path, or campaign default. Country codes pass through the shared normalizer before duplicate and allow or deny evaluation.
+
+Setup readiness is distinct from open or closed state: configuration may be complete while a phase is closed. Participation is accepted only when the phase is open, setup is complete, the requested path is enabled, and the normalized country satisfies the configured rule.
+
 ## Storage plan
 
 Development can use a deterministic in-memory/test adapter. Production must use an AittaDB-compatible adapter and pass the same contract tests.
