@@ -82,6 +82,11 @@ test("confidential Authorization Code with PKCE validates discovery, token, and 
   assert.equal(harness.claims.length, 1);
   assert.match(harness.claims[0]?.fingerprint ?? "", /^[\w-]{43}$/u);
   assert.equal(harness.requests.length, 4);
+  for (const request of harness.requests) {
+    assert.equal(request.cookie, null);
+    assert.equal(request.redirect, "error");
+  }
+  assert.equal(harness.requests[0]?.authorization, null);
 
   const tokenRequest = harness.requests[2];
   assert.equal(tokenRequest?.url, `${ISSUER}/oauth/token`);
@@ -423,6 +428,8 @@ test("configuration rejects an extractable transaction cookie key", async () => 
 type ObservedRequest = Readonly<{
   url: string;
   authorization: string | null;
+  cookie: string | null;
+  redirect: RequestRedirect;
   body: Readonly<Record<string, string>>;
 }>;
 
@@ -463,6 +470,8 @@ async function createHarness(
     requests.push({
       url: request.url,
       authorization: request.headers.get("authorization"),
+      cookie: request.headers.get("cookie"),
+      redirect: request.redirect,
       body,
     });
     const kind = request.url.endsWith("/.well-known/openid-configuration")

@@ -367,7 +367,6 @@ async function discover(
       {
         method: "GET",
         headers: { Accept: "application/json", "Cache-Control": "no-cache" },
-        credentials: "omit",
         redirect: "error",
       },
     );
@@ -539,7 +538,6 @@ function confidentialRequest(
       "Content-Type": "application/x-www-form-urlencoded",
     },
     body,
-    credentials: "omit",
     redirect: "error",
   });
 }
