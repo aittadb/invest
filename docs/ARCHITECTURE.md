@@ -64,6 +64,12 @@ Money constructors reject floating-point, unsafe-integer, negative, and configur
 
 The first version requires acceptance. A material version replaces the required acceptance hash; a non-material version inherits the preceding requirement. This propagation prevents a later editorial save from bypassing an earlier material version that a participant has not accepted. Acceptance records derive version and hash evidence from the trusted snapshot rather than client input.
 
+### Participant profile and consent
+
+`domain/participant-profile.ts` keeps the authenticated subject and account-email label identity-bound while exposing an explicit policy for participant-editable, registration-only, withdraw-only, request-only, and system-managed fields. Required process messages are independent from optional marketing consent.
+
+An account-deletion request records intent but does not call indication or founder repositories. It emits a retry-stable withdrawal intent for an application service to coordinate across those separate lanes.
+
 ## Storage plan
 
 Development can use a deterministic in-memory/test adapter. Production must use an AittaDB-compatible adapter and pass the same contract tests.
