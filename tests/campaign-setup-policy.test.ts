@@ -8,6 +8,9 @@ import {
   type CampaignSetupPolicy,
 } from "../domain/campaign-setup-policy.ts";
 import {
+  participantRegistrationNoticesFromCampaignPolicy,
+} from "../domain/participant-registration-resource.ts";
+import {
   parsePhaseConfiguration,
   type PhaseConfiguration,
 } from "../domain/phase-configuration.ts";
@@ -21,6 +24,8 @@ function policy(overrides: Record<string, unknown> = {}): Record<string, unknown
     notices: {
       legalBoundary: "  This service records an expression of interest.  ",
       nonBindingInterest: "No payment or commitment is created.",
+      processEmail: "Required messages concern registration and review.",
+      marketingConsent: "Optional product updates require separate consent.",
       privacyContact: {
         label: "Privacy contact",
         href: "mailto:privacy@example.test",
@@ -63,6 +68,13 @@ test("campaign policy requires and freezes every deployment-owned decision", () 
   assert.equal(parsed.value.notices.legalBoundary, "This service records an expression of interest.");
   assert.equal(parsed.value.founderContributionChoices[0]?.label, "Engineering");
   assert.equal(parsed.value.notices.privacyContact.href, "mailto:privacy@example.test");
+  assert.deepEqual(
+    participantRegistrationNoticesFromCampaignPolicy(parsed.value),
+    {
+      processEmail: "Required messages concern registration and review.",
+      marketing: "Optional product updates require separate consent.",
+    },
+  );
   assert.equal(Object.isFrozen(parsed.value), true);
   assert.equal(Object.isFrozen(parsed.value.notices), true);
   assert.equal(Object.isFrozen(parsed.value.publicationReadiness), true);
@@ -88,6 +100,8 @@ test("campaign policy supplies no notice, founder-choice, or review defaults", (
   assert.deepEqual(incomplete.issues, [
     { code: "required", path: "notices.legalBoundary" },
     { code: "required", path: "notices.nonBindingInterest" },
+    { code: "required", path: "notices.processEmail" },
+    { code: "required", path: "notices.marketingConsent" },
     { code: "required", path: "notices.privacyContact" },
     { code: "required", path: "notices.retention" },
     { code: "required", path: "publicationReadiness.publicPresentationReviewed" },
@@ -103,6 +117,12 @@ test("campaign policy rejects unknown, unsafe, duplicate, and malformed values",
       { id: "area:duplicate", label: "One" },
       { id: "area:duplicate", label: "Two" },
     ],
+  })).ok, false);
+  assert.equal(parseCampaignSetupPolicy(policy({
+    notices: {
+      ...(policy().notices as Record<string, unknown>),
+      processEmail: "Required process message.\nInjected second line.",
+    },
   })).ok, false);
   assert.equal(parseCampaignSetupPolicy(policy({
     notices: {
@@ -175,7 +195,7 @@ test("setup changes classify copy separately from participation policy", () => {
     campaignPolicy: requiredPolicy(policy({
       notices: {
         ...(policy().notices as Record<string, unknown>),
-        retention: "A changed retention statement.",
+        processEmail: "A changed required process message.",
       },
     })),
   }), "material");

@@ -7,6 +7,7 @@ import {
   type ActionField,
   type HtmlFormAction,
 } from "./hypermedia-action.ts";
+import type { CampaignSetupPolicy } from "./campaign-setup-policy.ts";
 import {
   PARTICIPANT_HOME_PATH,
   PRIVATE_PACKAGE_PATH,
@@ -74,6 +75,18 @@ export function defineParticipantRegistrationNotices(
   return Object.freeze({
     processEmail: requiredNotice(value?.processEmail),
     marketing: requiredNotice(value?.marketing),
+  });
+}
+
+/** Map the validated private campaign policy into the registration view. */
+export function participantRegistrationNoticesFromCampaignPolicy(
+  policy: CampaignSetupPolicy,
+): ParticipantRegistrationNotices {
+  const notices = policy?.notices;
+  if (notices === undefined) throw new ParticipantRegistrationResourceError();
+  return defineParticipantRegistrationNotices({
+    processEmail: notices.processEmail,
+    marketing: notices.marketingConsent,
   });
 }
 

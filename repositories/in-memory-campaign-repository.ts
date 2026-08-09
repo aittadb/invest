@@ -39,7 +39,7 @@ import {
   verifyPreparedAuditAppend,
 } from "./in-memory-audit-notification-repositories.ts";
 
-const CAMPAIGN_SETUP_SCHEMA_VERSION = 2;
+const CAMPAIGN_SETUP_SCHEMA_VERSION = 3;
 const MAX_CAMPAIGN_PHASES = 32;
 const CURRENT_SETUP_KEY = storageKey("campaign-setup-current", "configured-campaign");
 const HISTORY_COLLECTION = storageKey(

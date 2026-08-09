@@ -16,6 +16,8 @@ const POLICY_KEYS = new Set([
 const NOTICE_KEYS = new Set([
   "legalBoundary",
   "nonBindingInterest",
+  "processEmail",
+  "marketingConsent",
   "privacyContact",
   "retention",
 ]);
@@ -47,6 +49,8 @@ export type CampaignSetupPolicy = Readonly<{
   notices: Readonly<{
     legalBoundary: string;
     nonBindingInterest: string;
+    processEmail: string;
+    marketingConsent: string;
     privacyContact: CampaignPrivacyContact;
     retention: string;
   }>;
@@ -190,6 +194,20 @@ function parseNotices(
         issues,
       )
     : null;
+  const processEmail = Object.hasOwn(source, "processEmail")
+    ? requiredParticipantNotice(
+        source.processEmail,
+        "notices.processEmail",
+        issues,
+      )
+    : null;
+  const marketingConsent = Object.hasOwn(source, "marketingConsent")
+    ? requiredParticipantNotice(
+        source.marketingConsent,
+        "notices.marketingConsent",
+        issues,
+      )
+    : null;
   const privacyContact = Object.hasOwn(source, "privacyContact")
     ? parsePrivacyContact(source.privacyContact, issues)
     : null;
@@ -202,8 +220,16 @@ function parseNotices(
       )
     : null;
 
-  return legalBoundary && nonBindingInterest && privacyContact && retention
-    ? { legalBoundary, nonBindingInterest, privacyContact, retention }
+  return legalBoundary && nonBindingInterest && processEmail &&
+      marketingConsent && privacyContact && retention
+    ? {
+        legalBoundary,
+        nonBindingInterest,
+        processEmail,
+        marketingConsent,
+        privacyContact,
+        retention,
+      }
     : null;
 }
 
@@ -292,6 +318,20 @@ function requiredText(
     return null;
   }
   return normalized;
+}
+
+function requiredParticipantNotice(
+  value: unknown,
+  path: string,
+  issues: ValidationIssue[],
+): string | null {
+  const parsed = requiredText(value, path, MAX_NOTICE_LENGTH, issues);
+  if (parsed === null) return null;
+  if (parsed.includes("\t") || parsed.includes("\n")) {
+    issues.push({ code: "invalid_format", path });
+    return null;
+  }
+  return parsed;
 }
 
 function contactHref(value: unknown, issues: ValidationIssue[]): string | null {

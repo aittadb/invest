@@ -125,7 +125,7 @@ test("setup revisions and their adapter records remain immutable", async () => {
           ...setup.campaignPolicy,
           notices: {
             ...setup.campaignPolicy.notices,
-            retention: "Updated synthetic retention notice.",
+            processEmail: "Updated required process message.",
           },
         },
       };
@@ -144,8 +144,8 @@ test("setup revisions and their adapter records remain immutable", async () => {
   assert.equal(first.setup.publicCampaign.name, syntheticPublicCampaign.name);
   assert.equal(second.setup.publicCampaign.name, "Northstar Systems");
   assert.notEqual(
-    first.setup.campaignPolicy.notices.retention,
-    second.setup.campaignPolicy.notices.retention,
+    first.setup.campaignPolicy.notices.processEmail,
+    second.setup.campaignPolicy.notices.processEmail,
   );
 
   const history = await repository.listSetupHistory({ limit: 10 });
@@ -153,19 +153,19 @@ test("setup revisions and their adapter records remain immutable", async () => {
     revision: item.revision,
     name: item.setup.publicCampaign.name,
     state: item.setup.phases[0]?.state,
-    retention: item.setup.campaignPolicy.notices.retention,
+    processEmail: item.setup.campaignPolicy.notices.processEmail,
   })), [
     {
       revision: 1,
       name: syntheticPublicCampaign.name,
       state: "open",
-      retention: explicitSetup().campaignPolicy.notices.retention,
+      processEmail: explicitSetup().campaignPolicy.notices.processEmail,
     },
     {
       revision: 2,
       name: "Northstar Systems",
       state: "closed",
-      retention: "Updated synthetic retention notice.",
+      processEmail: "Updated required process message.",
     },
   ]);
   assert.equal(Object.isFrozen(history), true);
@@ -176,6 +176,33 @@ test("setup revisions and their adapter records remain immutable", async () => {
   assert.deepEqual(await reopened.readSetup(), second);
   assert.equal(state.readCalls > 0, true);
   assert.equal(state.listCalls > 0, true);
+});
+
+test("legacy private campaign setup records fail closed", async () => {
+  const state = new MemoryStorageState();
+  const repository = new DevelopmentInMemoryCampaignRepository(
+    new DeterministicMemoryStorageAdapter(state, true),
+  );
+  await repository.saveSetup(saveRequest({
+    operationId: "campaign-operation:legacy-schema",
+    recordedAt: FIRST_SAVE,
+    expectedRevision: null,
+    setup: explicitSetup(),
+  }));
+
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "campaign-setup-current"
+  );
+  assert(entry);
+  const [key, record] = entry;
+  state.records.set(key, freezeRecord({
+    key: record.key,
+    revision: record.revision,
+    value: { ...record.value, schemaVersion: 2 },
+  }));
+
+  const failure = await captureStorageFailure(() => repository.readSetup());
+  assert.equal(failure.code, "UNAVAILABLE");
 });
 
 test("operation IDs are retry-stable and cannot be reused for changed setup", async () => {
@@ -278,6 +305,18 @@ test("public projection reads expose only published presentation state", async (
   assert.equal(
     JSON.stringify(publicCampaign).includes(
       explicitSetup().campaignPolicy.notices.legalBoundary,
+    ),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(publicCampaign).includes(
+      explicitSetup().campaignPolicy.notices.processEmail,
+    ),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(publicCampaign).includes(
+      explicitSetup().campaignPolicy.notices.marketingConsent,
     ),
     false,
   );

@@ -145,6 +145,10 @@ export function explicitCampaignSetup(
           "This registration records interest and is not a securities offer.",
         nonBindingInterest:
           "No payment, allocation, reservation, or commitment is created.",
+        processEmail:
+          "Required messages concern this registration and its review.",
+        marketingConsent:
+          "Optional updates require separate consent and can be declined.",
         privacyContact: {
           label: "Northstar privacy contact",
           href: "https://northstar.example/privacy",
