@@ -99,7 +99,11 @@ export type SaveCampaignSetupRequest = Readonly<{
   setup: unknown;
 }>;
 
-export type CampaignAuditTransition = "updated" | "published" | "unpublished";
+export type CampaignAuditTransition =
+  | "created"
+  | "updated"
+  | "published"
+  | "unpublished";
 export type CampaignMutationConsistency =
   | "atomic-campaign-audit"
   | "unavailable";
@@ -405,7 +409,15 @@ function assertCampaignAuditTransition(
   next: CampaignSetupRevision,
   transition: CampaignAuditTransition,
 ): void {
-  if (current === null || expectedRevision === null) {
+  if (current === null) {
+    const validCreation = expectedRevision === null &&
+      next.revision === 1 &&
+      !next.setup.publicCampaign.published &&
+      transition === "created";
+    if (!validCreation) throw new StorageFailure("INVALID_REQUEST");
+    return;
+  }
+  if (expectedRevision === null) {
     throw new StorageFailure("PRECONDITION_FAILED");
   }
   if (current.revision !== expectedRevision) {
@@ -425,7 +437,8 @@ function assertCampaignAuditTransition(
 function isCampaignAuditTransition(
   value: unknown,
 ): value is CampaignAuditTransition {
-  return value === "updated" || value === "published" || value === "unpublished";
+  return value === "created" || value === "updated" ||
+    value === "published" || value === "unpublished";
 }
 
 async function campaignAuditEventId(operationId: StorageOperationId): Promise<string> {
