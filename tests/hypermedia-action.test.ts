@@ -141,6 +141,64 @@ test("projects one transition as equivalent JSON action and HTML form models", (
   );
 });
 
+test("projects hidden concurrency fields and repeated configured choices", () => {
+  const action = defineAction({
+    name: "edit-founder-application",
+    title: "Save application",
+    method: "PATCH",
+    href: "/participant/founder-interest",
+    requestMediaType: "application/x-www-form-urlencoded",
+    fields: [
+      {
+        name: "operation-id",
+        title: "Operation identifier",
+        type: "string",
+        format: "text",
+        location: "body",
+        required: true,
+        presentation: "hidden",
+        minLength: 1,
+        maxLength: 127,
+        value: "founder-operation:edit",
+      },
+      {
+        name: "secondary-areas",
+        title: "Secondary contribution areas",
+        type: "choice",
+        location: "body",
+        required: false,
+        multiple: true,
+        choices: [
+          { value: "area:product", title: "Product" },
+          { value: "area:operations", title: "Operations" },
+        ],
+        values: ["area:product"],
+      },
+    ],
+  });
+
+  const json = toHypermediaAction(action);
+  const html = toHtmlFormAction(action);
+  assert.deepEqual(
+    {
+      presentation: json.fields[0]?.presentation,
+      value: json.fields[0]?.value,
+      multiple: json.fields[1]?.multiple,
+      values: json.fields[1]?.values,
+    },
+    {
+      presentation: html.fields[0]?.presentation,
+      value: html.fields[0]?.value,
+      multiple: html.fields[1]?.multiple,
+      values: html.fields[1]?.values,
+    },
+  );
+  assert.equal(html.fields[0]?.inputType, "hidden");
+  assert.equal(html.fields[1]?.control, "select");
+  assert.equal(Object.isFrozen(json.fields[1]?.values), true);
+  assert.equal(Object.isFrozen(html.fields[1]?.values), true);
+});
+
 test("keeps JSON-only actions valid without pretending native form parity", () => {
   const action = defineAction(jsonMutationDefinition("DELETE"));
 

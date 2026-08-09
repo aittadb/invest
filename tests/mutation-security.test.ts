@@ -248,6 +248,41 @@ test("valid JSON and form requests return one verified generic boundary", async 
   assert.equal(Object.getPrototypeOf(reservedName.body), Object.prototype);
 });
 
+test("explicit repeated form fields become bounded arrays without widening defaults", async () => {
+  const trusted = await session();
+  const guard = createBrowserMutationGuard({
+    allowedOrigins: [APP_ORIGIN],
+    resolveSession: async () => trusted,
+    now: () => NOW,
+    repeatedFormFields: ["secondary-areas"],
+  });
+  const verified = await guard(
+    requestWithBody(
+      new URLSearchParams([
+        [MUTATION_CSRF_FIELD, CSRF_TOKEN],
+        ["secondary-areas", "area:product"],
+        ["secondary-areas", "area:operations"],
+      ]).toString(),
+      "application/x-www-form-urlencoded",
+    ),
+  );
+
+  assert.deepEqual(verified.body, {
+    "secondary-areas": ["area:product", "area:operations"],
+  });
+  assert.equal(Object.isFrozen(verified.body["secondary-areas"]), true);
+
+  assert.throws(
+    () =>
+      createBrowserMutationGuard({
+        allowedOrigins: [APP_ORIGIN],
+        resolveSession: async () => trusted,
+        repeatedFormFields: [MUTATION_CSRF_FIELD],
+      }),
+    /configuration/u,
+  );
+});
+
 type SessionOptions = Readonly<{
   type?: "participant" | "owner";
   subject?: string;

@@ -55,6 +55,7 @@ export type BrowserMutationGuardOptions = Readonly<{
   now?: () => Date;
   maxBodyBytes?: number;
   maxFields?: number;
+  repeatedFormFields?: readonly string[];
 }>;
 
 export type BrowserMutationGuard = (
@@ -147,6 +148,10 @@ export function createBrowserMutationGuard(
     DEFAULT_MUTATION_FIELDS,
     MAX_MUTATION_FIELDS,
   );
+  const repeatedFormFields = parseRepeatedFormFields(
+    options.repeatedFormFields ?? [],
+    maxFields,
+  );
   const now = options.now ?? (() => new Date());
 
   if (typeof options.resolveSession !== "function") invalidConfiguration();
@@ -163,7 +168,12 @@ export function createBrowserMutationGuard(
       request.headers.get("content-type"),
     );
     const bytes = await readBoundedBody(request, maxBodyBytes);
-    const parsed = parseBody(bytes, mediaType, maxFields);
+    const parsed = parseBody(
+      bytes,
+      mediaType,
+      maxFields,
+      repeatedFormFields,
+    );
     const csrfToken = csrfProof(request, mediaType, parsed.fields);
 
     if (
@@ -396,6 +406,7 @@ function parseBody(
   bytes: Uint8Array,
   mediaType: MutationMediaType,
   maxFields: number,
+  repeatedFormFields: ReadonlySet<string>,
 ): Readonly<{ fields: Record<string, unknown> }> {
   let text: string;
   try {
@@ -425,11 +436,49 @@ function parseBody(
   const fields = entriesToNullPrototypeRecord([]);
   for (const [name, value] of entries) {
     if (Object.hasOwn(fields, name)) {
-      throw new MutationSecurityFailure("INVALID_REQUEST");
+      if (!repeatedFormFields.has(name)) {
+        throw new MutationSecurityFailure("INVALID_REQUEST");
+      }
+
+      const prior = fields[name];
+      fields[name] = Array.isArray(prior)
+        ? [...prior, value]
+        : [prior, value];
+      continue;
     }
     fields[name] = value;
   }
+  for (const [name, value] of Object.entries(fields)) {
+    if (Array.isArray(value)) fields[name] = Object.freeze([...value]);
+  }
   return { fields };
+}
+
+function parseRepeatedFormFields(
+  values: readonly string[],
+  maximum: number,
+): ReadonlySet<string> {
+  if (!Array.isArray(values) || values.length > maximum) {
+    invalidConfiguration();
+  }
+
+  const parsed = new Set<string>();
+  for (const value of values) {
+    if (
+      typeof value !== "string" ||
+      value.length < 1 ||
+      value.length > 128 ||
+      value.trim() !== value ||
+      hasControlCharacter(value) ||
+      value === MUTATION_CSRF_FIELD ||
+      value === MUTATION_METHOD_FIELD ||
+      parsed.has(value)
+    ) {
+      invalidConfiguration();
+    }
+    parsed.add(value);
+  }
+  return parsed;
 }
 
 function assertFieldEntries(

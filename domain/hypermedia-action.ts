@@ -19,6 +19,7 @@ type ActionFieldBase = Readonly<{
   location: ActionFieldLocation;
   required: boolean;
   sensitive?: boolean;
+  presentation?: "control" | "hidden";
 }>;
 
 export type TextActionField = ActionFieldBase &
@@ -53,8 +54,11 @@ export type ChoiceActionField = ActionFieldBase &
   Readonly<{
     type: "choice";
     choices: readonly Readonly<{ value: string; title: string }>[];
+    multiple?: boolean;
     value?: string;
     defaultValue?: string;
+    values?: readonly string[];
+    defaultValues?: readonly string[];
   }>;
 
 export type ActionField =
@@ -81,6 +85,7 @@ export type HypermediaActionField = Readonly<{
   location: ActionFieldLocation;
   required: boolean;
   sensitive?: boolean;
+  presentation?: "control" | "hidden";
   format?: TextActionField["format"];
   min_length?: number;
   max_length?: number;
@@ -90,6 +95,9 @@ export type HypermediaActionField = Readonly<{
   step?: number;
   value?: string | number | boolean;
   default?: string | number | boolean;
+  multiple?: boolean;
+  values?: readonly string[];
+  default_values?: readonly string[];
   choices?: readonly Readonly<{ value: string; title: string }>[];
 }>;
 
@@ -106,9 +114,10 @@ export type HtmlFormField = Readonly<{
   name: string;
   label: string;
   control: "input" | "textarea" | "select";
-  inputType?: "text" | "email" | "url" | "number" | "checkbox";
+  inputType?: "text" | "email" | "url" | "number" | "checkbox" | "hidden";
   required: boolean;
   sensitive: boolean;
+  presentation?: "control" | "hidden";
   minLength?: number;
   maxLength?: number;
   maxBytes?: number;
@@ -117,6 +126,9 @@ export type HtmlFormField = Readonly<{
   step?: number;
   value?: string | number | boolean;
   defaultValue?: string | number | boolean;
+  multiple?: boolean;
+  values?: readonly string[];
+  defaultValues?: readonly string[];
   choices?: readonly Readonly<{ value: string; label: string }>[];
 }>;
 
@@ -211,8 +223,31 @@ function validateField(field: ActionField): void {
   if (!isFieldLocation(field.location)) fail();
   if (typeof field.required !== "boolean") fail();
   if (field.sensitive !== undefined && typeof field.sensitive !== "boolean") fail();
+  if (
+    field.presentation !== undefined &&
+    field.presentation !== "control" &&
+    field.presentation !== "hidden"
+  ) {
+    fail();
+  }
 
-  if (field.sensitive && (field.value !== undefined || field.defaultValue !== undefined)) {
+  if (
+    field.sensitive &&
+    (field.value !== undefined ||
+      field.defaultValue !== undefined ||
+      (field.type === "choice" &&
+        (field.values !== undefined || field.defaultValues !== undefined)))
+  ) {
+    fail();
+  }
+
+  if (
+    field.presentation === "hidden" &&
+    (field.location !== "body" ||
+      field.sensitive === true ||
+      (field.type !== "string" && field.type !== "integer") ||
+      (field.value === undefined && field.defaultValue === undefined))
+  ) {
     fail();
   }
 
@@ -296,6 +331,32 @@ function validateChoiceField(field: ChoiceActionField): void {
   for (const value of [field.value, field.defaultValue]) {
     if (value !== undefined && !values.has(value)) fail();
   }
+
+  if (field.multiple !== undefined && typeof field.multiple !== "boolean") {
+    fail();
+  }
+
+  if (field.multiple === true) {
+    if (field.value !== undefined || field.defaultValue !== undefined) fail();
+    validateChoiceValues(field.values, values);
+    validateChoiceValues(field.defaultValues, values);
+  } else if (field.values !== undefined || field.defaultValues !== undefined) {
+    fail();
+  }
+}
+
+function validateChoiceValues(
+  selected: readonly string[] | undefined,
+  choices: ReadonlySet<string>,
+): void {
+  if (selected === undefined) return;
+  if (!Array.isArray(selected) || selected.length > choices.size) fail();
+
+  const seen = new Set<string>();
+  for (const value of selected) {
+    if (!choices.has(value) || seen.has(value)) fail();
+    seen.add(value);
+  }
 }
 
 function isFormCompatible(action: ActionContract): boolean {
@@ -316,6 +377,9 @@ function toHypermediaField(field: ActionField): HypermediaActionField {
     location: field.location,
     required: field.required,
     ...(field.sensitive === undefined ? {} : { sensitive: field.sensitive }),
+    ...(field.presentation === undefined
+      ? {}
+      : { presentation: field.presentation }),
   };
 
   switch (field.type) {
@@ -350,8 +414,15 @@ function toHypermediaField(field: ActionField): HypermediaActionField {
         choices: Object.freeze(
           field.choices.map((choice) => Object.freeze({ ...choice })),
         ),
+        ...(field.multiple === undefined ? {} : { multiple: field.multiple }),
         ...(field.value === undefined ? {} : { value: field.value }),
         ...(field.defaultValue === undefined ? {} : { default: field.defaultValue }),
+        ...(field.values === undefined
+          ? {}
+          : { values: Object.freeze([...field.values]) }),
+        ...(field.defaultValues === undefined
+          ? {}
+          : { default_values: Object.freeze([...field.defaultValues]) }),
       });
   }
 }
@@ -362,15 +433,26 @@ function toHtmlField(field: ActionField): HtmlFormField {
     label: field.title,
     required: field.required,
     sensitive: field.sensitive ?? false,
+    ...(field.presentation === undefined
+      ? {}
+      : { presentation: field.presentation }),
   };
 
   switch (field.type) {
     case "string": {
       const multiline = field.format === "multiline";
+      const hidden = field.presentation === "hidden";
+      const inputType = hidden
+        ? "hidden" as const
+        : field.format === "email" || field.format === "url"
+          ? field.format
+          : "text" as const;
       return Object.freeze({
         ...common,
-        control: multiline ? "textarea" : "input",
-        ...(multiline ? {} : { inputType: field.format ?? "text" }),
+        control: multiline && !hidden ? "textarea" : "input",
+        ...(multiline && !hidden
+          ? {}
+          : { inputType }),
         ...(field.minLength === undefined ? {} : { minLength: field.minLength }),
         maxLength: field.maxLength,
         ...(field.maxBytes === undefined ? {} : { maxBytes: field.maxBytes }),
@@ -382,7 +464,7 @@ function toHtmlField(field: ActionField): HtmlFormField {
       return Object.freeze({
         ...common,
         control: "input",
-        inputType: "number",
+        inputType: field.presentation === "hidden" ? "hidden" : "number",
         minimum: field.minimum,
         maximum: field.maximum,
         step: field.step ?? 1,
@@ -406,8 +488,15 @@ function toHtmlField(field: ActionField): HtmlFormField {
             Object.freeze({ value: choice.value, label: choice.title })
           ),
         ),
+        ...(field.multiple === undefined ? {} : { multiple: field.multiple }),
         ...(field.value === undefined ? {} : { value: field.value }),
         ...(field.defaultValue === undefined ? {} : { defaultValue: field.defaultValue }),
+        ...(field.values === undefined
+          ? {}
+          : { values: Object.freeze([...field.values]) }),
+        ...(field.defaultValues === undefined
+          ? {}
+          : { defaultValues: Object.freeze([...field.defaultValues]) }),
       });
   }
 }
@@ -431,6 +520,12 @@ function freezeField(field: ActionField): ActionField {
     choices: Object.freeze(
       field.choices.map((choice) => Object.freeze({ ...choice })),
     ),
+    ...(field.values === undefined
+      ? {}
+      : { values: Object.freeze([...field.values]) }),
+    ...(field.defaultValues === undefined
+      ? {}
+      : { defaultValues: Object.freeze([...field.defaultValues]) }),
   });
 }
 

@@ -2,6 +2,11 @@ import type { ApplicationRouteHandler } from "../contracts.ts";
 import { composeRouteHandlers } from "./compose.ts";
 import { handleParticipantHomeRoutes } from "./participant-home.ts";
 
+export {
+  createFounderInterestRouteHandler,
+  type FounderInterestRouteDependencies,
+} from "./founder-interest.ts";
+
 export function createParticipantRouteHandler(
   resourceHandlers: readonly ApplicationRouteHandler[] = [
     handleParticipantHomeRoutes,

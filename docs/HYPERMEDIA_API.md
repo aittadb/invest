@@ -108,9 +108,25 @@ Mutation actions will also declare their request media type and typed fields. Fi
 
 Framework-independent action definitions are the common source for machine controls and browser forms. Version `0.1` supports `GET`, `POST`, `PUT`, `PATCH`, and `DELETE`, plus `text/html`, `application/x-www-form-urlencoded`, and `application/json` action types. String, integer, boolean, and choice fields are bounded before publication, and sensitive fields never include advertised current or default values.
 
+Fields may mark server-issued operation and revision values with `presentation: "hidden"`; this affects only the HTML control and does not make the value an authorization boundary. A configured choice can declare `multiple: true` and publish its selected `values`. Native forms submit that field repeatedly, and the mutation guard accepts repeated values only for names explicitly allowlisted by the owning route. Unlisted duplicate form fields remain invalid.
+
 A native form projection is available when a `GET` action has query fields or a mutation uses form-encoded body fields. Because HTML forms submit only `GET` or `POST`, form models carry the effective `PUT`, `PATCH`, or `DELETE` method explicitly while retaining the same action name, target, fields, and constraints as JSON. Actions requiring JSON, path substitution, or caller-supplied headers are machine controls until an equivalent human interaction is implemented; they must not be presented as native-form parity.
 
 Browser mutation forms also receive a server-generated hidden CSRF proof. The request guard removes CSRF and effective-method transport fields before feature input validation. JSON mutations carry the proof in the designated request header and use the advertised HTTP method directly. Both forms require the same trusted session, exact allowed origin, expiry, body bounds, feature authorization, and domain preconditions.
+
+## Participant Founder Interest
+
+`/participant/founder-interest` is the canonical resource for the authenticated participant's founder application. Its HTML and JSON representations expose the same current fields, received or withdrawn status, revision, and immutable history without publishing the participant subject or persistence identifier.
+
+The resource type is `participant-founder-interest`. It links to itself with `self` and to the public campaign with `campaign`. Depending on current state and injected campaign policy, it exposes these actions:
+
+- `create-founder-application` with `POST` when no application exists and creation is allowed;
+- `edit-founder-application` with `PATCH` while the application is received; and
+- `withdraw-founder-application` with `DELETE` while the application is received.
+
+Create and edit accept bounded expertise, intended contribution, configured primary and secondary contribution areas, availability, start timing, compensation expectation, HTTPS professional-profile links, and an optional note. Every mutation carries a server-issued `operation-id`; edit and withdrawal also carry `expected-revision`, and withdrawal requires explicit confirmation. Form method overrides and CSRF fields are transport values removed before this feature input is parsed.
+
+The route obtains a participant-bound application service from an injected factory. The trusted route or mutation actor selects that factory; body fields cannot select a subject. Founder mutations call only the founder repository, so an account's investment indications are neither prerequisites nor side effects.
 
 ## Identity and Authorization
 

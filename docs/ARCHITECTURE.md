@@ -133,6 +133,14 @@ Each mutation atomically compare-and-sets the current application and creates an
 
 The owner review collection and detail handlers project one resource model into HTML or hypermedia JSON at the same URI. Anonymous requests receive authentication-required without private data, every authenticated non-owner receives the same not-found surface before repository access, and the owner home advertises review only when the route group supplies that capability. Production wiring still requires an authorized persistent founder review repository.
 
+### Participant founder-interest resource
+
+`/participant/founder-interest` projects one participant-bound founder application as HTML or versioned hypermedia JSON from a shared capability model. The model exposes create only when injected campaign policy permits it, exposes edit and withdrawal only for received applications, and publishes no subject or storage identifier. Both representations include the same current fields and immutable history.
+
+`worker/founder-interest-service.ts` is a narrow, framework-independent orchestration boundary over `FounderApplicationRepository`. A request-scoped factory supplies the trusted actor, subject-bound repository, opaque application identifier, contribution choices, campaign creation policy, and clock. Operation IDs become retry-stable history IDs; when a response is retried, the service recovers the original timestamp from immutable history instead of relying on process memory. Existing applications remain readable even when creation policy is closed or temporarily irrelevant.
+
+`worker/routes/founder-interest.ts` owns content negotiation, strict request-field allowlists, and response projection. Mutations pass through the shared same-origin, CSRF, body-bound, and trusted-session guard before feature parsing. Only the verified participant subject selects a mutation service. Storage failures map to fixed public HTML and JSON errors, while inaccessible foreign and missing state remain non-disclosing. Production composition must inject an AittaDB-backed factory; the route creates no process-local production repository.
+
 ### Investment indications
 
 `domain/investment-indication.ts` defines personal and company indication records as framework-independent immutable revisions. Currency and amount boundaries come from deployment configuration, while package acceptance comes from the trusted current package and acknowledgment repository; neither can be supplied as an authoritative client field. Company uniqueness uses normalized registration country and an injectable country-aware identifier normalizer, and occupied keys return only a fixed conflict.
