@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 import Image from "next/image";
 
-import { chatGPTSignInPath } from "./chatgpt-auth";
 import { aittaDbPublicCampaign } from "@/campaigns/aittadb-public";
+import { publicCampaignActions } from "@/domain/public-campaign-resource";
 
 export const metadata: Metadata = {
   title: "AittaDB investment pre-registration",
@@ -11,9 +11,9 @@ export const metadata: Metadata = {
 };
 
 export default function Home() {
-  const signInPath = chatGPTSignInPath("/");
-  const investorPath = chatGPTSignInPath("/?intent=investor");
-  const founderPath = chatGPTSignInPath("/?intent=founder");
+  const signInPath = publicCampaignActions.signIn.href;
+  const investorPath = publicCampaignActions.investor.href;
+  const founderPath = publicCampaignActions.founder.href;
 
   return (
     <div className="campaign-page" id="top">

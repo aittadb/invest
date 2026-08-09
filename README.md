@@ -22,6 +22,8 @@ Version one collects non-binding interest only. It does not accept money, reserv
 
 The current scaffold intentionally does not declare local D1 or R2 bindings in `.openai/hosting.json`. Production publication remains blocked until the configured backend passes this app's authorization, consistency, listing, pagination, quota, and non-disclosure contract tests.
 
+Each application URI supports equivalent human HTML and versioned hypermedia JSON selected through `Accept`. See [docs/HYPERMEDIA_API.md](docs/HYPERMEDIA_API.md) for the media type, document structure, authorization rules, and route definition of done.
+
 ## Repository Files
 
 - `AGENTS.md`: authoritative agent and contributor rules. Keep below 32,000 bytes.
@@ -31,6 +33,7 @@ The current scaffold intentionally does not declare local D1 or R2 bindings in `
 - `CHANGELOG.md`: completed task history and retired task mappings.
 - `docs/ARCHITECTURE.md`: app architecture and storage boundary.
 - `docs/STYLE_GUIDE.md`: UI and HTML/CSS guidance.
+- `docs/HYPERMEDIA_API.md`: same-URI HTML and hypermedia JSON contract.
 - `.env.example`: runtime setting names with inert placeholder values.
 
 ## Local Development

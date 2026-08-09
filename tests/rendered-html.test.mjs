@@ -1,14 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-async function render() {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
+let workerPromise;
+
+async function loadWorker() {
+  if (!workerPromise) {
+    const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+    workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
+    workerPromise = import(workerUrl.href).then(({ default: worker }) => worker);
+  }
+  return workerPromise;
+}
+
+async function render(headers = { accept: "text/html" }) {
+  const worker = await loadWorker();
 
   return worker.fetch(
     new Request("http://localhost/", {
-      headers: { accept: "text/html" },
+      headers,
     }),
     {
       ASSETS: {
@@ -26,6 +35,7 @@ test("server-renders the signed-out AittaDB pre-registration landing page", asyn
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
+  assert.match(response.headers.get("vary") ?? "", /\bAccept\b/i);
 
   const html = await response.text();
   assert.match(html, /<title>AittaDB investment pre-registration<\/title>/i);
@@ -39,4 +49,61 @@ test("server-renders the signed-out AittaDB pre-registration landing page", asyn
     /Initial implementation scaffold|Product areas to build next|Repository contract|ChatGPT Sites application|features to build/i,
   );
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
+});
+
+test("the root resource negotiates equivalent public hypermedia JSON", async () => {
+  const response = await render({
+    accept: "application/vnd.aittadb-invest+json; version=0.1",
+  });
+
+  assert.equal(response.status, 200);
+  assert.match(
+    response.headers.get("content-type") ?? "",
+    /^application\/vnd\.aittadb-invest\+json;\s*version=0\.1/i,
+  );
+  assert.equal(response.headers.get("investor-app-api-version"), "0.1");
+  assert.match(response.headers.get("vary") ?? "", /\bAccept\b/i);
+
+  const document = await response.json();
+  assert.equal(document.api_version, "0.1");
+  assert.equal(document.type, "investment-pre-registration");
+  assert.equal(document.data.name, "AittaDB");
+  assert.equal(document.data.status, "open");
+  assert.equal(document.data.interest_is_binding, false);
+  assert.deepEqual(
+    document.actions.map((action) => action.name),
+    ["sign-in", "pre-register-investor", "pre-register-founder"],
+  );
+  assert.ok(document.links.some((link) => link.rel.includes("self")));
+  assert.doesNotMatch(JSON.stringify(document), /email|credential|private package content/i);
+
+  const html = await (await render()).text();
+  assert.match(html, new RegExp(document.data.product_summary));
+  for (const action of document.actions) {
+    assert.match(html, new RegExp(new URL(action.href).pathname));
+  }
+});
+
+test("JSON selection depends on Accept and rejects unsupported versions", async () => {
+  const compatibilityResponse = await render({
+    accept: "application/json",
+    "user-agent": "ExampleBrowser/1.0",
+  });
+  const apiClientResponse = await render({
+    accept: "application/json",
+    "user-agent": "ExampleApiClient/1.0",
+  });
+
+  assert.equal(compatibilityResponse.status, 200);
+  assert.equal(apiClientResponse.status, 200);
+  assert.deepEqual(
+    await compatibilityResponse.json(),
+    await apiClientResponse.json(),
+  );
+
+  const unsupported = await render({
+    accept: "application/vnd.aittadb-invest+json; version=1.0",
+  });
+  assert.equal(unsupported.status, 406);
+  assert.equal((await unsupported.json()).data.code, "not_acceptable");
 });
