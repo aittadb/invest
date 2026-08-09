@@ -118,6 +118,10 @@ Each mutation atomically compare-and-sets the current application and creates an
 
 Participants can edit or withdraw active indications and reactivate withdrawn indications after satisfying the current package requirement. The configured owner can reject an active indication with a bounded participant-visible reason. Each transition appends a full immutable history snapshot, and participant capability projections include only transitions valid in the current lifecycle without exposing owner identity.
 
+`DevelopmentInMemoryIndicationRepository` composes these transitions over a development/test `StorageAdapter` and binds participant mutations to its trusted subject. One atomic transaction compare-and-sets the current snapshot, creates the next immutable cumulative-history revision, and acquires or releases a hashed active-uniqueness lease. Personal and normalized company uniqueness values never appear in storage keys or public errors.
+
+Reads reconstruct every transition, verify the current record against all immutable history prefixes, snapshot and operation fingerprints, storage revisions, and any required active lease. Retry-stable operations return their original snapshot; changed retries and stale writes fail without mutating indication, aggregate, or founder state. This repository is deterministic development proof, not production storage.
+
 ### Aggregate and reconciliation contracts
 
 `domain/investment-aggregate.ts` accepts only a closed projection of indication ID, revision, lifecycle status, amount, and currency. Calculation keeps the highest revision for each indication, accepts an identical repeated revision as a retry, rejects conflicting same-revision facts, and sums only active indications with safe integer arithmetic. Withdrawn and rejected latest revisions therefore remove their indication from the calculated total.
