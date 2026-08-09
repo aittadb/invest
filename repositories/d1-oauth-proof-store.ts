@@ -1,7 +1,6 @@
 import {
   parseActorSubject,
   parseTimestamp,
-  type ActorSubject,
 } from "../domain/foundation.ts";
 import type {
   AittaDBOAuthProofMetadata,
@@ -16,32 +15,29 @@ const STORAGE_SCOPES = new Set([
   "storage.write",
   "storage.delete",
 ]);
-const OWNER_DIGEST_DOMAIN = "investor-app/oauth-owner-subject/v1\0";
 const MAX_ISSUER_LENGTH = 2_048;
 const MAX_AUDIENCE_LENGTH = 255;
 
 const CLAIM_TRANSACTION_SQL = `
 INSERT INTO investor_oauth_transaction_claims (
   transaction_fingerprint,
-  owner_subject_digest,
   expires_at,
   claimed_at
 )
-SELECT ?, ?, ?, ?
+SELECT ?, ?, ?
 WHERE ? > ?
 ON CONFLICT(transaction_fingerprint) DO NOTHING
 `;
 
 const RECORD_PROOF_SQL = `
 INSERT INTO investor_oauth_verified_proofs (
-  owner_subject_digest,
   issuer,
   audience,
   scopes_json,
   verified_at,
   token_expires_at
 )
-VALUES (?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?)
 `;
 
 export type D1OAuthProofValue = string | number | null;
@@ -75,9 +71,10 @@ export class OAuthProofPersistenceFailure extends Error {
 /**
  * D1 persistence for the short-lived OAuth proof handshake only.
  *
- * The adapter stores one-way owner digests and closed verification metadata. It
- * never receives authorization codes, tokens, client secrets, PKCE verifiers,
- * raw state, or cookie plaintext.
+ * The adapter validates the service-owned owner subject but deliberately drops
+ * it before storing closed verification metadata. It never receives
+ * authorization codes, tokens, client secrets, PKCE verifiers, raw state, or
+ * cookie plaintext.
  */
 export class D1OAuthProofStore
 implements OAuthTransactionClaimStore, AittaDBOAuthProofResultSink {
@@ -102,10 +99,8 @@ implements OAuthTransactionClaimStore, AittaDBOAuthProofResultSink {
     const claimedAt = currentTimestamp(this.now);
     if (claim.expiresAt <= claimedAt) return false;
 
-    const ownerSubjectDigest = await digestOwnerSubject(claim.ownerSubject);
     const changes = await this.run(CLAIM_TRANSACTION_SQL, [
       claim.fingerprint,
-      ownerSubjectDigest,
       claim.expiresAt,
       claimedAt,
       claim.expiresAt,
@@ -120,9 +115,7 @@ implements OAuthTransactionClaimStore, AittaDBOAuthProofResultSink {
     proof: AittaDBOAuthProofMetadata,
   ): Promise<void> {
     const metadata = parseProofMetadata(proof);
-    const ownerSubjectDigest = await digestOwnerSubject(metadata.ownerSubject);
     const changes = await this.run(RECORD_PROOF_SQL, [
-      ownerSubjectDigest,
       metadata.issuer,
       metadata.audience,
       JSON.stringify(metadata.scopes),
@@ -156,7 +149,7 @@ implements OAuthTransactionClaimStore, AittaDBOAuthProofResultSink {
 
 function parseTransactionClaim(
   value: OAuthTransactionClaim,
-): OAuthTransactionClaim {
+): Readonly<{ fingerprint: string; expiresAt: string }> {
   if (
     typeof value !== "object" ||
     value === null ||
@@ -170,14 +163,19 @@ function parseTransactionClaim(
   if (!ownerSubject.ok || !expiresAt.ok) persistenceFailure();
   return Object.freeze({
     fingerprint: value.fingerprint,
-    ownerSubject: ownerSubject.value,
     expiresAt: expiresAt.value,
   });
 }
 
 function parseProofMetadata(
   value: AittaDBOAuthProofMetadata,
-): AittaDBOAuthProofMetadata {
+): Readonly<{
+  issuer: string;
+  audience: string;
+  scopes: readonly string[];
+  verifiedAt: string;
+  tokenExpiresAt: string;
+}> {
   if (
     typeof value !== "object" ||
     value === null ||
@@ -200,7 +198,6 @@ function parseProofMetadata(
     persistenceFailure();
   }
   return Object.freeze({
-    ownerSubject: ownerSubject.value,
     issuer,
     audience,
     scopes,
@@ -274,22 +271,6 @@ function currentTimestamp(now: () => Date): string {
     persistenceFailure();
   }
   return value.toISOString();
-}
-
-async function digestOwnerSubject(ownerSubject: ActorSubject): Promise<string> {
-  let digest: ArrayBuffer;
-  try {
-    digest = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(`${OWNER_DIGEST_DOMAIN}${ownerSubject}`),
-    );
-  } catch {
-    persistenceFailure();
-  }
-  return Array.from(
-    new Uint8Array(digest),
-    (byte) => byte.toString(16).padStart(2, "0"),
-  ).join("");
 }
 
 function persistenceFailure(): never {

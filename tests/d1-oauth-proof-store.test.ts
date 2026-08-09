@@ -49,12 +49,9 @@ test("D1 transaction claims have one atomic winner and reject replay", async (t)
   assert.deepEqual(Object.keys(row).sort(), [
     "claimed_at",
     "expires_at",
-    "owner_subject_digest",
     "transaction_fingerprint",
   ]);
   assert.equal(row.transaction_fingerprint, FINGERPRINT);
-  assert.match(String(row.owner_subject_digest), /^[0-9a-f]{64}$/u);
-  assert.equal(JSON.stringify(row).includes(OWNER_SUBJECT), false);
 });
 
 test("expired claims are rejected without a D1 write", async (t) => {
@@ -96,27 +93,32 @@ test("verified proofs persist only bounded closed metadata", async (t) => {
     "audience",
     "id",
     "issuer",
-    "owner_subject_digest",
     "scopes_json",
     "token_expires_at",
     "verified_at",
   ]);
-  assert.match(String(row.owner_subject_digest), /^[0-9a-f]{64}$/u);
-  assert.notEqual(row.owner_subject_digest, OWNER_SUBJECT);
   assert.equal(row.issuer, proof.issuer);
   assert.equal(row.audience, proof.audience);
   assert.equal(row.scopes_json, '["storage.read","storage.write"]');
   assert.equal(row.verified_at, proof.verifiedAt);
   assert.equal(row.token_expires_at, proof.tokenExpiresAt);
 
-  const schema = database.sqlite.prepare(
-    "SELECT sql FROM sqlite_schema WHERE name IN (?, ?) ORDER BY name",
-  ).all(
-    "investor_oauth_transaction_claims",
-    "investor_oauth_verified_proofs",
-  );
-  const serialized = JSON.stringify({ rows, schema }).toLowerCase();
-  assert.equal(serialized.includes(OWNER_SUBJECT.toLowerCase()), false);
+  assert.deepEqual(tableColumns(database, "investor_oauth_transaction_claims"), [
+    "transaction_fingerprint",
+    "expires_at",
+    "claimed_at",
+  ]);
+  assert.deepEqual(tableColumns(database, "investor_oauth_verified_proofs"), [
+    "id",
+    "issuer",
+    "audience",
+    "scopes_json",
+    "verified_at",
+    "token_expires_at",
+  ]);
+  assert.doesNotMatch(MIGRATION, /owner|subject|digest/iu);
+
+  const serialized = JSON.stringify(rows).toLowerCase();
   for (const forbiddenColumn of [
     "authorization_code",
     "access_token",
@@ -124,10 +126,38 @@ test("verified proofs persist only bounded closed metadata", async (t) => {
     "pkce_verifier",
     "raw_state",
     "cookie_plaintext",
-    "owner_subject text",
+    "owner",
+    "subject",
+    "digest",
   ]) {
     assert.equal(serialized.includes(forbiddenColumn), false);
   }
+});
+
+test("D1 writes use an exact closed SQL and bind-value set", async (t) => {
+  const database = migratedDatabase(t);
+  const store = new D1OAuthProofStore({ database, now: () => NOW });
+  const claim = validClaim();
+  const proof = validProof();
+
+  assert.equal(await store.claim(claim), true);
+  await store.recordVerifiedProof(proof);
+
+  assert.equal(database.operations.length, 2);
+  assert.deepEqual(database.operations.map((operation) => compactSql(operation.sql)), [
+    "INSERT INTO investor_oauth_transaction_claims ( transaction_fingerprint, expires_at, claimed_at ) SELECT ?, ?, ? WHERE ? > ? ON CONFLICT(transaction_fingerprint) DO NOTHING",
+    "INSERT INTO investor_oauth_verified_proofs ( issuer, audience, scopes_json, verified_at, token_expires_at ) VALUES (?, ?, ?, ?, ?)",
+  ]);
+  assert.deepEqual(database.operations.map((operation) => operation.values), [
+    [claim.fingerprint, claim.expiresAt, NOW.toISOString(), claim.expiresAt, NOW.toISOString()],
+    [
+      proof.issuer,
+      proof.audience,
+      '["storage.read","storage.write"]',
+      proof.verifiedAt,
+      proof.tokenExpiresAt,
+    ],
+  ]);
 });
 
 test("malformed claims and proof metadata fail before persistence", async (t) => {
@@ -136,6 +166,10 @@ test("malformed claims and proof metadata fail before persistence", async (t) =>
 
   await assert.rejects(
     store.claim({ ...validClaim(), fingerprint: "raw-state" }),
+    persistenceFailure,
+  );
+  await assert.rejects(
+    store.claim({ ...validClaim(), ownerSubject: "" as ActorSubject }),
     persistenceFailure,
   );
   await assert.rejects(
@@ -156,6 +190,13 @@ test("malformed claims and proof metadata fail before persistence", async (t) =>
     store.recordVerifiedProof({
       ...validProof(),
       issuer: "http://database.example.test",
+    }),
+    persistenceFailure,
+  );
+  await assert.rejects(
+    store.recordVerifiedProof({
+      ...validProof(),
+      ownerSubject: "" as ActorSubject,
     }),
     persistenceFailure,
   );
@@ -240,28 +281,50 @@ function migratedDatabase(t: test.TestContext): SqliteD1Database {
   return new SqliteD1Database(sqlite);
 }
 
+function tableColumns(database: SqliteD1Database, table: string): string[] {
+  return database.sqlite
+    .prepare(`PRAGMA table_info(${table})`)
+    .all()
+    .map((column) => String((column as Record<string, unknown>).name));
+}
+
+function compactSql(sql: string): string {
+  return sql.trim().replace(/\s+/gu, " ");
+}
+
+type RecordedD1Operation = {
+  readonly sql: string;
+  values: D1OAuthProofValue[];
+};
+
 class SqliteD1Database implements D1OAuthProofDatabase {
   readonly sqlite: DatabaseSync;
+  readonly operations: RecordedD1Operation[] = [];
 
   constructor(sqlite: DatabaseSync) {
     this.sqlite = sqlite;
   }
 
   prepare(sql: string): D1OAuthProofStatement {
-    return new SqliteD1Statement(this.sqlite.prepare(sql));
+    const operation: RecordedD1Operation = { sql, values: [] };
+    this.operations.push(operation);
+    return new SqliteD1Statement(this.sqlite.prepare(sql), operation);
   }
 }
 
 class SqliteD1Statement implements D1OAuthProofStatement {
   private values: D1OAuthProofValue[] = [];
   private readonly statement: StatementSync;
+  private readonly operation: RecordedD1Operation;
 
-  constructor(statement: StatementSync) {
+  constructor(statement: StatementSync, operation: RecordedD1Operation) {
     this.statement = statement;
+    this.operation = operation;
   }
 
   bind(...values: D1OAuthProofValue[]): D1OAuthProofStatement {
     this.values = values;
+    this.operation.values = [...values];
     return this;
   }
 
