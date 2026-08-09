@@ -63,7 +63,12 @@ test("active D1 configuration emits the deterministic Sites artifact", async (t)
 
   const sqlite = new DatabaseSync(":memory:");
   t.after(() => sqlite.close());
-  sqlite.exec(emitted);
+  const segments = emitted.split("\n--> statement-breakpoint\n");
+  assert.equal(segments.length, 2);
+  for (const segment of segments) {
+    assert.equal(splitSqlStatements(segment).length, 1);
+    sqlite.exec(segment);
+  }
   const tables = sqlite.prepare(
     "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
   ).all().map((row) => (row as { name: string }).name);
@@ -107,7 +112,66 @@ test("migrations are not staged without an active D1 binding", async (t) => {
   assert.equal(example.r2, null);
 });
 
-test("compound trigger migrations are rejected instead of split", async (t) => {
+test("unquoted trigger keywords are rejected before splitting", async (t) => {
+  const migrations = [
+    "CREATE TRIGGER example AFTER INSERT ON records BEGIN SELECT 1; END;\n",
+    "CREATE TEMP TRIGGER example AFTER INSERT ON records BEGIN SELECT 1; END;\n",
+    "CREATE TEMPORARY\nTRIGGER example AFTER INSERT ON records BEGIN SELECT 1; END;\n",
+    "CREATE /* comment */ TRIGGER example AFTER INSERT ON records BEGIN SELECT 1; END;\n",
+    "CREATE -- comment\nTRIGGER example AFTER INSERT ON records BEGIN SELECT 1; END;\n",
+    "CREATE/**/TEMPORARY/**/trigger example AFTER INSERT ON records BEGIN SELECT 1; END;\n",
+  ];
+
+  for (const [index, migration] of migrations.entries()) {
+    await t.test(`bypass form ${index + 1}`, async (t) => {
+      const paths = await migrationPaths(t);
+      await writeFile(join(paths.sourceDirectory, "0001_trigger.sql"), migration);
+
+      await assert.rejects(
+        stageSitesMigrations(paths),
+        /unsupported compound SQL/u,
+      );
+      await assert.rejects(
+        access(join(paths.outputDirectory, "0001_trigger.sql")),
+        { code: "ENOENT" },
+      );
+    });
+  }
+});
+
+test("quoted and commented trigger text remains valid", async (t) => {
+  const migrations = [
+    "CREATE TABLE records (\"TRIGGER\" TEXT);\n",
+    "CREATE TABLE records (`TRIGGER` TEXT);\n",
+    "CREATE TABLE records ([TRIGGER] TEXT);\n",
+    "CREATE TABLE records (value TEXT DEFAULT 'TRIGGER');\n",
+    "-- TRIGGER\n/* TRIGGER */\nCREATE TABLE records (value TEXT);\n",
+  ];
+
+  for (const [index, migration] of migrations.entries()) {
+    await t.test(`quoted form ${index + 1}`, async (t) => {
+      const paths = await migrationPaths(t);
+      await writeFile(join(paths.sourceDirectory, "0001_table.sql"), migration);
+
+      assert.equal(await stageSitesMigrations(paths), true);
+      const emitted = await readFile(
+        join(paths.outputDirectory, "0001_table.sql"),
+        "utf8",
+      );
+      const sqlite = new DatabaseSync(":memory:");
+      t.after(() => sqlite.close());
+      for (const segment of emitted.split("\n--> statement-breakpoint\n")) {
+        sqlite.exec(segment);
+      }
+    });
+  }
+});
+
+async function migrationPaths(t: test.TestContext): Promise<{
+  activeHostingConfig: string;
+  sourceDirectory: string;
+  outputDirectory: string;
+}> {
   const directory = await temporaryDirectory(t);
   const activeHostingConfig = join(directory, "hosting.json");
   const sourceDirectory = join(directory, "migrations");
@@ -117,20 +181,8 @@ test("compound trigger migrations are rejected instead of split", async (t) => {
     activeHostingConfig,
     `${JSON.stringify({ project_id: "test", d1: "DB", r2: null })}\n`,
   );
-  await writeFile(
-    join(sourceDirectory, "0001_trigger.sql"),
-    "CREATE TRIGGER example AFTER INSERT ON records BEGIN SELECT 1; END;\n",
-  );
-
-  await assert.rejects(
-    stageSitesMigrations({
-      activeHostingConfig,
-      sourceDirectory,
-      outputDirectory,
-    }),
-    /unsupported compound SQL/u,
-  );
-});
+  return { activeHostingConfig, sourceDirectory, outputDirectory };
+}
 
 async function temporaryDirectory(t: test.TestContext): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "investor-sites-migrations-"));

@@ -75,7 +75,7 @@ export async function emitSitesMigrations(
   await mkdir(resolve(outputDirectory, "meta"), { recursive: true });
   for (const fileName of fileNames) {
     const source = await readFile(resolve(sourceDirectory, fileName), "utf8");
-    if (/\bCREATE\s+TRIGGER\b/iu.test(source)) {
+    if (containsUnquotedTriggerKeyword(source)) {
       throw new Error(`D1 migration ${fileName} contains unsupported compound SQL`);
     }
     const statements = splitSqlStatements(source);
@@ -171,6 +171,89 @@ export function splitSqlStatements(source: string): string[] {
     throw new Error("Every D1 migration statement must end with a semicolon");
   }
   return statements;
+}
+
+function containsUnquotedTriggerKeyword(source: string): boolean {
+  let token = "";
+  let quote: "'" | '"' | "`" | "]" | null = null;
+  let lineComment = false;
+  let blockComment = false;
+
+  const finishToken = (): boolean => {
+    const isTrigger = token.toUpperCase() === "TRIGGER";
+    token = "";
+    return isTrigger;
+  };
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1];
+
+    if (lineComment) {
+      if (character === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (character === "*" && next === "/") {
+        index += 1;
+        blockComment = false;
+      }
+      continue;
+    }
+    if (quote) {
+      if (character === quote) {
+        if (quote !== "]" && next === quote) {
+          index += 1;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+
+    if (character === "-" && next === "-") {
+      if (finishToken()) return true;
+      index += 1;
+      lineComment = true;
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      if (finishToken()) return true;
+      index += 1;
+      blockComment = true;
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      if (finishToken()) return true;
+      quote = character;
+      continue;
+    }
+    if (character === "[") {
+      if (finishToken()) return true;
+      quote = "]";
+      continue;
+    }
+    if (isSqliteIdentifierCharacter(character)) {
+      token += character;
+      continue;
+    }
+    if (finishToken()) return true;
+  }
+
+  return finishToken();
+}
+
+function isSqliteIdentifierCharacter(character: string): boolean {
+  if (!character) return false;
+  const codePoint = character.codePointAt(0);
+  return (
+    (character >= "A" && character <= "Z") ||
+    (character >= "a" && character <= "z") ||
+    (character >= "0" && character <= "9") ||
+    character === "_" ||
+    character === "$" ||
+    (codePoint !== undefined && codePoint >= 0x80)
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
