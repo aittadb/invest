@@ -1,0 +1,705 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  parseAmountAggregateConfiguration,
+  type AmountAggregateConfiguration,
+  type CurrencyCode,
+} from "../domain/amount-aggregate-configuration.ts";
+import {
+  parseMinorUnits,
+  parseStableId,
+  type MinorUnits,
+} from "../domain/foundation.ts";
+import {
+  APPLY_CALCULATED_AGGREGATE_CONFIRMATION,
+  type InvestmentAggregateContribution,
+  type InvestmentAggregateCorrectionConfirmation,
+  type InvestmentAggregateReconciliationPreview,
+} from "../domain/investment-aggregate.ts";
+import {
+  StorageFailure,
+  assertStorageListBoundary,
+  assertStorageTransactionBoundary,
+  storageKeyString,
+  type StorageAdapter,
+  type StorageCursor,
+  type StorageDocument,
+  type StorageKey,
+  type StoragePage,
+  type StorageRecord,
+  type StorageTransactionRequest,
+  type StorageTransactionResult,
+} from "../domain/storage-adapter.ts";
+import {
+  DevelopmentInMemoryAggregateRepository,
+  type ApplyAggregateContributionRequest,
+  type InvestmentAggregateRepository,
+} from "../repositories/in-memory-aggregate-repository.ts";
+
+const currency = "XYZ" as CurrencyCode;
+
+export type InvestmentAggregateRepositoryContractFixture = Readonly<{
+  repository: InvestmentAggregateRepository;
+  reopen: () => InvestmentAggregateRepository;
+}>;
+
+export type InvestmentAggregateRepositoryContractFactory =
+  () => InvestmentAggregateRepositoryContractFixture;
+
+/** Reusable behavior contract for development and production aggregate repositories. */
+export async function verifyInvestmentAggregateRepositoryContract(
+  createFixture: InvestmentAggregateRepositoryContractFactory,
+): Promise<void> {
+  const fixture = createFixture();
+  assert.deepEqual(await fixture.repository.readStored(), stored(0, 0, 0));
+  assert.deepEqual(await fixture.repository.calculate(), summary(0, 0));
+  assert.deepEqual(await fixture.repository.previewReconciliation(), {
+    status: "match",
+    stored: stored(0, 0, 0),
+    calculated: summary(0, 0),
+    correctionRequired: false,
+  });
+
+  const firstRequest = applyRequest(
+    "aggregate-operation:first-active",
+    0,
+    contribution("indication:first", 1, "active", 100),
+  );
+  const first = await fixture.repository.applyContribution(firstRequest);
+  assert.deepEqual(first, {
+    disposition: "applied",
+    stored: stored(1, 100, 1),
+    calculated: summary(100, 1),
+    replayed: false,
+  });
+  assert.deepEqual(
+    await fixture.repository.applyContribution(firstRequest),
+    { ...first, replayed: true },
+  );
+
+  await rejectsStorage(
+    () => fixture.repository.applyContribution({
+      ...firstRequest,
+      contribution: contribution("indication:first", 1, "active", 200),
+    }),
+    "CONFLICT",
+  );
+
+  const duplicate = await fixture.repository.applyContribution(applyRequest(
+    "aggregate-operation:first-duplicate",
+    1,
+    contribution("indication:first", 1, "active", 100),
+  ));
+  assert.deepEqual(duplicate, {
+    disposition: "duplicate",
+    stored: stored(1, 100, 1),
+    calculated: summary(100, 1),
+    replayed: false,
+  });
+
+  await rejectsStorage(
+    () => fixture.repository.applyContribution(applyRequest(
+      "aggregate-operation:first-conflict",
+      1,
+      contribution("indication:first", 1, "withdrawn", 100),
+    )),
+    "CONFLICT",
+  );
+
+  const second = await fixture.repository.applyContribution(applyRequest(
+    "aggregate-operation:second-active",
+    1,
+    contribution("indication:second", 1, "active", 250),
+  ));
+  assert.deepEqual(second.stored, stored(2, 350, 2));
+
+  const withdrawn = await fixture.repository.applyContribution(applyRequest(
+    "aggregate-operation:first-withdrawn",
+    2,
+    contribution("indication:first", 2, "withdrawn", 100),
+  ));
+  assert.deepEqual(withdrawn, {
+    disposition: "applied",
+    stored: stored(3, 250, 1),
+    calculated: summary(250, 1),
+    replayed: false,
+  });
+
+  const rejected = await fixture.repository.applyContribution(applyRequest(
+    "aggregate-operation:second-rejected",
+    3,
+    contribution("indication:second", 2, "rejected", 250),
+  ));
+  assert.deepEqual(rejected.stored, stored(4, 0, 0));
+
+  const superseded = await fixture.repository.applyContribution(applyRequest(
+    "aggregate-operation:first-superseded",
+    4,
+    contribution("indication:first", 1, "active", 100),
+  ));
+  assert.deepEqual(superseded, {
+    disposition: "superseded",
+    stored: stored(4, 0, 0),
+    calculated: summary(0, 0),
+    replayed: false,
+  });
+
+  const reopened = await fixture.repository.applyContribution(applyRequest(
+    "aggregate-operation:first-reopened",
+    4,
+    contribution("indication:first", 3, "active", 120),
+  ));
+  assert.deepEqual(reopened.stored, stored(5, 120, 1));
+
+  await rejectsStorage(
+    () => fixture.repository.applyContribution(applyRequest(
+      "aggregate-operation:stale",
+      4,
+      contribution("indication:second", 3, "active", 250),
+    )),
+    "PRECONDITION_FAILED",
+  );
+
+  const freshRepository = fixture.reopen();
+  assert.deepEqual(await freshRepository.readStored(), stored(5, 120, 1));
+  assert.deepEqual(await freshRepository.calculate(), summary(120, 1));
+  assert.equal(
+    (await freshRepository.previewReconciliation()).correctionRequired,
+    false,
+  );
+
+  const delayedReplay = await freshRepository.applyContribution(firstRequest);
+  assert.deepEqual(delayedReplay, { ...first, replayed: true });
+  assert.deepEqual(await freshRepository.readStored(), stored(5, 120, 1));
+}
+
+test("adapter-backed development repository passes the aggregate contract", async () => {
+  await verifyInvestmentAggregateRepositoryContract(() => {
+    const state = new MemoryStorageState();
+    const adapter = new DeterministicMemoryStorageAdapter(state);
+    return {
+      repository: new DevelopmentInMemoryAggregateRepository(adapter, currency),
+      reopen: () =>
+        new DevelopmentInMemoryAggregateRepository(adapter, currency),
+    };
+  });
+});
+
+test("persisted mismatches require an exact preview-bound correction", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state);
+  const repository = new DevelopmentInMemoryAggregateRepository(
+    adapter,
+    currency,
+  );
+  await repository.applyContribution(applyRequest(
+    "aggregate-operation:mismatch-seed",
+    0,
+    contribution("indication:mismatch", 1, "active", 10_000),
+  ));
+
+  mutateAggregateRecord(state, (snapshot) => {
+    snapshot.totalAmount = 8_000;
+  });
+  const transactionsBeforePreview = state.transactionCalls;
+  const preview = await repository.previewReconciliation();
+  assert.deepEqual(preview, {
+    status: "mismatch",
+    stored: stored(1, 8_000, 1),
+    calculated: summary(10_000, 1),
+    correctionRequired: true,
+  });
+  assert.equal(state.transactionCalls, transactionsBeforePreview);
+
+  await rejectsStorage(
+    () => repository.applyContribution(applyRequest(
+      "aggregate-operation:blocked-during-mismatch",
+      1,
+      contribution("indication:other", 1, "active", 500),
+    )),
+    "PRECONDITION_FAILED",
+  );
+  assert.deepEqual(await repository.readStored(), stored(1, 8_000, 1));
+
+  const wrongConfirmation = confirmationFor(preview, {
+    expectedCalculatedAmount: minorUnits(10_001),
+  });
+  await rejectsStorage(
+    () => repository.applyConfirmedCorrection({
+      operationId: "aggregate-operation:wrong-correction",
+      confirmation: wrongConfirmation,
+    }),
+    "PRECONDITION_FAILED",
+  );
+  assert.equal(state.transactionCalls, transactionsBeforePreview);
+
+  await rejectsStorage(
+    () => repository.applyConfirmedCorrection({
+      operationId: "aggregate-operation:invalid-correction",
+      confirmation: {
+        ...confirmationFor(preview),
+        confirmation: "yes",
+      },
+    }),
+    "INVALID_REQUEST",
+  );
+  assert.equal(state.transactionCalls, transactionsBeforePreview);
+
+  const correctionRequest = {
+    operationId: "aggregate-operation:exact-correction",
+    confirmation: confirmationFor(preview),
+  };
+  const correction = await repository.applyConfirmedCorrection(
+    correctionRequest,
+  );
+  assert.deepEqual(correction, {
+    preview,
+    stored: stored(2, 10_000, 1),
+    replayed: false,
+  });
+  assert.deepEqual(
+    await new DevelopmentInMemoryAggregateRepository(
+      adapter,
+      currency,
+    ).applyConfirmedCorrection(correctionRequest),
+    { ...correction, replayed: true },
+  );
+
+  await rejectsStorage(
+    () => repository.applyConfirmedCorrection({
+      ...correctionRequest,
+      confirmation: confirmationFor(preview, {
+        expectedStoredAmount: minorUnits(8_001),
+      }),
+    }),
+    "CONFLICT",
+  );
+  await rejectsStorage(
+    () => repository.applyConfirmedCorrection({
+      operationId: "aggregate-operation:stale-correction",
+      confirmation: confirmationFor(preview),
+    }),
+    "PRECONDITION_FAILED",
+  );
+  assert.deepEqual(await repository.previewReconciliation(), {
+    status: "match",
+    stored: stored(2, 10_000, 1),
+    calculated: summary(10_000, 1),
+    correctionRequired: false,
+  });
+});
+
+test("integer overflow and malformed projections fail without partial writes", async () => {
+  const state = new MemoryStorageState();
+  const repository = new DevelopmentInMemoryAggregateRepository(
+    new DeterministicMemoryStorageAdapter(state),
+    currency,
+  );
+  await repository.applyContribution(applyRequest(
+    "aggregate-operation:max-safe",
+    0,
+    contribution(
+      "indication:max-safe",
+      1,
+      "active",
+      Number.MAX_SAFE_INTEGER,
+    ),
+  ));
+  const transactionsBeforeOverflow = state.transactionCalls;
+
+  await rejectsStorage(
+    () => repository.applyContribution(applyRequest(
+      "aggregate-operation:amount-overflow",
+      1,
+      contribution("indication:overflow", 1, "active", 1),
+    )),
+    "INVALID_REQUEST",
+  );
+  assert.equal(state.transactionCalls, transactionsBeforeOverflow);
+  assert.deepEqual(
+    await repository.readStored(),
+    stored(1, Number.MAX_SAFE_INTEGER, 1),
+  );
+  assert.deepEqual(
+    await repository.calculate(),
+    summary(Number.MAX_SAFE_INTEGER, 1),
+  );
+
+  await rejectsStorage(
+    () => repository.applyContribution({
+      operationId: "aggregate-operation:fractional",
+      expectedStoredRevision: 1,
+      contribution: {
+        ...contribution("indication:fractional", 1, "active", 1),
+        amount: 1.5,
+      } as unknown as InvestmentAggregateContribution,
+    }),
+    "INVALID_REQUEST",
+  );
+
+  mutateAggregateRecord(state, (snapshot) => {
+    snapshot.revision = Number.MAX_SAFE_INTEGER;
+  }, Number.MAX_SAFE_INTEGER);
+  await rejectsStorage(
+    () => repository.applyContribution(applyRequest(
+      "aggregate-operation:revision-overflow",
+      Number.MAX_SAFE_INTEGER,
+      contribution("indication:max-safe", 2, "withdrawn", 0),
+    )),
+    "PRECONDITION_FAILED",
+  );
+  assert.equal(state.transactionCalls, transactionsBeforeOverflow);
+});
+
+test("public reads use the closed sanitizer and expose no private aggregate facts", async () => {
+  const state = new MemoryStorageState();
+  const repository = new DevelopmentInMemoryAggregateRepository(
+    new DeterministicMemoryStorageAdapter(state),
+    currency,
+  );
+  const privateProjection = {
+    ...contribution("indication:private", 1, "active", 12_500),
+    participantSubject: "issuer.invalid/subject:private",
+    companyName: "Private Company",
+    note: "Private strategic note",
+  } as unknown as InvestmentAggregateContribution;
+  await rejectsStorage(
+    () => repository.applyContribution({
+      operationId: "aggregate-operation:leaky-projection",
+      expectedStoredRevision: 0,
+      contribution: privateProjection,
+    }),
+    "INVALID_REQUEST",
+  );
+
+  await repository.applyContribution(applyRequest(
+    "aggregate-operation:public-value",
+    0,
+    contribution("indication:public-value", 1, "active", 12_500),
+  ));
+  const publicAggregate = await repository.readPublicAggregate(
+    visibleConfiguration(),
+    10_000,
+  );
+  assert.deepEqual(publicAggregate, {
+    amount: 12_500,
+    currency: "XYZ",
+    label: "Recorded non-binding interest",
+    qualifier: "Self-declared, unverified, and non-binding.",
+    oversubscription: {
+      status: "oversubscribed",
+      targetAmount: 10_000,
+      remainingAmount: 0,
+      amountOverTarget: 2_500,
+    },
+  });
+  assert.deepEqual(Object.keys(publicAggregate ?? {}), [
+    "amount",
+    "currency",
+    "label",
+    "qualifier",
+    "oversubscription",
+  ]);
+  assert.doesNotMatch(
+    JSON.stringify(publicAggregate),
+    /participant|subject|company|note|contributing|count|indicationId|active|withdrawn|rejected/iu,
+  );
+  assert.equal(Object.isFrozen(publicAggregate), true);
+  assert.equal(
+    await repository.readPublicAggregate(hiddenConfiguration(), 10_000),
+    null,
+  );
+});
+
+function applyRequest(
+  operationId: string,
+  expectedStoredRevision: number,
+  value: InvestmentAggregateContribution,
+): ApplyAggregateContributionRequest {
+  return {
+    operationId,
+    expectedStoredRevision,
+    contribution: value,
+  };
+}
+
+function contribution(
+  id: string,
+  indicationRevision: number,
+  status: InvestmentAggregateContribution["status"],
+  amount: number,
+): InvestmentAggregateContribution {
+  const parsedId = parseStableId<"investment-indication">(id);
+  assert(parsedId.ok);
+  return Object.freeze({
+    indicationId: parsedId.value,
+    indicationRevision,
+    status,
+    amount: minorUnits(amount),
+    currency,
+  });
+}
+
+function stored(
+  revision: number,
+  totalAmount: number,
+  contributingIndicationCount: number,
+) {
+  return Object.freeze({
+    revision,
+    totalAmount: minorUnits(totalAmount),
+    currency,
+    contributingIndicationCount,
+  });
+}
+
+function summary(totalAmount: number, contributingIndicationCount: number) {
+  return Object.freeze({
+    totalAmount: minorUnits(totalAmount),
+    currency,
+    contributingIndicationCount,
+  });
+}
+
+function confirmationFor(
+  preview: InvestmentAggregateReconciliationPreview,
+  overrides: Partial<InvestmentAggregateCorrectionConfirmation> = {},
+): InvestmentAggregateCorrectionConfirmation {
+  return {
+    confirmation: APPLY_CALCULATED_AGGREGATE_CONFIRMATION,
+    expectedStoredRevision: preview.stored.revision,
+    expectedStoredAmount: preview.stored.totalAmount,
+    expectedStoredContributingIndicationCount:
+      preview.stored.contributingIndicationCount,
+    expectedCalculatedAmount: preview.calculated.totalAmount,
+    expectedCalculatedContributingIndicationCount:
+      preview.calculated.contributingIndicationCount,
+    ...overrides,
+  };
+}
+
+function visibleConfiguration(): AmountAggregateConfiguration {
+  return amountConfiguration({
+    visibility: "non_zero",
+    label: "Recorded non-binding interest",
+    qualifier: "Self-declared, unverified, and non-binding.",
+  });
+}
+
+function hiddenConfiguration(): AmountAggregateConfiguration {
+  return amountConfiguration({ visibility: "hidden" });
+}
+
+function amountConfiguration(publicAggregate: unknown) {
+  const parsed = parseAmountAggregateConfiguration({
+    amount: {
+      currency,
+      minimum: 0,
+      increment: 1,
+      maximum: null,
+    },
+    publicAggregate,
+  });
+  assert(parsed.ok);
+  return parsed.value;
+}
+
+function minorUnits(value: number): MinorUnits {
+  const parsed = parseMinorUnits(value);
+  assert(parsed.ok);
+  return parsed.value;
+}
+
+async function rejectsStorage(
+  operation: () => Promise<unknown>,
+  code: StorageFailure["code"],
+): Promise<void> {
+  try {
+    await operation();
+  } catch (error) {
+    assert(error instanceof StorageFailure);
+    assert.equal(error.code, code);
+    return;
+  }
+  assert.fail("Expected a StorageFailure.");
+}
+
+type MutableRecord = Record<string, unknown>;
+
+function mutateAggregateRecord(
+  state: MemoryStorageState,
+  mutation: (snapshot: MutableRecord) => void,
+  storageRevision?: number,
+): void {
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.value.kind === "investment-aggregate-state"
+  );
+  assert.notEqual(entry, undefined);
+  if (entry === undefined) return;
+  const [key, record] = entry;
+  const document = cloneDocument(record.value) as MutableRecord;
+  const snapshot = mutableRecord(document.snapshot);
+  mutation(snapshot);
+  state.records.set(key, freezeRecord({
+    key: record.key,
+    revision: storageRevision ?? record.revision,
+    value: document as StorageDocument,
+  }));
+}
+
+function mutableRecord(value: unknown): MutableRecord {
+  assert.equal(typeof value, "object");
+  assert.notEqual(value, null);
+  assert.equal(Array.isArray(value), false);
+  return value as MutableRecord;
+}
+
+class MemoryStorageState {
+  readonly records = new Map<string, StorageRecord>();
+  readonly operations = new Map<
+    string,
+    Readonly<{ fingerprint: string; result: StorageTransactionResult }>
+  >();
+  transactionCalls = 0;
+}
+
+class DeterministicMemoryStorageAdapter implements StorageAdapter {
+  readonly #state: MemoryStorageState;
+
+  constructor(state: MemoryStorageState) {
+    this.#state = state;
+  }
+
+  async read(key: StorageKey): Promise<StorageRecord | null> {
+    return cloneRecord(this.#state.records.get(storageKeyString(key)) ?? null);
+  }
+
+  async list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    assertStorageListBoundary(request);
+    const start = request.cursor === undefined ? 0 : parseCursor(request.cursor);
+    const records = [...this.#state.records.values()]
+      .filter((record) => record.key.collection === request.collection)
+      .sort((left, right) => left.key.id.localeCompare(right.key.id));
+    if (start < 0 || start > records.length) {
+      throw new StorageFailure("INVALID_REQUEST");
+    }
+    const items = records.slice(start, start + request.limit).map(cloneRecord);
+    const next = start + items.length;
+    return Object.freeze({
+      items: Object.freeze(
+        items.filter((item): item is StorageRecord => item !== null),
+      ),
+      nextCursor: next < records.length
+        ? (`aggregate-cursor:${next}` as StorageCursor)
+        : null,
+    });
+  }
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    assertStorageTransactionBoundary(request);
+    this.#state.transactionCalls += 1;
+    const operationKey = request.operationId as string;
+    const fingerprint = JSON.stringify(request);
+    const prior = this.#state.operations.get(operationKey);
+    if (prior !== undefined) {
+      if (prior.fingerprint !== fingerprint) {
+        throw new StorageFailure("CONFLICT");
+      }
+      return cloneResult(prior.result, true);
+    }
+
+    for (const mutation of request.mutations) {
+      const current = this.#state.records.get(storageKeyString(mutation.key));
+      if (mutation.expectedRevision === null) {
+        if (current !== undefined) throw new StorageFailure("CONFLICT");
+      } else if (
+        current === undefined ||
+        current.revision !== mutation.expectedRevision
+      ) {
+        throw new StorageFailure("PRECONDITION_FAILED");
+      }
+    }
+
+    const nextRecords = new Map(this.#state.records);
+    const resultRecords: (StorageRecord | null)[] = [];
+    for (const mutation of request.mutations) {
+      const key = storageKeyString(mutation.key);
+      const current = nextRecords.get(key);
+      if (mutation.type === "delete") {
+        nextRecords.delete(key);
+        resultRecords.push(null);
+        continue;
+      }
+      const record = freezeRecord({
+        key: mutation.key,
+        revision: (current?.revision ?? 0) + 1,
+        value: mutation.value,
+      });
+      nextRecords.set(key, record);
+      resultRecords.push(record);
+    }
+
+    this.#state.records.clear();
+    for (const [key, record] of nextRecords) this.#state.records.set(key, record);
+    const result = Object.freeze({
+      replayed: false,
+      records: Object.freeze(resultRecords.map(cloneRecord)),
+    });
+    this.#state.operations.set(operationKey, { fingerprint, result });
+    return cloneResult(result, false);
+  }
+}
+
+function parseCursor(cursor: StorageCursor): number {
+  const match = /^aggregate-cursor:(\d+)$/.exec(cursor);
+  if (match === null) throw new StorageFailure("INVALID_REQUEST");
+  return Number.parseInt(match[1], 10);
+}
+
+function cloneResult(
+  result: StorageTransactionResult,
+  replayed: boolean,
+): StorageTransactionResult {
+  return Object.freeze({
+    replayed,
+    records: Object.freeze(result.records.map(cloneRecord)),
+  });
+}
+
+function cloneRecord(record: StorageRecord | null): StorageRecord | null {
+  return record === null
+    ? null
+    : freezeRecord({
+        key: record.key,
+        revision: record.revision,
+        value: record.value,
+      });
+}
+
+function freezeRecord(input: Readonly<{
+  key: StorageKey;
+  revision: number;
+  value: StorageDocument;
+}>): StorageRecord {
+  return Object.freeze({
+    key: Object.freeze({ ...input.key }),
+    revision: input.revision,
+    value: deepFreeze(cloneDocument(input.value)),
+  });
+}
+
+function cloneDocument(value: StorageDocument): StorageDocument {
+  return JSON.parse(JSON.stringify(value)) as StorageDocument;
+}
+
+function deepFreeze<Value>(value: Value): Value {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) {
+    return value;
+  }
+  Object.freeze(value);
+  for (const child of Object.values(value)) deepFreeze(child);
+  return value;
+}

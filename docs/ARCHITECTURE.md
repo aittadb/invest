@@ -128,6 +128,10 @@ Reads reconstruct every transition, verify the current record against all immuta
 
 Reconciliation compares a stored revision, amount, and private contributing count with a fresh calculation. A correction intent exists only for a mismatch and only after an explicit confirmation binds every stored and calculated preview value; persistence must still compare-and-set the stored revision. Public output is rebuilt from an allowlist containing configured amount, currency, label, qualifier, and optional integer target progress. It has no structural place for indication IDs, participant or company identity, notes, lifecycle detail, moderation, or private counts.
 
+`DevelopmentInMemoryAggregateRepository` persists one latest closed contribution projection per indication, the current aggregate snapshot, and immutable operation receipts through a development/test `StorageAdapter`. A newer indication revision atomically replaces its projection and compare-and-sets the aggregate; identical delivery deduplicates, older delivery is superseded, and conflicting same-revision facts fail. Recreating the repository over the adapter reopens the same state without process-local totals.
+
+Every calculated view is rebuilt from persisted projections with safe integer arithmetic. A stored mismatch blocks ordinary projection updates until an exact preview-bound correction compare-and-sets the current snapshot. Public reads always pass through the closed aggregate sanitizer and cannot return indication identity or private contributing counts. This repository is deterministic development proof, not production storage.
+
 ### Phase and country eligibility
 
 `domain/phase-configuration.ts` requires explicit phase identity, state, participation paths, and country policy. It supplies no built-in country, path, or campaign default. Country codes pass through the shared normalizer before duplicate and allow or deny evaluation.
