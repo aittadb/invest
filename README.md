@@ -39,7 +39,7 @@ Each application URI supports equivalent human HTML and versioned hypermedia JSO
 ## Repository Files
 
 - `AGENTS.md`: authoritative agent and contributor rules. Keep below 32,000 bytes.
-- `PLAN.md`: small, accepted, unfinished implementation tasks.
+- `PLAN.md`: small, accepted, unfinished implementation tasks with explicit dependencies.
 - `ROADMAP.md`: future product direction, not current capability.
 - `BACKLOG.md`: unscheduled ideas and deferred decisions.
 - `CHANGELOG.md`: completed task history and retired task mappings.
@@ -72,7 +72,7 @@ npm run validate
 
 ## Planning Workflow
 
-Before repository-affecting implementation, add or amend one unchecked `PLAN.md` task. Keep tasks small: one primitive, route group, security control, UI flow, storage contract, or narrowly bounded proof per task. Completed tasks move to `CHANGELOG.md` with evidence and are removed from `PLAN.md`.
+Before repository-affecting implementation, add or amend one unchecked `PLAN.md` task. Keep tasks small: one primitive, route group, security control, UI flow, storage contract, or narrowly bounded proof per task. Record only direct dependencies. Ready tasks may proceed concurrently in isolated branches and Git worktrees, with one focused task per worktree. Completed tasks move to `CHANGELOG.md` with evidence and are removed from `PLAN.md`.
 
 ## License
 

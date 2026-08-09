@@ -46,6 +46,12 @@ The specification expects these narrow boundaries:
 
 Domain logic should depend on these interfaces instead of framework request objects or AittaDB HTTP details.
 
+### Parallel development boundaries
+
+Each domain and repository lane owns a narrow contract, implementation, contract tests, and documentation. A sibling repository must not import another sibling's concrete implementation. Cross-lane behavior is coordinated through small domain projections or application services, so package, participant, founder, indication, aggregate, audit, and campaign work can be developed and tested independently until a use case intentionally composes them.
+
+The generic `StorageAdapter` supplies bounded persistence primitives; it must not become a feature-level service locator. Repository contract suites run against deterministic fakes and production adapters alike. A PLAN dependency is therefore required only when a task consumes another task's public contract, implementation, or live proof, not merely because both tasks will eventually participate in the same workflow.
+
 ### Shared foundation
 
 `domain/foundation.ts` is the framework-independent boundary for values shared by later contracts. It provides branded integer minor units, canonical UTC timestamps, bounded stable identifiers, case-sensitive identity subjects, normalized two-letter country codes, structured validation results, and fixed-message public error mapping.

@@ -13,9 +13,10 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "agents:check": "node scripts/check-agents-size.mjs",
+    "plan:check": "node scripts/check-plan.mjs",
     "instances:check": "node scripts/check-instance-boundaries.mjs",
     "sites:package": "node scripts/require-active-hosting.mjs && npm run build",
-    "validate": "npm run agents:check && npm run instances:check && npm run lint && npm run typecheck && npm test"
+    "validate": "npm run agents:check && npm run plan:check && npm run instances:check && npm run lint && npm run typecheck && npm test"
   },
   "dependencies": {
     "react": "19.2.6",

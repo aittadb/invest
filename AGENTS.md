@@ -57,16 +57,22 @@ Every application URI is a resource, not an HTML-only page. Use `Accept` for rep
 
 Before repository-affecting implementation, add or amend an unchecked root `PLAN.md` task. Questions, review-only work, and tiny clarification answers do not need a plan item.
 
-`PLAN.md` is a flat unfinished queue. Each item:
+`PLAN.md` is a flat unfinished task graph, not a single-worker queue. Each item:
 
 - uses a stable `TASK-NNN` identifier;
 - owns exactly one domain primitive, route group, storage contract, security control, UI flow, or narrowly bounded proof;
 - fits one focused commit;
 - states an objective pass/fail definition of done;
 - includes contract, implementation, tests, docs, failures, and validation together when it is an implementation task;
-- is dependency ordered when possible.
+- records direct prerequisites as `Depends on: TASK-NNN` or `Depends on: none`;
+- records a concrete external blocker separately when one exists;
+- is topologically ordered when that improves readability without implying serial execution.
 
-Split broad work into the smallest coherent increments. Do not combine independent resources, methods, controls, migrations, or live proof matrices in one task. Broad requests first create a decomposition task; add dependency-ordered replacements, then retire the umbrella unchanged in `CHANGELOG.md` with its mapping.
+A task dependency is justified only when the dependent task cannot meet its DoD without consuming the prerequisite's contract, implementation, or validated proof. Similar subject matter, preferred merge order, shared infrastructure, or possible future integration do not by themselves create a dependency. Keep sibling domain modules and repositories behind narrow interfaces so independent lanes remain independently testable.
+
+Every task whose dependencies are complete and which has no external blocker may proceed concurrently. Keep one task in focus per agent worktree, not one task globally. Use isolated branches and Git worktrees, prefer disjoint file ownership, validate each task independently, and integrate complete commits in dependency order. The integrating branch owns the authoritative `PLAN.md` removal and `CHANGELOG.md` evidence update when parallel workers would otherwise race on those shared ledgers.
+
+Split broad work into the smallest coherent increments. Do not combine independent resources, methods, controls, migrations, or live proof matrices in one task. Broad requests first create a decomposition task; add dependency-mapped replacements, then retire the umbrella unchanged in `CHANGELOG.md` with its mapping.
 
 If a proposed task names several independent repositories, routes, use cases, or security controls, split it. A good PLAN item can be reviewed by asking one yes/no question: did this one primitive or bounded proof meet its stated contract? Prefer ten small tasks with crisp DoDs over one umbrella that hides partial progress.
 
@@ -101,6 +107,7 @@ README must state experimental status, FSL-1.1-MIT source availability with two-
 - Test: `npm test`
 - Lint: `npm run lint`
 - Agent instruction budget: `npm run agents:check`
+- Plan dependency graph: `npm run plan:check`
 - Local validation: `npm run validate`
 - Sites package build: `npm run sites:package`
 
@@ -108,6 +115,6 @@ Keep commands synchronized with `package.json`, CI, README, and contributor docs
 
 ## Git and Deployment
 
-Use feature branches. Keep intended changes checkpointed with focused commits; do not leave completed work loose in the worktree. For parallel agent implementation, use isolated Git worktrees and integrate only reviewed, complete, validated commits. Preserve unrelated work. Do not push to `main`, merge, deploy, publish, rotate hosted secrets, or change Sites access without explicit approval.
+Use feature branches. Keep intended changes checkpointed with focused commits; do not leave completed work loose in the worktree. For parallel agent implementation, reserve independent PLAN tasks first, use one isolated Git worktree per task, and integrate only reviewed, complete, validated commits after their declared dependencies. Preserve unrelated work. Do not push to `main`, merge, deploy, publish, rotate hosted secrets, or change Sites access without explicit approval.
 
 Production publication is blocked until the configured backend supports the required authorization, consistency, listing, pagination, quota, and non-disclosure behavior and the production adapter passes contract and end-to-end tests.
