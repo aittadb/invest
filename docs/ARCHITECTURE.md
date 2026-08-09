@@ -94,6 +94,12 @@ Acknowledgment records are keyed to the authenticated participant subject throug
 
 An account-deletion request records intent but does not call indication or founder repositories. It emits a retry-stable withdrawal intent for an application service to coordinate across those separate lanes.
 
+### Development participant repository
+
+`DevelopmentInMemoryParticipantRepository` composes through a development/test `StorageAdapter` and binds every profile key to the trusted authenticated subject through a one-way storage identifier. Registration takes identity-bound account fields only from that trusted account. Later mutations call the participant field-policy domain operations, so profile edits cannot replace subject, account email label, process acknowledgment, consent state, deletion state, or system timestamps.
+
+Each write atomically compare-and-sets the current profile and creates an immutable subject revision under one operation ID. Replays return their original snapshot and changed retries or stale revisions fail. A deletion request persists only its state and exposes a separate application-level withdrawal intent; the repository does not import or mutate indication or founder storage. Anonymous, foreign, denied, and missing records retain the same non-disclosing shapes.
+
 ### Founder applications
 
 `domain/founder-application.ts` validates founder fields against deployment-supplied contribution choices and records received or withdrawn state as immutable revision snapshots. Create, edit, and withdrawal transitions are scoped to the applicant subject, while owner review remains a separate use case.
