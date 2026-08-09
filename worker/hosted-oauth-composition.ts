@@ -125,7 +125,12 @@ const HOSTED_OAUTH_AVAILABILITY_EVIDENCE: Readonly<
 > = Object.freeze({
   request: "investor_app.oauth.discovery.request",
   fetch: "investor_app.oauth.discovery.fetch",
-  status: "investor_app.oauth.discovery.status",
+  status_redirect: "investor_app.oauth.discovery.status_redirect",
+  status_unauthorized: "investor_app.oauth.discovery.status_unauthorized",
+  status_not_found: "investor_app.oauth.discovery.status_not_found",
+  status_rate_limited: "investor_app.oauth.discovery.status_rate_limited",
+  status_server: "investor_app.oauth.discovery.status_server",
+  status_other: "investor_app.oauth.discovery.status_other",
   content_type: "investor_app.oauth.discovery.content_type",
   declared_size: "investor_app.oauth.discovery.declared_size",
   body: "investor_app.oauth.discovery.body",

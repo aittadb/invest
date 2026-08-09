@@ -29,7 +29,12 @@ export type OAuthRandomBytes = (length: number) => Uint8Array;
 export type OAuthAvailabilityFailurePhase =
   | "request"
   | "fetch"
-  | "status"
+  | "status_redirect"
+  | "status_unauthorized"
+  | "status_not_found"
+  | "status_rate_limited"
+  | "status_server"
+  | "status_other"
   | "content_type"
   | "declared_size"
   | "body"
@@ -561,7 +566,7 @@ async function fetchJson(
     unavailable();
   }
   if (!response.ok) {
-    report?.("status");
+    report?.(availabilityStatusPhase(response.status));
     unavailable();
   }
   if (!response.headers.get("content-type")?.toLowerCase().startsWith(
@@ -583,6 +588,17 @@ async function fetchJson(
     unavailable();
   }
   return parsed;
+}
+
+function availabilityStatusPhase(
+  status: number,
+): OAuthAvailabilityFailurePhase {
+  if (status >= 300 && status <= 399) return "status_redirect";
+  if (status === 401 || status === 403) return "status_unauthorized";
+  if (status === 404) return "status_not_found";
+  if (status === 429) return "status_rate_limited";
+  if (status >= 500 && status <= 599) return "status_server";
+  return "status_other";
 }
 
 async function readBoundedText(

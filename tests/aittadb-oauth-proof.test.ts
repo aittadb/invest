@@ -175,7 +175,7 @@ test("availability reports one fixed non-secret discovery failure phase", async 
       { failAt: "discovery", fetchFailure: new Error(CLIENT_SECRET) },
     ],
     [
-      "status",
+      "status_server",
       {
         discoveryResponse: new Response(CLIENT_SECRET, {
           status: 503,
@@ -251,7 +251,7 @@ test("provider redirects are returned manually and rejected without following", 
   });
 
   assert.equal(await harness.service.availability(), false);
-  assert.deepEqual(harness.availabilityFailures, ["status"]);
+  assert.deepEqual(harness.availabilityFailures, ["status_redirect"]);
   assert.equal(harness.requests.length, 1);
   assert.equal(harness.requests[0]?.redirect, "manual");
   assert.equal(harness.requests[0]?.authorization, null);

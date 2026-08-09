@@ -283,7 +283,12 @@ test("hosted availability evidence is fixed and credential-free", async (t) => {
   const phases: OAuthAvailabilityFailurePhase[] = [
     "request",
     "fetch",
-    "status",
+    "status_redirect",
+    "status_unauthorized",
+    "status_not_found",
+    "status_rate_limited",
+    "status_server",
+    "status_other",
     "content_type",
     "declared_size",
     "body",
