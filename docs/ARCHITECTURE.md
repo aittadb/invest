@@ -137,6 +137,12 @@ Acknowledgment records are keyed to the authenticated participant subject throug
 
 An account-deletion request records intent but does not call indication or founder repositories. It emits a retry-stable withdrawal intent for an application service to coordinate across those separate lanes.
 
+### Participant access-registration resource
+
+`domain/participant-registration-resource.ts` projects the signed-in account and current participant profile into one HTML and versioned hypermedia capability model at `/participant/registration`. The provider email is display-only, subject and email never become action fields, and required process notice text remains independent from optional marketing consent. `worker/routes/participant-registration.ts` accepts a request-scoped `ParticipantRepository` factory, browser mutation guard, actor-bound CSRF provider, operation-ID issuer, clock, and deployment-supplied notices; it installs no global or production repository.
+
+An available registration action requires a validated CSRF proof before either representation is returned. HTML carries the proof only in its hidden transport field, while JSON carries it only in `MUTATION_CSRF_HEADER`; actionless registered resources emit neither. The route enforces participant rather than owner authority, trusted actor/account equality, exact resource origin, bounds, exact fields, and fixed non-disclosing errors. It reuses the persisted registration timestamp when asking the repository to evaluate a retry, preserving exact replay and changed-retry behavior without process memory. Public HTML loads its route-specific stylesheet from the same origin under a `style-src 'self'` policy.
+
 ### Development participant repository
 
 `DevelopmentInMemoryParticipantRepository` composes through a development/test `StorageAdapter` and binds every profile key to the trusted authenticated subject through a one-way storage identifier. Registration takes identity-bound account fields only from that trusted account. Later mutations call the participant field-policy domain operations, so profile edits cannot replace subject, account email label, process acknowledgment, consent state, deletion state, or system timestamps.

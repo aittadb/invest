@@ -15,6 +15,11 @@ export {
   type InvestmentInterestRouteDependencies,
 } from "./investment-interest.ts";
 
+export {
+  createParticipantRegistrationRouteHandler,
+  type ParticipantRegistrationRouteDependencies,
+} from "./participant-registration.ts";
+
 export function createParticipantRouteHandler(
   resourceHandlers: readonly ApplicationRouteHandler[] = [],
   capabilities: ParticipantRouteCapabilities = {},
