@@ -17,8 +17,11 @@ import { createPackageVersion } from "../domain/package-content.ts";
 import {
   parseParticipantAccount,
   registerParticipantProfile,
+  requestParticipantAccountDeletion,
+  type ParticipantProfile,
 } from "../domain/participant-profile.ts";
 import { createPublicCampaignDocument } from "../domain/public-campaign-resource.ts";
+import { StorageFailure } from "../domain/storage-adapter.ts";
 import { readParticipantAuthorizationState } from "../services/participant-access.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
 
@@ -198,41 +201,26 @@ test("participant documents expose only configured and permitted interest workfl
   );
 });
 
-test("repository projection reads package acknowledgment only for a registered participant", async () => {
+test("repository projection returns one stable participant, package, and acceptance state", async () => {
   const alice = account("oidc:alice", "alice@example.test");
-  const registeredAt = parseTimestamp("2026-08-09T08:00:00.000Z");
-  assert(registeredAt.ok);
-  const profile = registerParticipantProfile(
-    alice,
-    {
-      displayName: "Alice Participant",
-      country: "FI",
-      declaredInterest: "both",
-      participationContext: "company",
-      processEmailNoticeAcknowledged: true,
-      marketingConsent: false,
-    },
-    registeredAt.value,
-  );
-  assert(profile.ok);
-
-  const version = await createPackageVersion({
-    id: "package-version:repository",
-    createdAt: "2026-08-09T09:00:00.000Z",
-    changeSummary: "Repository-backed package",
-    materialChange: true,
-    acknowledgmentText: "I acknowledge the current information package.",
-    sections: [],
-  });
-  assert(version.ok);
+  const profile = registeredProfile(alice);
+  const version = await packageVersion("repository", "Repository-backed package");
+  let profileReads = 0;
+  let packageReads = 0;
   let acknowledgmentReads = 0;
 
   const state = await readParticipantAuthorizationState({
     participant: {
-      current: async () => ({ revision: 1, snapshot: profile.value }),
+      current: async () => {
+        profileReads += 1;
+        return { revision: 1, snapshot: profile };
+      },
     },
     packages: {
-      current: async () => ({ revision: 1, snapshot: version.value }),
+      current: async () => {
+        packageReads += 1;
+        return { revision: 1, snapshot: version };
+      },
     },
     acknowledgments: {
       requiresCurrentAcceptance: async () => {
@@ -243,7 +231,114 @@ test("repository projection reads package acknowledgment only for a registered p
   });
   assert.equal(state?.profile.subject, alice.subject);
   assert.equal(state?.currentPackage?.requiresCurrentAcceptance, true);
+  assert.equal(profileReads, 2);
+  assert.equal(packageReads, 2);
   assert.equal(acknowledgmentReads, 1);
+});
+
+test("repository projection retries a participant change and returns deletion-requested state", async () => {
+  const alice = account("oidc:alice", "alice@example.test");
+  const initial = registeredProfile(alice);
+  const requestedAt = parseTimestamp("2026-08-09T10:00:00.000Z");
+  assert(requestedAt.ok);
+  const deleted = requestParticipantAccountDeletion(initial, requestedAt.value);
+  const version = await packageVersion("profile-race", "Stable package");
+  const profiles = [
+    { revision: 1, snapshot: initial },
+    { revision: 1, snapshot: deleted.profile },
+    { revision: 2, snapshot: deleted.profile },
+    { revision: 2, snapshot: deleted.profile },
+  ];
+  let profileRead = 0;
+  let acknowledgmentReads = 0;
+
+  const state = await readParticipantAuthorizationState({
+    participant: {
+      current: async () => profiles[profileRead++] ?? assert.fail("Unexpected profile read"),
+    },
+    packages: {
+      current: async () => ({ revision: 1, snapshot: version }),
+    },
+    acknowledgments: {
+      requiresCurrentAcceptance: async () => {
+        acknowledgmentReads += 1;
+        return false;
+      },
+    },
+  });
+
+  assert.equal(state?.profile.accountDeletionRequested, true);
+  assert.equal(profileRead, 4);
+  assert.equal(acknowledgmentReads, 2);
+});
+
+test("repository projection retries package publication around the acceptance read", async () => {
+  const alice = account("oidc:alice", "alice@example.test");
+  const profile = registeredProfile(alice);
+  const first = await packageVersion("package-race-v1", "First package");
+  const second = await packageVersion("package-race-v2", "Second package");
+  const packages = [
+    { revision: 1, snapshot: first },
+    { revision: 1, snapshot: second },
+    { revision: 2, snapshot: second },
+    { revision: 2, snapshot: second },
+  ];
+  const acceptance = [false, true];
+  let packageRead = 0;
+  let acknowledgmentRead = 0;
+
+  const state = await readParticipantAuthorizationState({
+    participant: {
+      current: async () => ({ revision: 1, snapshot: profile }),
+    },
+    packages: {
+      current: async () => packages[packageRead++] ?? assert.fail("Unexpected package read"),
+    },
+    acknowledgments: {
+      requiresCurrentAcceptance: async () =>
+        acceptance[acknowledgmentRead++] ?? assert.fail("Unexpected acknowledgment read"),
+    },
+  });
+
+  assert.equal(state?.currentPackage?.id, second.id);
+  assert.equal(state?.currentPackage?.changeSummary, "Second package");
+  assert.equal(state?.currentPackage?.requiresCurrentAcceptance, true);
+  assert.equal(packageRead, 4);
+  assert.equal(acknowledgmentRead, 2);
+});
+
+test("repository projection fails closed when participant or package state keeps changing", async () => {
+  const alice = account("oidc:alice", "alice@example.test");
+  const profile = registeredProfile(alice);
+  const version = await packageVersion("continuing-race", "Changing package");
+  let profileRead = 0;
+  let packageRead = 0;
+
+  await assert.rejects(
+    readParticipantAuthorizationState({
+      participant: {
+        current: async () => ({
+          revision: ++profileRead,
+          snapshot: profile,
+        }),
+      },
+      packages: {
+        current: async () => ({
+          revision: ++packageRead,
+          snapshot: version,
+        }),
+      },
+      acknowledgments: {
+        requiresCurrentAcceptance: async () => false,
+      },
+    }),
+    unavailableFailure,
+  );
+  assert.equal(profileRead, 4);
+  assert.equal(packageRead, 4);
+});
+
+test("missing participant short-circuits package and acknowledgment reads", async () => {
 
   const missing = await readParticipantAuthorizationState({
     participant: { current: async () => null },
@@ -257,6 +352,139 @@ test("repository projection reads package acknowledgment only for a registered p
   });
   assert.equal(missing, null);
 });
+
+test("repository projection masks repository exceptions and private details", async () => {
+  const alice = account("oidc:alice", "alice@example.test");
+  const profile = registeredProfile(alice);
+  const version = await packageVersion("repository-failure", "Private package");
+  const privateDetail = "private-participant-key:alice";
+
+  await assertUnavailableMasks(
+    readParticipantAuthorizationState({
+      participant: {
+        current: async () => {
+          throw new Error(privateDetail);
+        },
+      },
+      packages: {
+        current: async () => assert.fail("Package state must stay unread."),
+      },
+      acknowledgments: {
+        requiresCurrentAcceptance: async () =>
+          assert.fail("Acknowledgment state must stay unread."),
+      },
+    }),
+    privateDetail,
+  );
+
+  await assertUnavailableMasks(
+    readParticipantAuthorizationState({
+      participant: {
+        current: async () => ({ revision: 1, snapshot: profile }),
+      },
+      packages: {
+        current: async () => ({ revision: 1, snapshot: version }),
+      },
+      acknowledgments: {
+        requiresCurrentAcceptance: async () => {
+          throw new Error(privateDetail);
+        },
+      },
+    }),
+    privateDetail,
+  );
+
+  await assertUnavailableMasks(
+    readParticipantAuthorizationState({
+      participant: {
+        current: async () => ({ revision: 1, snapshot: profile }),
+      },
+      packages: {
+        current: async () => ({ revision: 1, snapshot: version }),
+      },
+      acknowledgments: {
+        requiresCurrentAcceptance: async () =>
+          privateDetail as unknown as boolean,
+      },
+    }),
+    privateDetail,
+  );
+
+  await assertUnavailableMasks(
+    readParticipantAuthorizationState({
+      participant: {
+        current: async () => ({ revision: 1, snapshot: profile }),
+      },
+      packages: {
+        current: async () => {
+          throw new Error(privateDetail);
+        },
+      },
+      acknowledgments: {
+        requiresCurrentAcceptance: async () =>
+          assert.fail("Acknowledgment state must stay unread."),
+      },
+    }),
+    privateDetail,
+  );
+});
+
+async function assertUnavailableMasks(
+  operation: Promise<unknown>,
+  privateDetail: string,
+): Promise<void> {
+  await assert.rejects(
+    operation,
+    (error: unknown) => {
+      assert.ok(error instanceof StorageFailure);
+      assert.equal(error.code, "UNAVAILABLE");
+      assert.equal(error.message, "Storage is temporarily unavailable.");
+      assert.doesNotMatch(error.message, new RegExp(privateDetail, "u"));
+      return true;
+    },
+  );
+}
+
+function registeredProfile(
+  participantAccount: ReturnType<typeof account>,
+): ParticipantProfile {
+  const registeredAt = parseTimestamp("2026-08-09T08:00:00.000Z");
+  assert(registeredAt.ok);
+  const profile = registerParticipantProfile(
+    participantAccount,
+    {
+      displayName: "Alice Participant",
+      country: "FI",
+      declaredInterest: "both",
+      participationContext: "company",
+      processEmailNoticeAcknowledged: true,
+      marketingConsent: false,
+    },
+    registeredAt.value,
+  );
+  assert(profile.ok);
+  return profile.value;
+}
+
+async function packageVersion(suffix: string, changeSummary: string) {
+  const version = await createPackageVersion({
+    id: `package-version:${suffix}`,
+    createdAt: "2026-08-09T09:00:00.000Z",
+    changeSummary,
+    materialChange: true,
+    acknowledgmentText: "I acknowledge the current information package.",
+    sections: [],
+  });
+  assert(version.ok);
+  return version.value;
+}
+
+function unavailableFailure(error: unknown): boolean {
+  assert.ok(error instanceof StorageFailure);
+  assert.equal(error.code, "UNAVAILABLE");
+  assert.equal(error.message, "Storage is temporarily unavailable.");
+  return true;
+}
 
 function account(subject: string, email: string) {
   const parsed = parseParticipantAccount({
