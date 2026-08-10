@@ -41,11 +41,11 @@ import {
   MemoryStorageState,
 } from "./support/memory-storage-adapter.ts";
 
-test("participant authorization binds private state to the trusted account subject", () => {
+test("participant authorization binds private state to the exact trusted account", () => {
   const alice = account("oidc:alice", "alice@example.test");
   const authorized = authorizeParticipantAccess(
     alice,
-    authorizationState(alice.subject),
+    authorizationState(alice.subject, alice.accountEmailLabel),
   );
   assert.ok(authorized);
   assert.equal(authorized.subject, alice.subject);
@@ -54,15 +54,27 @@ test("participant authorization binds private state to the trusted account subje
 
   const foreign = authorizeParticipantAccess(
     alice,
-    authorizationState(actorSubject("oidc:bob")),
+    authorizationState(actorSubject("oidc:bob"), "bob@example.test"),
   );
   assert.equal(foreign, null);
+  const changedProviderEmail = account(
+    "oidc:alice",
+    "alice.changed@example.test",
+  );
+  assert.equal(
+    authorizeParticipantAccess(
+      changedProviderEmail,
+      authorizationState(alice.subject, alice.accountEmailLabel),
+    ),
+    null,
+  );
   assert.equal(authorizeParticipantAccess(alice, null), null);
 
   const malformed = {
-    ...authorizationState(alice.subject),
+    ...authorizationState(alice.subject, alice.accountEmailLabel),
     currentPackage: {
-      ...authorizationState(alice.subject).currentPackage,
+      ...authorizationState(alice.subject, alice.accountEmailLabel)
+        .currentPackage,
       changeSummary: "Private value\u0000must not pass",
     },
   } as ParticipantAuthorizationState;
@@ -80,7 +92,7 @@ test("authorized state round-trips only through the bounded renderer projection"
   const alice = account("oidc:alice", "alice@example.test");
   const authorized = authorizeParticipantAccess(
     alice,
-    authorizationState(alice.subject),
+    authorizationState(alice.subject, alice.accountEmailLabel),
   );
   assert.ok(authorized);
 
@@ -102,7 +114,7 @@ test("public and participant documents project only authorized capabilities", ()
   const alice = account("oidc:alice", "alice@example.test");
   const participant = authorizeParticipantAccess(
     alice,
-    authorizationState(alice.subject),
+    authorizationState(alice.subject, alice.accountEmailLabel),
   );
   assert.ok(participant);
 
@@ -246,6 +258,7 @@ test("repository projection returns one stable participant, package, and accepta
     },
   });
   assert.equal(state?.profile.subject, alice.subject);
+  assert.equal(state?.profile.accountEmailLabel, alice.accountEmailLabel);
   assert.equal(state?.currentPackage?.requiresCurrentAcceptance, true);
   assert.equal(profileReads, 2);
   assert.equal(packageReads, 2);
@@ -998,15 +1011,22 @@ function account(subject: string, email: string) {
 
 function authorizationState(
   subject: ReturnType<typeof actorSubject>,
+  accountEmailLabel = "alice@example.test",
 ): ParticipantAuthorizationState {
+  const profileAccount = parseParticipantAccount({
+    subject,
+    accountEmailLabel,
+  });
   const id = parseStableId<"package-version">("package-version:current");
   const createdAt = parseTimestamp("2026-08-09T09:00:00.000Z");
+  assert(profileAccount.ok);
   assert(id.ok);
   assert(createdAt.ok);
 
   return {
     profile: {
-      subject,
+      subject: profileAccount.value.subject,
+      accountEmailLabel: profileAccount.value.accountEmailLabel,
       displayName: "Alice Participant",
       declaredInterest: "both",
       participationContext: "company",
@@ -1032,7 +1052,7 @@ function authorizedParticipant(
   declaredInterest: "founder" | "investor" | "both",
 ) {
   const alice = account("oidc:alice", "alice@example.test");
-  const state = authorizationState(alice.subject);
+  const state = authorizationState(alice.subject, alice.accountEmailLabel);
   const participant = authorizeParticipantAccess(
     alice,
     {

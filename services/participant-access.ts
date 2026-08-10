@@ -174,6 +174,7 @@ function authorizationState(
   return Object.freeze({
     profile: Object.freeze({
       subject: participant.snapshot.subject,
+      accountEmailLabel: participant.snapshot.accountEmailLabel,
       displayName: participant.snapshot.displayName,
       declaredInterest: participant.snapshot.declaredInterest,
       participationContext: participant.snapshot.participationContext,

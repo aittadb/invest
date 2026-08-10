@@ -1,6 +1,5 @@
 import { chatGPTSignInPath, chatGPTSignOutPath } from "./auth-navigation.ts";
 import {
-  parseActorSubject,
   parseStableId,
   parseTimestamp,
   type ActorSubject,
@@ -37,6 +36,7 @@ const MAX_CHANGE_SUMMARY_LENGTH = 500;
 export type ParticipantAuthorizationState = Readonly<{
   profile: Readonly<{
     subject: ActorSubject;
+    accountEmailLabel: ParticipantAccount["accountEmailLabel"];
     displayName: string;
     declaredInterest: DeclaredInterest;
     participationContext: ParticipationContext;
@@ -122,8 +122,17 @@ export function authorizeParticipantAccess(
   if (state === null) return null;
   const profile = record(state.profile);
   if (profile === null) return null;
-  const subject = parseActorSubject(profile.subject);
-  if (!subject.ok || subject.value !== account.subject) return null;
+  const profileAccount = parseParticipantAccount({
+    subject: profile.subject,
+    accountEmailLabel: profile.accountEmailLabel,
+  });
+  if (
+    !profileAccount.ok ||
+    profileAccount.value.subject !== account.subject ||
+    profileAccount.value.accountEmailLabel !== account.accountEmailLabel
+  ) {
+    return null;
+  }
   if (!validDisplayName(profile.displayName)) return null;
   if (!isDeclaredInterest(profile.declaredInterest)) return null;
   if (!isParticipationContext(profile.participationContext)) return null;

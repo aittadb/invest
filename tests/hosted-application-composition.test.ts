@@ -395,6 +395,143 @@ test("hosted participant access is subject-bound and excludes the configured own
   );
 });
 
+test("hosted participant access requires the persisted provider email label", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  const displayName = "Exact email participant";
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    displayName,
+    "participant-operation:exact-email-binding",
+  );
+  await appendHostedPackageVersion(service, 1, 0);
+  const worker = hostedPackageWorker(service);
+
+  const valid = await worker.fetch(
+    participantRequestFor(
+      "/participant",
+      PARTICIPANT_SUBJECT,
+      PARTICIPANT_EMAIL,
+    ),
+    env,
+    executionContext,
+  );
+  assert.equal(valid.status, 200);
+  const validDocument = await valid.json() as HostedParticipantHomeDocument;
+  assert.equal(validDocument.data.display_name, displayName);
+  assert.equal(validDocument.data.account_email, PARTICIPANT_EMAIL);
+  const validPackage = await worker.fetch(
+    participantRequestFor(
+      "/participant/package",
+      PARTICIPANT_SUBJECT,
+      PARTICIPANT_EMAIL,
+    ),
+    env,
+    executionContext,
+  );
+  assert.equal(validPackage.status, 200);
+  assert.match(await validPackage.text(), /Private package budget content 1/u);
+
+  const changedEmail = await worker.fetch(
+    participantRequestFor(
+      "/participant",
+      PARTICIPANT_SUBJECT,
+      "changed-provider-email@example.test",
+    ),
+    env,
+    executionContext,
+  );
+  assert.equal(changedEmail.status, 404);
+  assert.doesNotMatch(
+    await changedEmail.text(),
+    /Exact email participant|participant@example\.test/u,
+  );
+  const changedEmailPackage = await worker.fetch(
+    participantRequestFor(
+      "/participant/package",
+      PARTICIPANT_SUBJECT,
+      "changed-provider-email@example.test",
+    ),
+    env,
+    executionContext,
+  );
+  assert.equal(changedEmailPackage.status, 404);
+  assert.doesNotMatch(
+    await changedEmailPackage.text(),
+    /Exact email participant|participant@example\.test|Private package budget content/u,
+  );
+});
+
+test("hosted participant request scopes isolate alternating and concurrent subjects", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  const participants = [
+    {
+      subject: "sites-alternating-participant-a",
+      email: "alternating-a@example.test",
+      displayName: "Alternating participant A",
+      operationId: "participant-operation:alternating-a",
+    },
+    {
+      subject: "sites-alternating-participant-b",
+      email: "alternating-b@example.test",
+      displayName: "Alternating participant B",
+      operationId: "participant-operation:alternating-b",
+    },
+  ] as const;
+  for (const participant of participants) {
+    await registerHostedParticipant(
+      service,
+      participant.subject,
+      participant.email,
+      participant.displayName,
+      participant.operationId,
+    );
+  }
+  const worker = hostedPackageWorker(service);
+
+  const assertOwnProfile = async (
+    participant: (typeof participants)[number],
+  ): Promise<void> => {
+    const response = await worker.fetch(
+      participantRequestFor(
+        "/participant",
+        participant.subject,
+        participant.email,
+      ),
+      env,
+      executionContext,
+    );
+    assert.equal(response.status, 200);
+    const document = await response.json() as HostedParticipantHomeDocument;
+    assert.equal(document.data.display_name, participant.displayName);
+    assert.equal(document.data.account_email, participant.email);
+    const other = participants.find(
+      (candidate) => candidate.subject !== participant.subject,
+    );
+    assert(other);
+    assert.equal(JSON.stringify(document).includes(other.displayName), false);
+    assert.equal(JSON.stringify(document).includes(other.email), false);
+  };
+
+  for (const participant of [
+    participants[0],
+    participants[1],
+    participants[0],
+    participants[1],
+  ]) {
+    await assertOwnProfile(participant);
+  }
+  await Promise.all(
+    Array.from(
+      { length: 12 },
+      (_, index) => assertOwnProfile(participants[index % 2]!),
+    ),
+  );
+});
+
 test("participant access reconstructs maximum package history once per request", async () => {
   const service = new SyntheticAittaDBService();
   await registerHostedParticipant(
@@ -2077,6 +2214,13 @@ type TestAcknowledgmentDocument = Readonly<{
   actions: readonly TestAction[];
 }>;
 
+type HostedParticipantHomeDocument = Readonly<{
+  data: Readonly<{
+    display_name: string;
+    account_email: string;
+  }>;
+}>;
+
 type ParticipantAcknowledgmentResponse = Readonly<{
   document: TestAcknowledgmentDocument;
   csrfToken: string | null;
@@ -2172,11 +2316,23 @@ function ownerRequest(pathname: string): Request {
 }
 
 function participantRequest(pathname: string): Request {
+  return participantRequestFor(
+    pathname,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+  );
+}
+
+function participantRequestFor(
+  pathname: string,
+  subject: string,
+  email: string,
+): Request {
   return new Request(`${APP_ORIGIN}${pathname}`, {
     headers: {
       accept: "application/json",
-      "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
-      "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+      "oai-authenticated-user-id": subject,
+      "oai-authenticated-user-email": email,
     },
   });
 }

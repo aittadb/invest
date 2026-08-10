@@ -177,7 +177,10 @@ test("an authorized participant receives equivalent root HTML and JSON capabilit
     "oai-authenticated-user-id": "participant-subject",
     "oai-authenticated-user-email": "participant@example.com",
   };
-  const state = participantState("participant-subject");
+  const state = participantState(
+    "participant-subject",
+    "participant@example.com",
+  );
 
   const html = await (
     await render(
@@ -225,7 +228,10 @@ test("participant home and package status negotiate from the same authorized sta
     "oai-authenticated-user-id": "participant-subject",
     "oai-authenticated-user-email": "participant@example.com",
   };
-  const state = participantState("participant-subject");
+  const state = participantState(
+    "participant-subject",
+    "participant@example.com",
+  );
 
   const homeHtmlResponse = await render(
     participantHeaders,
@@ -304,7 +310,10 @@ test("signed-out, foreign, and missing participant state disclose no private cap
     "oai-authenticated-user-id": "participant-subject",
     "oai-authenticated-user-email": "participant@example.com",
   };
-  for (const state of [participantState("foreign-subject"), null]) {
+  for (const state of [
+    participantState("foreign-subject", "foreign@example.com"),
+    null,
+  ]) {
     const rootHtml = await (
       await render(
         actorHeaders,
@@ -374,7 +383,7 @@ test("owner and participant capabilities coexist without conflating roles", asyn
     "oai-authenticated-user-id": "owner-subject",
     "oai-authenticated-user-email": "owner@example.com",
   };
-  const state = participantState("owner-subject");
+  const state = participantState("owner-subject", "owner@example.com");
   const html = await (
     await render(
       headers,
@@ -547,10 +556,11 @@ test("absent, invalid, and unpublished campaign configuration stays generic", as
   }
 });
 
-function participantState(subject) {
+function participantState(subject, accountEmailLabel) {
   return {
     profile: {
       subject,
+      accountEmailLabel,
       displayName: "Private Participant",
       declaredInterest: "both",
       participationContext: "company",

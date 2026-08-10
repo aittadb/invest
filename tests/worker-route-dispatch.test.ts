@@ -31,7 +31,6 @@ import {
   type ParticipantAuthorizationState,
 } from "../domain/participant-home-resource.ts";
 import {
-  parseActorSubject,
   parseStableId,
   parseTimestamp,
 } from "../domain/foundation.ts";
@@ -513,7 +512,10 @@ test("an injected public campaign reader controls the public resource and fails 
 
 test("the Worker resolves participant state from the trusted actor and replaces spoofed state", async () => {
   const renderedRequests: Request[] = [];
-  const state = participantAuthorizationState("participant-subject");
+  const state = participantAuthorizationState(
+    "participant-subject",
+    "participant@example.com",
+  );
   const worker = createApplicationWorker({
     fetchApplication: async (request) => {
       renderedRequests.push(request);
@@ -643,7 +645,7 @@ function participantAccess(userId: string, email: string) {
   assert(account.ok);
   const access = authorizeParticipantAccess(
     account.value,
-    participantAuthorizationState(userId),
+    participantAuthorizationState(userId, email),
   );
   assert(access);
   return access;
@@ -651,17 +653,22 @@ function participantAccess(userId: string, email: string) {
 
 function participantAuthorizationState(
   userId: string,
+  email: string,
 ): ParticipantAuthorizationState {
-  const subject = parseActorSubject(userId);
+  const account = parseParticipantAccount({
+    subject: userId,
+    accountEmailLabel: email,
+  });
   const id = parseStableId<"package-version">("package-version:current");
   const createdAt = parseTimestamp("2026-08-09T09:00:00.000Z");
-  assert(subject.ok);
+  assert(account.ok);
   assert(id.ok);
   assert(createdAt.ok);
 
   return {
     profile: {
-      subject: subject.value,
+      subject: account.value.subject,
+      accountEmailLabel: account.value.accountEmailLabel,
       displayName: "Private Participant Name",
       declaredInterest: "both",
       participationContext: "company",
