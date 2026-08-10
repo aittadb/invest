@@ -37,6 +37,7 @@ import type { PublicCampaignPresentationReader } from "../repositories/in-memory
 import type { ParticipantRequestRepositoryScope } from "../repositories/storage-application-repository-factory.ts";
 import type { ParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
 import {
+  StorageFailure,
   parseStorageOperationId,
   type StorageOperationId,
 } from "../domain/storage-adapter.ts";
@@ -436,47 +437,43 @@ async function runtimeParticipantFounderInterestRoute(
   pathname: string,
   participantRequest: ParticipantRequestRepositoryScope | null,
 ): Promise<FounderInterestRouteDependencies | null> {
+  const exactFounderResource = pathname === FOUNDER_INTEREST_PATH;
   if (
     runtime === null ||
+    (pathname !== "/participant" && !exactFounderResource)
+  ) {
+    return null;
+  }
+  const unavailableRoute = exactFounderResource
+    ? unavailableFounderInterestRoute()
+    : null;
+  if (
     actor === null ||
     isOwner ||
-    pathname !== FOUNDER_INTEREST_PATH ||
     participantAccess === null ||
     participantAccess.subject !== actor.userId ||
     !participantWorkflowAccess(participantAccess, { founderInterest: true })
       .founderInterest
   ) {
-    return null;
+    return unavailableRoute;
   }
 
   const account = parseParticipantAccount({
     subject: actor.userId,
     accountEmailLabel: actor.email,
   });
-  if (!account.ok) return null;
+  if (!account.ok) return unavailableRoute;
 
   try {
     const repositories = runtime.repositoryFactory;
     const campaign = await repositories.campaignRepository().readSetup();
-    if (campaign === null) return null;
-    const contributionAreaChoices =
-      campaign.setup.campaignPolicy.founderContributionChoices;
-    if (contributionAreaChoices.length === 0) return null;
+    const contributionAreaChoices = campaign?.setup.campaignPolicy
+      .founderContributionChoices ?? Object.freeze([]);
 
     const founder = requiredParticipantRequest(participantRequest)
       .participantFounderApplications(
       contributionAreaChoices,
     );
-    const participant = await founder.participant.current();
-    if (
-      participant === null ||
-      !profilePermitsFounder(
-        participant.snapshot,
-        account.value.subject,
-      )
-    ) {
-      return null;
-    }
 
     const appOrigin = new URL(resourceUrl).origin;
     const identity = Object.freeze({
@@ -522,8 +519,20 @@ async function runtimeParticipantFounderInterestRoute(
       createOperationId: () => randomOperationId("founder-operation"),
     });
   } catch {
-    return null;
+    return unavailableRoute;
   }
+}
+
+function unavailableFounderInterestRoute(): FounderInterestRouteDependencies {
+  return Object.freeze({
+    serviceFor() {
+      throw new StorageFailure("NOT_FOUND");
+    },
+    async verifyMutation() {
+      throw new StorageFailure("NOT_FOUND");
+    },
+    csrfTokenFor: () => null,
+  });
 }
 
 async function founderCreationAllowed(
@@ -538,6 +547,7 @@ async function founderCreationAllowed(
   ]);
   if (
     campaign === null ||
+    expectedChoices.length === 0 ||
     currentParticipant === null ||
     !profilePermitsFounder(currentParticipant.snapshot, subject) ||
     campaign.setup.publicCampaign.published !== true ||

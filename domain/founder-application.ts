@@ -108,13 +108,35 @@ export type IndependentParticipationRecords<InvestmentRecord> = Readonly<{
   investmentRecords: readonly InvestmentRecord[];
 }>;
 
+/**
+ * Founder history is returned as one bounded resource. Reserve the final
+ * transition for withdrawal so every received application can still be
+ * withdrawn after the maximum supported number of edits.
+ */
+export const MAX_FOUNDER_APPLICATION_REVISIONS = 16;
+
+export function canEditFounderApplication(
+  application: FounderApplication,
+): application is ReceivedFounderApplication {
+  return application.status === "received" &&
+    application.revision < MAX_FOUNDER_APPLICATION_REVISIONS - 1;
+}
+
+export function canWithdrawFounderApplication(
+  application: FounderApplication,
+): application is ReceivedFounderApplication {
+  return application.status === "received" &&
+    application.revision < MAX_FOUNDER_APPLICATION_REVISIONS;
+}
+
 const MAX_CONTRIBUTION_AREA_CHOICES = 64;
 const MAX_CONTRIBUTION_AREA_LABEL_LENGTH = 120;
-const MAX_SECONDARY_CONTRIBUTION_AREAS = 16;
+export const MAX_SECONDARY_CONTRIBUTION_AREAS = 16;
 const MAX_LONG_TEXT_LENGTH = 4_000;
 const MAX_SHORT_TEXT_LENGTH = 500;
 const MAX_PROFILE_LINKS = 8;
 const MAX_PROFILE_LINK_LENGTH = 2_048;
+const MAX_CANONICAL_PROFILE_LINK_LENGTH = MAX_PROFILE_LINK_LENGTH * 9;
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
 
@@ -359,7 +381,7 @@ function parseProfessionalProfileLinks(
 
   for (const [index, candidate] of value.entries()) {
     const path = `fields.professionalProfileLinks[${index}]`;
-    if (typeof candidate !== "string" || candidate.length > MAX_PROFILE_LINK_LENGTH) {
+    if (typeof candidate !== "string") {
       return invalid({ code: "invalid_format", path });
     }
 
@@ -375,6 +397,8 @@ function parseProfessionalProfileLinks(
       parsed.hostname.length === 0 ||
       parsed.username.length > 0 ||
       parsed.password.length > 0 ||
+      parsed.href.length > MAX_CANONICAL_PROFILE_LINK_LENGTH ||
+      (candidate.length > MAX_PROFILE_LINK_LENGTH && candidate !== parsed.href) ||
       seenLinks.has(parsed.href)
     ) {
       return invalid({ code: "invalid_format", path });
@@ -600,7 +624,7 @@ export function editFounderApplication(
   value: unknown,
   contributionAreaChoices: readonly ContributionAreaChoice[],
 ): ValidationResult<ReceivedFounderApplication> {
-  if (application.status !== "received") {
+  if (!canEditFounderApplication(application)) {
     return invalid({ code: "invalid_rule", path: "status" });
   }
 
@@ -670,7 +694,7 @@ export function withdrawFounderApplication(
   application: FounderApplication,
   value: unknown,
 ): ValidationResult<WithdrawnFounderApplication> {
-  if (application.status !== "received") {
+  if (!canWithdrawFounderApplication(application)) {
     return invalid({ code: "invalid_rule", path: "status" });
   }
 

@@ -262,7 +262,7 @@ function requiredContributionAreaChoices(
   value: unknown,
 ): readonly ContributionAreaChoice[] {
   const parsed = parseContributionAreaChoices(value);
-  if (!parsed.ok || parsed.value.length < 1) invalidConfiguration();
+  if (!parsed.ok) invalidConfiguration();
   return parsed.value;
 }
 

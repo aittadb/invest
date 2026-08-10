@@ -13,9 +13,13 @@ import {
 import {
   MUTATION_CSRF_FIELD,
   MUTATION_CSRF_HEADER,
+  MUTATION_METHOD_FIELD,
   MutationSecurityFailure,
 } from "../http/mutation-security.ts";
-import { OWNER_PACKAGE_WORKSPACE_HEADER } from "../http/runtime-capabilities.ts";
+import {
+  OWNER_PACKAGE_WORKSPACE_HEADER,
+  PARTICIPANT_FOUNDER_INTEREST_HEADER,
+} from "../http/runtime-capabilities.ts";
 import type { OwnerPackageDocument } from "../domain/owner-package-resource.ts";
 import {
   FOUNDER_INTEREST_PATH,
@@ -55,6 +59,9 @@ import type {
   WorkerExecutionContext,
 } from "../worker/contracts.ts";
 import { createHostedApplicationRuntimeResolver } from "../worker/hosted-application-composition.ts";
+import {
+  MAX_FOUNDER_INTEREST_MUTATION_FIELDS,
+} from "../worker/routes/founder-interest.ts";
 import {
   MAX_OWNER_PACKAGE_MUTATION_BYTES,
   MAX_OWNER_PACKAGE_MUTATION_FIELDS,
@@ -967,6 +974,123 @@ test("request-scoped cache rejects over-limit hosted ancestry like a fresh reade
   assert.equal(freshReads.count(), 33);
 });
 
+test("hosted participant home discovers founder access without reading application state", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-discovery",
+    { declaredInterest: "founder" },
+  );
+
+  const privateNote = "PRIVATE FOUNDER DISCOVERY STATE";
+  const seedWorker = hostedPackageWorker(service);
+  const seedProof = await founderResource(seedWorker, env);
+  const seedAction = requiredAction(
+    seedProof.document,
+    "create-founder-application",
+  );
+  assert.equal(
+    (await submitFounderMutation(
+      seedWorker,
+      env,
+      seedProof,
+      "POST",
+      actionBody(seedAction, founderFields({ note: privateNote })),
+    )).status,
+    201,
+  );
+
+  const readsBefore = service.readCollections.length;
+  const worker = hostedPackageWorker(service);
+  const response = await worker.fetch(
+    participantRequest("/participant"),
+    env,
+    executionContext,
+  );
+  assert.equal(response.status, 200);
+  const document = await response.json() as Readonly<{
+    links: readonly Readonly<{ rel: readonly string[]; href: string }>[];
+  }>;
+  assert.doesNotMatch(JSON.stringify(document), new RegExp(privateNote, "u"));
+  assert.ok(document.links.some((link) =>
+    link.rel.includes("founder-interest") &&
+    link.href === `${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`
+  ));
+  assert.deepEqual(
+    service.readCollections.slice(readsBefore).filter((collection) =>
+      collection.startsWith("founder-application")
+    ),
+    [],
+  );
+
+  const rendered: Request[] = [];
+  const htmlWorker = createApplicationWorker({
+    fetchApplication: async (request) => {
+      rendered.push(request);
+      return new Response("participant application");
+    },
+    fetchOptimizedImage: async () => new Response("image"),
+    resolveApplicationRuntime: createHostedApplicationRuntimeResolver({
+      fetch: service.fetch,
+      now: () => NOW,
+    }),
+  });
+  const htmlHome = await htmlWorker.fetch(
+    new Request(`${APP_ORIGIN}/participant`, {
+      headers: {
+        accept: "text/html",
+        "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+        "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(htmlHome.status, 200);
+  assert.equal(
+    rendered[0]?.headers.get(PARTICIPANT_FOUNDER_INTEREST_HEADER),
+    "available",
+  );
+
+  for (const accept of ["application/json", "text/html"]) {
+    const anonymous = await hostedPackageWorker(service).fetch(
+      new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+        headers: { accept },
+      }),
+      env,
+      executionContext,
+    );
+    assert.equal(anonymous.status, 401);
+  }
+  const unsupported = await hostedPackageWorker(service).fetch(
+    new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+      headers: {
+        accept: "application/vnd.aittadb-invest+json; version=99.0",
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(unsupported.status, 406);
+  const unauthorized = await hostedPackageWorker(service).fetch(
+    new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+      headers: {
+        accept: "application/json",
+        "oai-authenticated-user-id": "sites-unregistered-founder",
+        "oai-authenticated-user-email": "unregistered@example.test",
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(unauthorized.status, 404);
+});
+
 test("hosted founder applications persist their complete lifecycle across workers", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
@@ -1154,6 +1278,231 @@ test("hosted founder creation rechecks campaign policy after action discovery", 
   assert.deepEqual(actionNames(closed.document), []);
 });
 
+test("hosted founder history and exact retries survive contribution choice evolution", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-choice-evolution",
+    { declaredInterest: "founder" },
+  );
+  const worker = hostedPackageWorker(service);
+  const initial = await founderResource(worker, env);
+  const createBody = actionBody(
+    requiredAction(initial.document, "create-founder-application"),
+    founderFields(),
+  );
+  assert.equal(
+    (await submitFounderMutation(worker, env, initial, "POST", createBody)).status,
+    201,
+  );
+
+  const evolvedChoices = [
+    { id: "area:commercial", label: "Commercial" },
+    { id: "area:delivery", label: "Delivery" },
+  ] as const;
+  await configureHostedFounderCampaign(service, "open", evolvedChoices);
+  const reopened = await founderResource(hostedPackageWorker(service), env);
+  assert.equal(
+    reopened.document.data.history[0]?.fields.primary_contribution_area_id,
+    "area:engineering",
+  );
+
+  const replay = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    reopened,
+    "POST",
+    createBody,
+  );
+  assert.equal(replay.status, 200);
+  assert.equal(
+    (await replay.json() as FounderInterestDocument).data.history.length,
+    1,
+  );
+
+  const invalidProof = await founderResource(hostedPackageWorker(service), env);
+  const invalidAction = requiredAction(
+    invalidProof.document,
+    "edit-founder-application",
+  );
+  const removedChoice = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    invalidProof,
+    "PATCH",
+    actionBody(invalidAction, founderFields({
+      "operation-id": "founder-operation:removed-choice",
+      "expected-revision": 1,
+    })),
+  );
+  assert.equal(removedChoice.status, 400);
+
+  const currentProof = await founderResource(hostedPackageWorker(service), env);
+  const currentAction = requiredAction(
+    currentProof.document,
+    "edit-founder-application",
+  );
+  const currentChoice = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    currentProof,
+    "PATCH",
+    actionBody(currentAction, founderFields({
+      "operation-id": "founder-operation:current-choice",
+      "expected-revision": 1,
+      "primary-contribution-area-id": "area:commercial",
+      [FOUNDER_SECONDARY_AREAS_FIELD]: ["area:delivery"],
+    })),
+  );
+  assert.equal(currentChoice.status, 200);
+  const edited = await currentChoice.json() as FounderInterestDocument;
+  assert.deepEqual(
+    edited.data.history.map((entry) => entry.fields.primary_contribution_area_id),
+    ["area:engineering", "area:commercial"],
+  );
+});
+
+test("hosted maximum founder payloads remain bounded across restart, retry, edit, and withdrawal", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  const choices = maximumHostedContributionChoices();
+  await configureHostedFounderCampaign(service, "open", choices);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:maximum-founder-storage",
+    { declaredInterest: "founder" },
+  );
+  const worker = hostedPackageWorker(service);
+  const initial = await founderResource(worker, env);
+  const createBody = actionBody(
+    requiredAction(initial.document, "create-founder-application"),
+    maximumHostedFounderFields("\u0800"),
+  );
+  assert.equal(
+    (await submitFounderMutation(worker, env, initial, "POST", createBody)).status,
+    201,
+  );
+
+  const restarted = await founderResource(hostedPackageWorker(service), env);
+  assert.equal(restarted.document.data.revision, 1);
+  const replay = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    restarted,
+    "POST",
+    createBody,
+  );
+  assert.equal(replay.status, 200);
+
+  const editProof = await founderResource(hostedPackageWorker(service), env);
+  const editBody = actionBody(
+    requiredAction(editProof.document, "edit-founder-application"),
+    maximumHostedFounderFields("\u0801", { "expected-revision": 1 }),
+  );
+  assert.equal(
+    (await submitFounderMutation(
+      hostedPackageWorker(service),
+      env,
+      editProof,
+      "PATCH",
+      editBody,
+    )).status,
+    200,
+  );
+
+  const withdrawProof = await founderResource(hostedPackageWorker(service), env);
+  assert.equal(
+    (await submitFounderMutation(
+      hostedPackageWorker(service),
+      env,
+      withdrawProof,
+      "DELETE",
+      actionBody(
+        requiredAction(withdrawProof.document, "withdraw-founder-application"),
+        { "confirm-withdrawal": true },
+      ),
+    )).status,
+    200,
+  );
+  assert.ok(recordsIn(service, "founder-application-fields").length > 2);
+  assert.ok(service.maximumRecordBytesSeen <= MAX_HOSTED_RECORD_BYTES);
+  assert.ok(
+    service.maximumTransactionMutationsSeen <= MAX_HOSTED_TRANSACTION_MUTATIONS,
+  );
+  assert.ok(
+    service.maximumTransactionBytesSeen <= MAX_HOSTED_TRANSACTION_BYTES,
+  );
+  for (const record of [
+    ...recordsIn(service, "founder-applications"),
+    ...recordsIn(service, "founder-application-history"),
+  ]) {
+    assert.equal(Object.hasOwn(record.value, "application"), false);
+    assert.equal(Object.hasOwn(record.value, "history"), false);
+    assert.ok(JSON.stringify(record.value).length < 4_096);
+  }
+});
+
+test("hosted HTML founder create and edit accept all valid repeated fields", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  const choices = maximumHostedContributionChoices();
+  await configureHostedFounderCampaign(service, "open", choices);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:maximum-founder-form",
+    { declaredInterest: "founder" },
+  );
+  assert.equal(MAX_FOUNDER_INTEREST_MUTATION_FIELDS, 28);
+
+  const createProof = await founderHtmlResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  const createEntries = maximumFounderFormEntries(
+    createProof.csrfToken,
+    "founder-operation:maximum-form-create",
+  );
+  assert.equal(createEntries.length, 26);
+  const created = await submitFounderHtmlMutation(
+    hostedPackageWorker(service),
+    env,
+    createProof.cookie,
+    createEntries,
+  );
+  assert.equal(created.status, 201);
+  assert.match(await created.text(), /Revision 1/u);
+
+  const editProof = await founderHtmlResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  const editEntries = maximumFounderFormEntries(
+    editProof.csrfToken,
+    "founder-operation:maximum-form-edit",
+    1,
+  );
+  assert.equal(editEntries.length, MAX_FOUNDER_INTEREST_MUTATION_FIELDS);
+  const edited = await submitFounderHtmlMutation(
+    hostedPackageWorker(service),
+    env,
+    editProof.cookie,
+    editEntries,
+  );
+  assert.equal(edited.status, 200);
+  assert.match(await edited.text(), /Revision 2/u);
+});
+
 test("hosted founder state and mutation proofs remain participant-bound", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
@@ -1204,18 +1553,18 @@ test("hosted founder state and mutation proofs remain participant-bound", async 
   assert.equal(foreign.document.data.status, "not_submitted");
   assert.doesNotMatch(JSON.stringify(foreign.document), new RegExp(privateNote, "u"));
 
-  for (const request of [
-    new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+  for (const [request, expectedStatus] of [
+    [new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
       headers: { accept: "application/json" },
-    }),
-    ownerRequest(FOUNDER_INTEREST_PATH),
-  ]) {
+    }), 401],
+    [ownerRequest(FOUNDER_INTEREST_PATH), 404],
+  ] as const) {
     const response = await hostedPackageWorker(service).fetch(
       request,
       env,
       executionContext,
     );
-    assert.equal(response.status, 404);
+    assert.equal(response.status, expectedStatus);
     assert.doesNotMatch(await response.text(), new RegExp(privateNote, "u"));
   }
 
@@ -1883,6 +2232,7 @@ class SyntheticAittaDBService {
   tokenRequests = 0;
   discoveryRequests = 0;
   readRequests = 0;
+  readonly readCollections: string[] = [];
   transactionRequests = 0;
   maximumRecordBytesSeen = 0;
   maximumTransactionMutationsSeen = 0;
@@ -1953,6 +2303,7 @@ class SyntheticAittaDBService {
       this.readRequests += 1;
       const collection = decodeURIComponent(read[1] ?? "");
       const id = decodeURIComponent(read[2] ?? "");
+      this.readCollections.push(collection);
       const record = this.records.get(`${collection}/${id}`);
       return record === undefined
         ? protocolFailure("not_found")
@@ -2406,6 +2757,10 @@ async function registerHostedParticipant(
 async function configureHostedFounderCampaign(
   service: SyntheticAittaDBService,
   phaseState: "closed" | "open" = "open",
+  founderContributionChoices?: readonly Readonly<{
+    id: string;
+    label: string;
+  }>[],
 ): Promise<void> {
   const repository = new StorageCampaignRepository(hostedStorageAdapter(service));
   const current = await repository.readSetup();
@@ -2416,7 +2771,17 @@ async function configureHostedFounderCampaign(
     }`,
     expectedRevision,
     recordedAt: "2026-08-10T10:30:00.000Z",
-    setup: explicitCampaignSetup({ phaseState }),
+    setup: {
+      ...explicitCampaignSetup({ phaseState }),
+      ...(founderContributionChoices === undefined
+        ? {}
+        : {
+            campaignPolicy: {
+              ...explicitCampaignSetup({ phaseState }).campaignPolicy,
+              founderContributionChoices,
+            },
+          }),
+    },
   });
   assert.equal(result.setup.phases[0]?.state, phaseState);
 }
@@ -2540,6 +2905,124 @@ function founderFields(
     note: "Initial hosted founder note.",
     ...overrides,
   });
+}
+
+function maximumHostedContributionChoices() {
+  return Object.freeze(Array.from({ length: 17 }, (_, index) => Object.freeze({
+    id: `area:${index}`,
+    label: `Area ${index}`,
+  })));
+}
+
+function maximumHostedFounderFields(
+  character: string,
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> {
+  const profileLinks = Array.from({ length: 8 }, (_, index) => {
+    const prefix = `https://profiles.invalid/${index}/`;
+    return `${prefix}${character.repeat(2_048 - prefix.length)}`;
+  });
+  return founderFields({
+    "expertise-summary": character.repeat(4_000),
+    "intended-contribution": character.repeat(4_000),
+    "primary-contribution-area-id": "area:0",
+    [FOUNDER_SECONDARY_AREAS_FIELD]: Array.from(
+      { length: 16 },
+      (_, index) => `area:${index + 1}`,
+    ),
+    "approximate-availability": character.repeat(500),
+    "possible-start-timing": character.repeat(500),
+    "compensation-expectation": character.repeat(500),
+    "professional-profile-links": profileLinks.join("\n"),
+    note: character.repeat(4_000),
+    ...overrides,
+  });
+}
+
+type FounderHtmlProof = Readonly<{
+  csrfToken: string;
+  cookie: string;
+}>;
+
+async function founderHtmlResource(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+): Promise<FounderHtmlProof> {
+  const response = await worker.fetch(
+    new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+      headers: {
+        accept: "text/html",
+        "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+        "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  const csrfToken = /name="_csrf" type="hidden" value="([^"]+)"/u.exec(html)?.[1];
+  const setCookie = response.headers.get("set-cookie");
+  assert(csrfToken);
+  assert(setCookie);
+  return Object.freeze({
+    csrfToken,
+    cookie: cookieHeader(setCookie),
+  });
+}
+
+function maximumFounderFormEntries(
+  csrfToken: string,
+  operationId: string,
+  expectedRevision?: number,
+): readonly (readonly [string, string])[] {
+  return Object.freeze([
+    [MUTATION_CSRF_FIELD, csrfToken] as const,
+    ...(expectedRevision === undefined
+      ? []
+      : [
+          [MUTATION_METHOD_FIELD, "PATCH"] as const,
+          ["expected-revision", String(expectedRevision)] as const,
+        ]),
+    ["operation-id", operationId] as const,
+    ["expertise-summary", "Maximum valid form expertise."] as const,
+    ["intended-contribution", "Maximum valid form contribution."] as const,
+    ["primary-contribution-area-id", "area:0"] as const,
+    ...Array.from({ length: 16 }, (_, index) =>
+      [FOUNDER_SECONDARY_AREAS_FIELD, `area:${index + 1}`] as const
+    ),
+    ["approximate-availability", "Three days each week."] as const,
+    ["possible-start-timing", "After mutual confirmation."] as const,
+    ["compensation-expectation", "Open to discussion."] as const,
+    ["professional-profile-links", "https://profiles.invalid/founder"] as const,
+    ["note", "All repeated fields are present."] as const,
+  ]);
+}
+
+async function submitFounderHtmlMutation(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  cookie: string,
+  entries: readonly (readonly [string, string])[],
+): Promise<Response> {
+  const body = new URLSearchParams();
+  for (const [name, value] of entries) body.append(name, value);
+  return worker.fetch(
+    new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+      method: "POST",
+      headers: {
+        accept: "text/html",
+        "content-type": "application/x-www-form-urlencoded",
+        cookie,
+        origin: APP_ORIGIN,
+        "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+        "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+      },
+      body,
+    }),
+    env,
+    executionContext,
+  );
 }
 
 async function ownerWorkspace(

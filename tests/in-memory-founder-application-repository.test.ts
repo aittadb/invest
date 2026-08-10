@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  MAX_FOUNDER_APPLICATION_REVISIONS,
   parseContributionAreaChoices,
   type ContributionAreaChoice,
   type FounderApplicationId,
@@ -30,6 +31,11 @@ import {
 import {
   DevelopmentInMemoryFounderApplicationReviewRepository,
   DevelopmentInMemoryFounderApplicationRepository,
+  MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS,
+  MAX_FOUNDER_APPLICATION_STORAGE_READS,
+  MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES,
+  MAX_FOUNDER_APPLICATION_STORAGE_TRANSACTION_BYTES,
+  MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS,
   type CreateFounderApplicationRequest,
   type EditFounderApplicationRequest,
   type FounderApplicationRepository,
@@ -290,20 +296,18 @@ test("current records are checked against immutable adapter history", async () =
     fields: fields({ note: "Current note." }),
   }));
 
-  const currentEntry = [...state.records.entries()].find(([, record]) =>
-    record.key.collection === "founder-applications"
+  const historyEntry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "founder-application-history" &&
+    record.value.revision === 1
   );
-  assert.notEqual(currentEntry, undefined);
-  if (currentEntry === undefined) return;
-  const [key, current] = currentEntry;
-  const corrupted = cloneDocument(current.value) as MutableRecord;
-  const application = mutableRecord(corrupted.application);
-  const history = application.history as MutableRecord[];
-  const firstFields = mutableRecord(history[0]?.fields);
-  firstFields.note = "Consistently rewritten prior history.";
+  assert.notEqual(historyEntry, undefined);
+  if (historyEntry === undefined) return;
+  const [key, history] = historyEntry;
+  const corrupted = cloneDocument(history.value) as MutableRecord;
+  corrupted.operationFingerprint = `sha256:${"0".repeat(64)}`;
   state.records.set(key, freezeRecord({
-    key: current.key,
-    revision: current.revision,
+    key: history.key,
+    revision: history.revision,
     value: corrupted as StorageDocument,
   }));
 
@@ -336,7 +340,238 @@ test("concurrent exact creates recover one immutable server-timed result", async
     [false, true],
   );
   assert.equal(state.operations.size, 1);
-  assert.equal(state.records.size, 2);
+  assert.equal(
+    state.records.size,
+    2 + recordsIn(state, "founder-application-fields").length,
+  );
+});
+
+test("maximum founder payloads stay within hosted record, transaction, restart, and retry budgets", async () => {
+  const state = new MemoryStorageState();
+  const observed = new ObservedStorageAdapter(
+    new DeterministicMemoryStorageAdapter(state, true),
+  );
+  const configuredChoices = maximumContributionAreaChoices();
+  const owner = repository(observed, ALICE_SUBJECT, configuredChoices);
+  const create = {
+    operationId: "founder-operation:maximum-create",
+    expectedRevision: null,
+    id: APPLICATION_ID,
+    occurredAt: "2026-08-10T10:00:00.000Z",
+    historyEntryId: "founder-history:maximum-create",
+    fields: maximumFields("\u0800"),
+  } satisfies CreateFounderApplicationRequest;
+
+  const created = await owner.create(create);
+  assert.equal(created.revision, 1);
+  assert.ok(recordsIn(state, "founder-application-fields").length > 1);
+  assert.ok(
+    observed.maximumRecordBytes <=
+      MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES,
+  );
+  assert.ok(
+    observed.maximumTransactionBytes <=
+      MAX_FOUNDER_APPLICATION_STORAGE_TRANSACTION_BYTES,
+  );
+  assert.ok(
+    observed.maximumTransactionMutations <=
+      2 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS,
+  );
+
+  observed.resetReads();
+  assert.deepEqual(
+    await repository(observed, ALICE_SUBJECT, configuredChoices).get(
+      APPLICATION_ID,
+    ),
+    created.snapshot,
+  );
+  assert.ok(observed.reads <= MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS);
+
+  const replay = await repository(
+    observed,
+    ALICE_SUBJECT,
+    configuredChoices,
+  ).create({ ...create, occurredAt: "2026-08-10T10:01:00.000Z" });
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.snapshot, created.snapshot);
+
+  const edit = editRequest({
+    operationId: "founder-operation:maximum-edit",
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T11:00:00.000Z",
+    historyEntryId: "founder-history:maximum-edit",
+    fields: maximumFields("\u0801"),
+  });
+  const edited = await repository(
+    observed,
+    ALICE_SUBJECT,
+    configuredChoices,
+  ).edit(edit);
+  const editReplay = await repository(
+    observed,
+    ALICE_SUBJECT,
+    configuredChoices,
+  ).edit({ ...edit, occurredAt: "2026-08-10T11:01:00.000Z" });
+  assert.equal(editReplay.replayed, true);
+  assert.deepEqual(editReplay.snapshot, edited.snapshot);
+
+  const fieldsBeforeWithdrawal = recordsIn(
+    state,
+    "founder-application-fields",
+  ).length;
+  const withdrawn = await repository(
+    observed,
+    ALICE_SUBJECT,
+    configuredChoices,
+  ).withdraw(withdrawRequest({
+    operationId: "founder-operation:maximum-withdraw",
+    expectedRevision: 2,
+    occurredAt: "2026-08-10T12:00:00.000Z",
+    historyEntryId: "founder-history:maximum-withdraw",
+  }));
+  assert.equal(withdrawn.revision, 3);
+  assert.equal(
+    recordsIn(state, "founder-application-fields").length,
+    fieldsBeforeWithdrawal,
+  );
+  assert.deepEqual(
+    await repository(observed, ALICE_SUBJECT, configuredChoices).get(
+      APPLICATION_ID,
+    ),
+    withdrawn.snapshot,
+  );
+
+  for (const record of [
+    ...recordsIn(state, "founder-applications"),
+    ...recordsIn(state, "founder-application-history"),
+  ]) {
+    assert.equal(Object.hasOwn(record.value, "application"), false);
+    assert.equal(Object.hasOwn(record.value, "history"), false);
+    assert.ok(jsonBytes(record.value) < 4_096);
+  }
+});
+
+test("founder ancestry is finite and always reserves the final transition for withdrawal", async () => {
+  const state = new MemoryStorageState();
+  const observed = new ObservedStorageAdapter(
+    new DeterministicMemoryStorageAdapter(state, true),
+  );
+  const owner = repository(observed, ALICE_SUBJECT);
+  await owner.create(createRequest());
+
+  for (let revision = 1; revision < MAX_FOUNDER_APPLICATION_REVISIONS - 1; revision += 1) {
+    await repository(observed, ALICE_SUBJECT).edit(editRequest({
+      operationId: `founder-operation:bounded-edit-${revision}`,
+      expectedRevision: revision,
+      occurredAt: new Date(
+        Date.parse("2026-08-10T10:00:00.000Z") + revision * 60_000,
+      ).toISOString(),
+      historyEntryId: `founder-history:bounded-edit-${revision}`,
+      fields: fields({ note: `Bounded edit ${revision}.` }),
+    }));
+  }
+
+  await rejectsStorage(
+    () => repository(observed, ALICE_SUBJECT).edit(editRequest({
+      operationId: "founder-operation:over-budget-edit",
+      expectedRevision: MAX_FOUNDER_APPLICATION_REVISIONS - 1,
+      occurredAt: "2026-08-10T11:00:00.000Z",
+      historyEntryId: "founder-history:over-budget-edit",
+      fields: fields(),
+    })),
+    "PRECONDITION_FAILED",
+  );
+
+  observed.resetReads();
+  const received = await repository(observed, ALICE_SUBJECT).get(APPLICATION_ID);
+  assert.equal(received?.revision, MAX_FOUNDER_APPLICATION_REVISIONS - 1);
+  assert.ok(observed.reads <= MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS);
+
+  const withdrawn = await repository(observed, ALICE_SUBJECT).withdraw(
+    withdrawRequest({
+      operationId: "founder-operation:bounded-withdraw",
+      expectedRevision: MAX_FOUNDER_APPLICATION_REVISIONS - 1,
+      occurredAt: "2026-08-10T12:00:00.000Z",
+      historyEntryId: "founder-history:bounded-withdraw",
+    }),
+  );
+  assert.equal(withdrawn.revision, MAX_FOUNDER_APPLICATION_REVISIONS);
+  assert.equal(
+    recordsIn(state, "founder-application-history").length,
+    MAX_FOUNDER_APPLICATION_REVISIONS,
+  );
+  assert.equal(
+    recordsIn(state, "founder-application-fields").length,
+    MAX_FOUNDER_APPLICATION_REVISIONS - 1,
+  );
+  assert.equal(state.records.size, MAX_FOUNDER_APPLICATION_REVISIONS * 2);
+  assert.ok(
+    MAX_FOUNDER_APPLICATION_STORAGE_READS >
+      MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS,
+  );
+});
+
+test("persisted founder history survives configured contribution choice evolution", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true);
+  const original = repository(adapter, ALICE_SUBJECT);
+  await original.create(createRequest());
+  const historicalEdit = editRequest({
+    operationId: "founder-operation:historical-choice-edit",
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T11:00:00.000Z",
+    historyEntryId: "founder-history:historical-choice-edit",
+    fields: fields({
+      primaryContributionAreaId: "area:product",
+      secondaryContributionAreaIds: ["area:engineering"],
+    }),
+  });
+  const historical = await original.edit(historicalEdit);
+
+  const evolvedChoices = choices([
+    { id: "area:commercial", label: "Commercial" },
+    { id: "area:delivery", label: "Delivery" },
+  ]);
+  const evolved = repository(adapter, ALICE_SUBJECT, evolvedChoices);
+  assert.deepEqual(await evolved.get(APPLICATION_ID), historical.snapshot);
+
+  const replay = await evolved.edit({
+    ...historicalEdit,
+    occurredAt: "2026-08-10T11:01:00.000Z",
+  });
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.snapshot, historical.snapshot);
+
+  await rejectsStorage(
+    () => evolved.edit(editRequest({
+      operationId: "founder-operation:removed-choice-edit",
+      expectedRevision: 2,
+      occurredAt: "2026-08-10T12:00:00.000Z",
+      historyEntryId: "founder-history:removed-choice-edit",
+      fields: fields(),
+    })),
+    "INVALID_REQUEST",
+  );
+
+  const current = await evolved.edit(editRequest({
+    operationId: "founder-operation:evolved-choice-edit",
+    expectedRevision: 2,
+    occurredAt: "2026-08-10T12:00:00.000Z",
+    historyEntryId: "founder-history:evolved-choice-edit",
+    fields: fields({
+      primaryContributionAreaId: "area:commercial",
+      secondaryContributionAreaIds: ["area:delivery"],
+    }),
+  }));
+  assert.equal(current.revision, 3);
+  assert.equal(
+    current.snapshot.history[1]?.fields.primaryContributionAreaId,
+    "area:product",
+  );
+  assert.equal(
+    current.snapshot.history[2]?.fields.primaryContributionAreaId,
+    "area:commercial",
+  );
 });
 
 test("configured owner can page and inspect opaque founder review records", async () => {
@@ -414,12 +649,54 @@ test("founder repository has no investment-indication dependency", async () => {
 function repository(
   storage: StorageAdapter,
   subject: ActorSubject | null,
+  configuredChoices = contributionAreaChoices,
 ): DevelopmentInMemoryFounderApplicationRepository {
   return new DevelopmentInMemoryFounderApplicationRepository(
     storage,
     subject,
-    contributionAreaChoices,
+    configuredChoices,
   );
+}
+
+function maximumContributionAreaChoices(): readonly ContributionAreaChoice[] {
+  return choices(Array.from({ length: 17 }, (_, index) => ({
+    id: `area:${index}`,
+    label: `Area ${index}`,
+  })));
+}
+
+function maximumFields(character: string) {
+  const profileLinks = Array.from({ length: 8 }, (_, index) => {
+    const prefix = `https://profiles.invalid/${index}/`;
+    return `${prefix}${character.repeat(2_048 - prefix.length)}`;
+  });
+  return fields({
+    expertiseSummary: character.repeat(4_000),
+    intendedContribution: character.repeat(4_000),
+    primaryContributionAreaId: "area:0",
+    secondaryContributionAreaIds: Array.from(
+      { length: 16 },
+      (_, index) => `area:${index + 1}`,
+    ),
+    approximateAvailability: character.repeat(500),
+    possibleStartTiming: character.repeat(500),
+    compensationExpectation: character.repeat(500),
+    professionalProfileLinks: profileLinks,
+    note: character.repeat(4_000),
+  });
+}
+
+function recordsIn(
+  state: MemoryStorageState,
+  collection: string,
+): readonly StorageRecord[] {
+  return [...state.records.values()].filter(
+    (record) => record.key.collection === collection,
+  );
+}
+
+function jsonBytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 function createRequest(): CreateFounderApplicationRequest {
@@ -610,6 +887,55 @@ class DeterministicMemoryStorageAdapter implements StorageAdapter {
   }
 }
 
+class ObservedStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  reads = 0;
+  maximumRecordBytes = 0;
+  maximumTransactionBytes = 0;
+  maximumTransactionMutations = 0;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+  }
+
+  resetReads(): void {
+    this.reads = 0;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    this.reads += 1;
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    this.maximumTransactionBytes = Math.max(
+      this.maximumTransactionBytes,
+      jsonBytes(request),
+    );
+    this.maximumTransactionMutations = Math.max(
+      this.maximumTransactionMutations,
+      request.mutations.length,
+    );
+    for (const mutation of request.mutations) {
+      if (mutation.type !== "put") continue;
+      const bytes = jsonBytes(mutation.value);
+      this.maximumRecordBytes = Math.max(this.maximumRecordBytes, bytes);
+      assert.ok(bytes <= MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES);
+    }
+    assert.ok(
+      jsonBytes(request) <=
+        MAX_FOUNDER_APPLICATION_STORAGE_TRANSACTION_BYTES,
+    );
+    return this.#delegate.transact(request);
+  }
+}
+
 class ConcurrentTransactionStorageAdapter implements StorageAdapter {
   readonly #delegate: StorageAdapter;
   readonly #ready: Promise<void>;
@@ -679,13 +1005,6 @@ function freezeRecord(input: Readonly<{
 }
 
 type MutableRecord = Record<string, unknown>;
-
-function mutableRecord(value: unknown): MutableRecord {
-  assert.equal(typeof value, "object");
-  assert.notEqual(value, null);
-  assert.equal(Array.isArray(value), false);
-  return value as MutableRecord;
-}
 
 function cloneDocument(value: StorageDocument): StorageDocument {
   return JSON.parse(JSON.stringify(value)) as StorageDocument;

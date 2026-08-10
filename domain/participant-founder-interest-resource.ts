@@ -5,6 +5,10 @@ import type {
   FounderApplicationHistoryEntry,
 } from "./founder-application.ts";
 import {
+  canEditFounderApplication,
+  canWithdrawFounderApplication,
+} from "./founder-application.ts";
+import {
   actionWhenAllowed,
   currentActions,
   defineAction,
@@ -23,6 +27,8 @@ import {
 export const FOUNDER_INTEREST_PATH = "/participant/founder-interest";
 export const FOUNDER_SECONDARY_AREAS_FIELD =
   "secondary-contribution-area-ids";
+const MAX_PROFILE_LINK_FORM_LENGTH = 8 * 2_048 + 7;
+const MAX_PROFILE_LINK_FORM_BYTES = 8 * 2_048 * 3 + 7;
 
 export type FounderInterestFieldsData = Readonly<{
   expertise_summary: string;
@@ -87,45 +93,58 @@ export function createFounderInterestCapabilityModel(
   const self = new URL(FOUNDER_INTEREST_PATH, input.requestUrl).href;
   const application = input.application;
   const actions = currentActions(
-    actionWhenAllowed(application === null && input.canCreate, () =>
-      founderFieldsAction(
-        "create-founder-application",
-        "Submit founder application",
-        "POST",
-        self,
-        input.operationIds.create,
-        input.contributionAreaChoices,
-        null,
-      )),
-    actionWhenAllowed(application?.status === "received", () =>
-      founderFieldsAction(
-        "edit-founder-application",
-        "Save application",
-        "PATCH",
-        self,
-        input.operationIds.edit,
-        input.contributionAreaChoices,
-        application?.status === "received" ? application : null,
-      )),
-    actionWhenAllowed(application?.status === "received", () =>
-      defineAction({
-        name: "withdraw-founder-application",
-        title: "Withdraw application",
-        method: "DELETE",
-        href: self,
-        requestMediaType: "application/x-www-form-urlencoded",
-        fields: [
-          operationIdField(input.operationIds.withdraw),
-          expectedRevisionField(application?.revision ?? 1),
-          {
-            name: "confirm-withdrawal",
-            title: "I want to withdraw this application",
-            type: "boolean",
-            location: "body",
-            required: true,
-          },
-        ],
-      })),
+    actionWhenAllowed(
+      application === null &&
+        input.contributionAreaChoices.length > 0 &&
+        input.canCreate,
+      () =>
+        founderFieldsAction(
+          "create-founder-application",
+          "Submit founder application",
+          "POST",
+          self,
+          input.operationIds.create,
+          input.contributionAreaChoices,
+          null,
+        ),
+    ),
+    actionWhenAllowed(
+      application !== null &&
+        input.contributionAreaChoices.length > 0 &&
+        canEditFounderApplication(application),
+      () =>
+        founderFieldsAction(
+          "edit-founder-application",
+          "Save application",
+          "PATCH",
+          self,
+          input.operationIds.edit,
+          input.contributionAreaChoices,
+          application?.status === "received" ? application : null,
+        ),
+    ),
+    actionWhenAllowed(
+      application !== null && canWithdrawFounderApplication(application),
+      () =>
+        defineAction({
+          name: "withdraw-founder-application",
+          title: "Withdraw application",
+          method: "DELETE",
+          href: self,
+          requestMediaType: "application/x-www-form-urlencoded",
+          fields: [
+            operationIdField(input.operationIds.withdraw),
+            expectedRevisionField(application?.revision ?? 1),
+            {
+              name: "confirm-withdrawal",
+              title: "I want to withdraw this application",
+              type: "boolean",
+              location: "body",
+              required: true,
+            },
+          ],
+        }),
+    ),
   );
 
   const actionContracts = Object.freeze([...actions]);
@@ -212,6 +231,22 @@ function founderFields(
     value: choice.id,
     title: choice.label,
   }));
+  const configuredIds = new Set(choices.map((choice) => choice.id));
+  const currentPrimary = current !== null &&
+      configuredIds.has(current.primaryContributionAreaId)
+    ? current.primaryContributionAreaId
+    : null;
+  const currentSecondary = current?.secondaryContributionAreaIds.filter(
+    (id) => configuredIds.has(id),
+  ) ?? [];
+  const currentProfileLinks = current?.professionalProfileLinks.join("\n") ??
+    null;
+  const prefilledProfileLinks = currentProfileLinks !== null &&
+      currentProfileLinks.length <= MAX_PROFILE_LINK_FORM_LENGTH &&
+      new TextEncoder().encode(currentProfileLinks).byteLength <=
+        MAX_PROFILE_LINK_FORM_BYTES
+    ? currentProfileLinks
+    : null;
 
   return [
     requiredMultiline(
@@ -233,8 +268,8 @@ function founderFields(
       location: "body",
       required: true,
       choices: contributionChoices,
-      ...(current
-        ? { value: current.primaryContributionAreaId }
+      ...(currentPrimary !== null
+        ? { value: currentPrimary }
         : {}),
     },
     {
@@ -245,8 +280,8 @@ function founderFields(
       required: false,
       multiple: true,
       choices: contributionChoices,
-      ...(current
-        ? { values: current.secondaryContributionAreaIds }
+      ...(currentSecondary.length > 0
+        ? { values: currentSecondary }
         : {}),
     },
     requiredText(
@@ -275,10 +310,10 @@ function founderFields(
       location: "body",
       required: false,
       minLength: 0,
-      maxLength: 10_000,
-      maxBytes: 40_000,
-      ...(current
-        ? { value: current.professionalProfileLinks.join("\n") }
+      maxLength: MAX_PROFILE_LINK_FORM_LENGTH,
+      maxBytes: MAX_PROFILE_LINK_FORM_BYTES,
+      ...(prefilledProfileLinks !== null
+        ? { value: prefilledProfileLinks }
         : {}),
     },
     {

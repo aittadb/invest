@@ -1,7 +1,8 @@
-import type {
-  ContributionAreaChoice,
-  FounderApplication,
-  FounderApplicationFields,
+import {
+  MAX_SECONDARY_CONTRIBUTION_AREAS,
+  type ContributionAreaChoice,
+  type FounderApplication,
+  type FounderApplicationFields,
 } from "../../domain/founder-application.ts";
 import { parseActorSubject, type ActorSubject } from "../../domain/foundation.ts";
 import {
@@ -53,7 +54,6 @@ const EXPECTED_REVISION_FIELD = "expected-revision";
 const CONFIRM_WITHDRAWAL_FIELD = "confirm-withdrawal";
 
 export const MAX_FOUNDER_INTEREST_MUTATION_BYTES = 262_144;
-export const MAX_FOUNDER_INTEREST_MUTATION_FIELDS = 13;
 
 const FOUNDER_FIELD_NAMES = Object.freeze([
   "expertise-summary",
@@ -66,6 +66,18 @@ const FOUNDER_FIELD_NAMES = Object.freeze([
   "professional-profile-links",
   "note",
 ]);
+const FOUNDER_SINGLE_VALUE_FIELD_COUNT = FOUNDER_FIELD_NAMES.length - 1;
+const FOUNDER_OPERATION_ID_FIELD_COUNT = 1;
+const FOUNDER_EXPECTED_REVISION_FIELD_COUNT = 1;
+const FOUNDER_CSRF_FIELD_COUNT = 1;
+const FOUNDER_METHOD_OVERRIDE_FIELD_COUNT = 1;
+export const MAX_FOUNDER_INTEREST_MUTATION_FIELDS =
+  FOUNDER_SINGLE_VALUE_FIELD_COUNT +
+  MAX_SECONDARY_CONTRIBUTION_AREAS +
+  FOUNDER_OPERATION_ID_FIELD_COUNT +
+  FOUNDER_EXPECTED_REVISION_FIELD_COUNT +
+  FOUNDER_CSRF_FIELD_COUNT +
+  FOUNDER_METHOD_OVERRIDE_FIELD_COUNT;
 
 export type FounderInterestCsrfTokenProvider = (
   request: Request,
@@ -180,6 +192,13 @@ export function createFounderInterestRouteHandler(
         status: response.status,
         headers,
       });
+    }
+
+    if (context.actor === null) {
+      return errorResponse(
+        authenticationRequiredError(context.resourceUrl),
+        representation.kind,
+      );
     }
 
     let clearCookie: string | null = null;
@@ -366,7 +385,7 @@ function stringList(value: unknown): readonly string[] {
   if (value === undefined) return Object.freeze([]);
   const values = Array.isArray(value) ? value : [value];
   if (
-    values.length > 16 ||
+    values.length > MAX_SECONDARY_CONTRIBUTION_AREAS ||
     values.some((candidate) => typeof candidate !== "string")
   ) {
     invalidRequest();

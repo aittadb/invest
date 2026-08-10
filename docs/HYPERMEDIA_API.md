@@ -145,12 +145,14 @@ Browser mutation forms also receive a server-generated hidden CSRF proof. The re
 The resource type is `participant-founder-interest`. It links to itself with `self` and to the public campaign with `campaign`. Depending on current state and injected campaign policy, it exposes these actions:
 
 - `create-founder-application` with `POST` when no application exists and creation is allowed;
-- `edit-founder-application` with `PATCH` while the application is received; and
-- `withdraw-founder-application` with `DELETE` while the application is received.
+- `edit-founder-application` with `PATCH` while the application is received, current contribution choices are available, and the bounded edit budget remains; and
+- `withdraw-founder-application` with `DELETE` while the application is received and the reserved withdrawal transition remains.
 
 Create and edit accept bounded expertise, intended contribution, configured primary and secondary contribution areas, availability, start timing, compensation expectation, HTTPS professional-profile links, and an optional note. Every mutation carries a server-issued `operation-id`; edit and withdrawal also carry `expected-revision`, and withdrawal requires explicit confirmation. Form method overrides and CSRF fields are transport values removed before this feature input is parsed.
 
-The route obtains a participant-bound application service from an injected factory. The trusted route or mutation actor selects that factory; body fields cannot select a subject. In the hosted runtime, the exact founder path is available only to an active non-owner profile declaring founder or combined interest. Configured contribution choices come from private campaign setup, while publication, phase, country, profile, and unchanged-choice policy are rechecked immediately before create. A closed phase removes create without preventing an existing application from being read, edited, or withdrawn.
+The route obtains a participant-bound application service from an injected factory. The trusted route or mutation actor selects that factory; body fields cannot select a subject. In the hosted runtime, an eligible active non-owner profile discovers the founder link from `/participant` without loading application state. The exact founder path deliberately negotiates authentication-required for anonymous callers and non-disclosing not-found for unauthorized authenticated callers. Configured contribution choices come from private campaign setup, while publication, phase, country, profile, and unchanged-choice policy are rechecked immediately before create. A closed phase removes create without preventing an existing application from being read, edited when current choices and budget permit, or withdrawn.
+
+Founder history contains at most 16 transitions and reserves its final slot for withdrawal. Historical field payloads retain the contribution-choice IDs under which they were accepted, so configuration changes do not invalidate reads or exact retries. Current choices alone constrain new create and edit submissions; removed historical values remain visible in history but are not advertised as valid edit choices.
 
 HTML and JSON mutations use the same origin-bound, actor-bound, one-use browser proof. The founder route narrows the shared mutation envelope and is the only route that permits repeated `secondary-contribution-area-ids`. Founder mutations call only the subject-bound founder repository, so an account's investment indications and aggregates are neither prerequisites nor side effects.
 

@@ -1,4 +1,7 @@
 import {
+  MAX_FOUNDER_APPLICATION_REVISIONS,
+  canEditFounderApplication,
+  canWithdrawFounderApplication,
   createFounderApplication,
   editFounderApplication,
   parseContributionAreaChoices,
@@ -21,6 +24,7 @@ import {
 } from "../domain/foundation.ts";
 import {
   MAX_STORAGE_PAGE_SIZE,
+  MAX_STORAGE_TRANSACTION_MUTATIONS,
   StorageFailure,
   assertStorageListBoundary,
   parseStorageCollection,
@@ -34,17 +38,81 @@ import {
   type StorageKey,
   type StorageOperationId,
   type StorageRecord,
+  type StorageTransactionRequest,
 } from "../domain/storage-adapter.ts";
 
-const FOUNDER_APPLICATION_SCHEMA_VERSION = 1;
+const FOUNDER_APPLICATION_SCHEMA_VERSION = 2;
 const CURRENT_APPLICATIONS = storageCollection("founder-applications");
 const APPLICATION_HISTORY = storageCollection("founder-application-history");
-const STORED_DOCUMENT_KEYS = new Set([
+const APPLICATION_FIELDS = storageCollection("founder-application-fields");
+
+export const MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES = 65_536;
+export const MAX_FOUNDER_APPLICATION_STORAGE_TRANSACTION_BYTES = 1_048_576;
+export const MAX_SERIALIZED_FOUNDER_APPLICATION_FIELDS_BYTES = 524_288;
+export const FOUNDER_APPLICATION_FIELDS_CHUNK_RAW_BYTES = 45_000;
+export const MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS = Math.ceil(
+  MAX_SERIALIZED_FOUNDER_APPLICATION_FIELDS_BYTES /
+    FOUNDER_APPLICATION_FIELDS_CHUNK_RAW_BYTES,
+);
+export const MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS =
+  1 + MAX_FOUNDER_APPLICATION_REVISIONS *
+    (1 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS);
+export const MAX_FOUNDER_APPLICATION_STORAGE_READS =
+  3 + 2 * MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS;
+
+const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+const CURRENT_DOCUMENT_KEYS = new Set([
   "kind",
   "schemaVersion",
   "operationId",
   "operationFingerprint",
-  "application",
+  "applicationId",
+  "applicantSubject",
+  "status",
+  "createdAt",
+  "updatedAt",
+  "withdrawnAt",
+  "revision",
+  "fields",
+]);
+const TRANSITION_DOCUMENT_KEYS = new Set([
+  "kind",
+  "schemaVersion",
+  "operationId",
+  "operationFingerprint",
+  "applicationId",
+  "applicantSubject",
+  "historyEntryId",
+  "occurredAt",
+  "revision",
+  "transitionKind",
+  "status",
+  "createdAt",
+  "updatedAt",
+  "withdrawnAt",
+  "fields",
+]);
+const FIELDS_REFERENCE_KEYS = new Set([
+  "revision",
+  "hash",
+  "bytes",
+  "chunks",
+]);
+const FIELDS_CHUNK_DOCUMENT_KEYS = new Set([
+  "kind",
+  "schemaVersion",
+  "applicationId",
+  "applicantSubject",
+  "fieldsRevision",
+  "fieldsHash",
+  "fieldsBytes",
+  "chunkIndex",
+  "chunkCount",
+  "data",
+]);
+const FIELDS_PAYLOAD_KEYS = new Set([
+  "contributionAreaIds",
+  "fields",
 ]);
 
 export type FounderApplicationMutationResult<
@@ -118,27 +186,80 @@ export interface FounderApplicationReviewRepository {
   get(reviewId: unknown): Promise<FounderApplicationReviewItem | null>;
 }
 
-type ParsedMutationRequest = Readonly<{
+type MutationKind = "create" | "edit" | "withdraw";
+type TransitionKind = "created" | "edited" | "withdrawn";
+
+type ParsedMutationEnvelope = Readonly<{
   operationId: StorageOperationId;
   id: FounderApplicationId;
   occurredAt: Timestamp;
   historyEntryId: FounderApplicationHistoryEntryId;
   expectedRevision: number | null;
-  fields?: FounderApplicationFields;
+  fields?: unknown;
 }>;
 
-type StoredFounderApplication = Readonly<{
+type ParsedMutationRequest = Omit<ParsedMutationEnvelope, "fields"> &
+  Readonly<{ fields?: FounderApplicationFields }>;
+
+type StoredFieldsReference = Readonly<{
+  revision: number;
+  hash: string;
+  bytes: number;
+  chunks: number;
+}>;
+
+type PreparedFieldsChunk = Readonly<{
+  key: StorageKey;
+  value: StorageDocument;
+}>;
+
+type StoredFields = Readonly<{
+  reference: StoredFieldsReference;
+  fields: FounderApplicationFields;
+  choices: readonly ContributionAreaChoice[];
+  chunks: readonly PreparedFieldsChunk[];
+}>;
+
+type StoredTransition = Readonly<{
   operationId: StorageOperationId;
   operationFingerprint: string;
-  application: FounderApplication;
+  applicationId: FounderApplicationId;
+  applicantSubject: ActorSubject;
+  historyEntryId: FounderApplicationHistoryEntryId;
+  occurredAt: Timestamp;
+  revision: number;
+  transitionKind: TransitionKind;
+  fields: StoredFieldsReference;
   document: StorageDocument;
 }>;
 
-type MutationKind = "create" | "edit" | "withdraw";
+type StoredCurrent = Readonly<{
+  operationId: StorageOperationId;
+  operationFingerprint: string;
+  applicationId: FounderApplicationId;
+  applicantSubject: ActorSubject;
+  revision: number;
+  fields: StoredFieldsReference;
+  document: StorageDocument;
+}>;
+
+type MaterializedApplication = Readonly<{
+  application: FounderApplication;
+  terminal: StoredTransition;
+  fieldsByRevision: ReadonlyMap<number, StoredFields>;
+}>;
+
+type PreparedMutation = Readonly<{
+  application: FounderApplication;
+  currentDocument: StorageDocument;
+  historyDocument: StorageDocument;
+  fieldsChunks: readonly PreparedFieldsChunk[];
+}>;
 
 /**
  * Subject-bound repository composed entirely through a supplied StorageAdapter.
- * A new instance can reopen every record; no application state lives here.
+ * Current and transition records contain only bounded metadata; each create or
+ * edit owns one bounded, chunked fields payload and history grows linearly.
  */
 export class StorageFounderApplicationRepository
   implements FounderApplicationRepository
@@ -168,15 +289,15 @@ export class StorageFounderApplicationRepository
     request: CreateFounderApplicationRequest,
   ): Promise<FounderApplicationMutationResult<ReceivedFounderApplication>> {
     const subject = this.#requiredSubject();
-    const parsed = parseCreateRequest(request, this.#contributionAreaChoices);
-    const fingerprint = await operationFingerprint("create", subject, parsed);
-    const replay = await this.#replayIfKnown(
-      parsed,
-      subject,
-      fingerprint,
-    );
+    const envelope = parseCreateEnvelope(request);
+    const replay = await this.#replayIfKnown("create", envelope, subject);
     if (replay !== null) return receivedResult(replay);
 
+    const parsed = parseRequestFields(
+      envelope,
+      this.#contributionAreaChoices,
+    );
+    const fingerprint = await operationFingerprint("create", subject, parsed);
     const created = createFounderApplication(
       {
         id: parsed.id,
@@ -190,7 +311,13 @@ export class StorageFounderApplicationRepository
     if (!created.ok) invalidRequest();
 
     return receivedResult(
-      await this.#writeSnapshot(created.value, parsed, subject, fingerprint),
+      await this.#writeSnapshot(
+        created.value,
+        parsed,
+        subject,
+        fingerprint,
+        null,
+      ),
     );
   }
 
@@ -198,8 +325,7 @@ export class StorageFounderApplicationRepository
     const subject = this.#applicantSubject;
     if (subject === null) return null;
 
-    const applicationId = requiredApplicationId(id);
-    const stored = await this.#readCurrent(applicationId, subject);
+    const stored = await this.#readCurrent(requiredApplicationId(id), subject);
     return stored?.application ?? null;
   }
 
@@ -207,18 +333,21 @@ export class StorageFounderApplicationRepository
     request: EditFounderApplicationRequest,
   ): Promise<FounderApplicationMutationResult<ReceivedFounderApplication>> {
     const subject = this.#requiredSubject();
-    const parsed = parseEditRequest(request, this.#contributionAreaChoices);
-    const fingerprint = await operationFingerprint("edit", subject, parsed);
-    const replay = await this.#replayIfKnown(
-      parsed,
-      subject,
-      fingerprint,
-    );
+    const envelope = parseEditEnvelope(request);
+    const replay = await this.#replayIfKnown("edit", envelope, subject);
     if (replay !== null) return receivedResult(replay);
 
+    const parsed = parseRequestFields(
+      envelope,
+      this.#contributionAreaChoices,
+    );
+    const fingerprint = await operationFingerprint("edit", subject, parsed);
     const current = await this.#readCurrent(parsed.id, subject);
     if (current === null) notFound();
     requireCurrentRevision(current.application, parsed.expectedRevision);
+    if (!canEditFounderApplication(current.application)) {
+      throw new StorageFailure("PRECONDITION_FAILED");
+    }
 
     const edited = editFounderApplication(
       current.application,
@@ -233,7 +362,13 @@ export class StorageFounderApplicationRepository
     if (!edited.ok) invalidRequest();
 
     return receivedResult(
-      await this.#writeSnapshot(edited.value, parsed, subject, fingerprint),
+      await this.#writeSnapshot(
+        edited.value,
+        parsed,
+        subject,
+        fingerprint,
+        current,
+      ),
     );
   }
 
@@ -241,18 +376,17 @@ export class StorageFounderApplicationRepository
     request: WithdrawFounderApplicationRequest,
   ): Promise<FounderApplicationMutationResult<WithdrawnFounderApplication>> {
     const subject = this.#requiredSubject();
-    const parsed = parseWithdrawRequest(request);
-    const fingerprint = await operationFingerprint("withdraw", subject, parsed);
-    const replay = await this.#replayIfKnown(
-      parsed,
-      subject,
-      fingerprint,
-    );
+    const parsed = parseWithdrawEnvelope(request);
+    const replay = await this.#replayIfKnown("withdraw", parsed, subject);
     if (replay !== null) return withdrawnResult(replay);
 
+    const fingerprint = await operationFingerprint("withdraw", subject, parsed);
     const current = await this.#readCurrent(parsed.id, subject);
     if (current === null) notFound();
     requireCurrentRevision(current.application, parsed.expectedRevision);
+    if (!canWithdrawFounderApplication(current.application)) {
+      throw new StorageFailure("PRECONDITION_FAILED");
+    }
 
     const withdrawn = withdrawFounderApplication(current.application, {
       actorSubject: subject,
@@ -262,7 +396,13 @@ export class StorageFounderApplicationRepository
     if (!withdrawn.ok) invalidRequest();
 
     return withdrawnResult(
-      await this.#writeSnapshot(withdrawn.value, parsed, subject, fingerprint),
+      await this.#writeSnapshot(
+        withdrawn.value,
+        parsed,
+        subject,
+        fingerprint,
+        current,
+      ),
     );
   }
 
@@ -274,73 +414,71 @@ export class StorageFounderApplicationRepository
   async #readCurrent(
     id: FounderApplicationId,
     subject: ActorSubject,
-  ): Promise<StoredFounderApplication | null> {
+  ): Promise<MaterializedApplication | null> {
     const key = await currentApplicationKey(subject, id);
     const record = await this.#storage.read(key);
     if (record === null) return null;
-
-    const stored = await decodeStoredApplication(
-      record,
-      key,
-      "current",
-      subject,
-      id,
-      null,
-      this.#contributionAreaChoices,
-    );
-    if (stored.application.applicantSubject !== subject) return null;
-    await this.#verifyImmutableHistory(stored.application, subject);
-    return stored;
-  }
-
-  async #verifyImmutableHistory(
-    application: FounderApplication,
-    subject: ActorSubject,
-  ): Promise<void> {
-    await verifyImmutableApplicationHistory(
-      this.#storage,
-      application,
-      subject,
-      this.#contributionAreaChoices,
-    );
+    return loadCurrentApplication(this.#storage, record, subject, id);
   }
 
   async #replayIfKnown(
-    request: ParsedMutationRequest,
+    kind: MutationKind,
+    envelope: ParsedMutationEnvelope,
     subject: ActorSubject,
-    fingerprint: string,
   ): Promise<FounderApplicationMutationResult | null> {
-    const revision = nextRevision(request.expectedRevision);
-    const historyKey = await applicationHistoryKey(
-      subject,
-      request.id,
-      revision,
-    );
+    const revision = nextRevision(envelope.expectedRevision);
+    const historyKey = await applicationHistoryKey(subject, envelope.id, revision);
     const record = await this.#storage.read(historyKey);
     if (record === null) return null;
 
-    const stored = await decodeStoredApplication(
+    const terminal = decodeStoredTransition(
       record,
       historyKey,
-      "history",
       subject,
-      request.id,
+      envelope.id,
       revision,
-      this.#contributionAreaChoices,
     );
-    if (stored.operationId !== request.operationId) {
+    if (terminal.operationId !== envelope.operationId) {
       throw new StorageFailure(
-        request.expectedRevision === null ? "CONFLICT" : "PRECONDITION_FAILED",
+        envelope.expectedRevision === null ? "CONFLICT" : "PRECONDITION_FAILED",
       );
     }
-    if (stored.operationFingerprint !== fingerprint) {
+
+    const materialized = await materializeApplication(
+      this.#storage,
+      subject,
+      envelope.id,
+      revision,
+      terminal,
+    );
+    const storedFields = materialized.fieldsByRevision.get(
+      terminal.fields.revision,
+    );
+    if (storedFields === undefined) unavailable();
+    const parsed = kind === "withdraw"
+      ? requestWithoutFields(envelope)
+      : parseRequestFields(envelope, storedFields.choices);
+    const fingerprint = await operationFingerprint(kind, subject, parsed);
+    if (terminal.operationFingerprint !== fingerprint) {
       throw new StorageFailure("CONFLICT");
     }
 
-    return this.#transactSnapshot(
-      stored.document,
-      stored.application,
-      request,
+    const transitionKind = mutationTransitionKind(kind);
+    if (terminal.transitionKind !== transitionKind) {
+      throw new StorageFailure("CONFLICT");
+    }
+    const fieldsChunks = kind === "withdraw"
+      ? Object.freeze([])
+      : storedFields.chunks;
+    return this.#transactPrepared(
+      prepareMutation(
+        materialized.application,
+        terminal.operationId,
+        terminal.operationFingerprint,
+        terminal.fields,
+        fieldsChunks,
+      ),
+      parsed,
       subject,
     );
   }
@@ -350,41 +488,61 @@ export class StorageFounderApplicationRepository
     request: ParsedMutationRequest,
     subject: ActorSubject,
     fingerprint: string,
+    current: MaterializedApplication | null,
   ): Promise<FounderApplicationMutationResult> {
     if (application.revision !== nextRevision(request.expectedRevision)) {
       unavailable();
     }
-    const document = founderApplicationDocument(
+
+    let storedFields: StoredFields;
+    let fieldsChunks: readonly PreparedFieldsChunk[];
+    if (request.fields === undefined) {
+      if (current === null) unavailable();
+      const inherited = current.fieldsByRevision.get(
+        current.terminal.fields.revision,
+      );
+      if (inherited === undefined) unavailable();
+      storedFields = inherited;
+      fieldsChunks = Object.freeze([]);
+    } else {
+      storedFields = await prepareStoredFields(
+        subject,
+        application.id,
+        application.revision,
+        request.fields,
+        this.#contributionAreaChoices,
+      );
+      fieldsChunks = storedFields.chunks;
+    }
+
+    const prepared = prepareMutation(
       application,
       request.operationId,
       fingerprint,
+      storedFields.reference,
+      fieldsChunks,
     );
     try {
-      return await this.#transactSnapshot(
-        document,
-        application,
-        request,
-        subject,
-      );
+      return await this.#transactPrepared(prepared, request, subject);
     } catch (error) {
       if (
         error instanceof StorageFailure &&
         (error.code === "CONFLICT" || error.code === "PRECONDITION_FAILED")
       ) {
-        const replay = await this.#replayIfKnown(
-          request,
-          subject,
-          fingerprint,
-        );
+        const kind = application.history.at(-1)?.kind === "created"
+          ? "create"
+          : application.history.at(-1)?.kind === "edited"
+            ? "edit"
+            : "withdraw";
+        const replay = await this.#replayIfKnown(kind, request, subject);
         if (replay !== null) return replay;
       }
       throw error;
     }
   }
 
-  async #transactSnapshot(
-    document: StorageDocument,
-    expectedApplication: FounderApplication,
+  async #transactPrepared(
+    prepared: PreparedMutation,
     request: ParsedMutationRequest,
     subject: ActorSubject,
   ): Promise<FounderApplicationMutationResult> {
@@ -392,62 +550,69 @@ export class StorageFounderApplicationRepository
     const historyKey = await applicationHistoryKey(
       subject,
       request.id,
-      expectedApplication.revision,
+      prepared.application.revision,
     );
-    const result = await this.#storage.transact({
-      operationId: request.operationId,
-      mutations: [
-        {
-          type: "put",
-          key: currentKey,
-          expectedRevision: request.expectedRevision,
-          value: document,
-        },
-        {
-          type: "put",
-          key: historyKey,
-          expectedRevision: null,
-          value: document,
-        },
-      ],
-    });
-
-    const currentRecord = result.records[0];
-    const historyRecord = result.records[1];
-    if (!currentRecord || !historyRecord) unavailable();
-
-    const current = await decodeStoredApplication(
-      currentRecord,
-      currentKey,
-      "current",
-      subject,
-      request.id,
-      expectedApplication.revision,
-      this.#contributionAreaChoices,
-    );
-    const historical = await decodeStoredApplication(
-      historyRecord,
-      historyKey,
-      "history",
-      subject,
-      request.id,
-      expectedApplication.revision,
-      this.#contributionAreaChoices,
-    );
+    const mutations = [
+      {
+        type: "put" as const,
+        key: currentKey,
+        expectedRevision: request.expectedRevision,
+        value: prepared.currentDocument,
+      },
+      {
+        type: "put" as const,
+        key: historyKey,
+        expectedRevision: null,
+        value: prepared.historyDocument,
+      },
+      ...prepared.fieldsChunks.map((chunk) => ({
+        type: "put" as const,
+        key: chunk.key,
+        expectedRevision: null,
+        value: chunk.value,
+      })),
+    ];
     if (
-      canonicalJson(applicationSnapshotDocument(current.application)) !==
-        canonicalJson(applicationSnapshotDocument(historical.application)) ||
-      canonicalJson(applicationSnapshotDocument(current.application)) !==
-        canonicalJson(applicationSnapshotDocument(expectedApplication))
+      mutations.length > MAX_STORAGE_TRANSACTION_MUTATIONS ||
+      mutations.length > 2 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS
     ) {
       unavailable();
     }
-    await this.#verifyImmutableHistory(current.application, subject);
+    const transaction: StorageTransactionRequest = Object.freeze({
+      operationId: request.operationId,
+      mutations: Object.freeze(mutations),
+    });
+    if (
+      jsonByteLength(transaction) >
+        MAX_FOUNDER_APPLICATION_STORAGE_TRANSACTION_BYTES
+    ) {
+      unavailable();
+    }
 
-    return mutationResult(
-      current.application,
-      result.replayed,
+    const result = await this.#storage.transact(transaction);
+    if (
+      typeof result.replayed !== "boolean" ||
+      result.records.length !== mutations.length
+    ) {
+      unavailable();
+    }
+    verifyExactRecord(
+      result.records[0],
+      currentKey,
+      prepared.application.revision,
+      prepared.currentDocument,
     );
+    verifyExactRecord(
+      result.records[1],
+      historyKey,
+      1,
+      prepared.historyDocument,
+    );
+    for (const [index, chunk] of prepared.fieldsChunks.entries()) {
+      verifyExactRecord(result.records[index + 2], chunk.key, 1, chunk.value);
+    }
+
+    return mutationResult(prepared.application, result.replayed);
   }
 }
 
@@ -461,7 +626,6 @@ implements FounderApplicationReviewRepository {
 
   readonly #storage: StorageAdapter;
   readonly #permitted: boolean;
-  readonly #contributionAreaChoices: readonly ContributionAreaChoice[];
 
   constructor(
     storage: StorageAdapter,
@@ -478,7 +642,6 @@ implements FounderApplicationReviewRepository {
 
     const parsedChoices = parseContributionAreaChoices(contributionAreaChoices);
     if (!parsedChoices.ok) invalidRequest();
-    this.#contributionAreaChoices = parsedChoices.value;
   }
 
   async list(
@@ -530,168 +693,681 @@ implements FounderApplicationReviewRepository {
     record: StorageRecord,
   ): Promise<FounderApplicationReviewItem> {
     const coordinates = storedApplicationCoordinates(record.value);
-    const expectedKey = await currentApplicationKey(
-      coordinates.subject,
-      coordinates.id,
-    );
-    const stored = await decodeStoredApplication(
-      record,
-      expectedKey,
-      "current",
-      coordinates.subject,
-      coordinates.id,
-      null,
-      this.#contributionAreaChoices,
-    );
-    await verifyImmutableApplicationHistory(
+    const stored = await loadCurrentApplication(
       this.#storage,
-      stored.application,
+      record,
       coordinates.subject,
-      this.#contributionAreaChoices,
+      coordinates.id,
     );
     return Object.freeze({
-      reviewId: await founderReviewId(
-        coordinates.subject,
-        coordinates.id,
-      ),
+      reviewId: await founderReviewId(coordinates.subject, coordinates.id),
       application: stored.application,
     });
   }
 }
 
-async function verifyImmutableApplicationHistory(
+async function loadCurrentApplication(
   storage: StorageAdapter,
-  application: FounderApplication,
+  record: StorageRecord,
+  expectedSubject: ActorSubject,
+  expectedId: FounderApplicationId,
+): Promise<MaterializedApplication> {
+  const key = await currentApplicationKey(expectedSubject, expectedId);
+  const current = decodeStoredCurrent(
+    record,
+    key,
+    expectedSubject,
+    expectedId,
+  );
+  const materialized = await materializeApplication(
+    storage,
+    expectedSubject,
+    expectedId,
+    current.revision,
+    null,
+  );
+  if (
+    canonicalJson(
+      currentApplicationDocument(
+        materialized.application,
+        materialized.terminal.operationId,
+        materialized.terminal.operationFingerprint,
+        materialized.terminal.fields,
+      ),
+    ) !== canonicalJson(current.document) ||
+    canonicalJson(fieldsReferenceDocument(current.fields)) !==
+      canonicalJson(fieldsReferenceDocument(materialized.terminal.fields))
+  ) {
+    unavailable();
+  }
+  return materialized;
+}
+
+async function materializeApplication(
+  storage: StorageAdapter,
   subject: ActorSubject,
-  choices: readonly ContributionAreaChoice[],
-): Promise<void> {
-  for (let revision = 1; revision <= application.revision; revision += 1) {
-    const key = await applicationHistoryKey(subject, application.id, revision);
-    const record = await storage.read(key);
-    if (record === null) unavailable();
-    const historical = await decodeStoredApplication(
-      record,
-      key,
-      "history",
+  id: FounderApplicationId,
+  revision: number,
+  knownTerminal: StoredTransition | null,
+): Promise<MaterializedApplication> {
+  if (
+    !Number.isSafeInteger(revision) ||
+    revision < 1 ||
+    revision > MAX_FOUNDER_APPLICATION_REVISIONS
+  ) {
+    unavailable();
+  }
+
+  const transitions = await Promise.all(
+    Array.from({ length: revision }, async (_, index) => {
+      const transitionRevision = index + 1;
+      if (
+        knownTerminal !== null &&
+        transitionRevision === knownTerminal.revision
+      ) {
+        return knownTerminal;
+      }
+      const key = await applicationHistoryKey(subject, id, transitionRevision);
+      const record = await storage.read(key);
+      if (record === null) unavailable();
+      return decodeStoredTransition(
+        record,
+        key,
+        subject,
+        id,
+        transitionRevision,
+      );
+    }),
+  );
+
+  const references = new Map<number, StoredFieldsReference>();
+  let priorReference: StoredFieldsReference | null = null;
+  for (const transition of transitions) {
+    if (transition.transitionKind === "withdrawn") {
+      if (
+        priorReference === null ||
+        canonicalJson(fieldsReferenceDocument(priorReference)) !==
+          canonicalJson(fieldsReferenceDocument(transition.fields))
+      ) {
+        unavailable();
+      }
+    } else if (transition.fields.revision !== transition.revision) {
+      unavailable();
+    }
+    const prior = references.get(transition.fields.revision);
+    if (
+      prior !== undefined &&
+      canonicalJson(fieldsReferenceDocument(prior)) !==
+        canonicalJson(fieldsReferenceDocument(transition.fields))
+    ) {
+      unavailable();
+    }
+    references.set(transition.fields.revision, transition.fields);
+    priorReference = transition.fields;
+  }
+  const fieldsEntries = await Promise.all(
+    [...references.entries()].map(async ([fieldsRevision, reference]) => {
+      const stored = await readStoredFields(storage, subject, id, reference);
+      return [fieldsRevision, stored] as const;
+    }),
+  );
+  const fieldsByRevision = new Map<number, StoredFields>(fieldsEntries);
+
+  let application: FounderApplication | null = null;
+  for (const transition of transitions) {
+    const storedFields = fieldsByRevision.get(transition.fields.revision);
+    if (storedFields === undefined) unavailable();
+
+    if (transition.revision === 1) {
+      if (transition.transitionKind !== "created") unavailable();
+      const created = createFounderApplication(
+        {
+          id,
+          applicantSubject: subject,
+          occurredAt: transition.occurredAt,
+          historyEntryId: transition.historyEntryId,
+          fields: storedFields.fields,
+        },
+        storedFields.choices,
+      );
+      if (!created.ok) unavailable();
+      application = created.value;
+    } else if (transition.transitionKind === "edited") {
+      if (application === null) unavailable();
+      const edited = editFounderApplication(
+        application,
+        {
+          actorSubject: subject,
+          occurredAt: transition.occurredAt,
+          historyEntryId: transition.historyEntryId,
+          fields: storedFields.fields,
+        },
+        storedFields.choices,
+      );
+      if (!edited.ok) unavailable();
+      application = edited.value;
+    } else if (transition.transitionKind === "withdrawn") {
+      if (
+        application === null ||
+        canonicalJson(fieldsDocument(application.fields)) !==
+          canonicalJson(fieldsDocument(storedFields.fields))
+      ) {
+        unavailable();
+      }
+      const withdrawn = withdrawFounderApplication(application, {
+        actorSubject: subject,
+        occurredAt: transition.occurredAt,
+        historyEntryId: transition.historyEntryId,
+      });
+      if (!withdrawn.ok) unavailable();
+      application = withdrawn.value;
+    } else {
+      unavailable();
+    }
+
+    const entry = application.history.at(-1);
+    if (entry === undefined) unavailable();
+    const kind = transitionMutationKind(transition.transitionKind);
+    const expectedFingerprint = await operationFingerprint(
+      kind,
       subject,
-      application.id,
-      revision,
-      choices,
+      Object.freeze({
+        operationId: transition.operationId,
+        id,
+        occurredAt: transition.occurredAt,
+        historyEntryId: transition.historyEntryId,
+        expectedRevision: transition.revision === 1
+          ? null
+          : transition.revision - 1,
+        ...(kind === "withdraw" ? {} : { fields: entry.fields }),
+      }),
     );
     if (
-      canonicalJson(historyDocument(historical.application.history)) !==
-      canonicalJson(historyDocument(application.history.slice(0, revision)))
+      expectedFingerprint !== transition.operationFingerprint ||
+      canonicalJson(
+        applicationTransitionDocument(
+          application,
+          transition.operationId,
+          transition.operationFingerprint,
+          transition.fields,
+        ),
+      ) !== canonicalJson(transition.document)
     ) {
       unavailable();
     }
   }
+
+  if (application === null) unavailable();
+  const terminal = transitions.at(-1);
+  if (terminal === undefined) unavailable();
+  return Object.freeze({ application, terminal, fieldsByRevision });
 }
 
-function storedApplicationCoordinates(
-  value: StorageDocument,
-): Readonly<{ subject: ActorSubject; id: FounderApplicationId }> {
-  const source = objectRecord(value);
-  const application = objectRecord(source?.application);
-  const subject = parseActorSubject(application?.applicantSubject);
-  const id = parseStableId<"founder-application">(application?.id);
-  if (!subject.ok || !id.ok) unavailable();
-  return Object.freeze({ subject: subject.value, id: id.value });
-}
-
-async function founderReviewId(
-  subject: ActorSubject,
-  id: FounderApplicationId,
-): Promise<string> {
-  let digest: ArrayBuffer;
-  try {
-    digest = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(`founder-review\u0000${subject}\u0000${id}`),
-    );
-  } catch {
+function decodeStoredCurrent(
+  record: StorageRecord,
+  expectedKey: StorageKey,
+  expectedSubject: ActorSubject,
+  expectedId: FounderApplicationId,
+): StoredCurrent {
+  const source = exactStoredDocument(
+    record,
+    expectedKey,
+    CURRENT_DOCUMENT_KEYS,
+    "founder-application-current",
+  );
+  const operationId = storedOperationId(source.operationId);
+  const operationFingerprint = storedFingerprint(source.operationFingerprint);
+  const applicationId = storedApplicationId(source.applicationId);
+  const applicantSubject = storedActorSubject(source.applicantSubject);
+  const revision = storedRevision(source.revision);
+  const fields = storedFieldsReference(source.fields);
+  if (
+    applicationId !== expectedId ||
+    applicantSubject !== expectedSubject ||
+    record.revision !== revision
+  ) {
     unavailable();
   }
-  const hexadecimal = [...new Uint8Array(digest)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-  return `founder-review:${hexadecimal}`;
+  return Object.freeze({
+    operationId,
+    operationFingerprint,
+    applicationId,
+    applicantSubject,
+    revision,
+    fields,
+    document: record.value,
+  });
 }
 
-function requiredReviewId(value: unknown): string {
+function decodeStoredTransition(
+  record: StorageRecord,
+  expectedKey: StorageKey,
+  expectedSubject: ActorSubject,
+  expectedId: FounderApplicationId,
+  expectedRevision: number,
+): StoredTransition {
+  const source = exactStoredDocument(
+    record,
+    expectedKey,
+    TRANSITION_DOCUMENT_KEYS,
+    "founder-application-transition",
+  );
+  const operationId = storedOperationId(source.operationId);
+  const operationFingerprint = storedFingerprint(source.operationFingerprint);
+  const applicationId = storedApplicationId(source.applicationId);
+  const applicantSubject = storedActorSubject(source.applicantSubject);
+  const historyEntryId = storedHistoryEntryId(source.historyEntryId);
+  const occurredAt = storedTimestamp(source.occurredAt);
+  const revision = storedRevision(source.revision);
+  const transitionKind = storedTransitionKind(source.transitionKind);
+  const fields = storedFieldsReference(source.fields);
   if (
-    typeof value !== "string" ||
-    !/^founder-review:[0-9a-f]{64}$/.test(value)
+    applicationId !== expectedId ||
+    applicantSubject !== expectedSubject ||
+    revision !== expectedRevision ||
+    record.revision !== 1
   ) {
-    invalidRequest();
+    unavailable();
   }
-  return value;
+  return Object.freeze({
+    operationId,
+    operationFingerprint,
+    applicationId,
+    applicantSubject,
+    historyEntryId,
+    occurredAt,
+    revision,
+    transitionKind,
+    fields,
+    document: record.value,
+  });
 }
 
-function parseCreateRequest(
-  request: CreateFounderApplicationRequest,
-  choices: readonly ContributionAreaChoice[],
-): ParsedMutationRequest & Readonly<{ fields: FounderApplicationFields }> {
-  if (request.expectedRevision !== null) invalidRequest();
-  return parseMutationRequest(request, null, choices, true) as
-    ParsedMutationRequest & Readonly<{ fields: FounderApplicationFields }>;
+function exactStoredDocument(
+  record: StorageRecord,
+  expectedKey: StorageKey,
+  expectedKeys: ReadonlySet<string>,
+  expectedKind: string,
+): Record<string, unknown> {
+  const source = objectRecord(record.value);
+  if (
+    storageKeyString(record.key) !== storageKeyString(expectedKey) ||
+    source === null ||
+    !hasExactKeys(source, expectedKeys) ||
+    source.kind !== expectedKind ||
+    source.schemaVersion !== FOUNDER_APPLICATION_SCHEMA_VERSION ||
+    jsonByteLength(record.value) >
+      MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES
+  ) {
+    unavailable();
+  }
+  return source;
 }
 
-function parseEditRequest(
-  request: EditFounderApplicationRequest,
+async function prepareStoredFields(
+  subject: ActorSubject,
+  id: FounderApplicationId,
+  revision: number,
+  fields: FounderApplicationFields,
   choices: readonly ContributionAreaChoice[],
-): ParsedMutationRequest & Readonly<{ fields: FounderApplicationFields }> {
-  return parseMutationRequest(
-    request,
-    requiredExpectedRevision(request.expectedRevision),
+): Promise<StoredFields> {
+  const payload = fieldsPayloadDocument(fields, choices);
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(payload);
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+  const bytes = new TextEncoder().encode(serialized);
+  if (
+    bytes.byteLength < 1 ||
+    bytes.byteLength > MAX_SERIALIZED_FOUNDER_APPLICATION_FIELDS_BYTES
+  ) {
+    unavailable();
+  }
+  const reference = Object.freeze({
+    revision,
+    hash: await hashBytes(bytes),
+    bytes: bytes.byteLength,
+    chunks: Math.ceil(
+      bytes.byteLength / FOUNDER_APPLICATION_FIELDS_CHUNK_RAW_BYTES,
+    ),
+  });
+  if (
+    reference.chunks < 1 ||
+    reference.chunks > MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS
+  ) {
+    unavailable();
+  }
+
+  const chunks: PreparedFieldsChunk[] = [];
+  for (let chunkIndex = 0; chunkIndex < reference.chunks; chunkIndex += 1) {
+    const start = chunkIndex * FOUNDER_APPLICATION_FIELDS_CHUNK_RAW_BYTES;
+    const part = bytes.slice(
+      start,
+      Math.min(
+        start + FOUNDER_APPLICATION_FIELDS_CHUNK_RAW_BYTES,
+        bytes.byteLength,
+      ),
+    );
+    const value = fieldsChunkDocument(
+      subject,
+      id,
+      reference,
+      chunkIndex,
+      base64UrlEncode(part),
+    );
+    requireBoundedRecord(value);
+    chunks.push(Object.freeze({
+      key: await applicationFieldsChunkKey(subject, id, revision, chunkIndex),
+      value,
+    }));
+  }
+  return Object.freeze({
+    reference,
+    fields,
     choices,
-    true,
-  ) as ParsedMutationRequest & Readonly<{ fields: FounderApplicationFields }>;
+    chunks: Object.freeze(chunks),
+  });
 }
 
-function parseWithdrawRequest(
-  request: WithdrawFounderApplicationRequest,
-): ParsedMutationRequest {
-  return parseMutationRequest(
+async function readStoredFields(
+  storage: StorageAdapter,
+  subject: ActorSubject,
+  id: FounderApplicationId,
+  reference: StoredFieldsReference,
+): Promise<StoredFields> {
+  const records = await Promise.all(
+    Array.from({ length: reference.chunks }, async (_, chunkIndex) => {
+      const key = await applicationFieldsChunkKey(
+        subject,
+        id,
+        reference.revision,
+        chunkIndex,
+      );
+      const record = await storage.read(key);
+      if (record === null) unavailable();
+      const source = exactStoredDocument(
+        record,
+        key,
+        FIELDS_CHUNK_DOCUMENT_KEYS,
+        "founder-application-fields-chunk",
+      );
+      if (
+        record.revision !== 1 ||
+        source.applicationId !== id ||
+        source.applicantSubject !== subject ||
+        source.fieldsRevision !== reference.revision ||
+        source.fieldsHash !== reference.hash ||
+        source.fieldsBytes !== reference.bytes ||
+        source.chunkIndex !== chunkIndex ||
+        source.chunkCount !== reference.chunks ||
+        typeof source.data !== "string"
+      ) {
+        unavailable();
+      }
+      const bytes = base64UrlDecode(source.data);
+      const expectedBytes = chunkIndex === reference.chunks - 1
+        ? reference.bytes -
+          chunkIndex * FOUNDER_APPLICATION_FIELDS_CHUNK_RAW_BYTES
+        : FOUNDER_APPLICATION_FIELDS_CHUNK_RAW_BYTES;
+      if (bytes.byteLength !== expectedBytes) unavailable();
+      return Object.freeze({
+        bytes,
+        chunk: Object.freeze({ key, value: record.value }),
+      });
+    }),
+  );
+
+  const bytes = new Uint8Array(reference.bytes);
+  let offset = 0;
+  for (const record of records) {
+    bytes.set(record.bytes, offset);
+    offset += record.bytes.byteLength;
+  }
+  if (offset !== bytes.byteLength || await hashBytes(bytes) !== reference.hash) {
+    unavailable();
+  }
+
+  let serialized: string;
+  let candidate: unknown;
+  try {
+    serialized = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    candidate = JSON.parse(serialized);
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+  const source = objectRecord(candidate);
+  if (source === null || !hasExactKeys(source, FIELDS_PAYLOAD_KEYS)) {
+    unavailable();
+  }
+  const choices = storedContributionAreaChoices(source.contributionAreaIds);
+  const parsedFields = parseFounderApplicationFields(source.fields, choices);
+  if (!parsedFields.ok) unavailable();
+  if (
+    JSON.stringify(fieldsPayloadDocument(parsedFields.value, choices)) !==
+      serialized
+  ) {
+    unavailable();
+  }
+
+  return Object.freeze({
+    reference,
+    fields: parsedFields.value,
+    choices,
+    chunks: Object.freeze(records.map((record) => record.chunk)),
+  });
+}
+
+function prepareMutation(
+  application: FounderApplication,
+  operationId: StorageOperationId,
+  operationFingerprint: string,
+  fields: StoredFieldsReference,
+  fieldsChunks: readonly PreparedFieldsChunk[],
+): PreparedMutation {
+  const currentDocument = currentApplicationDocument(
+    application,
+    operationId,
+    operationFingerprint,
+    fields,
+  );
+  const historyDocument = applicationTransitionDocument(
+    application,
+    operationId,
+    operationFingerprint,
+    fields,
+  );
+  requireBoundedRecord(currentDocument);
+  requireBoundedRecord(historyDocument);
+  return Object.freeze({
+    application,
+    currentDocument,
+    historyDocument,
+    fieldsChunks,
+  });
+}
+
+function currentApplicationDocument(
+  application: FounderApplication,
+  operationId: StorageOperationId,
+  operationFingerprint: string,
+  fields: StoredFieldsReference,
+): StorageDocument {
+  return Object.freeze({
+    kind: "founder-application-current",
+    schemaVersion: FOUNDER_APPLICATION_SCHEMA_VERSION,
+    operationId,
+    operationFingerprint,
+    applicationId: application.id,
+    applicantSubject: application.applicantSubject,
+    status: application.status,
+    createdAt: application.createdAt,
+    updatedAt: application.updatedAt,
+    withdrawnAt: application.withdrawnAt,
+    revision: application.revision,
+    fields: fieldsReferenceDocument(fields),
+  });
+}
+
+function applicationTransitionDocument(
+  application: FounderApplication,
+  operationId: StorageOperationId,
+  operationFingerprint: string,
+  fields: StoredFieldsReference,
+): StorageDocument {
+  const entry = application.history.at(-1);
+  if (entry === undefined || entry.revision !== application.revision) {
+    unavailable();
+  }
+  return Object.freeze({
+    kind: "founder-application-transition",
+    schemaVersion: FOUNDER_APPLICATION_SCHEMA_VERSION,
+    operationId,
+    operationFingerprint,
+    applicationId: application.id,
+    applicantSubject: application.applicantSubject,
+    historyEntryId: entry.id,
+    occurredAt: entry.occurredAt,
+    revision: application.revision,
+    transitionKind: entry.kind,
+    status: application.status,
+    createdAt: application.createdAt,
+    updatedAt: application.updatedAt,
+    withdrawnAt: application.withdrawnAt,
+    fields: fieldsReferenceDocument(fields),
+  });
+}
+
+function fieldsReferenceDocument(
+  reference: StoredFieldsReference,
+): StorageDocument {
+  return Object.freeze({
+    revision: reference.revision,
+    hash: reference.hash,
+    bytes: reference.bytes,
+    chunks: reference.chunks,
+  });
+}
+
+function fieldsChunkDocument(
+  subject: ActorSubject,
+  id: FounderApplicationId,
+  reference: StoredFieldsReference,
+  chunkIndex: number,
+  data: string,
+): StorageDocument {
+  return Object.freeze({
+    kind: "founder-application-fields-chunk",
+    schemaVersion: FOUNDER_APPLICATION_SCHEMA_VERSION,
+    applicationId: id,
+    applicantSubject: subject,
+    fieldsRevision: reference.revision,
+    fieldsHash: reference.hash,
+    fieldsBytes: reference.bytes,
+    chunkIndex,
+    chunkCount: reference.chunks,
+    data,
+  });
+}
+
+function fieldsPayloadDocument(
+  fields: FounderApplicationFields,
+  choices: readonly ContributionAreaChoice[],
+): StorageDocument {
+  return Object.freeze({
+    contributionAreaIds: choices.map((choice) => choice.id),
+    fields: fieldsDocument(fields),
+  });
+}
+
+function fieldsDocument(fields: FounderApplicationFields): StorageDocument {
+  return Object.freeze({
+    expertiseSummary: fields.expertiseSummary,
+    intendedContribution: fields.intendedContribution,
+    primaryContributionAreaId: fields.primaryContributionAreaId,
+    secondaryContributionAreaIds: [...fields.secondaryContributionAreaIds],
+    approximateAvailability: fields.approximateAvailability,
+    possibleStartTiming: fields.possibleStartTiming,
+    compensationExpectation: fields.compensationExpectation,
+    professionalProfileLinks: [...fields.professionalProfileLinks],
+    note: fields.note,
+  });
+}
+
+function parseCreateEnvelope(
+  request: CreateFounderApplicationRequest,
+): ParsedMutationEnvelope {
+  if (request.expectedRevision !== null) invalidRequest();
+  return parseMutationEnvelope(request, null, true);
+}
+
+function parseEditEnvelope(
+  request: EditFounderApplicationRequest,
+): ParsedMutationEnvelope {
+  return parseMutationEnvelope(
     request,
     requiredExpectedRevision(request.expectedRevision),
-    Object.freeze([]),
-    false,
+    true,
   );
 }
 
-function parseMutationRequest(
+function parseWithdrawEnvelope(
+  request: WithdrawFounderApplicationRequest,
+): ParsedMutationRequest {
+  return requestWithoutFields(
+    parseMutationEnvelope(
+      request,
+      requiredExpectedRevision(request.expectedRevision),
+      false,
+    ),
+  );
+}
+
+function parseMutationEnvelope(
   request: FounderApplicationMutationRequest &
     Readonly<{ expectedRevision: number | null; fields?: unknown }>,
   expectedRevision: number | null,
-  choices: readonly ContributionAreaChoice[],
-  requiresFields: boolean,
-): ParsedMutationRequest {
+  includeFields: boolean,
+): ParsedMutationEnvelope {
   const operationId = parseStorageOperationId(request.operationId);
   const id = parseStableId<"founder-application">(request.id);
   const occurredAt = parseTimestamp(request.occurredAt);
   const historyEntryId = parseStableId<"founder-application-history-entry">(
     request.historyEntryId,
   );
-  const fields = requiresFields
-    ? parseFounderApplicationFields(request.fields, choices)
-    : null;
-  if (
-    !operationId.ok ||
-    !id.ok ||
-    !occurredAt.ok ||
-    !historyEntryId.ok ||
-    (fields !== null && !fields.ok)
-  ) {
+  if (!operationId.ok || !id.ok || !occurredAt.ok || !historyEntryId.ok) {
     invalidRequest();
   }
-
   return Object.freeze({
     operationId: operationId.value,
     id: id.value,
     occurredAt: occurredAt.value,
     historyEntryId: historyEntryId.value,
     expectedRevision,
-    ...(fields === null ? {} : { fields: fields.value }),
+    ...(includeFields ? { fields: request.fields } : {}),
+  });
+}
+
+function parseRequestFields(
+  envelope: ParsedMutationEnvelope,
+  choices: readonly ContributionAreaChoice[],
+): ParsedMutationRequest & Readonly<{ fields: FounderApplicationFields }> {
+  const fields = parseFounderApplicationFields(envelope.fields, choices);
+  if (!fields.ok) invalidRequest();
+  return Object.freeze({ ...envelope, fields: fields.value }) as
+    ParsedMutationRequest & Readonly<{ fields: FounderApplicationFields }>;
+}
+
+function requestWithoutFields(
+  envelope: ParsedMutationEnvelope,
+): ParsedMutationRequest {
+  return Object.freeze({
+    operationId: envelope.operationId,
+    id: envelope.id,
+    occurredAt: envelope.occurredAt,
+    historyEntryId: envelope.historyEntryId,
+    expectedRevision: envelope.expectedRevision,
   });
 }
 
@@ -699,7 +1375,7 @@ function requiredExpectedRevision(value: unknown): number {
   if (
     !Number.isSafeInteger(value) ||
     (value as number) < 1 ||
-    (value as number) >= Number.MAX_SAFE_INTEGER
+    (value as number) >= MAX_FOUNDER_APPLICATION_REVISIONS
   ) {
     invalidRequest();
   }
@@ -710,222 +1386,15 @@ function requireCurrentRevision(
   application: FounderApplication,
   expectedRevision: number | null,
 ): void {
-  if (
-    expectedRevision === null ||
-    application.revision !== expectedRevision
-  ) {
+  if (expectedRevision === null || application.revision !== expectedRevision) {
     throw new StorageFailure("PRECONDITION_FAILED");
   }
 }
 
 function nextRevision(expectedRevision: number | null): number {
-  return expectedRevision === null ? 1 : expectedRevision + 1;
-}
-
-async function decodeStoredApplication(
-  record: StorageRecord,
-  expectedKey: StorageKey,
-  recordKind: "current" | "history",
-  expectedSubject: ActorSubject,
-  expectedId: FounderApplicationId,
-  expectedApplicationRevision: number | null,
-  choices: readonly ContributionAreaChoice[],
-): Promise<StoredFounderApplication> {
-  if (storageKeyString(record.key) !== storageKeyString(expectedKey)) {
-    unavailable();
-  }
-
-  const source = objectRecord(record.value);
-  if (
-    source === null ||
-    !hasExactKeys(source, STORED_DOCUMENT_KEYS) ||
-    source.kind !== "founder-application-snapshot" ||
-    source.schemaVersion !== FOUNDER_APPLICATION_SCHEMA_VERSION ||
-    typeof source.operationFingerprint !== "string" ||
-    !/^sha256:[0-9a-f]{64}$/.test(source.operationFingerprint)
-  ) {
-    unavailable();
-  }
-
-  const operationId = parseStorageOperationId(source.operationId);
-  if (!operationId.ok) unavailable();
-  const application = reconstructFounderApplication(source.application, choices);
-  if (
-    application.id !== expectedId ||
-    application.applicantSubject !== expectedSubject ||
-    (expectedApplicationRevision !== null &&
-      application.revision !== expectedApplicationRevision) ||
-    (recordKind === "current" && record.revision !== application.revision) ||
-    (recordKind === "history" && record.revision !== 1)
-  ) {
-    unavailable();
-  }
-
-  const expectedFingerprint = await fingerprintForStoredApplication(
-    application,
-    operationId.value,
-  );
-  if (expectedFingerprint !== source.operationFingerprint) unavailable();
-
-  return Object.freeze({
-    operationId: operationId.value,
-    operationFingerprint: source.operationFingerprint,
-    application,
-    document: record.value,
-  });
-}
-
-function reconstructFounderApplication(
-  value: unknown,
-  choices: readonly ContributionAreaChoice[],
-): FounderApplication {
-  const source = objectRecord(value);
-  if (source === null || !Array.isArray(source.history) || source.history.length < 1) {
-    unavailable();
-  }
-
-  const first = objectRecord(source.history[0]);
-  if (first === null || first.kind !== "created") unavailable();
-  const created = createFounderApplication(
-    {
-      id: source.id,
-      applicantSubject: source.applicantSubject,
-      occurredAt: first.occurredAt,
-      historyEntryId: first.id,
-      fields: first.fields,
-    },
-    choices,
-  );
-  if (!created.ok) unavailable();
-
-  let application: FounderApplication = created.value;
-  for (const candidate of source.history.slice(1)) {
-    const entry = objectRecord(candidate);
-    if (entry === null) unavailable();
-
-    if (entry.kind === "edited") {
-      const edited = editFounderApplication(
-        application,
-        {
-          actorSubject: application.applicantSubject,
-          occurredAt: entry.occurredAt,
-          historyEntryId: entry.id,
-          fields: entry.fields,
-        },
-        choices,
-      );
-      if (!edited.ok) unavailable();
-      application = edited.value;
-      continue;
-    }
-
-    if (entry.kind === "withdrawn") {
-      const withdrawn = withdrawFounderApplication(application, {
-        actorSubject: application.applicantSubject,
-        occurredAt: entry.occurredAt,
-        historyEntryId: entry.id,
-      });
-      if (!withdrawn.ok) unavailable();
-      application = withdrawn.value;
-      continue;
-    }
-
-    unavailable();
-  }
-
-  if (
-    canonicalJson(applicationSnapshotDocument(application)) !==
-    canonicalJson(value)
-  ) {
-    unavailable();
-  }
-  return application;
-}
-
-function founderApplicationDocument(
-  application: FounderApplication,
-  operationId: StorageOperationId,
-  operationFingerprint: string,
-): StorageDocument {
-  return Object.freeze({
-    kind: "founder-application-snapshot",
-    schemaVersion: FOUNDER_APPLICATION_SCHEMA_VERSION,
-    operationId,
-    operationFingerprint,
-    application: applicationSnapshotDocument(application),
-  });
-}
-
-function applicationSnapshotDocument(
-  application: FounderApplication,
-): StorageDocument {
-  return {
-    id: application.id,
-    applicantSubject: application.applicantSubject,
-    fields: fieldsDocument(application.fields),
-    status: application.status,
-    createdAt: application.createdAt,
-    updatedAt: application.updatedAt,
-    withdrawnAt: application.withdrawnAt,
-    revision: application.revision,
-    history: historyDocument(application.history),
-  };
-}
-
-function historyDocument(
-  history: FounderApplication["history"],
-): readonly StorageDocument[] {
-  return history.map((entry) => ({
-      id: entry.id,
-      applicationId: entry.applicationId,
-      applicantSubject: entry.applicantSubject,
-      occurredAt: entry.occurredAt,
-      revision: entry.revision,
-      kind: entry.kind,
-      status: entry.status,
-      fields: fieldsDocument(entry.fields),
-    }));
-}
-
-function fieldsDocument(fields: FounderApplicationFields): StorageDocument {
-  return {
-    expertiseSummary: fields.expertiseSummary,
-    intendedContribution: fields.intendedContribution,
-    primaryContributionAreaId: fields.primaryContributionAreaId,
-    secondaryContributionAreaIds: [...fields.secondaryContributionAreaIds],
-    approximateAvailability: fields.approximateAvailability,
-    possibleStartTiming: fields.possibleStartTiming,
-    compensationExpectation: fields.compensationExpectation,
-    professionalProfileLinks: [...fields.professionalProfileLinks],
-    note: fields.note,
-  };
-}
-
-async function fingerprintForStoredApplication(
-  application: FounderApplication,
-  operationId: StorageOperationId,
-): Promise<string> {
-  const entry = application.history[application.history.length - 1];
-  if (entry === undefined) unavailable();
-  const kind: MutationKind = entry.kind === "created"
-    ? "create"
-    : entry.kind === "edited"
-      ? "edit"
-      : "withdraw";
-  return operationFingerprint(
-    kind,
-    application.applicantSubject,
-    Object.freeze({
-      operationId,
-      id: application.id,
-      occurredAt: entry.occurredAt,
-      historyEntryId: entry.id,
-      expectedRevision: application.revision === 1
-        ? null
-        : application.revision - 1,
-      ...(kind === "withdraw" ? {} : { fields: entry.fields }),
-    }),
-  );
+  const revision = expectedRevision === null ? 1 : expectedRevision + 1;
+  if (revision > MAX_FOUNDER_APPLICATION_REVISIONS) invalidRequest();
+  return revision;
 }
 
 async function operationFingerprint(
@@ -944,20 +1413,181 @@ async function operationFingerprint(
       ? {}
       : { fields: fieldsDocument(request.fields) }),
   };
+  return hashBytes(new TextEncoder().encode(canonicalJson(payload)));
+}
 
-  let digest: ArrayBuffer;
-  try {
-    digest = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(canonicalJson(payload)),
-    );
-  } catch {
+function mutationTransitionKind(kind: MutationKind): TransitionKind {
+  return kind === "create" ? "created" : kind === "edit" ? "edited" : "withdrawn";
+}
+
+function transitionMutationKind(kind: TransitionKind): MutationKind {
+  return kind === "created" ? "create" : kind === "edited" ? "edit" : "withdraw";
+}
+
+function storedApplicationCoordinates(
+  value: StorageDocument,
+): Readonly<{ subject: ActorSubject; id: FounderApplicationId }> {
+  const source = objectRecord(value);
+  if (
+    source === null ||
+    !hasExactKeys(source, CURRENT_DOCUMENT_KEYS) ||
+    source.kind !== "founder-application-current" ||
+    source.schemaVersion !== FOUNDER_APPLICATION_SCHEMA_VERSION
+  ) {
     unavailable();
   }
-  const hexadecimal = [...new Uint8Array(digest)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-  return `sha256:${hexadecimal}`;
+  return Object.freeze({
+    subject: storedActorSubject(source.applicantSubject),
+    id: storedApplicationId(source.applicationId),
+  });
+}
+
+function storedFieldsReference(value: unknown): StoredFieldsReference {
+  const source = objectRecord(value);
+  if (
+    source === null ||
+    !hasExactKeys(source, FIELDS_REFERENCE_KEYS) ||
+    !Number.isSafeInteger(source.revision) ||
+    (source.revision as number) < 1 ||
+    (source.revision as number) > MAX_FOUNDER_APPLICATION_REVISIONS ||
+    typeof source.hash !== "string" ||
+    !HASH_PATTERN.test(source.hash) ||
+    !Number.isSafeInteger(source.bytes) ||
+    (source.bytes as number) < 1 ||
+    (source.bytes as number) >
+      MAX_SERIALIZED_FOUNDER_APPLICATION_FIELDS_BYTES ||
+    !Number.isSafeInteger(source.chunks) ||
+    (source.chunks as number) !== Math.ceil(
+      (source.bytes as number) / FOUNDER_APPLICATION_FIELDS_CHUNK_RAW_BYTES,
+    ) ||
+    (source.chunks as number) < 1 ||
+    (source.chunks as number) > MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS
+  ) {
+    unavailable();
+  }
+  return Object.freeze({
+    revision: source.revision as number,
+    hash: source.hash,
+    bytes: source.bytes as number,
+    chunks: source.chunks as number,
+  });
+}
+
+function storedContributionAreaChoices(
+  value: unknown,
+): readonly ContributionAreaChoice[] {
+  if (!Array.isArray(value)) unavailable();
+  const parsed = parseContributionAreaChoices(
+    value.map((id) => ({ id, label: "Historical contribution area" })),
+  );
+  if (!parsed.ok || parsed.value.length < 1) unavailable();
+  if (
+    canonicalJson(value) !==
+      canonicalJson(parsed.value.map((choice) => choice.id))
+  ) {
+    unavailable();
+  }
+  return parsed.value;
+}
+
+function storedOperationId(value: unknown): StorageOperationId {
+  const parsed = parseStorageOperationId(value);
+  if (!parsed.ok) unavailable();
+  return parsed.value;
+}
+
+function storedApplicationId(value: unknown): FounderApplicationId {
+  const parsed = parseStableId<"founder-application">(value);
+  if (!parsed.ok) unavailable();
+  return parsed.value;
+}
+
+function storedHistoryEntryId(value: unknown): FounderApplicationHistoryEntryId {
+  const parsed = parseStableId<"founder-application-history-entry">(value);
+  if (!parsed.ok) unavailable();
+  return parsed.value;
+}
+
+function storedActorSubject(value: unknown): ActorSubject {
+  const parsed = parseActorSubject(value);
+  if (!parsed.ok) unavailable();
+  return parsed.value;
+}
+
+function storedTimestamp(value: unknown): Timestamp {
+  const parsed = parseTimestamp(value);
+  if (!parsed.ok) unavailable();
+  return parsed.value;
+}
+
+function storedRevision(value: unknown): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    (value as number) < 1 ||
+    (value as number) > MAX_FOUNDER_APPLICATION_REVISIONS
+  ) {
+    unavailable();
+  }
+  return value as number;
+}
+
+function storedFingerprint(value: unknown): string {
+  if (typeof value !== "string" || !HASH_PATTERN.test(value)) unavailable();
+  return value;
+}
+
+function storedTransitionKind(value: unknown): TransitionKind {
+  if (value !== "created" && value !== "edited" && value !== "withdrawn") {
+    unavailable();
+  }
+  return value;
+}
+
+function verifyExactRecord(
+  record: StorageRecord | null | undefined,
+  expectedKey: StorageKey,
+  expectedRevision: number,
+  expectedValue: StorageDocument,
+): void {
+  if (
+    record === null ||
+    record === undefined ||
+    storageKeyString(record.key) !== storageKeyString(expectedKey) ||
+    record.revision !== expectedRevision ||
+    canonicalJson(record.value) !== canonicalJson(expectedValue) ||
+    jsonByteLength(record.value) >
+      MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES
+  ) {
+    unavailable();
+  }
+}
+
+function requireBoundedRecord(value: StorageDocument): void {
+  if (
+    jsonByteLength(value) > MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES
+  ) {
+    unavailable();
+  }
+}
+
+async function founderReviewId(
+  subject: ActorSubject,
+  id: FounderApplicationId,
+): Promise<string> {
+  const digest = await hashBytes(
+    new TextEncoder().encode(`founder-review\u0000${subject}\u0000${id}`),
+  );
+  return `founder-review:${digest.slice("sha256:".length)}`;
+}
+
+function requiredReviewId(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    !/^founder-review:[0-9a-f]{64}$/u.test(value)
+  ) {
+    invalidRequest();
+  }
+  return value;
 }
 
 /** Compatibility name retained for deterministic development fixtures. */
@@ -989,23 +1619,69 @@ async function applicationHistoryKey(
   );
 }
 
+async function applicationFieldsChunkKey(
+  subject: ActorSubject,
+  id: FounderApplicationId,
+  revision: number,
+  chunkIndex: number,
+): Promise<StorageKey> {
+  return requiredStorageKey(
+    APPLICATION_FIELDS,
+    await hashedStorageId(
+      "founder-fields",
+      `${subject}\u0000${id}\u0000${revision}\u0000${chunkIndex}`,
+    ),
+  );
+}
+
 async function hashedStorageId(
   namespace: string,
   value: string,
 ): Promise<string> {
+  const digest = await hashBytes(
+    new TextEncoder().encode(`${namespace}\u0000${value}`),
+  );
+  return `${namespace}:${digest.slice("sha256:".length)}`;
+}
+
+async function hashBytes(bytes: Uint8Array): Promise<string> {
   let digest: ArrayBuffer;
   try {
-    digest = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(`${namespace}\u0000${value}`),
-    );
-  } catch {
-    unavailable();
+    const input = new Uint8Array(bytes.byteLength);
+    input.set(bytes);
+    digest = await crypto.subtle.digest("SHA-256", input);
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
   }
-  const hexadecimal = [...new Uint8Array(digest)]
+  return `sha256:${[...new Uint8Array(digest)]
     .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-  return `${namespace}:${hexadecimal}`;
+    .join("")}`;
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 8_192) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 8_192));
+  }
+  return btoa(binary)
+    .replace(/\+/gu, "-")
+    .replace(/\//gu, "_")
+    .replace(/=+$/gu, "");
+}
+
+function base64UrlDecode(value: string): Uint8Array {
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) unavailable();
+  const padded = value.replace(/-/gu, "+").replace(/_/gu, "/") +
+    "=".repeat((4 - value.length % 4) % 4);
+  let binary: string;
+  try {
+    binary = atob(padded);
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  if (base64UrlEncode(bytes) !== value) unavailable();
+  return bytes;
 }
 
 function requiredStorageKey(
@@ -1047,6 +1723,16 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function jsonByteLength(value: unknown): number {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+  return new TextEncoder().encode(serialized).byteLength;
 }
 
 function canonicalJson(value: unknown): string {
