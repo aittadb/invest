@@ -15,11 +15,14 @@ package management only in the configured-owner route group. For a signed-in
 non-owner, it derives the trusted `participantAccess` projection from that
 subject's persistent profile, current package, and current acknowledgment gate.
 An unregistered subject stops after the profile read without opening package or
-acknowledgment storage. Founder composition opens private campaign policy and a
-fresh subject-bound profile/application pair only for the exact founder resource
-after participant authorization. Indication, aggregate, moderation, export,
-deletion coordination, registration-route, and profile-route composition still
-require their own named persistent capabilities.
+acknowledgment storage. On `/participant/registration`, the runtime instead
+combines a fresh subject-bound participant repository, the hosted mutation
+session, and only the two registration notices mapped from persisted campaign
+policy. Founder composition opens private campaign policy and a fresh
+subject-bound profile/application pair only for the exact founder resource after
+participant authorization. Indication, aggregate, moderation, export, deletion
+coordination, and profile-route composition still require their own named
+persistent capabilities.
 
 This source composition and its deterministic protocol services are not hosted
 acceptance evidence. Activation remains blocked until the configured AittaDB
@@ -111,6 +114,9 @@ subject-bound package acknowledgment, one participant-access state reader, and
 one participant-bound founder-application pair.
 That reader creates fresh profile and acknowledgment repositories for each
 trusted account and combines them only through the bounded projection service.
+The named `participantRepository(account)` capability returns a fresh repository
+bound to that validated account; registration composition additionally closes it
+over the request's trusted subject and provider email label.
 It intentionally has no generic builder or adapter accessor. The Worker calls
 these methods centrally and passes routes only their declared interfaces and
 mutation session; it never passes the adapter or factory into route context.

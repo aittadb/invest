@@ -51,6 +51,7 @@ import {
 } from "./in-memory-founder-application-repository.ts";
 import {
   StorageParticipantRepository,
+  type ParticipantRegistrationRepository,
   type ParticipantRepository,
 } from "./in-memory-participant-repository.ts";
 import { StorageParticipantInvestmentInterestRepository } from "./storage-participant-investment-repository.ts";
@@ -119,6 +120,9 @@ export class StorageApplicationRepositoryFactory {
   readonly #participantRequest: (
     account: ParticipantAccount,
   ) => ParticipantRequestRepositoryScope;
+  readonly #participantRepositoryFor: (
+    account: ParticipantAccount,
+  ) => ParticipantRegistrationRepository;
 
   constructor(storage: StorageAdapter, now: () => Date) {
     const adapter = requiredStorageAdapter(storage);
@@ -131,6 +135,8 @@ export class StorageApplicationRepositoryFactory {
     );
     this.#participantRequest = (account) =>
       createParticipantRequestRepositoryScope(adapter, account);
+    this.#participantRepositoryFor = (account) =>
+      new StorageParticipantRepository(adapter, account);
     this.#claimBrowserMutationReplay = Object.freeze(
       (claim: BrowserMutationReplayClaim) => claimReplay(adapter, clock, claim),
     );
@@ -174,6 +180,12 @@ export class StorageApplicationRepositoryFactory {
       amountConfiguration,
       parsingOptions,
     );
+  }
+
+  participantRepository(
+    account: ParticipantAccount,
+  ): ParticipantRegistrationRepository {
+    return this.#participantRepositoryFor(account);
   }
 }
 

@@ -14,6 +14,10 @@ import {
   type ParticipantAccessStateReader,
 } from "../domain/participant-home-resource.ts";
 import { isPhaseAcceptingParticipation } from "../domain/phase-configuration.ts";
+import {
+  PARTICIPANT_REGISTRATION_PATH,
+  participantRegistrationNoticesFromCampaignPolicy,
+} from "../domain/participant-registration-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   parsePublicCampaignConfiguration,
@@ -76,15 +80,19 @@ import {
   createInvestmentInterestRouteHandler,
   createParticipantPackageAcknowledgmentRouteHandler,
   createParticipantPackageReaderRouteHandler,
+  createParticipantRegistrationRouteHandler,
   createParticipantRouteHandler,
   MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
   MAX_ACKNOWLEDGMENT_MUTATION_FIELDS,
   MAX_FOUNDER_INTEREST_MUTATION_BYTES,
   MAX_FOUNDER_INTEREST_MUTATION_FIELDS,
+  MAX_REGISTRATION_MUTATION_BYTES,
+  MAX_REGISTRATION_MUTATION_FIELDS,
   type FounderInterestRouteDependencies,
   type InvestmentInterestRouteDependencies,
   type ParticipantPackageAcknowledgmentRouteDependencies,
   type ParticipantPackageReaderDependencies,
+  type ParticipantRegistrationRouteDependencies,
 } from "./routes/participant.ts";
 import { createParticipantFounderInterestService } from "./founder-interest-service.ts";
 import {
@@ -157,6 +165,16 @@ export function createApplicationWorker(
             isOwner,
             resourceUrl,
             participantRequest,
+          )
+        : null;
+      const participantRegistration = dependencies.dispatchRoute === undefined &&
+          applicationRuntime !== null
+        ? await runtimeParticipantRegistrationRoute(
+            applicationRuntime,
+            actor,
+            isOwner,
+            resourceUrl,
+            url.pathname,
           )
         : null;
       const ownerPackage = dependencies.dispatchRoute === undefined
@@ -258,6 +276,7 @@ export function createApplicationWorker(
       };
 
       const hasInjectedRoutes = ownerPackageAvailable ||
+        participantRegistration !== null ||
         participantPackageReader !== undefined ||
         participantPackageAcknowledgment !== undefined ||
         ownerIndicationModerationAvailable ||
@@ -272,6 +291,7 @@ export function createApplicationWorker(
               dependencies,
               campaignWorkspace,
               ownerOAuthProof,
+              participantRegistration,
               participantFounderInterest ?? null,
               {
                 owner: ownerPackage,
@@ -342,6 +362,7 @@ function createInjectedRouteDispatcher(
   dependencies: ApplicationWorkerDependencies,
   campaignWorkspace: CampaignWorkspaceDeploymentCapability | null,
   ownerOAuthProof: OwnerOAuthProofRouteDependencies | null,
+  participantRegistration: ParticipantRegistrationRouteDependencies | null,
   participantFounderInterest: FounderInterestRouteDependencies | null,
   packageRoutes: ResolvedPackageRoutes,
   available: InjectedRouteAvailability,
@@ -351,6 +372,11 @@ function createInjectedRouteDispatcher(
     public: handlePublicRoutes,
     participant: createParticipantRouteHandler(
       [
+        ...(participantRegistration
+          ? [createParticipantRegistrationRouteHandler(
+              participantRegistration,
+            )]
+          : []),
         ...(packageRoutes.participantReader
           ? [createParticipantPackageReaderRouteHandler(
               packageRoutes.participantReader,
@@ -427,6 +453,74 @@ function createInjectedRouteDispatcher(
   });
 }
 
+async function runtimeParticipantRegistrationRoute(
+  runtime: ApplicationRuntimeDeploymentCapability,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  resourceUrl: string,
+  pathname: string,
+): Promise<ParticipantRegistrationRouteDependencies | null> {
+  if (
+    pathname !== PARTICIPANT_REGISTRATION_PATH ||
+    actor === null ||
+    isOwner
+  ) {
+    return null;
+  }
+
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (!account.ok) return null;
+
+  try {
+    const repositories = runtime.repositoryFactory;
+    const currentCampaign = await repositories.campaignRepository().readSetup();
+    if (currentCampaign === null) return null;
+    const notices = participantRegistrationNoticesFromCampaignPolicy(
+      currentCampaign.setup.campaignPolicy,
+    );
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "participant" as const,
+      subject: account.value.subject,
+    });
+    const sameAccount = (candidate: typeof account.value) =>
+      candidate.subject === account.value.subject &&
+      candidate.accountEmailLabel === account.value.accountEmailLabel;
+
+    return Object.freeze({
+      repositoryFor(candidate) {
+        if (!sameAccount(candidate)) {
+          throw new Error("Participant registration is unavailable.");
+        }
+        return repositories.participantRepository(account.value);
+      },
+      verifyMutation: (request: Request) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          {
+            maxBodyBytes: MAX_REGISTRATION_MUTATION_BYTES,
+            maxFields: MAX_REGISTRATION_MUTATION_FIELDS,
+            repeatedFormFields: [],
+          },
+        ),
+      csrfTokenFor: (request, candidate) =>
+        sameAccount(candidate)
+          ? runtime.mutationSession.issue(request, identity, appOrigin)
+          : Promise.resolve(null),
+      notices,
+      now: runtime.now,
+      createOperationId: () => randomOperationId("participant-operation"),
+    });
+  } catch {
+    return null;
+  }
+}
+
 async function runtimeParticipantFounderInterestRoute(
   runtime: ApplicationRuntimeDeploymentCapability | null,
   actor: AuthenticatedActor | null,
@@ -467,12 +561,8 @@ async function runtimeParticipantFounderInterestRoute(
     const campaign = await repositories.campaignRepository().readSetup();
     const contributionAreaChoices = campaign?.setup.campaignPolicy
       .founderContributionChoices ?? Object.freeze([]);
-
     const founder = requiredParticipantRequest(participantRequest)
-      .participantFounderApplications(
-      contributionAreaChoices,
-    );
-
+      .participantFounderApplications(contributionAreaChoices);
     const appOrigin = new URL(resourceUrl).origin;
     const identity = Object.freeze({
       type: "participant" as const,
@@ -855,9 +945,10 @@ function requiredParticipantRequest(
 }
 
 function isParticipantAccessPath(pathname: string): boolean {
-  return pathname === "/" ||
+  return pathname !== PARTICIPANT_REGISTRATION_PATH &&
+    (pathname === "/" ||
     pathname === "/participant" ||
-    pathname.startsWith("/participant/");
+    pathname.startsWith("/participant/"));
 }
 
 function authenticatedActor(request: Request): AuthenticatedActor | null {

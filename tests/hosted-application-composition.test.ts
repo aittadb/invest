@@ -26,6 +26,10 @@ import {
   FOUNDER_SECONDARY_AREAS_FIELD,
   type FounderInterestDocument,
 } from "../domain/participant-founder-interest-resource.ts";
+import {
+  PARTICIPANT_REGISTRATION_PATH,
+  type ParticipantRegistrationDocument,
+} from "../domain/participant-registration-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   parseActorSubject,
@@ -87,6 +91,7 @@ const OWNER_EMAIL = "owner@example.test";
 const PARTICIPANT_SUBJECT = "sites-participant-subject";
 const PARTICIPANT_EMAIL = "participant@example.test";
 const PRIVATE_DRAFT_SENTINEL = "PRIVATE DRAFT SENTINEL MUST STAY HIDDEN";
+const PRIVATE_POLICY_SENTINEL = "PRIVATE CAMPAIGN POLICY MUST STAY HIDDEN";
 const MAX_HOSTED_RECORD_BYTES = 65_536;
 const MAX_HOSTED_TRANSACTION_MUTATIONS = 25;
 const MAX_HOSTED_TRANSACTION_BYTES = 1_048_576;
@@ -1833,6 +1838,187 @@ test("hosted founder state and mutation proofs remain participant-bound", async 
   assert.equal(unchanged.document.data.history.length, 1);
 });
 
+test("hosted participant registration persists policy-bound submissions across retries and restarts", async () => {
+  const service = new SyntheticAittaDBService();
+  const setup = explicitCampaignSetup();
+  await new StorageCampaignRepository(hostedStorageAdapter(service)).saveSetup({
+    operationId: "campaign-operation:registration-policy",
+    recordedAt: "2026-08-10T09:00:00.000Z",
+    expectedRevision: null,
+    setup: {
+      ...setup,
+      campaignPolicy: {
+        ...setup.campaignPolicy,
+        notices: {
+          ...setup.campaignPolicy.notices,
+          legalBoundary: PRIVATE_POLICY_SENTINEL,
+          processEmail: "Persisted process notice for registration.",
+          marketingConsent: "Persisted optional marketing notice.",
+        },
+      },
+    },
+  });
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  let clockTick = 0;
+  const worker = hostedPackageWorker(
+    service,
+    () => new Date(NOW.valueOf() + clockTick++),
+  );
+
+  const anonymousReads = service.readRequests;
+  const anonymous = await worker.fetch(
+    new Request(`${APP_ORIGIN}${PARTICIPANT_REGISTRATION_PATH}`, {
+      headers: { accept: "application/json" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(anonymous.status, 404);
+  assert.equal(service.readRequests, anonymousReads + 1);
+
+  const ownerReads = service.readRequests;
+  const owner = await worker.fetch(
+    ownerRequest(PARTICIPANT_REGISTRATION_PATH),
+    env,
+    executionContext,
+  );
+  assert.equal(owner.status, 404);
+  assert.equal(service.readRequests, ownerReads + 1);
+  assert.doesNotMatch(await owner.text(), /Persisted process|PRIVATE CAMPAIGN/u);
+
+  const [first, retry, changed] = await Promise.all([
+    participantRegistration(worker, env),
+    participantRegistration(worker, env),
+    participantRegistration(worker, env),
+  ]);
+  for (const resource of [first, retry, changed]) {
+    assert.equal(resource.document.data.status, "registration_required");
+    assert.equal(
+      resource.document.data.process_email_notice,
+      "Persisted process notice for registration.",
+    );
+    assert.equal(
+      resource.document.data.marketing_notice,
+      "Persisted optional marketing notice.",
+    );
+    assert.doesNotMatch(
+      JSON.stringify(resource.document),
+      new RegExp(PRIVATE_POLICY_SENTINEL, "u"),
+    );
+  }
+  const action = requiredAction(
+    first.document,
+    "register-participant-access",
+  );
+  const body = actionBody(action, {
+    "display-name": "Hosted participant",
+    country: "FI",
+    "declared-interest": "investor",
+    "participation-context": "individual",
+    "process-email-notice-acknowledged": true,
+    "marketing-consent": false,
+  });
+  const retryAction = requiredAction(
+    retry.document,
+    "register-participant-access",
+  );
+  const retryBody = actionBody(retryAction, {
+    ...body,
+    "operation-id": body["operation-id"],
+  });
+
+  const missingProof = await submitRegistration(
+    worker,
+    env,
+    first,
+    body,
+    { cookie: null },
+  );
+  assert.equal(missingProof.status, 403);
+  assert.equal(await hostedParticipantRepository(service).current(), null);
+
+  const foreignOrigin = await submitRegistration(
+    worker,
+    env,
+    first,
+    body,
+    { origin: "https://foreign.example.test" },
+  );
+  assert.equal(foreignOrigin.status, 403);
+  assert.equal(await hostedParticipantRepository(service).current(), null);
+
+  const registrationResponses = await Promise.all([
+    submitRegistration(worker, env, first, body),
+    submitRegistration(worker, env, retry, retryBody),
+  ]);
+  assert.deepEqual(
+    registrationResponses
+      .map(({ status }) => status)
+      .sort((left, right) => left - right),
+    [200, 201],
+  );
+  for (const response of registrationResponses) {
+    assert.match(response.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+  }
+  const created = registrationResponses.find(({ status }) => status === 201);
+  assert(created);
+  const createdDocument = await created.json() as ParticipantRegistrationDocument;
+  assert.equal(createdDocument.data.status, "registered");
+  assert.deepEqual(actionNames(createdDocument), []);
+
+  const changedAction = requiredAction(
+    changed.document,
+    "register-participant-access",
+  );
+  const duplicate = await submitRegistration(
+    worker,
+    env,
+    changed,
+    actionBody(changedAction, {
+      ...body,
+      "operation-id": body["operation-id"],
+      "display-name": "Changed duplicate",
+    }),
+  );
+  assert.equal(duplicate.status, 409);
+  assert.doesNotMatch(await duplicate.text(), /Hosted participant|Changed duplicate/u);
+
+  const restarted = hostedPackageWorker(service);
+  const persisted = await participantRegistration(restarted, env);
+  assert.equal(persisted.document.data.status, "registered");
+  assert.equal(persisted.document.data.display_name, "Hosted participant");
+  assert.equal(persisted.csrfToken, null);
+  assert.equal(persisted.cookie, null);
+  assert.deepEqual(actionNames(persisted.document), []);
+
+  const foreign = await participantRegistrationFor(
+    restarted,
+    env,
+    "sites-foreign-participant",
+    "foreign@example.test",
+  );
+  assert.equal(foreign.document.data.status, "registration_required");
+  assert.equal(foreign.document.data.display_name, null);
+  assert.doesNotMatch(
+    JSON.stringify(foreign.document),
+    /Hosted participant|PRIVATE CAMPAIGN POLICY/u,
+  );
+
+  const disclosureProbe = JSON.stringify({
+    created: createdDocument,
+    persisted: persisted.document,
+    foreign: foreign.document,
+  });
+  for (const privateValue of [
+    SERVICE_CLIENT_SECRET,
+    ACCESS_TOKEN,
+    MUTATION_KEY,
+    PRIVATE_POLICY_SENTINEL,
+  ]) {
+    assert.doesNotMatch(disclosureProbe, new RegExp(privateValue, "u"));
+  }
+});
+
 test("hosted package routes persist atomic private versions and current acknowledgments", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
@@ -2697,14 +2883,17 @@ function mutationRequest(proof: Readonly<{ token: string; setCookie: string }>) 
   });
 }
 
-function hostedPackageWorker(service: SyntheticAittaDBService) {
+function hostedPackageWorker(
+  service: SyntheticAittaDBService,
+  now: () => Date = () => NOW,
+) {
   return createApplicationWorker({
     fetchApplication: async () =>
       new Response("application fallback", { status: 404 }),
     fetchOptimizedImage: async () => new Response("image"),
     resolveApplicationRuntime: createHostedApplicationRuntimeResolver({
       fetch: service.fetch,
-      now: () => NOW,
+      now,
     }),
   });
 }
@@ -3393,6 +3582,86 @@ type HostedParticipantHomeDocument = Readonly<{
     account_email: string;
   }>;
 }>;
+
+type ParticipantRegistrationResponse = Readonly<{
+  document: ParticipantRegistrationDocument;
+  csrfToken: string | null;
+  cookie: string | null;
+}>;
+
+async function participantRegistration(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+): Promise<ParticipantRegistrationResponse> {
+  return participantRegistrationFor(
+    worker,
+    env,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+  );
+}
+
+async function participantRegistrationFor(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  subject: string,
+  email: string,
+): Promise<ParticipantRegistrationResponse> {
+  const response = await worker.fetch(
+    new Request(`${APP_ORIGIN}${PARTICIPANT_REGISTRATION_PATH}`, {
+      headers: {
+        accept: "application/json",
+        "oai-authenticated-user-id": subject,
+        "oai-authenticated-user-email": email,
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(response.status, 200);
+  const setCookie = response.headers.get("set-cookie");
+  return Object.freeze({
+    document: await response.json() as ParticipantRegistrationDocument,
+    csrfToken: response.headers.get(MUTATION_CSRF_HEADER),
+    cookie: setCookie === null ? null : cookieHeader(setCookie),
+  });
+}
+
+async function submitRegistration(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  resource: ParticipantRegistrationResponse,
+  body: Readonly<Record<string, unknown>>,
+  options: Readonly<{
+    cookie?: string | null;
+    origin?: string;
+  }> = {},
+): Promise<Response> {
+  const action = requiredAction(
+    resource.document,
+    "register-participant-access",
+  );
+  assert(resource.csrfToken);
+  const cookie = options.cookie === undefined ? resource.cookie : options.cookie;
+  const headers = new Headers({
+    accept: "application/json",
+    "content-type": "application/json",
+    origin: options.origin ?? APP_ORIGIN,
+    [MUTATION_CSRF_HEADER]: resource.csrfToken,
+    "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+    "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+  });
+  if (cookie !== null) headers.set("cookie", cookie);
+  return worker.fetch(
+    new Request(action.href, {
+      method: action.method,
+      headers,
+      body: JSON.stringify(body),
+    }),
+    env,
+    executionContext,
+  );
+}
 
 type ParticipantAcknowledgmentResponse = Readonly<{
   document: TestAcknowledgmentDocument;

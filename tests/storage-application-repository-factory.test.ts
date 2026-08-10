@@ -197,6 +197,7 @@ test("factory exposes only named application repository capabilities", async () 
     "ownerPackageWorkspace",
     "participantRequest",
     "participantInvestmentRepository",
+    "participantRepository",
   ]);
   assert.equal(
     factory.campaignRepository(),
@@ -283,6 +284,17 @@ test("factory exposes only named application repository capabilities", async () 
     "atomic-indication-aggregate-audit",
   );
   assertNoGenericStorageSurface(investment, storage);
+  const participant = factory.participantRepository(account.value);
+  assert.notEqual(
+    factory.participantRepository(account.value),
+    participant,
+  );
+  assert.deepEqual(Object.keys(participant), ["storageKind"]);
+  assert.equal(
+    (participant as typeof participant & { storageKind?: unknown }).storageKind,
+    "storage-adapter",
+  );
+  assertNoGenericStorageSurface(participant, storage);
   assert.doesNotMatch(
     Object.getOwnPropertyNames(Object.getPrototypeOf(factory)).join(" "),
     /adapter|storage|create/iu,

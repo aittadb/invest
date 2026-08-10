@@ -12,6 +12,7 @@ import type { AmountConfiguration } from "../domain/amount-aggregate-configurati
 import type { InvestmentIndicationParsingOptions } from "../domain/investment-indication.ts";
 import type { ParticipantAccount } from "../domain/participant-profile.ts";
 import type { ParticipantRequestRepositoryScope } from "../repositories/storage-application-repository-factory.ts";
+import type { ParticipantRegistrationRepository } from "../repositories/in-memory-participant-repository.ts";
 import type { OwnerCampaignEditorRepository } from "../services/owner-campaign-editor.ts";
 import type { OwnerPackageWorkspaceService } from "../services/owner-package-workspace.ts";
 import type {
@@ -39,6 +40,9 @@ export type ApplicationRepositoryFactory = Readonly<{
     parsingOptions?: InvestmentIndicationParsingOptions,
   ): ParticipantInvestmentInterestReader &
     AtomicParticipantInvestmentInterestMutationPort;
+  participantRepository(
+    account: ParticipantAccount,
+  ): ParticipantRegistrationRepository;
 }>;
 
 /** Backend-only deployment capability; it contains no serializable credential. */

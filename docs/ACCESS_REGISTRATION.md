@@ -1,11 +1,10 @@
 # Access Registration
 
 Access registration is an injectable participant resource at
-`/participant/registration`. `StorageParticipantRepository` now supplies the
-production-neutral persistence contract, but the resource is not wired into the
-hosted Worker. The trusted persistent participant projection is available;
-registration composition remains `TASK-091`, and profile self-service
-composition remains `TASK-092`.
+`/participant/registration`. Hosted composition installs it only for the exact
+path and a signed-in non-owner, using the credential-closed AittaDB repository
+factory and browser mutation session. Notice text comes only from the persisted
+private campaign policy. Profile self-service composition remains `TASK-092`.
 
 ## Representations
 
@@ -50,15 +49,27 @@ resource has no mutation action and emits no proof.
 Once hosted verification succeeds, its one-time proof cookie is expired exactly
 once on successful registration and on every later parser, repository, or
 rendering failure. Failures before verification do not emit that expiration
-cookie. Body and field limits run before the hosted replay capability is claimed
-and before the participant repository is opened.
+cookie. A hosted verifier that omits or malforms the expiration instruction
+fails before origin parsing or repository access. Body and field limits run
+before the hosted replay capability is claimed and before the participant
+repository is opened.
 
 The request-scoped repository factory receives the trusted subject and provider
 email as a `ParticipantAccount`. Registration delegates persistence to the
 existing `ParticipantRepository`: an exact operation retry returns its original
 snapshot, a changed retry conflicts, and a new duplicate registration conflicts.
-The route reuses the persisted registration timestamp for retry evaluation and
-does not retain process-memory authority.
+Serial retries reuse the persisted registration timestamp. If two exact requests
+both observe the missing profile, persistence treats the timestamp as
+server-generated metadata, recovers the first immutable revision after the
+losing transaction, and returns it as a replay. No process-memory authority is
+retained.
+
+Hosted composition reads the full campaign setup only on the registration path,
+projects only its process and optional-marketing notices into the route, and
+binds every repository and proof operation to the trusted account subject and
+provider email label. Anonymous users and configured owners do not open private
+campaign or participant registration storage. A foreign signed-in account sees
+only its own missing or current profile.
 
 HTML loads `/participant-registration.css` from the same origin. Registration
 responses are non-cacheable, use a same-origin stylesheet and form CSP, set
