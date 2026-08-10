@@ -24,6 +24,7 @@ import {
 import { StorageFailure } from "../domain/storage-adapter.ts";
 import type {
   AcknowledgmentRepository,
+  CurrentPackageAcceptanceStatus,
   PackageVersionRepository,
   RevisionedSnapshot,
 } from "../repositories/in-memory-content-repository.ts";
@@ -65,12 +66,19 @@ const PACKAGE_SECTION_KEYS = new Set([
   "markdown",
   "enabled",
 ]);
+const ACCEPTANCE_STATUS_KEYS = new Set([
+  "bindingRevision",
+  "versionId",
+  "contentHash",
+  "requiredAcceptanceHash",
+  "requiresCurrentAcceptance",
+]);
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
 
 export type ParticipantAccessRepositories = Readonly<{
   participant: Pick<ParticipantRepository, "current">;
   packages: Pick<PackageVersionRepository, "current">;
-  acknowledgments: Pick<AcknowledgmentRepository, "requiresCurrentAcceptance">;
+  acknowledgments: Pick<AcknowledgmentRepository, "currentAcceptanceStatus">;
 }>;
 
 export type ParticipantAccessRepositoriesResolver = (
@@ -93,15 +101,12 @@ export async function readParticipantAuthorizationState(
 
       const rawPackageBefore = await repositories.packages.current();
       const packageBefore = await validatePackageSample(rawPackageBefore);
-      const requiresCurrentAcceptance = packageBefore === null
+      const rawAcceptanceStatus = packageBefore === null
         ? null
-        : await repositories.acknowledgments.requiresCurrentAcceptance();
-      if (
-        requiresCurrentAcceptance !== null &&
-        typeof requiresCurrentAcceptance !== "boolean"
-      ) {
-        throw unavailable();
-      }
+        : await repositories.acknowledgments.currentAcceptanceStatus();
+      const acceptanceStatus = rawAcceptanceStatus === null
+        ? null
+        : detachAcceptanceStatus(rawAcceptanceStatus);
 
       const rawPackageAfter = await repositories.packages.current();
       const packageAfter = await validatePackageSample(rawPackageAfter);
@@ -113,10 +118,19 @@ export async function readParticipantAuthorizationState(
         sameParticipantProfileSnapshot(profileBefore, profileAfter) &&
         samePackageVersionSnapshot(packageBefore, packageAfter)
       ) {
+        if (
+          packageBefore !== null &&
+          packageAfter !== null &&
+          (acceptanceStatus === null ||
+            !acceptanceStatusMatchesPackage(acceptanceStatus, packageBefore) ||
+            !acceptanceStatusMatchesPackage(acceptanceStatus, packageAfter))
+        ) {
+          throw unavailable();
+        }
         return authorizationState(
           profileAfter,
           packageAfter,
-          requiresCurrentAcceptance,
+          acceptanceStatus?.requiresCurrentAcceptance ?? null,
         );
       }
     }
@@ -168,6 +182,37 @@ function authorizationState(
     }),
     currentPackage: packageState,
   });
+}
+
+function detachAcceptanceStatus(
+  value: unknown,
+): CurrentPackageAcceptanceStatus {
+  const source = exactDataRecord(value, ACCEPTANCE_STATUS_KEYS);
+  const versionId = requiredPackageVersionId(source.versionId);
+  const contentHash = requiredPackageHash(source.contentHash);
+  const requiredAcceptanceHash = requiredPackageHash(
+    source.requiredAcceptanceHash,
+  );
+  if (typeof source.requiresCurrentAcceptance !== "boolean") {
+    throw unavailable();
+  }
+  return Object.freeze({
+    bindingRevision: positiveSafeRevision(source.bindingRevision),
+    versionId,
+    contentHash,
+    requiredAcceptanceHash,
+    requiresCurrentAcceptance: source.requiresCurrentAcceptance,
+  });
+}
+
+function acceptanceStatusMatchesPackage(
+  status: CurrentPackageAcceptanceStatus,
+  currentPackage: RevisionedSnapshot<PackageVersion>,
+): boolean {
+  return status.versionId === currentPackage.snapshot.id &&
+    status.contentHash === currentPackage.snapshot.contentHash &&
+    status.requiredAcceptanceHash ===
+      currentPackage.snapshot.requiredAcceptanceHash;
 }
 
 function detachParticipantProfileSample(
@@ -680,11 +725,20 @@ function requiredStableId(value: unknown): string {
   return parsed.value;
 }
 
-function requiredPackageHash(value: unknown): string {
+function requiredPackageVersionId(
+  value: unknown,
+): CurrentPackageAcceptanceStatus["versionId"] {
+  requireBoundedString(value, 128);
+  const parsed = parseStableId<"package-version">(value);
+  if (!parsed.ok || parsed.value !== value) throw unavailable();
+  return parsed.value;
+}
+
+function requiredPackageHash(value: unknown): PackageContentHash {
   if (typeof value !== "string" || !SHA256_PATTERN.test(value)) {
     throw unavailable();
   }
-  return value;
+  return value as PackageContentHash;
 }
 
 function requireBoundedString(value: unknown, maximum: number): string {

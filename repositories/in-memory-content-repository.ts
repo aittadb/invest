@@ -4,6 +4,7 @@ import {
   PACKAGE_CONTENT_LIMITS,
   requiresRenewedAcceptance,
   type PackageAcceptanceRecord,
+  type PackageContentHash,
   type PackageSection,
   type PackageVersion,
 } from "../domain/package-content.ts";
@@ -65,6 +66,14 @@ export type CurrentPackageAcceptanceBinding = Readonly<{
   snapshot: PackageVersion;
 }>;
 
+export type CurrentPackageAcceptanceStatus = Readonly<{
+  bindingRevision: number;
+  versionId: StableId<"package-version">;
+  contentHash: PackageContentHash;
+  requiredAcceptanceHash: PackageContentHash;
+  requiresCurrentAcceptance: boolean;
+}>;
+
 /** Package reads that can atomically fence acceptance against the current head. */
 export interface AcceptanceBoundPackageVersionRepository
   extends PackageVersionRepository
@@ -98,6 +107,7 @@ export interface AcknowledgmentRepository {
   get(
     id: StableId<"package-acceptance">,
   ): Promise<PackageAcceptanceRecord | null>;
+  currentAcceptanceStatus(): Promise<CurrentPackageAcceptanceStatus>;
   requiresCurrentAcceptance(): Promise<boolean>;
 }
 
@@ -107,7 +117,14 @@ type StoredPackageVersion = Readonly<{
   previousVersionId: StableId<"package-version"> | null;
   mutationFingerprint: string;
   acceptanceBindingExpectedRevision: number | null;
+  ancestryLength: number;
+  reconstructionReadCount: number;
 }>;
+
+type PackageReconstructionContext = {
+  remainingReads: number;
+  readonly versionIds: Set<string>;
+};
 
 type PackageMutationFingerprint = Readonly<{
   source: "computed" | "supplied";
@@ -154,6 +171,17 @@ const CURRENT_PACKAGE_ID = stableId<"storage-record">("current-package");
 const MAX_PACKAGE_SECTION_RECORD_BYTES = 60_000;
 const MAX_PACKAGE_SECTION_CHUNKS = 16;
 const MAX_ACCEPTANCE_GATE_READ_ATTEMPTS = 3;
+export const PACKAGE_STORAGE_READ_LIMITS = Object.freeze({
+  maxVersionAncestry: 32,
+  maxReconstructionReads: 512,
+});
+
+function createPackageReconstructionContext(): PackageReconstructionContext {
+  return {
+    remainingReads: PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads,
+    versionIds: new Set<string>(),
+  };
+}
 
 /**
  * Immutable package repository over a credential-bound StorageAdapter.
@@ -204,6 +232,8 @@ export class StoragePackageVersionRepository
 
     let previousVersionId: StableId<"package-version"> | null;
     let previousVersion: PackageVersion | null;
+    let previousVersionAncestry: number;
+    let previousReconstructionReadCount: number;
     let acceptanceBindingExpectedRevision: number | null;
     if (existingIntent !== null) {
       requireIntentRequestMatch(
@@ -219,12 +249,17 @@ export class StoragePackageVersionRepository
         : await this.#readStoredVersion(packageVersionKey(previousVersionId));
       if (previousVersionId !== null && previous === null) unavailable();
       previousVersion = previous?.snapshot ?? null;
+      previousVersionAncestry = previous?.ancestryLength ?? 0;
+      previousReconstructionReadCount = previous?.reconstructionReadCount ?? 0;
       acceptanceBindingExpectedRevision =
         existingIntent.acceptanceBindingExpectedRevision;
     } else {
       const current = await this.#readCurrentStored();
       previousVersionId = current?.stored.snapshot.id ?? null;
       previousVersion = current?.stored.snapshot ?? null;
+      previousVersionAncestry = current?.stored.ancestryLength ?? 0;
+      previousReconstructionReadCount =
+        current?.stored.reconstructionReadCount ?? 0;
       if (current === null) {
         acceptanceBindingExpectedRevision = null;
       } else {
@@ -235,6 +270,10 @@ export class StoragePackageVersionRepository
         acceptanceBindingExpectedRevision = binding.revision;
       }
     }
+    if (
+      previousVersionAncestry >=
+        PACKAGE_STORAGE_READ_LIMITS.maxVersionAncestry
+    ) unavailable();
 
     let parsed: PackageVersion;
     try {
@@ -243,6 +282,13 @@ export class StoragePackageVersionRepository
       if (existingIntent !== null) conflict();
       throw error;
     }
+    const resultingReconstructionReadCount =
+      1 + previousReconstructionReadCount +
+      packageVersionReconstructionRecordCount(parsed);
+    if (
+      resultingReconstructionReadCount >
+        PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads
+    ) unavailable();
     const normalizedMutationHash = await packageNormalizedMutationHash(parsed);
     const intent = packageOperationIntent(
       request,
@@ -337,10 +383,12 @@ export class StoragePackageVersionRepository
   async currentAcceptanceBinding(): Promise<
     CurrentPackageAcceptanceBinding | null
   > {
-    const binding = await this.#readAcceptanceGate();
+    const context = createPackageReconstructionContext();
+    const binding = await this.#readAcceptanceGate(context);
     if (binding === null) return null;
     const stored = await this.#readStoredVersion(
       packageVersionKey(binding.versionId),
+      context,
     );
     if (
       stored === null ||
@@ -354,9 +402,12 @@ export class StoragePackageVersionRepository
 
   async #readOperationIntent(
     operationId: StorageOperationId,
+    context?: PackageReconstructionContext,
   ): Promise<StoredPackageOperationIntent | null> {
     const key = packageOperationIntentKey(operationId);
-    const value = await this.#storage.read(key);
+    const value = context === undefined
+      ? await this.#storage.read(key)
+      : await this.#readPackageRecord(key, context);
     if (value === null) return null;
     const { source } = exactStoredDocument(value, key, true, [
       "schemaVersion",
@@ -507,8 +558,9 @@ export class StoragePackageVersionRepository
     headRevision: number;
     stored: StoredPackageVersion;
   }> | null> {
+    const context = createPackageReconstructionContext();
     const headKey = packageVersionHeadKey();
-    const value = await this.#storage.read(headKey);
+    const value = await this.#readPackageRecord(headKey, context);
     if (value === null) return null;
     const { record: head, source } = exactStoredDocument(
       value,
@@ -517,16 +569,23 @@ export class StoragePackageVersionRepository
       ["schemaVersion", "kind", "versionId"],
     );
     const versionId = packageVersionIdFromHead(source);
-    const stored = await this.#readStoredVersion(packageVersionKey(versionId));
+    const stored = await this.#readStoredVersion(
+      packageVersionKey(versionId),
+      context,
+    );
     if (stored === null) unavailable();
     return Object.freeze({ headRevision: head.revision, stored });
   }
 
   async #readStoredVersion(
     key: StorageKey,
-    seen: ReadonlySet<string> = new Set<string>(),
+    context = createPackageReconstructionContext(),
+    depth = 0,
   ): Promise<StoredPackageVersion | null> {
-    const value = await this.#storage.read(key);
+    if (depth >= PACKAGE_STORAGE_READ_LIMITS.maxVersionAncestry) unavailable();
+    if (context.versionIds.has(key.id)) unavailable();
+    const remainingReadsBefore = context.remainingReads;
+    const value = await this.#readPackageRecord(key, context);
     if (value === null) return null;
     const { record, source } = exactStoredDocument(value, key, true, [
       "schemaVersion",
@@ -544,7 +603,6 @@ export class StoragePackageVersionRepository
       "contentHash",
       "requiredAcceptanceHash",
     ]);
-    if (seen.has(record.key.id)) unavailable();
     if (source.schemaVersion !== 1 || source.kind !== "package-version") {
       unavailable();
     }
@@ -567,22 +625,26 @@ export class StoragePackageVersionRepository
       "package-version-sections",
     );
 
-    const nextSeen = new Set(seen);
-    nextSeen.add(record.key.id);
+    context.versionIds.add(record.key.id);
     const previous = previousVersionId === null
       ? null
       : await this.#readStoredVersion(
           packageVersionKey(previousVersionId),
-          nextSeen,
+          context,
+          depth + 1,
         );
     if (previousVersionId !== null && previous === null) unavailable();
 
-    const sections = await this.#readStoredSections(versionId, sectionRecordIds);
+    const sections = await this.#readStoredSections(
+      versionId,
+      sectionRecordIds,
+      context,
+    );
     const parsed = await parseStoredPackageVersion(
       { ...source, sections },
       previous?.snapshot ?? null,
     );
-    const intent = await this.#readOperationIntent(operationId);
+    const intent = await this.#readOperationIntent(operationId, context);
     if (
       intent === null ||
       intent.packageVersionId !== versionId ||
@@ -600,17 +662,20 @@ export class StoragePackageVersionRepository
       previousVersionId,
       mutationFingerprint,
       acceptanceBindingExpectedRevision,
+      ancestryLength: (previous?.ancestryLength ?? 0) + 1,
+      reconstructionReadCount: remainingReadsBefore - context.remainingReads,
     });
   }
 
   async #readStoredSections(
     versionId: StableId<"package-version">,
     sectionRecordIds: readonly StableId<"storage-record">[],
+    context: PackageReconstructionContext,
   ): Promise<readonly PackageSection[]> {
     const sections: PackageSection[] = [];
     for (const [index, sectionRecordId] of sectionRecordIds.entries()) {
       const key = packageSectionKey(sectionRecordId);
-      const value = await this.#storage.read(key);
+      const value = await this.#readPackageRecord(key, context);
       if (value === null) unavailable();
       const { source } = exactStoredDocument(value, key, true, [
         "schemaVersion",
@@ -644,9 +709,7 @@ export class StoragePackageVersionRepository
       let markdownLength = 0;
       for (const [chunkIndex, chunkRecordId] of chunkRecordIds.entries()) {
         const chunkKey = packageSectionChunkKey(chunkRecordId);
-        const chunkValue = await this.#storage.read(
-          chunkKey,
-        );
+        const chunkValue = await this.#readPackageRecord(chunkKey, context);
         if (chunkValue === null) unavailable();
         const { source: chunk } = exactStoredDocument(
           chunkValue,
@@ -702,13 +765,17 @@ export class StoragePackageVersionRepository
     return Object.freeze({ revision: gate.revision });
   }
 
-  async #readAcceptanceGate(): Promise<Readonly<{
+  async #readAcceptanceGate(
+    context?: PackageReconstructionContext,
+  ): Promise<Readonly<{
     revision: number;
     versionId: StableId<"package-version">;
     requiredAcceptanceHash: string;
   }> | null> {
     const key = packageAcceptanceBindingKey();
-    const value = await this.#storage.read(key);
+    const value = context === undefined
+      ? await this.#storage.read(key)
+      : await this.#readPackageRecord(key, context);
     if (value === null) return null;
     const { record, source } = exactStoredDocument(value, key, false, [
       "schemaVersion",
@@ -727,6 +794,15 @@ export class StoragePackageVersionRepository
       versionId: parseRequiredStableId<"package-version">(source.versionId),
       requiredAcceptanceHash: source.requiredAcceptanceHash,
     });
+  }
+
+  async #readPackageRecord(
+    key: StorageKey,
+    context: PackageReconstructionContext,
+  ): Promise<StorageRecord | null> {
+    if (context.remainingReads <= 0) unavailable();
+    context.remainingReads -= 1;
+    return await this.#storage.read(key);
   }
 }
 
@@ -863,7 +939,7 @@ export class StorageAcknowledgmentRepository
     ))?.snapshot ?? null;
   }
 
-  async requiresCurrentAcceptance(): Promise<boolean> {
+  async currentAcceptanceStatus(): Promise<CurrentPackageAcceptanceStatus> {
     if (this.#participantSubject === null) notFound();
     for (let attempt = 0; attempt < MAX_ACCEPTANCE_GATE_READ_ATTEMPTS; attempt += 1) {
       const before = await this.#packages.currentAcceptanceBinding();
@@ -872,13 +948,23 @@ export class StorageAcknowledgmentRepository
       const after = await this.#packages.currentAcceptanceBinding();
       if (after === null) unavailable();
       if (sameAcceptanceBinding(before, after)) {
-        return requiresRenewedAcceptance(
-          after.snapshot,
-          latest?.snapshot ?? null,
-        );
+        return Object.freeze({
+          bindingRevision: after.bindingRevision,
+          versionId: after.snapshot.id,
+          contentHash: after.snapshot.contentHash,
+          requiredAcceptanceHash: after.snapshot.requiredAcceptanceHash,
+          requiresCurrentAcceptance: requiresRenewedAcceptance(
+            after.snapshot,
+            latest?.snapshot ?? null,
+          ),
+        });
       }
     }
     unavailable();
+  }
+
+  async requiresCurrentAcceptance(): Promise<boolean> {
+    return (await this.currentAcceptanceStatus()).requiresCurrentAcceptance;
   }
 
   async #readOwnStoredAcceptance(
@@ -1295,6 +1381,16 @@ function splitPackageSectionMarkdown(
     start = acceptedEnd;
   }
   return Object.freeze(chunks);
+}
+
+function packageVersionReconstructionRecordCount(
+  version: PackageVersion,
+): number {
+  return 2 + version.sections.reduce(
+    (count, section) =>
+      count + 1 + splitPackageSectionMarkdown(version.id, section).length,
+    0,
+  );
 }
 
 function storageDocumentBytes(document: StorageDocument): number {

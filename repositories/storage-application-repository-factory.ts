@@ -109,8 +109,8 @@ export class StorageApplicationRepositoryFactory {
           }),
           packages: this.#participantPackageReader,
           acknowledgments: Object.freeze({
-            requiresCurrentAcceptance: () =>
-              acknowledgments.requiresCurrentAcceptance(),
+            currentAcceptanceStatus: () =>
+              acknowledgments.currentAcceptanceStatus(),
           }),
         });
       },

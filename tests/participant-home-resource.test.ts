@@ -24,6 +24,8 @@ import { createPublicCampaignDocument } from "../domain/public-campaign-resource
 import {
   parseStorageOperationId,
   StorageFailure,
+  type StorageAdapter,
+  type StorageRecord,
 } from "../domain/storage-adapter.ts";
 import {
   StorageAcknowledgmentRepository,
@@ -237,9 +239,9 @@ test("repository projection returns one stable participant, package, and accepta
       },
     },
     acknowledgments: {
-      requiresCurrentAcceptance: async () => {
+      currentAcceptanceStatus: async () => {
         acknowledgmentReads += 1;
-        return true;
+        return acceptanceStatus(version, 1, true);
       },
     },
   });
@@ -248,6 +250,73 @@ test("repository projection returns one stable participant, package, and accepta
   assert.equal(profileReads, 2);
   assert.equal(packageReads, 2);
   assert.equal(acknowledgmentReads, 1);
+});
+
+test("repository projection detaches and validates closed acceptance evidence", async () => {
+  const alice = account("oidc:alice", "alice@example.test");
+  const profile = registeredProfile(alice);
+  const version = await packageVersion("acceptance-evidence", "Stable package");
+  const sharedStatus = { ...acceptanceStatus(version, 1, true) };
+  let packageReads = 0;
+  const state = await readParticipantAuthorizationState({
+    participant: {
+      current: async () => ({ revision: 1, snapshot: profile }),
+    },
+    packages: {
+      current: async () => {
+        packageReads += 1;
+        if (packageReads === 2) sharedStatus.requiresCurrentAcceptance = false;
+        return { revision: 1, snapshot: version };
+      },
+    },
+    acknowledgments: {
+      currentAcceptanceStatus: async () => sharedStatus,
+    },
+  });
+  assert.equal(state?.currentPackage?.requiresCurrentAcceptance, true);
+
+  let accessorCalls = 0;
+  const accessorStatus = { ...acceptanceStatus(version, 1, true) };
+  Object.defineProperty(accessorStatus, "contentHash", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      accessorCalls += 1;
+      return version.contentHash;
+    },
+  });
+  const malformed = [
+    { ...acceptanceStatus(version, 1, true), bindingRevision: 0 },
+    { ...acceptanceStatus(version, 1, true), versionId: " package:private " },
+    { ...acceptanceStatus(version, 1, true), contentHash: "sha256:private" },
+    {
+      ...acceptanceStatus(version, 1, true),
+      requiredAcceptanceHash: `sha256:${"A".repeat(64)}`,
+    },
+    {
+      ...acceptanceStatus(version, 1, true),
+      requiresCurrentAcceptance: "false",
+    },
+    { ...acceptanceStatus(version, 1, true), extra: "private" },
+    accessorStatus,
+  ];
+  for (const candidate of malformed) {
+    await assert.rejects(
+      readParticipantAuthorizationState({
+        participant: {
+          current: async () => ({ revision: 1, snapshot: profile }),
+        },
+        packages: {
+          current: async () => ({ revision: 1, snapshot: version }),
+        },
+        acknowledgments: {
+          currentAcceptanceStatus: async () => candidate as never,
+        },
+      }),
+      unavailableFailure,
+    );
+  }
+  assert.equal(accessorCalls, 0);
 });
 
 test("repository access reader reconstructs state through fresh storage-backed readers", async () => {
@@ -336,9 +405,9 @@ test("repository projection retries a participant change and returns deletion-re
       },
     },
     acknowledgments: {
-      requiresCurrentAcceptance: async () => {
+      currentAcceptanceStatus: async () => {
         acknowledgmentReads += 1;
-        return false;
+        return acceptanceStatus(version, 1, false);
       },
     },
   });
@@ -372,8 +441,17 @@ test("repository projection retries package publication around the acceptance re
       current: async () => packages[packageRead++] ?? assert.fail("Unexpected package read"),
     },
     acknowledgments: {
-      requiresCurrentAcceptance: async () =>
-        acceptance[acknowledgmentRead++] ?? assert.fail("Unexpected acknowledgment read"),
+      currentAcceptanceStatus: async () => {
+        const requiresCurrentAcceptance = acceptance[acknowledgmentRead++];
+        if (requiresCurrentAcceptance === undefined) {
+          return assert.fail("Unexpected acknowledgment read");
+        }
+        return acceptanceStatus(
+          acknowledgmentRead === 1 ? first : second,
+          acknowledgmentRead,
+          requiresCurrentAcceptance,
+        );
+      },
     },
   });
 
@@ -382,6 +460,75 @@ test("repository projection retries package publication around the acceptance re
   assert.equal(state?.currentPackage?.requiresCurrentAcceptance, true);
   assert.equal(packageRead, 4);
   assert.equal(acknowledgmentRead, 2);
+});
+
+test("repository projection rejects a stable package head with a stale accepted gate", async () => {
+  const alice = account("oidc:alice", "alice@example.test");
+  const profile = registeredProfile(alice);
+  const storageState = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(storageState);
+  const packages = new StoragePackageVersionRepository(storage);
+  const acknowledgments = new StorageAcknowledgmentRepository(
+    storage,
+    packages,
+    alice.subject,
+  );
+  const firstOperation = parseStorageOperationId("operation:stale-gate-v1");
+  const acceptanceOperation = parseStorageOperationId(
+    "operation:stale-gate-accept-v1",
+  );
+  const secondOperation = parseStorageOperationId("operation:stale-gate-v2");
+  const acceptanceId = parseStableId<"package-acceptance">(
+    "acceptance:stale-gate-v1",
+  );
+  const acceptedAt = parseTimestamp("2026-08-09T09:05:00.000Z");
+  assert(firstOperation.ok);
+  assert(acceptanceOperation.ok);
+  assert(secondOperation.ok);
+  assert(acceptanceId.ok);
+  assert(acceptedAt.ok);
+
+  const first = await packages.append({
+    operationId: firstOperation.value,
+    expectedRevision: null,
+    draft: packageDraft("package-version:stale-gate-v1", "First package"),
+  });
+  await acknowledgments.record({
+    operationId: acceptanceOperation.value,
+    expectedRevision: null,
+    id: acceptanceId.value,
+    acceptedAt: acceptedAt.value,
+    acceptedVersionId: first.snapshot.id,
+  });
+  const staleGate = [...storageState.records.values()].find((record) =>
+    record.key.collection === "private-package-acceptance-bindings"
+  );
+  assert(staleGate);
+  await packages.append({
+    operationId: secondOperation.value,
+    expectedRevision: first.revision,
+    draft: packageDraft("package-version:stale-gate-v2", "Second package"),
+  });
+
+  const corruptedStorage = storageWithGate(storage, staleGate);
+  const corruptedPackages = new StoragePackageVersionRepository(
+    corruptedStorage,
+  );
+  const corruptedAcknowledgments = new StorageAcknowledgmentRepository(
+    corruptedStorage,
+    corruptedPackages,
+    alice.subject,
+  );
+  await assert.rejects(
+    readParticipantAuthorizationState({
+      participant: {
+        current: async () => ({ revision: 1, snapshot: profile }),
+      },
+      packages: corruptedPackages,
+      acknowledgments: corruptedAcknowledgments,
+    }),
+    unavailableFailure,
+  );
 });
 
 test("repository projection detaches a mutable package alias before acceptance changes it", async () => {
@@ -401,14 +548,14 @@ test("repository projection detaches a mutable package alias before acceptance c
       current: async () => sharedSample,
     },
     acknowledgments: {
-      requiresCurrentAcceptance: async () => {
+      currentAcceptanceStatus: async () => {
         acknowledgmentRead += 1;
         if (acknowledgmentRead === 1) {
           sharedSample.revision = 2;
           Object.assign(sharedSnapshot, mutablePackageVersion(second));
-          return false;
+          return acceptanceStatus(first, 1, false);
         }
-        return true;
+        return acceptanceStatus(second, 2, true);
       },
     },
   });
@@ -441,7 +588,8 @@ test("repository projection fails closed when participant or package state keeps
         }),
       },
       acknowledgments: {
-        requiresCurrentAcceptance: async () => false,
+        currentAcceptanceStatus: async () =>
+          acceptanceStatus(version, packageRead, false),
       },
     }),
     unavailableFailure,
@@ -458,7 +606,7 @@ test("missing participant short-circuits package and acknowledgment reads", asyn
       current: async () => assert.fail("Package state must stay unread."),
     },
     acknowledgments: {
-      requiresCurrentAcceptance: async () =>
+      currentAcceptanceStatus: async () =>
         assert.fail("Acknowledgment state must stay unread."),
     },
   });
@@ -554,7 +702,7 @@ test("repository projection rejects malformed participant snapshots before packa
           current: async () => assert.fail("Package state must stay unread."),
         },
         acknowledgments: {
-          requiresCurrentAcceptance: async () =>
+          currentAcceptanceStatus: async () =>
             assert.fail("Acknowledgment state must stay unread."),
         },
       }),
@@ -632,7 +780,7 @@ test("repository projection rejects unbounded or non-data package snapshots", as
         },
         packages: { current: async () => candidate as never },
         acknowledgments: {
-          requiresCurrentAcceptance: async () =>
+          currentAcceptanceStatus: async () =>
             assert.fail("Acknowledgment state must stay unread."),
         },
       }),
@@ -660,7 +808,7 @@ test("repository projection masks repository exceptions and private details", as
         current: async () => assert.fail("Package state must stay unread."),
       },
       acknowledgments: {
-        requiresCurrentAcceptance: async () =>
+        currentAcceptanceStatus: async () =>
           assert.fail("Acknowledgment state must stay unread."),
       },
     }),
@@ -676,7 +824,7 @@ test("repository projection masks repository exceptions and private details", as
         current: async () => ({ revision: 1, snapshot: version }),
       },
       acknowledgments: {
-        requiresCurrentAcceptance: async () => {
+        currentAcceptanceStatus: async () => {
           throw new Error(privateDetail);
         },
       },
@@ -693,8 +841,7 @@ test("repository projection masks repository exceptions and private details", as
         current: async () => ({ revision: 1, snapshot: version }),
       },
       acknowledgments: {
-        requiresCurrentAcceptance: async () =>
-          privateDetail as unknown as boolean,
+        currentAcceptanceStatus: async () => privateDetail as never,
       },
     }),
     privateDetail,
@@ -711,7 +858,7 @@ test("repository projection masks repository exceptions and private details", as
         },
       },
       acknowledgments: {
-        requiresCurrentAcceptance: async () =>
+        currentAcceptanceStatus: async () =>
           assert.fail("Acknowledgment state must stay unread."),
       },
     }),
@@ -764,6 +911,39 @@ async function packageVersion(suffix: string, changeSummary: string) {
   );
   assert(version.ok);
   return version.value;
+}
+
+function acceptanceStatus(
+  version: Awaited<ReturnType<typeof packageVersion>>,
+  bindingRevision: number,
+  requiresCurrentAcceptance: boolean,
+) {
+  return Object.freeze({
+    bindingRevision,
+    versionId: version.id,
+    contentHash: version.contentHash,
+    requiredAcceptanceHash: version.requiredAcceptanceHash,
+    requiresCurrentAcceptance,
+  });
+}
+
+function storageWithGate(
+  delegate: StorageAdapter,
+  gate: StorageRecord,
+): StorageAdapter {
+  return Object.freeze({
+    async read(key: Parameters<StorageAdapter["read"]>[0]) {
+      return key.collection === "private-package-acceptance-bindings"
+        ? gate
+        : await delegate.read(key);
+    },
+    list(request: Parameters<StorageAdapter["list"]>[0]) {
+      return delegate.list(request);
+    },
+    transact(request: Parameters<StorageAdapter["transact"]>[0]) {
+      return delegate.transact(request);
+    },
+  });
 }
 
 function packageDraft(id: string, changeSummary: string) {

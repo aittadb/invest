@@ -28,6 +28,7 @@ import {
 import {
   InMemoryAcknowledgmentRepository,
   InMemoryPackageVersionRepository,
+  PACKAGE_STORAGE_READ_LIMITS,
   type CurrentPackageAcceptanceBinding,
   type RecordPackageAcceptanceRequest,
 } from "../repositories/in-memory-content-repository.ts";
@@ -112,6 +113,16 @@ test("both content repositories honor replay, revision, and stale-write contract
   assert.equal(firstAcceptance.revision, 1);
   assert.equal(acceptanceReplay.replayed, true);
   assert.deepEqual(acceptanceReplay.snapshot, firstAcceptance.snapshot);
+  assert.deepEqual(
+    await fixture.aliceAcknowledgments.currentAcceptanceStatus(),
+    {
+      bindingRevision: 3,
+      versionId: second.snapshot.id,
+      contentHash: second.snapshot.contentHash,
+      requiredAcceptanceHash: second.snapshot.requiredAcceptanceHash,
+      requiresCurrentAcceptance: false,
+    },
+  );
 
   await rejectsStorage(
     () => fixture.aliceAcknowledgments.record({
@@ -459,6 +470,165 @@ test("acceptance status retries an interleaved gate and never satisfies an obsol
     "UNAVAILABLE",
   );
   assert.equal(churningPackages.bindingReads, 6);
+});
+
+test("package ancestry ceiling blocks publication and bounds hostile acyclic history reads", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(
+    state,
+    () => true,
+    () => true,
+  );
+  const packages = new InMemoryPackageVersionRepository(storage);
+  let revision: number | null = null;
+  for (
+    let index = 1;
+    index <= PACKAGE_STORAGE_READ_LIMITS.maxVersionAncestry;
+    index += 1
+  ) {
+    const result = await packages.append({
+      operationId: operationId(`operation:bounded-depth-${index}`),
+      expectedRevision: revision,
+      draft: packageDraft(
+        `package:bounded-depth-${index}`,
+        timestampAtMinute("2026-08-04T08:00:00.000Z", index),
+        true,
+        `Bounded depth ${index}`,
+      ),
+    });
+    revision = result.revision;
+  }
+  assert.equal((await packages.current())?.revision, revision);
+
+  const recordsBefore = state.records.size;
+  const operationsBefore = state.operations.size;
+  await rejectsStorage(
+    () => packages.append({
+      operationId: operationId("operation:bounded-depth-overflow"),
+      expectedRevision: revision,
+      draft: packageDraft(
+        "package:bounded-depth-overflow",
+        "2026-08-04T09:00:00.000Z",
+        true,
+        "Must not become unreadable",
+      ),
+    }),
+    "UNAVAILABLE",
+  );
+  assert.equal(state.records.size, recordsBefore);
+  assert.equal(state.operations.size, operationsBefore);
+  assert.equal((await packages.current())?.revision, revision);
+
+  const parentState = new MemoryStorageState();
+  const parentPackages = new InMemoryPackageVersionRepository(
+    new DeterministicMemoryStorageAdapter(
+      parentState,
+      () => true,
+      () => true,
+    ),
+  );
+  await parentPackages.append({
+    operationId: operationId("operation:bounded-depth-parent"),
+    expectedRevision: null,
+    draft: packageDraft(
+      "package:bounded-depth-parent",
+      "2026-08-04T08:00:00.000Z",
+      true,
+      "Hostile acyclic parent",
+    ),
+  });
+  attachStandalonePackageParent(
+    state,
+    "package:bounded-depth-1",
+    parentState,
+    "package:bounded-depth-parent",
+  );
+
+  const counted = new CountingStorageAdapter(storage);
+  await rejectsStorage(
+    () => new InMemoryPackageVersionRepository(counted).current(),
+    "UNAVAILABLE",
+  );
+  assert.equal(
+    counted.readCount,
+    PACKAGE_STORAGE_READ_LIMITS.maxVersionAncestry + 1,
+  );
+  assert.equal(
+    counted.readKeys.some((key) => key.id === "package:bounded-depth-parent"),
+    false,
+  );
+});
+
+test("package reconstruction read budget blocks publication and caps storage reads", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(
+    state,
+    () => true,
+    () => true,
+  );
+  const packages = new InMemoryPackageVersionRepository(storage);
+  let revision: number | null = null;
+  for (let index = 1; index <= 3; index += 1) {
+    const result = await packages.append({
+      operationId: operationId(`operation:bounded-reads-${index}`),
+      expectedRevision: revision,
+      draft: densePackageDraft(
+        `package:bounded-reads-${index}`,
+        timestampAtMinute("2026-08-05T08:00:00.000Z", index),
+      ),
+    });
+    revision = result.revision;
+  }
+
+  const recordsBefore = state.records.size;
+  const operationsBefore = state.operations.size;
+  await rejectsStorage(
+    () => packages.append({
+      operationId: operationId("operation:bounded-reads-overflow"),
+      expectedRevision: revision,
+      draft: densePackageDraft(
+        "package:bounded-reads-overflow",
+        "2026-08-05T09:00:00.000Z",
+      ),
+    }),
+    "UNAVAILABLE",
+  );
+  assert.equal(state.records.size, recordsBefore);
+  assert.equal(state.operations.size, operationsBefore);
+  assert.equal((await packages.current())?.revision, revision);
+
+  const parentState = new MemoryStorageState();
+  const parentPackages = new InMemoryPackageVersionRepository(
+    new DeterministicMemoryStorageAdapter(
+      parentState,
+      () => true,
+      () => true,
+    ),
+  );
+  await parentPackages.append({
+    operationId: operationId("operation:bounded-reads-parent"),
+    expectedRevision: null,
+    draft: densePackageDraft(
+      "package:bounded-reads-parent",
+      "2026-08-05T08:00:00.000Z",
+    ),
+  });
+  attachStandalonePackageParent(
+    state,
+    "package:bounded-reads-1",
+    parentState,
+    "package:bounded-reads-parent",
+  );
+
+  const counted = new CountingStorageAdapter(storage);
+  await rejectsStorage(
+    () => new InMemoryPackageVersionRepository(counted).current(),
+    "UNAVAILABLE",
+  );
+  assert.equal(
+    counted.readCount,
+    PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads,
+  );
 });
 
 test("subjects and adapter grants prevent private or foreign disclosure", async () => {
@@ -1106,6 +1276,78 @@ function packageDraft(
   };
 }
 
+function densePackageDraft(id: string, createdAt: string) {
+  return {
+    id,
+    createdAt,
+    changeSummary: `Dense version ${id}`,
+    materialChange: true,
+    acknowledgmentText: "I acknowledge this dense information package.",
+    sections: Array.from({ length: 64 }, (_, index) => ({
+      id: `section:${id}:${index}`,
+      order: index,
+      title: `Dense section ${index + 1}`,
+      markdown: `# Dense section ${index + 1}`,
+      enabled: true,
+    })),
+  };
+}
+
+function timestampAtMinute(start: string, offsetMinutes: number): string {
+  return new Date(
+    new Date(start).valueOf() + offsetMinutes * 60_000,
+  ).toISOString();
+}
+
+function attachStandalonePackageParent(
+  state: MemoryStorageState,
+  childVersionId: string,
+  parentState: MemoryStorageState,
+  parentVersionId: string,
+): void {
+  const packageCollections = new Set([
+    "private-package-versions",
+    "private-package-operation-intents",
+    "private-package-version-sections",
+    "private-package-section-chunks",
+  ]);
+  for (const [key, record] of parentState.records) {
+    if (packageCollections.has(record.key.collection)) {
+      state.records.set(key, record);
+    }
+  }
+
+  let manifestUpdated = false;
+  let intentUpdated = false;
+  for (const [key, record] of state.records) {
+    if (
+      record.key.collection === "private-package-versions" &&
+      record.value.id === childVersionId
+    ) {
+      state.records.set(key, withRecordValue(record, {
+        ...record.value,
+        previousVersionId: parentVersionId,
+        acceptanceBindingExpectedRevision: 1,
+      }));
+      manifestUpdated = true;
+    }
+    if (
+      record.key.collection === "private-package-operation-intents" &&
+      record.value.packageVersionId === childVersionId
+    ) {
+      state.records.set(key, withRecordValue(record, {
+        ...record.value,
+        expectedOwnerRevision: 1,
+        previousVersionId: parentVersionId,
+        acceptanceBindingExpectedRevision: 1,
+      }));
+      intentUpdated = true;
+    }
+  }
+  assert.equal(manifestUpdated, true);
+  assert.equal(intentUpdated, true);
+}
+
 function acceptanceRequest(
   id: string,
   versionId: string,
@@ -1314,6 +1556,32 @@ class InterleavingStorageAdapter implements StorageAdapter {
       this.#beforeAcceptanceTransaction = null;
       await callback();
     }
+    return this.#delegate.transact(request);
+  }
+}
+
+class CountingStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readCount = 0;
+  readonly readKeys: StorageKey[] = [];
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+  }
+
+  async read(key: StorageKey): Promise<StorageRecord | null> {
+    this.readCount += 1;
+    this.readKeys.push(Object.freeze({ ...key }));
+    return await this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
     return this.#delegate.transact(request);
   }
 }

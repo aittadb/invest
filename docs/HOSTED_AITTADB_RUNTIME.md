@@ -187,7 +187,13 @@ All package and acknowledgment records use closed versioned schemas. Reads
 verify the exact requested key and record envelope, immutable or mutable
 revision rule, kind, identifiers, order, count, byte bound, and cross-record
 hashes. Chunk lengths are accumulated against the Markdown limit before
-concatenation or allocation. Every intent, stage, final publication, and
+concatenation or allocation. One reconstruction may follow at most 32 package
+versions and read at most 512 package records, including its head or gate,
+manifests, sections, chunks, and operation intents. Publication refuses a new
+version when the resulting reachable head would cross either limit. Existing
+over-limit or cyclic storage fails closed before another record is read; the
+reader retains one bounded visited set instead of copying it at each ancestor.
+Every intent, stage, final publication, and
 acknowledgment transaction response must contain an exact boolean replay flag
 and the exact positional key, revision, and value for every requested record;
 prepared audit output is verified separately. Extra, missing, null, reordered,
@@ -204,13 +210,18 @@ exact transaction on replay. Acknowledgment never advances the owner-visible
 package revision, and gate metadata never enters HTML, hypermedia, logs, or
 exports.
 
-The read-side `requiresCurrentAcceptance` repository method samples the exact
-gate before and after reading the latest participant acknowledgment. It returns
-a result only when both samples bind the same gate revision, version, content
-hash, and acceptance requirement; a small bounded retry handles one concurrent
-publication, and continuing gate movement fails closed. The acknowledgment
-route uses a separate single current/latest/current attempt and fails its
-precondition on change rather than running that bounded loop.
+The read-side `currentAcceptanceStatus` repository method samples the exact gate
+before and after reading the latest participant acknowledgment. It returns the
+boolean status together with the stable gate revision, package version,
+content hash, and required-acceptance hash only when both samples match. The
+participant authorization projection accepts that status only when its version
+and hashes also match both independently sampled current package snapshots. A
+small bounded retry handles one concurrent publication; a stale but internally
+valid gate, a continuing gate change, or any evidence mismatch fails closed.
+The boolean `requiresCurrentAcceptance` convenience method delegates to that
+evidence-bearing read. The acknowledgment route uses a separate single
+current/latest/current attempt and fails its precondition on change rather than
+running that bounded loop.
 
 ## Browser-Mutation Replay
 
