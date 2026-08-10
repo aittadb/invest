@@ -212,6 +212,8 @@ A deletion request persists only its existing request state and exposes a separa
 
 `StorageApplicationRepositoryFactory.participantAccessReader()` creates fresh subject-bound profile and acknowledgment repositories from the credential-closed adapter for every trusted account. The Worker obtains this capability only for a signed-in non-owner when no explicit test reader was injected. Configured owners and unrelated subjects receive no hosted participant authority. The complete runtime and factory stay outside route context and renderer inputs.
 
+Each authorization read also receives a fresh read-only adapter with one 528-record aggregate budget and a fresh package reader. That reader caches only verified immutable package-version reconstructions, bounded to 64 entries; mutable profile, package-head, acceptance-head, and gate records are resampled. Outer projection retries and nested gate retries therefore share the same finite storage allowance without reconstructing unchanged history, and neither the adapter nor cache survives the request-scoped use case.
+
 ### Founder applications
 
 `domain/founder-application.ts` validates founder fields against deployment-supplied contribution choices and records received or withdrawn state as immutable revision snapshots. Create, edit, and withdrawal transitions are scoped to the applicant subject, while owner review remains a separate use case.

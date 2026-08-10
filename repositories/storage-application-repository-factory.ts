@@ -28,6 +28,7 @@ import {
   type PublicCampaignPresentationReader,
 } from "./in-memory-campaign-repository.ts";
 import {
+  PACKAGE_STORAGE_READ_LIMITS,
   StorageAcknowledgmentRepository,
   StoragePackageVersionRepository,
   type AcknowledgmentRepository,
@@ -40,6 +41,8 @@ const REPLAY_COLLECTION = storageCollection("browser-mutation-replays");
 const REPLAY_CAPABILITY_PATTERN =
   /^browser-mutation:v1:[A-Za-z0-9_-]{43}$/u;
 const MAX_REPLAY_TTL_SECONDS = 600;
+export const PARTICIPANT_ACCESS_STORAGE_READ_LIMIT =
+  PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads + 16;
 
 type ParticipantPackageAcknowledgmentRepositories = Readonly<{
   packages: Pick<PackageVersionRepository, "current">;
@@ -97,17 +100,25 @@ export class StorageApplicationRepositoryFactory {
     };
     this.#participantAccessReader = createRepositoryParticipantAccessStateReader(
       (account) => {
-        const participant = new StorageParticipantRepository(adapter, account);
+        const requestStorage = participantAccessStorage(adapter);
+        const participant = new StorageParticipantRepository(
+          requestStorage,
+          account,
+        );
+        const requestPackages =
+          StoragePackageVersionRepository.requestScopedReader(requestStorage);
         const acknowledgments = new StorageAcknowledgmentRepository(
-          adapter,
-          packageVersions,
+          requestStorage,
+          requestPackages,
           account.subject,
         );
         return Object.freeze({
           participant: Object.freeze({
             current: () => participant.current(),
           }),
-          packages: this.#participantPackageReader,
+          packages: Object.freeze({
+            current: () => requestPackages.current(),
+          }),
           acknowledgments: Object.freeze({
             currentAcceptanceStatus: () =>
               acknowledgments.currentAcceptanceStatus(),
@@ -157,6 +168,23 @@ export class StorageApplicationRepositoryFactory {
   participantAccessReader(): ParticipantAccessStateReader {
     return this.#participantAccessReader;
   }
+}
+
+function participantAccessStorage(storage: StorageAdapter): StorageAdapter {
+  let remainingReads = PARTICIPANT_ACCESS_STORAGE_READ_LIMIT;
+  return Object.freeze({
+    async read(key: StorageKey) {
+      if (remainingReads <= 0) unavailable();
+      remainingReads -= 1;
+      return await storage.read(key);
+    },
+    async list() {
+      unavailable();
+    },
+    async transact() {
+      unavailable();
+    },
+  });
 }
 
 async function claimReplay(

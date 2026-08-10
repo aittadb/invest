@@ -20,14 +20,24 @@ import type { OwnerPackageDocument } from "../domain/owner-package-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   parseActorSubject,
+  parseStableId,
+  parseTimestamp,
 } from "../domain/foundation.ts";
 import {
   StorageFailure,
   parseStorageOperationId,
+  type StorageAdapter,
 } from "../domain/storage-adapter.ts";
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
-import { StoragePackageVersionRepository } from "../repositories/in-memory-content-repository.ts";
+import {
+  StorageAcknowledgmentRepository,
+  StoragePackageVersionRepository,
+} from "../repositories/in-memory-content-repository.ts";
 import { StorageParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
+import {
+  PARTICIPANT_ACCESS_STORAGE_READ_LIMIT,
+  StorageApplicationRepositoryFactory,
+} from "../repositories/storage-application-repository-factory.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
 import type {
   InvestorAppEnv,
@@ -378,6 +388,124 @@ test("hosted participant access is subject-bound and excludes the configured own
     await foreign.text(),
     /Private participant profile|Private owner profile/u,
   );
+});
+
+test("participant access reconstructs maximum package history once per request", async () => {
+  const service = new SyntheticAittaDBService();
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Package history participant",
+    "participant-operation:package-history-budget",
+  );
+  const current = await appendHostedPackageHistory(service, 32);
+  const account = parseParticipantAccount({
+    subject: PARTICIPANT_SUBJECT,
+    accountEmailLabel: PARTICIPANT_EMAIL,
+  });
+  assert(account.ok);
+
+  const unacceptedFactory = new StorageApplicationRepositoryFactory(
+    hostedStorageAdapter(service),
+    () => NOW,
+  );
+  const beforeUnaccepted = service.readRequests;
+  const unaccepted = await unacceptedFactory.participantAccessReader().read(
+    account.value,
+  );
+  const unacceptedReads = service.readRequests - beforeUnaccepted;
+  assert.equal(unaccepted?.currentPackage?.id, current.snapshot.id);
+  assert.equal(unaccepted?.currentPackage?.requiresCurrentAcceptance, true);
+  assert.ok(unacceptedReads < 160, `unexpected reads: ${unacceptedReads}`);
+  assert.ok(unacceptedReads <= PARTICIPANT_ACCESS_STORAGE_READ_LIMIT);
+
+  const subject = parseActorSubject(PARTICIPANT_SUBJECT);
+  const operationId = parseStorageOperationId(
+    "operation:package-history-acceptance",
+  );
+  const acceptanceId = parseStableId<"package-acceptance">(
+    "acceptance:package-history-budget",
+  );
+  const acceptedAt = parseTimestamp("2026-08-10T11:30:00.000Z");
+  assert(subject.ok);
+  assert(operationId.ok);
+  assert(acceptanceId.ok);
+  assert(acceptedAt.ok);
+  const acceptancePackages = hostedPackageRepository(service);
+  const acknowledgments = new StorageAcknowledgmentRepository(
+    hostedStorageAdapter(service),
+    acceptancePackages,
+    subject.value,
+  );
+  await acknowledgments.record({
+    operationId: operationId.value,
+    expectedRevision: null,
+    id: acceptanceId.value,
+    acceptedAt: acceptedAt.value,
+    acceptedVersionId: current.snapshot.id,
+  });
+
+  const acceptedFactory = new StorageApplicationRepositoryFactory(
+    hostedStorageAdapter(service),
+    () => NOW,
+  );
+  const beforeAccepted = service.readRequests;
+  const accepted = await acceptedFactory.participantAccessReader().read(
+    account.value,
+  );
+  const acceptedReads = service.readRequests - beforeAccepted;
+  assert.equal(accepted?.currentPackage?.requiresCurrentAcceptance, false);
+  assert.ok(acceptedReads < 160, `unexpected reads: ${acceptedReads}`);
+  assert.ok(acceptedReads <= PARTICIPANT_ACCESS_STORAGE_READ_LIMIT);
+});
+
+test("participant access keeps nested package retry reads inside one budget", async () => {
+  const service = new SyntheticAittaDBService();
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Package race participant",
+    "participant-operation:package-race-budget",
+  );
+  await appendHostedPackageHistory(service, 8);
+  const account = parseParticipantAccount({
+    subject: PARTICIPANT_SUBJECT,
+    accountEmailLabel: PARTICIPANT_EMAIL,
+  });
+  assert(account.ok);
+  const baseStorage = hostedStorageAdapter(service);
+  let delegatedReads = 0;
+  let publishedDuringGateRead = false;
+  const racingStorage: StorageAdapter = Object.freeze({
+    async read(key: Parameters<StorageAdapter["read"]>[0]) {
+      delegatedReads += 1;
+      const result = await baseStorage.read(key);
+      if (
+        !publishedDuringGateRead &&
+        key.collection === "private-package-acceptance-bindings"
+      ) {
+        publishedDuringGateRead = true;
+        await appendHostedPackageVersion(service, 9, 8);
+      }
+      return result;
+    },
+    list: (request: Parameters<StorageAdapter["list"]>[0]) =>
+      baseStorage.list(request),
+    transact: (request: Parameters<StorageAdapter["transact"]>[0]) =>
+      baseStorage.transact(request),
+  });
+  const factory = new StorageApplicationRepositoryFactory(
+    racingStorage,
+    () => NOW,
+  );
+
+  const state = await factory.participantAccessReader().read(account.value);
+  assert.equal(publishedDuringGateRead, true);
+  assert.equal(state?.currentPackage?.id, "package:budget-v9");
+  assert.ok(delegatedReads < 100, `unexpected reads: ${delegatedReads}`);
+  assert.ok(delegatedReads <= PARTICIPANT_ACCESS_STORAGE_READ_LIMIT);
 });
 
 test("hosted package routes persist atomic private versions and current acknowledgments", async () => {
@@ -1258,6 +1386,51 @@ function hostedPackageRepository(
   service: SyntheticAittaDBService,
 ): StoragePackageVersionRepository {
   return new StoragePackageVersionRepository(hostedStorageAdapter(service));
+}
+
+async function appendHostedPackageHistory(
+  service: SyntheticAittaDBService,
+  count: number,
+) {
+  let current: Awaited<
+    ReturnType<StoragePackageVersionRepository["append"]>
+  > | null = null;
+  for (let index = 1; index <= count; index += 1) {
+    current = await appendHostedPackageVersion(service, index, index - 1);
+  }
+  assert(current);
+  return current;
+}
+
+async function appendHostedPackageVersion(
+  service: SyntheticAittaDBService,
+  index: number,
+  expectedRevision: number,
+) {
+  const operationId = parseStorageOperationId(
+    `operation:package-budget-v${index}`,
+  );
+  assert(operationId.ok);
+  return hostedPackageRepository(service).append({
+    operationId: operationId.value,
+    expectedRevision: expectedRevision === 0 ? null : expectedRevision,
+    draft: {
+      id: `package:budget-v${index}`,
+      createdAt: new Date(
+        Date.parse("2026-08-09T08:00:00.000Z") + index * 60_000,
+      ).toISOString(),
+      changeSummary: `Package budget version ${index}`,
+      materialChange: true,
+      acknowledgmentText: `I acknowledge package budget version ${index}.`,
+      sections: [{
+        id: `section:package-budget-v${index}`,
+        order: 0,
+        title: `Package budget version ${index}`,
+        markdown: `Private package budget content ${index}.`,
+        enabled: true,
+      }],
+    },
+  });
 }
 
 function hostedParticipantRepository(

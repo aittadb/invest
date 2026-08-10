@@ -171,9 +171,13 @@ const CURRENT_PACKAGE_ID = stableId<"storage-record">("current-package");
 const MAX_PACKAGE_SECTION_RECORD_BYTES = 60_000;
 const MAX_PACKAGE_SECTION_CHUNKS = 16;
 const MAX_ACCEPTANCE_GATE_READ_ATTEMPTS = 3;
+const REQUEST_SCOPED_IMMUTABLE_READ_CACHE = Symbol(
+  "request-scoped-immutable-package-read-cache",
+);
 export const PACKAGE_STORAGE_READ_LIMITS = Object.freeze({
   maxVersionAncestry: 32,
   maxReconstructionReads: 512,
+  maxRequestCacheEntries: 64,
 });
 
 function createPackageReconstructionContext(): PackageReconstructionContext {
@@ -194,9 +198,30 @@ export class StoragePackageVersionRepository
 {
   readonly mutationConsistency = "atomic-package-version-audit" as const;
   readonly #storage: StorageAdapter;
+  readonly #immutableReadCache: Map<
+    string,
+    Promise<StoredPackageVersion | null>
+  > | null;
 
-  constructor(storage: StorageAdapter) {
+  constructor(
+    storage: StorageAdapter,
+    readCacheMode?: typeof REQUEST_SCOPED_IMMUTABLE_READ_CACHE,
+  ) {
     this.#storage = storage;
+    this.#immutableReadCache = readCacheMode ===
+        REQUEST_SCOPED_IMMUTABLE_READ_CACHE
+      ? new Map()
+      : null;
+  }
+
+  /** Creates one finite immutable-version cache for a single trusted read use case. */
+  static requestScopedReader(
+    storage: StorageAdapter,
+  ): StoragePackageVersionRepository {
+    return new StoragePackageVersionRepository(
+      storage,
+      REQUEST_SCOPED_IMMUTABLE_READ_CACHE,
+    );
   }
 
   async append(
@@ -584,6 +609,32 @@ export class StoragePackageVersionRepository
   ): Promise<StoredPackageVersion | null> {
     if (depth >= PACKAGE_STORAGE_READ_LIMITS.maxVersionAncestry) unavailable();
     if (context.versionIds.has(key.id)) unavailable();
+    const cacheKey = key.id as string;
+    const cached = this.#immutableReadCache?.get(cacheKey);
+    if (cached !== undefined) return await cached;
+    if (
+      this.#immutableReadCache !== null &&
+      this.#immutableReadCache.size >=
+        PACKAGE_STORAGE_READ_LIMITS.maxRequestCacheEntries
+    ) unavailable();
+
+    const pending = this.#readStoredVersionUncached(key, context, depth);
+    this.#immutableReadCache?.set(cacheKey, pending);
+    try {
+      return await pending;
+    } catch (error) {
+      if (this.#immutableReadCache?.get(cacheKey) === pending) {
+        this.#immutableReadCache.delete(cacheKey);
+      }
+      throw error;
+    }
+  }
+
+  async #readStoredVersionUncached(
+    key: StorageKey,
+    context: PackageReconstructionContext,
+    depth: number,
+  ): Promise<StoredPackageVersion | null> {
     const remainingReadsBefore = context.remainingReads;
     const value = await this.#readPackageRecord(key, context);
     if (value === null) return null;

@@ -223,6 +223,16 @@ evidence-bearing read. The acknowledgment route uses a separate single
 current/latest/current attempt and fails its precondition on change rather than
 running that bounded loop.
 
+Participant-access composition additionally creates one read-only adapter and
+one package reader per authorization projection. The adapter admits at most 528
+storage-record reads across profile, package, gate, and acknowledgment work.
+Within that request only, the package reader reuses up to 64 already verified
+immutable version reconstructions; mutable profile records, package and
+acceptance heads, and the acceptance gate are always sampled again. A nested
+gate or outer projection retry therefore shares one finite budget without
+turning immutable history into repeated outbound reads. The cache cannot survive
+the use case, enter another participant request, or authorize a mutation.
+
 ## Browser-Mutation Replay
 
 The factory supplies the first production repository capability: an atomic
@@ -326,7 +336,9 @@ owner/participant route scoping, restart reconstruction, immutable intent
 conflicts, advancing-clock retry recovery, 64-section and maximum-size Unicode
 records, failed-stage and failed-final-publication recovery, hostile record and
 transaction-result matrices, package/acceptance concurrency, stable gate
-sampling, exact material gating, and narrowing-only route mutation limits. The
+sampling, accepted and unaccepted maximum-history aggregate read counts, nested
+publication retry counts, exact material gating, and narrowing-only route
+mutation limits. The
 synthetic hosted services implement and enforce the discovered AittaDB
 read/list/transaction controls rather than bypassing the adapter. Source
 and built-artifact scans complement `npm run instances:check`, which rejects
