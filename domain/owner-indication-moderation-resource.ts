@@ -11,6 +11,7 @@ import {
 } from "./hypermedia-action.ts";
 import {
   INVESTMENT_INDICATION_LIMITS,
+  MAX_INVESTMENT_INDICATION_REVISIONS,
 } from "./investment-indication.ts";
 import {
   INVESTOR_APP_API_VERSION,
@@ -149,7 +150,8 @@ export function createOwnerIndicationDetailResource(
 ): OwnerIndicationDetailResource {
   const self = new URL(requestUrl);
   const reject = mutationAvailable &&
-      item.indication.lifecycle.status === "active"
+      item.indication.lifecycle.status === "active" &&
+      item.indication.revision < MAX_INVESTMENT_INDICATION_REVISIONS
     ? rejectControl(
         self.href,
         item.indication.revision,

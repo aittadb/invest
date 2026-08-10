@@ -10,9 +10,11 @@ import {
   parseStableId,
   type ActorSubject,
 } from "../domain/foundation.ts";
-import type {
-  InvestmentIndicationId,
-  TrustedPackageAcknowledgmentContext,
+import {
+  MAX_INVESTMENT_INDICATION_REVISIONS,
+  type InvestmentIndicationParsingOptions,
+  type InvestmentIndicationId,
+  type TrustedPackageAcknowledgmentContext,
 } from "../domain/investment-indication.ts";
 import {
   createPackageAcceptance,
@@ -38,6 +40,12 @@ import {
 } from "../domain/storage-adapter.ts";
 import {
   DevelopmentInMemoryIndicationRepository,
+  MAX_INDICATION_FIELDS_CHUNKS,
+  MAX_INDICATION_MATERIALIZATION_READS,
+  MAX_INDICATION_STORAGE_MUTATIONS,
+  MAX_INDICATION_STORAGE_READS,
+  MAX_INDICATION_STORAGE_RECORD_BYTES,
+  MAX_INDICATION_STORAGE_TRANSACTION_BYTES,
   type CreateIndicationRequest,
   type EditIndicationRequest,
   type IndicationRepository,
@@ -545,7 +553,7 @@ test("adapter-backed development repository passes the indication contract", asy
   });
 });
 
-test("current snapshots require every immutable history revision", async () => {
+test("current records require every immutable transition revision", async () => {
   const state = new MemoryStorageState();
   const storage = new DeterministicMemoryStorageAdapter(state, true);
   const alice = repository(storage, ALICE_SUBJECT);
@@ -574,8 +582,8 @@ test("current snapshots require every immutable history revision", async () => {
 
   const firstHistory = [...state.records.entries()].find(([, record]) =>
     record.key.collection === "investment-indication-history" &&
-    record.value.indication !== undefined &&
-    mutableRecord(record.value.indication).revision === 1
+    record.value.kind === "investment-indication-transition" &&
+    record.value.revision === 1
   );
   assert.notEqual(firstHistory, undefined);
   if (firstHistory === undefined) return;
@@ -583,15 +591,517 @@ test("current snapshots require every immutable history revision", async () => {
   await rejectsStorage(() => alice.get(PERSONAL_ONE), "UNAVAILABLE");
 });
 
+test("persisted indication history survives amount configuration evolution", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const contexts = await packageContexts();
+  const original = repository(storage, ALICE_SUBJECT);
+  const create = createRequest({
+    operationId: "indication-operation:historical-config-create",
+    id: PERSONAL_ONE,
+    occurredAt: "2026-08-10T09:00:00.000Z",
+    historyEntryId: "indication-history:historical-config-create",
+    fields: personalFields({ amount: 1_250 }),
+  });
+  await original.create(create, contexts.aliceCurrent);
+  const edit = editRequest({
+    operationId: "indication-operation:historical-config-edit",
+    id: PERSONAL_ONE,
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T10:00:00.000Z",
+    historyEntryId: "indication-history:historical-config-edit",
+    fields: personalFields({ amount: 1_500, note: "Historical EUR edit." }),
+  });
+  const historical = await original.edit(edit, contexts.aliceCurrent);
+
+  const evolvedAmount = configuredAmount({
+    currency: "usd",
+    minimum: 5_000,
+    increment: 1_000,
+    maximum: 20_000,
+  });
+  const evolved = repository(storage, ALICE_SUBJECT, evolvedAmount);
+  assert.deepEqual(await evolved.get(PERSONAL_ONE), historical.snapshot);
+
+  const createReplay = await evolved.create(create, contexts.aliceCurrent);
+  const editReplay = await evolved.edit(edit, contexts.aliceCurrent);
+  assert.equal(createReplay.replayed, true);
+  assert.equal(editReplay.replayed, true);
+  assert.deepEqual(editReplay.snapshot, historical.snapshot);
+  await rejectsStorage(
+    () => evolved.edit({
+      ...edit,
+      fields: personalFields({
+        amount: 1_750,
+        note: "Changed historical retry.",
+      }),
+    }, contexts.aliceCurrent),
+    "CONFLICT",
+  );
+
+  const current = await evolved.edit(editRequest({
+    operationId: "indication-operation:evolved-config-edit",
+    id: PERSONAL_ONE,
+    expectedRevision: 2,
+    occurredAt: "2026-08-10T11:00:00.000Z",
+    historyEntryId: "indication-history:evolved-config-edit",
+    fields: personalFields({ amount: 5_000, note: "Current USD edit." }),
+  }), contexts.aliceCurrent);
+  assert.equal(current.snapshot.history[1]?.fields.currency, "EUR");
+  assert.equal(current.snapshot.history[2]?.fields.currency, "USD");
+});
+
+test("compact indication records reject current, transition, reference, and chunk corruption", async (t) => {
+  const baseline = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(baseline, true);
+  const contexts = await packageContexts();
+  const alice = repository(storage, ALICE_SUBJECT);
+  await alice.create(createRequest({
+    operationId: "indication-operation:corruption-create",
+    id: PERSONAL_ONE,
+    occurredAt: "2026-08-10T09:00:00.000Z",
+    historyEntryId: "indication-history:corruption-create",
+    fields: maximumPersonalFields("\u0800"),
+  }), contexts.aliceCurrent);
+  await alice.edit(editRequest({
+    operationId: "indication-operation:corruption-edit",
+    id: PERSONAL_ONE,
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T10:00:00.000Z",
+    historyEntryId: "indication-history:corruption-edit",
+    fields: maximumPersonalFields("\u0801"),
+  }), contexts.aliceCurrent);
+
+  const corruptions: readonly Readonly<{
+    name: string;
+    apply(state: MemoryStorageState): void;
+  }>[] = [
+    {
+      name: "current record shape",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "investment-indications"),
+        (document) => {
+          document.unexpected = true;
+        },
+      ),
+    },
+    {
+      name: "current schema version",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "investment-indications"),
+        (document) => {
+          document.schemaVersion = 1;
+        },
+      ),
+    },
+    {
+      name: "transition kind",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordWhere(
+          state,
+          "investment-indication-history",
+          (record) => record.value.revision === 2,
+        ),
+        (document) => {
+          document.transitionKind = "withdrawn";
+        },
+      ),
+    },
+    {
+      name: "missing transition",
+      apply: (state) => {
+        const transition = requiredRecordWhere(
+          state,
+          "investment-indication-history",
+          (record) => record.value.revision === 1,
+        );
+        state.records.delete(storageKeyString(transition.key));
+      },
+    },
+    {
+      name: "field reference shape",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "investment-indications"),
+        (document) => {
+          delete mutableRecord(document.fields).hash;
+        },
+      ),
+    },
+    {
+      name: "field reference revision",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordWhere(
+          state,
+          "investment-indication-history",
+          (record) => record.value.revision === 1,
+        ),
+        (document) => {
+          mutableRecord(document.fields).revision = 2;
+        },
+      ),
+    },
+    {
+      name: "missing field chunk",
+      apply: (state) => {
+        const chunk = requiredRecordIn(state, "investment-indication-fields");
+        state.records.delete(storageKeyString(chunk.key));
+      },
+    },
+    {
+      name: "reordered field chunks",
+      apply: (state) => {
+        const chunks = sortedFieldChunks(state, 1);
+        const first = chunks[0];
+        const second = chunks[1];
+        assert(first && second);
+        replaceStoredDocument(state, first, second.value);
+        replaceStoredDocument(state, second, first.value);
+      },
+    },
+    {
+      name: "cross-subject field chunk",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "investment-indication-fields"),
+        (document) => {
+          document.participantSubject = BOB_SUBJECT;
+        },
+      ),
+    },
+    {
+      name: "field chunk hash",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "investment-indication-fields"),
+        (document) => {
+          document.fieldsHash = `sha256:${"0".repeat(64)}`;
+        },
+      ),
+    },
+    {
+      name: "field chunk byte count",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "investment-indication-fields"),
+        (document) => {
+          document.fieldsBytes = Number(document.fieldsBytes) + 1;
+        },
+      ),
+    },
+    {
+      name: "field chunk count",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "investment-indication-fields"),
+        (document) => {
+          document.chunkCount = Number(document.chunkCount) + 1;
+        },
+      ),
+    },
+    {
+      name: "field chunk payload",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "investment-indication-fields"),
+        (document) => {
+          const data = String(document.data);
+          document.data = `${data.startsWith("A") ? "B" : "A"}${data.slice(1)}`;
+        },
+      ),
+    },
+  ];
+
+  for (const corruption of corruptions) {
+    await t.test(corruption.name, async () => {
+      const state = cloneMemoryStorageState(baseline);
+      corruption.apply(state);
+      await rejectsStorage(
+        () => repository(
+          new DeterministicMemoryStorageAdapter(state, true),
+          ALICE_SUBJECT,
+        ).get(PERSONAL_ONE),
+        "UNAVAILABLE",
+      );
+    });
+  }
+});
+
+test("indication writes reject a malformed transaction result matrix", async (t) => {
+  const corruptions: readonly Readonly<{
+    name: string;
+    apply(result: StorageTransactionResult): unknown;
+  }>[] = [
+    { name: "primitive envelope", apply: () => null },
+    {
+      name: "non-boolean replay marker",
+      apply: (result) => ({ ...result, replayed: "false" }),
+    },
+    {
+      name: "missing result record",
+      apply: (result) => ({
+        ...result,
+        records: result.records.slice(0, -1),
+      }),
+    },
+    {
+      name: "sparse records array",
+      apply: (result) => {
+        const records = new Array(result.records.length);
+        for (let index = 1; index < result.records.length; index += 1) {
+          records[index] = result.records[index];
+        }
+        return { ...result, records };
+      },
+    },
+    {
+      name: "wrong current revision",
+      apply: (result) => corruptTransactionRecord(result, 0, (record) => {
+        record.revision = Number(record.revision) + 1;
+      }),
+    },
+    {
+      name: "wrong transition value",
+      apply: (result) => corruptTransactionRecord(result, 1, (record) => {
+        mutableRecord(record.value).operationFingerprint =
+          `sha256:${"0".repeat(64)}`;
+      }),
+    },
+    {
+      name: "wrong field chunk key",
+      apply: (result) => corruptTransactionRecord(result, 2, (record) => {
+        mutableRecord(record.key).id = "indication-fields:wrong";
+      }),
+    },
+  ];
+
+  for (const [index, corruption] of corruptions.entries()) {
+    await t.test(corruption.name, async () => {
+      const state = new MemoryStorageState();
+      const adapter = new MalformedTransactionResultStorageAdapter(
+        new DeterministicMemoryStorageAdapter(state, true),
+        corruption.apply,
+      );
+      const contexts = await packageContexts();
+      await rejectsStorage(
+        () => repository(adapter, ALICE_SUBJECT).create(createRequest({
+          operationId: `indication-operation:malformed-result-${index}`,
+          id: PERSONAL_ONE,
+          occurredAt: "2026-08-10T09:00:00.000Z",
+          historyEntryId: `indication-history:malformed-result-${index}`,
+          fields: personalFields(),
+        }), contexts.aliceCurrent),
+        "UNAVAILABLE",
+      );
+    });
+  }
+});
+
+test("maximum indication payloads stay within record, transaction, restart, and retry budgets", async () => {
+  const state = new MemoryStorageState();
+  const observed = new ObservedStorageAdapter(
+    new DeterministicMemoryStorageAdapter(state, true),
+  );
+  const contexts = await packageContexts();
+  const alice = repository(observed, ALICE_SUBJECT);
+  const create = createRequest({
+    operationId: "indication-operation:maximum-create",
+    id: PERSONAL_ONE,
+    occurredAt: "2026-08-10T09:00:00.000Z",
+    historyEntryId: "indication-history:maximum-create",
+    fields: maximumPersonalFields("\u0800"),
+  });
+
+  const created = await alice.create(create, contexts.aliceCurrent);
+  const fieldRecords = recordsIn(state, "investment-indication-fields");
+  assert.ok(fieldRecords.length > 1);
+  assert.ok(fieldRecords.length <= MAX_INDICATION_FIELDS_CHUNKS);
+  assert.ok(observed.maximumRecordBytes <= MAX_INDICATION_STORAGE_RECORD_BYTES);
+  assert.ok(
+    observed.maximumTransactionBytes <=
+      MAX_INDICATION_STORAGE_TRANSACTION_BYTES,
+  );
+  assert.ok(
+    observed.maximumTransactionMutations <= MAX_INDICATION_STORAGE_MUTATIONS,
+  );
+
+  observed.resetReads();
+  assert.deepEqual(
+    await repository(observed, ALICE_SUBJECT).get(PERSONAL_ONE),
+    created.snapshot,
+  );
+  assert.ok(observed.reads <= MAX_INDICATION_MATERIALIZATION_READS);
+
+  observed.resetReads();
+  const createReplay = await repository(observed, ALICE_SUBJECT).create(
+    create,
+    contexts.aliceCurrent,
+  );
+  assert.equal(createReplay.replayed, true);
+  assert.deepEqual(createReplay.snapshot, created.snapshot);
+  assert.ok(observed.reads <= MAX_INDICATION_STORAGE_READS);
+
+  const edit = editRequest({
+    operationId: "indication-operation:maximum-edit",
+    id: PERSONAL_ONE,
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T10:00:00.000Z",
+    historyEntryId: "indication-history:maximum-edit",
+    fields: maximumPersonalFields("\u0801"),
+  });
+  const edited = await repository(observed, ALICE_SUBJECT).edit(
+    edit,
+    contexts.aliceCurrent,
+  );
+  const editReplay = await repository(observed, ALICE_SUBJECT).edit(
+    edit,
+    contexts.aliceCurrent,
+  );
+  assert.equal(editReplay.replayed, true);
+  assert.deepEqual(editReplay.snapshot, edited.snapshot);
+
+  const fieldsBeforeWithdrawal = recordsIn(
+    state,
+    "investment-indication-fields",
+  ).length;
+  const withdrawn = await repository(observed, ALICE_SUBJECT).withdraw(
+    withdrawRequest({
+      operationId: "indication-operation:maximum-withdraw",
+      id: PERSONAL_ONE,
+      expectedRevision: 2,
+      occurredAt: "2026-08-10T11:00:00.000Z",
+      historyEntryId: "indication-history:maximum-withdraw",
+    }),
+  );
+  assert.equal(withdrawn.revision, 3);
+  assert.equal(
+    recordsIn(state, "investment-indication-fields").length,
+    fieldsBeforeWithdrawal,
+  );
+  assert.deepEqual(
+    await repository(observed, ALICE_SUBJECT).get(PERSONAL_ONE),
+    withdrawn.snapshot,
+  );
+
+  for (const record of [
+    ...recordsIn(state, "investment-indications"),
+    ...recordsIn(state, "investment-indication-history"),
+  ]) {
+    assert.equal(Object.hasOwn(record.value, "history"), false);
+    assert.equal(Object.hasOwn(record.value, "snapshot"), false);
+    assert.ok(jsonBytes(record.value) < 4_096);
+  }
+});
+
+test("indication ancestry reserves its final revision for withdrawal", async () => {
+  const state = new MemoryStorageState();
+  const observed = new ObservedStorageAdapter(
+    new DeterministicMemoryStorageAdapter(state, true),
+  );
+  const contexts = await packageContexts();
+  await repository(observed, ALICE_SUBJECT).create(createRequest({
+    operationId: "indication-operation:bounded-create",
+    id: PERSONAL_ONE,
+    occurredAt: "2026-08-10T09:00:00.000Z",
+    historyEntryId: "indication-history:bounded-create",
+    fields: maximumPersonalFields("\u0800"),
+  }), contexts.aliceCurrent);
+
+  for (
+    let expectedRevision = 1;
+    expectedRevision < MAX_INVESTMENT_INDICATION_REVISIONS - 1;
+    expectedRevision += 1
+  ) {
+    await repository(observed, ALICE_SUBJECT).edit(editRequest({
+      operationId: `indication-operation:bounded-edit-${expectedRevision}`,
+      id: PERSONAL_ONE,
+      expectedRevision,
+      occurredAt: new Date(
+        Date.parse("2026-08-10T10:00:00.000Z") + expectedRevision * 60_000,
+      ).toISOString(),
+      historyEntryId: `indication-history:bounded-edit-${expectedRevision}`,
+      fields: maximumPersonalFields(expectedRevision % 2 === 0 ? "\u0800" : "\u0801"),
+    }), contexts.aliceCurrent);
+  }
+
+  await rejectsStorage(
+    () => repository(observed, ALICE_SUBJECT).edit(editRequest({
+      operationId: "indication-operation:over-budget-edit",
+      id: PERSONAL_ONE,
+      expectedRevision: MAX_INVESTMENT_INDICATION_REVISIONS - 1,
+      occurredAt: "2026-08-10T11:30:00.000Z",
+      historyEntryId: "indication-history:over-budget-edit",
+      fields: maximumPersonalFields("\u0800"),
+    }), contexts.aliceCurrent),
+    "INVALID_REQUEST",
+  );
+
+  observed.resetReads();
+  const active = await repository(observed, ALICE_SUBJECT).get(PERSONAL_ONE);
+  assert.equal(active?.revision, MAX_INVESTMENT_INDICATION_REVISIONS - 1);
+  assert.equal(active?.lifecycle.status, "active");
+  assert.ok(observed.reads <= MAX_INDICATION_MATERIALIZATION_READS);
+
+  const fieldsBeforeWithdrawal = recordsIn(
+    state,
+    "investment-indication-fields",
+  ).length;
+  const withdrawal = withdrawRequest({
+    operationId: "indication-operation:bounded-withdraw",
+    id: PERSONAL_ONE,
+    expectedRevision: MAX_INVESTMENT_INDICATION_REVISIONS - 1,
+    occurredAt: "2026-08-10T12:00:00.000Z",
+    historyEntryId: "indication-history:bounded-withdraw",
+  });
+  observed.resetReads();
+  const withdrawn = await repository(observed, ALICE_SUBJECT).withdraw(withdrawal);
+  assert.equal(withdrawn.revision, MAX_INVESTMENT_INDICATION_REVISIONS);
+  assert.ok(observed.reads <= MAX_INDICATION_STORAGE_READS);
+  assert.equal(
+    recordsIn(state, "investment-indication-history").length,
+    MAX_INVESTMENT_INDICATION_REVISIONS,
+  );
+  assert.equal(
+    recordsIn(state, "investment-indication-fields").length,
+    fieldsBeforeWithdrawal,
+  );
+
+  observed.resetReads();
+  const replay = await repository(observed, ALICE_SUBJECT).withdraw(withdrawal);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.snapshot, withdrawn.snapshot);
+  assert.ok(observed.reads <= MAX_INDICATION_STORAGE_READS);
+  await rejectsStorage(
+    () => repository(observed, ALICE_SUBJECT).reactivate(
+      reactivateRequest({
+        operationId: "indication-operation:bounded-overflow",
+        id: PERSONAL_ONE,
+        expectedRevision: MAX_INVESTMENT_INDICATION_REVISIONS,
+        occurredAt: "2026-08-10T13:00:00.000Z",
+        historyEntryId: "indication-history:bounded-overflow",
+      }),
+      contexts.aliceCurrent,
+    ),
+    "INVALID_REQUEST",
+  );
+});
+
 function repository(
   storage: StorageAdapter,
   subject: ActorSubject | null,
+  configuredAmount: AmountConfiguration = amountConfiguration,
+  parsingOptions: InvestmentIndicationParsingOptions = {},
 ): DevelopmentInMemoryIndicationRepository {
   return new DevelopmentInMemoryIndicationRepository(
     storage,
     subject,
     OWNER_SUBJECT,
-    amountConfiguration,
+    configuredAmount,
+    parsingOptions,
   );
 }
 
@@ -664,6 +1174,13 @@ function personalFields(overrides: Readonly<Record<string, unknown>> = {}) {
   };
 }
 
+function maximumPersonalFields(character: string) {
+  return personalFields({
+    availabilityPeriod: character.repeat(500),
+    note: character.repeat(4_000),
+  });
+}
+
 function companyFields(overrides: Readonly<Record<string, unknown>> = {}) {
   return {
     kind: "company",
@@ -679,13 +1196,16 @@ function companyFields(overrides: Readonly<Record<string, unknown>> = {}) {
   };
 }
 
-function configuredAmount(): AmountConfiguration {
+function configuredAmount(
+  overrides: Readonly<Record<string, unknown>> = {},
+): AmountConfiguration {
   const parsed = parseAmountAggregateConfiguration({
     amount: {
       currency: "eur",
       minimum: 1_000,
       increment: 250,
       maximum: 10_000,
+      ...overrides,
     },
     publicAggregate: { visibility: "hidden" },
   });
@@ -918,6 +1438,83 @@ class DeterministicMemoryStorageAdapter implements StorageAdapter {
   }
 }
 
+class ObservedStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  reads = 0;
+  maximumRecordBytes = 0;
+  maximumTransactionBytes = 0;
+  maximumTransactionMutations = 0;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+  }
+
+  resetReads(): void {
+    this.reads = 0;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    this.reads += 1;
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    this.maximumTransactionBytes = Math.max(
+      this.maximumTransactionBytes,
+      jsonBytes(request),
+    );
+    this.maximumTransactionMutations = Math.max(
+      this.maximumTransactionMutations,
+      request.mutations.length,
+    );
+    for (const mutation of request.mutations) {
+      if (mutation.type !== "put") continue;
+      const bytes = jsonBytes(mutation.value);
+      this.maximumRecordBytes = Math.max(this.maximumRecordBytes, bytes);
+      assert.ok(bytes <= MAX_INDICATION_STORAGE_RECORD_BYTES);
+    }
+    assert.ok(
+      jsonBytes(request) <= MAX_INDICATION_STORAGE_TRANSACTION_BYTES,
+    );
+    return this.#delegate.transact(request);
+  }
+}
+
+class MalformedTransactionResultStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #corrupt: (result: StorageTransactionResult) => unknown;
+
+  constructor(
+    delegate: StorageAdapter,
+    corrupt: (result: StorageTransactionResult) => unknown,
+  ) {
+    this.#delegate = delegate;
+    this.#corrupt = corrupt;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    return this.#corrupt(
+      await this.#delegate.transact(request),
+    ) as StorageTransactionResult;
+  }
+}
+
 function seedUnrelatedRecords(state: MemoryStorageState): void {
   for (const [collection, id, value] of [
     ["investment-aggregates", "aggregate:current", { total: 7_000 }],
@@ -941,6 +1538,104 @@ function unrelatedEvidence(state: MemoryStorageState): string {
         storageKeyString(right.key),
       )),
   );
+}
+
+function recordsIn(
+  state: MemoryStorageState,
+  collection: string,
+): readonly StorageRecord[] {
+  return [...state.records.values()].filter(
+    (record) => record.key.collection === collection,
+  );
+}
+
+function requiredRecordIn(
+  state: MemoryStorageState,
+  collection: string,
+): StorageRecord {
+  const record = recordsIn(state, collection)[0];
+  assert(record);
+  return record;
+}
+
+function requiredRecordWhere(
+  state: MemoryStorageState,
+  collection: string,
+  predicate: (record: StorageRecord) => boolean,
+): StorageRecord {
+  const record = recordsIn(state, collection).find(predicate);
+  assert(record);
+  return record;
+}
+
+function sortedFieldChunks(
+  state: MemoryStorageState,
+  fieldsRevision: number,
+): readonly StorageRecord[] {
+  return recordsIn(state, "investment-indication-fields")
+    .filter((record) => record.value.fieldsRevision === fieldsRevision)
+    .sort((left, right) =>
+      Number(left.value.chunkIndex) - Number(right.value.chunkIndex)
+    );
+}
+
+function mutateStoredDocument(
+  state: MemoryStorageState,
+  record: StorageRecord,
+  mutate: (document: Record<string, unknown>) => void,
+): void {
+  const value = cloneDocument(record.value);
+  const document = mutableRecord(value);
+  mutate(document);
+  replaceStoredDocument(state, record, document as StorageDocument);
+}
+
+function replaceStoredDocument(
+  state: MemoryStorageState,
+  record: StorageRecord,
+  value: StorageDocument,
+): void {
+  state.records.set(storageKeyString(record.key), freezeRecord({
+    key: record.key,
+    revision: record.revision,
+    value,
+  }));
+}
+
+function cloneMemoryStorageState(source: MemoryStorageState): MemoryStorageState {
+  const clone = new MemoryStorageState();
+  for (const [key, record] of source.records) {
+    const copied = cloneRecord(record);
+    assert(copied);
+    clone.records.set(key, copied);
+  }
+  for (const [key, operation] of source.operations) {
+    clone.operations.set(key, {
+      fingerprint: operation.fingerprint,
+      result: cloneResult(operation.result, operation.result.replayed),
+    });
+  }
+  return clone;
+}
+
+function corruptTransactionRecord(
+  result: StorageTransactionResult,
+  index: number,
+  mutate: (record: Record<string, unknown>) => void,
+): unknown {
+  const records = result.records.map((record) =>
+    record === null
+      ? null
+      : cloneDocument(record as unknown as StorageDocument)
+  );
+  const candidate = records[index];
+  assert(candidate && typeof candidate === "object" && !Array.isArray(candidate));
+  mutate(candidate as Record<string, unknown>);
+  return { replayed: result.replayed, records };
+}
+
+function jsonBytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 function parseCursor(cursor: StorageCursor): number {

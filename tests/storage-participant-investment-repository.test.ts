@@ -301,7 +301,7 @@ test("participant index has an observed 100-item read and write ceiling", async 
   );
   assert.equal((await reopened.listOwned()).length, 100);
   assert.equal(counted.listCalls, 0);
-  assert.equal(counted.readCalls, 201);
+  assert.equal(counted.readCalls, 401);
 
   const recordsBefore = state.records.size;
   const operationsBefore = state.operations.size;

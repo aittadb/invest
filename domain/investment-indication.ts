@@ -285,6 +285,7 @@ export const INVESTMENT_INDICATION_LIMITS = Object.freeze({
   noteLength: 4_000,
   rejectionReasonLength: 500,
 });
+export const MAX_INVESTMENT_INDICATION_REVISIONS = 16;
 
 const MAX_IDENTIFIER_INPUT_LENGTH = INVESTMENT_INDICATION_LIMITS.identifierInputLength;
 const MAX_IDENTIFIER_LENGTH = INVESTMENT_INDICATION_LIMITS.identifierLength;
@@ -319,6 +320,9 @@ const REJECTION_KEYS = new Set(["occurredAt", "historyEntryId", "reason"]);
 
 const ACTIVE_PARTICIPANT_TRANSITIONS = Object.freeze([
   Object.freeze({ type: "edit", acknowledgment: "current-required" }),
+  Object.freeze({ type: "withdraw", acknowledgment: "not-required" }),
+] as const satisfies readonly ParticipantVisibleIndicationTransition[]);
+const WITHDRAW_ONLY_PARTICIPANT_TRANSITIONS = Object.freeze([
   Object.freeze({ type: "withdraw", acknowledgment: "not-required" }),
 ] as const satisfies readonly ParticipantVisibleIndicationTransition[]);
 const WITHDRAWN_PARTICIPANT_TRANSITIONS = Object.freeze([
@@ -558,6 +562,9 @@ export function editInvestmentIndication(
 ): ValidationResult<ActiveInvestmentIndication> {
   assertParticipantOwns(indication, actor);
   assertStatus(indication, "active");
+  if (indication.revision >= MAX_INVESTMENT_INDICATION_REVISIONS - 1) {
+    return invalid({ code: "out_of_range", path: "revision" });
+  }
   const source = parseOperation(value, EDIT_KEYS);
   if (!source.ok) return source;
 
@@ -615,6 +622,9 @@ export function withdrawInvestmentIndication(
 ): ValidationResult<WithdrawnInvestmentIndication> {
   assertParticipantOwns(indication, actor);
   assertStatus(indication, "active");
+  if (indication.revision >= MAX_INVESTMENT_INDICATION_REVISIONS) {
+    return invalid({ code: "out_of_range", path: "revision" });
+  }
   const source = parseOperation(value, TRANSITION_KEYS);
   if (!source.ok) return source;
   const metadata = parseTransitionMetadata(indication, source.value);
@@ -664,6 +674,9 @@ export function reactivateInvestmentIndication(
 ): ValidationResult<ActiveInvestmentIndication> {
   assertParticipantOwns(indication, actor);
   assertStatus(indication, "withdrawn");
+  if (indication.revision >= MAX_INVESTMENT_INDICATION_REVISIONS - 1) {
+    return invalid({ code: "out_of_range", path: "revision" });
+  }
   const source = parseOperation(value, TRANSITION_KEYS);
   if (!source.ok) return source;
   const metadata = parseTransitionMetadata(indication, source.value);
@@ -718,6 +731,9 @@ export function rejectInvestmentIndication(
 ): ValidationResult<RejectedInvestmentIndication> {
   assertOwnerActor(actor);
   assertStatus(indication, "active");
+  if (indication.revision >= MAX_INVESTMENT_INDICATION_REVISIONS) {
+    return invalid({ code: "out_of_range", path: "revision" });
+  }
   const source = parseOperation(value, REJECTION_KEYS);
   if (!source.ok) return source;
   const metadata = parseTransitionMetadata(indication, source.value);
@@ -779,14 +795,22 @@ export function participantVisibleIndicationLifecycle(
     return Object.freeze({
       status: "active",
       rejectionReason: null,
-      transitions: ACTIVE_PARTICIPANT_TRANSITIONS,
+      transitions:
+        indication.revision >= MAX_INVESTMENT_INDICATION_REVISIONS
+          ? NO_PARTICIPANT_TRANSITIONS
+          : indication.revision === MAX_INVESTMENT_INDICATION_REVISIONS - 1
+          ? WITHDRAW_ONLY_PARTICIPANT_TRANSITIONS
+          : ACTIVE_PARTICIPANT_TRANSITIONS,
     });
   }
   if (indication.lifecycle.status === "withdrawn") {
     return Object.freeze({
       status: "withdrawn",
       rejectionReason: null,
-      transitions: WITHDRAWN_PARTICIPANT_TRANSITIONS,
+      transitions:
+        indication.revision < MAX_INVESTMENT_INDICATION_REVISIONS - 1
+        ? WITHDRAWN_PARTICIPANT_TRANSITIONS
+        : NO_PARTICIPANT_TRANSITIONS,
     });
   }
   return Object.freeze({

@@ -16,11 +16,13 @@ import {
   assertNoActiveIndicationConflict,
   createInvestmentIndication,
   editInvestmentIndication,
+  MAX_INVESTMENT_INDICATION_REVISIONS,
   participantVisibleIndicationLifecycle,
   reactivateInvestmentIndication,
   rejectInvestmentIndication,
   withdrawInvestmentIndication,
   type ActiveInvestmentIndication,
+  type InvestmentIndication,
   type OwnerIndicationActor,
   type ParticipantIndicationActor,
   type TrustedPackageAcknowledgmentContext,
@@ -96,6 +98,89 @@ test("one personal indication can be active for a participant", async () => {
   assert.doesNotThrow(() =>
     assertNoActiveIndicationConflict(anotherParticipant, [first]),
   );
+});
+
+test("the bounded lifecycle stops advertising or accepting revision seventeen", async () => {
+  const version = await packageVersion();
+  const context = acknowledgmentContext(
+    version,
+    acceptance(version, firstParticipant, "acceptance:revision-ceiling"),
+  );
+  let indication: InvestmentIndication = createIndication(
+    createInput("indication:revision-ceiling", personalFields()),
+    firstParticipant,
+    context,
+  );
+  for (
+    let revision = 2;
+    revision < MAX_INVESTMENT_INDICATION_REVISIONS;
+    revision += 1
+  ) {
+    const transition = transitionInput(
+      `indication-history:revision-ceiling-${revision}`,
+      `2026-08-${String(9 + revision).padStart(2, "0")}T11:00:00.000Z`,
+    );
+    const result: ValidationResult<InvestmentIndication> =
+      indication.lifecycle.status === "active"
+      ? withdrawInvestmentIndication(indication, transition, firstParticipant)
+      : reactivateInvestmentIndication(
+          indication,
+          transition,
+          firstParticipant,
+          context,
+        );
+    indication = valueOf(result);
+  }
+
+  assert.equal(indication.revision, MAX_INVESTMENT_INDICATION_REVISIONS - 1);
+  assert.deepEqual(participantVisibleIndicationLifecycle(indication), {
+    status: "active",
+    rejectionReason: null,
+    transitions: [{ type: "withdraw", acknowledgment: "not-required" }],
+  });
+  const finalEdit = editInvestmentIndication(
+    indication,
+    {
+      occurredAt: "2026-08-25T10:00:00.000Z",
+      historyEntryId: "indication-history:revision-ceiling-final-edit",
+      fields: personalFields({ note: "Must leave room to withdraw." }),
+    },
+    firstParticipant,
+    amountConfiguration,
+    context,
+  );
+  assert.equal(finalEdit.ok, false);
+
+  indication = valueOf(withdrawInvestmentIndication(
+    indication,
+    transitionInput(
+      "indication-history:revision-ceiling-16",
+      "2026-08-25T11:00:00.000Z",
+    ),
+    firstParticipant,
+  ));
+  assert.equal(indication.revision, MAX_INVESTMENT_INDICATION_REVISIONS);
+  assert.deepEqual(participantVisibleIndicationLifecycle(indication), {
+    status: "withdrawn",
+    rejectionReason: null,
+    transitions: [],
+  });
+  const overflow = reactivateInvestmentIndication(
+    indication,
+    transitionInput(
+      "indication-history:revision-ceiling-overflow",
+      "2026-08-26T11:00:00.000Z",
+    ),
+    firstParticipant,
+    context,
+  );
+  assert.equal(overflow.ok, false);
+  if (!overflow.ok) {
+    assert.deepEqual(overflow.issues, [{
+      code: "out_of_range",
+      path: "revision",
+    }]);
+  }
 });
 
 test("normalized company duplicates fail without disclosing the existing record", async () => {
