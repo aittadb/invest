@@ -4,7 +4,8 @@ Access registration is an injectable participant resource at
 `/participant/registration`. Hosted composition installs it only for the exact
 path and a signed-in non-owner, using the credential-closed AittaDB repository
 factory and browser mutation session. Notice text comes only from the persisted
-private campaign policy. Profile self-service composition remains `TASK-092`.
+private campaign policy. Registered participants can continue to the separately
+composed profile self-service resource.
 
 ## Representations
 

@@ -123,6 +123,9 @@ over the request's trusted subject and provider email label. Its
 registration-only recovery capability can read immutable profile revision 1 but
 cannot write a stale-policy submission. Notice snapshots remain inside the
 subject-bound profile records; no notice key contains participant identity.
+Profile self-service uses the same named capability only after the trusted
+participant-access projection has been resolved for the exact profile path,
+then binds every route callback to that account again.
 It intentionally has no generic builder or adapter accessor. The Worker calls
 these methods centrally and passes routes only their declared interfaces and
 mutation session; it never passes the adapter or factory into route context.

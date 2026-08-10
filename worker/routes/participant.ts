@@ -26,6 +26,19 @@ export {
 } from "./participant-registration.ts";
 
 export {
+  createParticipantProfileRouteHandler,
+  MAX_PROFILE_DELETE_MUTATION_BYTES,
+  MAX_PROFILE_DELETE_MUTATION_FIELDS,
+  MAX_PROFILE_PATCH_MUTATION_BYTES,
+  MAX_PROFILE_PATCH_MUTATION_FIELDS,
+  MAX_PROFILE_POST_MUTATION_BYTES,
+  MAX_PROFILE_POST_MUTATION_FIELDS,
+  participantProfileMutationLimits,
+  type ParticipantProfileMutationVerifier,
+  type ParticipantProfileRouteDependencies,
+} from "./participant-profile.ts";
+
+export {
   createParticipantPackageReaderRouteHandler,
   type ParticipantPackageReaderDependencies,
 } from "./participant-package-reader.ts";

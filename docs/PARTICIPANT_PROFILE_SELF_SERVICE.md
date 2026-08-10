@@ -1,10 +1,10 @@
 # Participant Profile Self-Service
 
 Participant profile self-service is an injectable registered-reader resource at
-`/participant/profile`. `StorageParticipantRepository` now supplies the
-production-neutral persistence contract, and the trusted participant-access
-projection and access registration are available. Hosted profile composition
-remains `TASK-092`, so this resource is not yet installed in the hosted Worker.
+`/participant/profile`. Hosted composition installs it only for that exact path
+and a signed-in non-owner with a subject- and email-bound participant-access
+projection. Every read and mutation uses a fresh `StorageParticipantRepository`
+bound again to the same trusted account.
 
 ## Representations
 
@@ -68,21 +68,31 @@ canonical resource origin and binds the verified participant session subject to
 the exact trusted account.
 
 The guard enforces bounded JSON or URL-encoded bodies, a supported content
-type, an unexpired actor-bound session, and an expiring CSRF proof. HTML carries
-the proof only in `_csrf`; hypermedia JSON carries it only in the
-`x-investor-app-csrf` response header. The proof and header name are absent from
-the JSON document. A resource with no mutation actions issues neither operation
-IDs nor a CSRF proof.
+type, an unexpired actor-bound session, and an expiring CSRF proof. Direct
+`PATCH` requests are limited to 2 KiB and six fields, direct `DELETE` requests
+to 512 bytes and three fields, and the native-form `POST` transport to 2 KiB and
+eight fields including its proof and method override. Repeated form fields are
+never allowed. Exact action-field validation runs after transport verification.
+
+HTML carries the proof only in `_csrf`; hypermedia JSON carries it only in the
+`x-investor-app-csrf` response header. A hosted proof's encrypted cookie is sent
+only in `Set-Cookie`, never in either representation. Hosted verification must
+return one valid expiration cookie. That cookie is attached exactly once to a
+successful response or any later parser, repository, or rendering failure;
+failures before verification attach none. A resource with no mutation actions
+issues neither operation IDs nor a CSRF proof or cookie.
 
 Mutations delegate compare-and-set, idempotency, and immutable revision history
 to the existing `ParticipantRepository`. Exact immediate retries reuse the
 persisted resulting timestamp and return the repository replay without adding a
-revision. Before any existing-profile write, the storage repository verifies the
-current record against the expected immutable revision. A response lost after
-commit can be reconstructed only from the exact stored operation revision;
-changed retries conflict, stale revisions fail their precondition, and new
-attempts to repeat a completed withdraw-only or request-only transition do not
-create no-op revisions.
+revision. If concurrent exact requests sample different server timestamps, the
+loser performs one bounded current-snapshot recovery and retries with the
+winner's persisted timestamp. Changed retries still conflict and stale
+operations still fail their precondition. Before any existing-profile write,
+the storage repository verifies the current record against the expected
+immutable revision. A response lost after commit can be reconstructed only from
+the exact stored operation revision, and new attempts to repeat a completed
+withdraw-only or request-only transition do not create no-op revisions.
 
 Anonymous requests receive only the fixed sign-in resource. Owners,
 unregistered accounts, foreign subjects, missing records, and inaccessible
@@ -90,3 +100,9 @@ records receive fixed non-disclosing failures. Malformed or stale trusted
 projections fail closed. HTML loads `/participant-profile.css` from the same
 origin under a restrictive CSP; all profile responses are non-cacheable and use
 same-origin resource isolation.
+
+The Worker resolves the trusted participant projection once for the profile
+request, reuses that binding when composing the route, and lets the route read
+its full validated profile through the subject-bound repository. It does not
+place the runtime, adapter, credential, repository factory, or private campaign
+policy in route context or output.

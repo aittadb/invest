@@ -25,6 +25,9 @@ import {
 } from "../../domain/participant-profile-resource.ts";
 import {
   parseParticipantAccount,
+  requestParticipantAccountDeletion,
+  updateParticipantProfile,
+  withdrawMarketingConsent,
   type ParticipantAccount,
   type ParticipantProfile,
 } from "../../domain/participant-profile.ts";
@@ -49,6 +52,10 @@ import {
   type BrowserMutationGuardOptions,
   type VerifiedMutationRequest,
 } from "../../http/mutation-security.ts";
+import type {
+  BrowserMutationProof,
+  BrowserMutationVerificationLimits,
+} from "../../http/browser-mutation-session.ts";
 import type {
   ParticipantProfileMutationResult,
   ParticipantProfileSnapshot,
@@ -89,6 +96,47 @@ const DELETION_REQUEST_FIELDS = Object.freeze([
   DELETION_CONFIRMATION_FIELD,
 ]);
 
+export const MAX_PROFILE_POST_MUTATION_BYTES = 2_048;
+export const MAX_PROFILE_POST_MUTATION_FIELDS = 8;
+export const MAX_PROFILE_PATCH_MUTATION_BYTES = 2_048;
+export const MAX_PROFILE_PATCH_MUTATION_FIELDS = 6;
+export const MAX_PROFILE_DELETE_MUTATION_BYTES = 512;
+export const MAX_PROFILE_DELETE_MUTATION_FIELDS = 3;
+
+const PROFILE_MUTATION_LIMITS = Object.freeze({
+  POST: Object.freeze({
+    maxBodyBytes: MAX_PROFILE_POST_MUTATION_BYTES,
+    maxFields: MAX_PROFILE_POST_MUTATION_FIELDS,
+    repeatedFormFields: Object.freeze([]),
+  }),
+  PATCH: Object.freeze({
+    maxBodyBytes: MAX_PROFILE_PATCH_MUTATION_BYTES,
+    maxFields: MAX_PROFILE_PATCH_MUTATION_FIELDS,
+    repeatedFormFields: Object.freeze([]),
+  }),
+  DELETE: Object.freeze({
+    maxBodyBytes: MAX_PROFILE_DELETE_MUTATION_BYTES,
+    maxFields: MAX_PROFILE_DELETE_MUTATION_FIELDS,
+    repeatedFormFields: Object.freeze([]),
+  }),
+} satisfies Readonly<
+  Record<"POST" | "PATCH" | "DELETE", BrowserMutationVerificationLimits>
+>);
+
+/** Route-owned limits selected before hosted or compatibility verification. */
+export function participantProfileMutationLimits(
+  requestMethod: string,
+): BrowserMutationVerificationLimits {
+  if (
+    requestMethod !== "POST" &&
+    requestMethod !== "PATCH" &&
+    requestMethod !== "DELETE"
+  ) {
+    throw new MutationSecurityFailure("INVALID_REQUEST");
+  }
+  return PROFILE_MUTATION_LIMITS[requestMethod];
+}
+
 export type ParticipantProfileRepositoryFactory = (
   account: ParticipantAccount,
 ) => ParticipantRepository;
@@ -96,11 +144,22 @@ export type ParticipantProfileRepositoryFactory = (
 export type ParticipantProfileCsrfTokenProvider = (
   request: Request,
   account: ParticipantAccount,
-) => string | null | Promise<string | null>;
+) =>
+  | string
+  | BrowserMutationProof
+  | null
+  | Promise<string | BrowserMutationProof | null>;
+
+export type ParticipantProfileMutationVerifier = (
+  request: Request,
+) => Promise<
+  VerifiedMutationRequest & Readonly<{ clearCookie: string }>
+>;
 
 export type ParticipantProfileRouteDependencies = Readonly<{
   repositoryFor: ParticipantProfileRepositoryFactory;
-  mutationSecurity: BrowserMutationGuardOptions;
+  mutationSecurity?: BrowserMutationGuardOptions;
+  verifyMutation?: ParticipantProfileMutationVerifier;
   csrfTokenFor: ParticipantProfileCsrfTokenProvider;
   now?: () => Date;
   createOperationId?: (operation: ParticipantProfileOperation) => string;
@@ -112,7 +171,9 @@ export function createParticipantProfileRouteHandler(
 ): ApplicationRouteHandler {
   if (
     typeof dependencies.repositoryFor !== "function" ||
-    typeof dependencies.csrfTokenFor !== "function"
+    typeof dependencies.csrfTokenFor !== "function" ||
+    (dependencies.verifyMutation === undefined) ===
+      (dependencies.mutationSecurity === undefined)
   ) {
     throw new Error("Invalid participant-profile route configuration.");
   }
@@ -121,9 +182,13 @@ export function createParticipantProfileRouteHandler(
   if (typeof now !== "function" || typeof createOperationId !== "function") {
     throw new Error("Invalid participant-profile route configuration.");
   }
-  const mutationGuard = createBrowserMutationGuard(
-    dependencies.mutationSecurity,
-  );
+  const hostedMutationVerifier = dependencies.verifyMutation;
+  const mutationGuard: (
+    request: Request,
+  ) => Promise<VerifiedMutationRequest & Readonly<{ clearCookie?: string }>> =
+    hostedMutationVerifier ?? createLegacyMutationVerifier(
+      dependencies.mutationSecurity as BrowserMutationGuardOptions,
+    );
 
   return async (context) => {
     if (context.url.pathname !== PARTICIPANT_PROFILE_PATH) return null;
@@ -178,8 +243,15 @@ export function createParticipantProfileRouteHandler(
       return methodNotAllowedResponse(context.resourceUrl, representation.kind);
     }
 
+    let clearCookie: string | null = null;
     try {
       const verified = await mutationGuard(context.request);
+      if (hostedMutationVerifier !== undefined) {
+        if (!validSetCookie(verified.clearCookie)) {
+          throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+        }
+        clearCookie = verified.clearCookie;
+      }
       assertExactResourceOrigin(context.request, context.resourceUrl);
       const authorized = requiredAuthorizedParticipant(context);
       if (
@@ -199,43 +271,81 @@ export function createParticipantProfileRouteHandler(
       );
       const mutation = parseProfileMutation(verified);
       requireMutationAvailable(current, mutation);
-      const occurredAt = mutationTimestamp(
+      const applied = await applyMutationWithReplayRecovery(
+        repository,
+        authorized.account,
+        mutation,
         current,
-        mutation.expectedRevision,
         now,
       );
-      const result = await applyMutation(
-        repository,
-        mutation,
-        occurredAt,
-      );
       requireMutationResult(
-        result,
+        applied.result,
         current,
         mutation,
-        occurredAt,
+        applied.occurredAt,
         authorized.account,
       );
 
-      return await resourceResponse({
+      return withSetCookie(await resourceResponse({
         context,
         representation: representation.kind,
         account: authorized.account,
         current: Object.freeze({
-          revision: result.revision,
-          snapshot: result.snapshot,
+          revision: applied.result.revision,
+          snapshot: applied.result.snapshot,
         }),
         acknowledgment: acknowledgmentState(authorized.access),
         csrfTokenFor: dependencies.csrfTokenFor,
         createOperationId,
-      });
+      }), clearCookie);
     } catch (error) {
-      return errorResponse(
+      return withSetCookie(errorResponse(
         publicRouteError(error, context.resourceUrl),
         representation.kind,
-      );
+      ), clearCookie);
     }
   };
+}
+
+function createLegacyMutationVerifier(
+  options: BrowserMutationGuardOptions,
+): (request: Request) => Promise<VerifiedMutationRequest> {
+  const guards = Object.freeze({
+    POST: createBrowserMutationGuard(
+      legacyGuardOptions(options, PROFILE_MUTATION_LIMITS.POST),
+    ),
+    PATCH: createBrowserMutationGuard(
+      legacyGuardOptions(options, PROFILE_MUTATION_LIMITS.PATCH),
+    ),
+    DELETE: createBrowserMutationGuard(
+      legacyGuardOptions(options, PROFILE_MUTATION_LIMITS.DELETE),
+    ),
+  });
+  return (request) => {
+    const method = request.method;
+    if (method !== "POST" && method !== "PATCH" && method !== "DELETE") {
+      throw new MutationSecurityFailure("INVALID_REQUEST");
+    }
+    return guards[method](request);
+  };
+}
+
+function legacyGuardOptions(
+  options: BrowserMutationGuardOptions,
+  limits: BrowserMutationVerificationLimits,
+): BrowserMutationGuardOptions {
+  return Object.freeze({
+    ...options,
+    maxBodyBytes: Math.min(
+      options.maxBodyBytes ?? limits.maxBodyBytes ?? 1,
+      limits.maxBodyBytes ?? 1,
+    ),
+    maxFields: Math.min(
+      options.maxFields ?? limits.maxFields ?? 1,
+      limits.maxFields ?? 1,
+    ),
+    repeatedFormFields: [],
+  });
 }
 
 type ProfileMutation =
@@ -394,6 +504,53 @@ async function applyMutation(
   });
 }
 
+type AppliedProfileMutation = Readonly<{
+  result: ParticipantProfileMutationResult;
+  occurredAt: Timestamp;
+}>;
+
+async function applyMutationWithReplayRecovery(
+  repository: ParticipantRepository,
+  account: ParticipantAccount,
+  mutation: ProfileMutation,
+  current: ParticipantProfileSnapshot,
+  now: () => Date,
+): Promise<AppliedProfileMutation> {
+  const occurredAt = mutationTimestamp(
+    current,
+    mutation.expectedRevision,
+    now,
+  );
+  try {
+    return Object.freeze({
+      result: await applyMutation(repository, mutation, occurredAt),
+      occurredAt,
+    });
+  } catch (error) {
+    if (
+      !(error instanceof StorageFailure) ||
+      (error.code !== "CONFLICT" && error.code !== "PRECONDITION_FAILED")
+    ) {
+      throw error;
+    }
+
+    const replay = requireOwnedCurrentProfile(
+      await repository.current(),
+      account,
+    );
+    if (replay.revision !== mutation.expectedRevision + 1) throw error;
+    const replayedAt = mutationTimestamp(
+      replay,
+      mutation.expectedRevision,
+      now,
+    );
+    return Object.freeze({
+      result: await applyMutation(repository, mutation, replayedAt),
+      occurredAt: replayedAt,
+    });
+  }
+}
+
 function requireMutationResult(
   result: ParticipantProfileMutationResult,
   current: ParticipantProfileSnapshot,
@@ -412,34 +569,111 @@ function requireMutationResult(
     unavailable();
   }
   requireOwnedProfile(result.snapshot, account);
+  const expected = expectedProfileTransition(
+    current.snapshot,
+    mutation,
+    occurredAt,
+  );
+  if (
+    !sameParticipantProfile(result.snapshot, expected.profile) ||
+    !sameParticipantIntents(result.intents, expected.intents)
+  ) unavailable();
+}
 
+function expectedProfileTransition(
+  current: ParticipantProfile,
+  mutation: ProfileMutation,
+  occurredAt: Timestamp,
+): Readonly<{
+  profile: ParticipantProfile;
+  intents: ParticipantProfileMutationResult["intents"];
+}> {
   if (mutation.kind === "update") {
-    if (result.intents.length !== 0) unavailable();
-    return;
+    const updated = updateParticipantProfile(
+      current,
+      mutation.changes,
+      occurredAt,
+    );
+    if (!updated.ok) unavailable();
+    return Object.freeze({
+      profile: updated.value,
+      intents: Object.freeze([]),
+    });
   }
   if (mutation.kind === "withdraw-marketing-consent") {
-    if (
-      result.intents.length !== 0 ||
-      result.snapshot.marketingConsent.state !== "withdrawn"
-    ) {
-      unavailable();
-    }
-    return;
+    return Object.freeze({
+      profile: withdrawMarketingConsent(current, occurredAt),
+      intents: Object.freeze([]),
+    });
   }
+  const transition = requestParticipantAccountDeletion(current, occurredAt);
+  return Object.freeze({
+    profile: transition.profile,
+    intents: transition.intents,
+  });
+}
 
-  const deletion = result.snapshot.accountDeletionRequest;
-  const intent = result.intents[0];
-  if (
-    result.intents.length !== 1 ||
-    deletion.state !== "requested" ||
-    deletion.requestedAt !== occurredAt ||
-    intent?.type !== "withdraw-active-interest" ||
-    intent.subject !== account.subject ||
-    intent.reason !== "account-deletion-request" ||
-    intent.requestedAt !== occurredAt
-  ) {
-    unavailable();
+function sameParticipantProfile(
+  left: ParticipantProfile,
+  right: ParticipantProfile,
+): boolean {
+  return left.subject === right.subject &&
+    left.accountEmailLabel === right.accountEmailLabel &&
+    left.displayName === right.displayName &&
+    left.country === right.country &&
+    left.declaredInterest === right.declaredInterest &&
+    left.participationContext === right.participationContext &&
+    left.processEmailNoticeAcknowledgedAt ===
+      right.processEmailNoticeAcknowledgedAt &&
+    sameMarketingConsent(left.marketingConsent, right.marketingConsent) &&
+    sameDeletionRequest(
+      left.accountDeletionRequest,
+      right.accountDeletionRequest,
+    ) &&
+    left.registeredAt === right.registeredAt &&
+    left.updatedAt === right.updatedAt;
+}
+
+function sameMarketingConsent(
+  left: ParticipantProfile["marketingConsent"],
+  right: ParticipantProfile["marketingConsent"],
+): boolean {
+  if (left.state !== right.state) return false;
+  if (left.state === "not-granted" || right.state === "not-granted") {
+    return true;
   }
+  if (left.state === "granted" || right.state === "granted") {
+    return left.state === "granted" &&
+      right.state === "granted" &&
+      left.grantedAt === right.grantedAt;
+  }
+  return left.grantedAt === right.grantedAt &&
+    left.withdrawnAt === right.withdrawnAt;
+}
+
+function sameDeletionRequest(
+  left: ParticipantProfile["accountDeletionRequest"],
+  right: ParticipantProfile["accountDeletionRequest"],
+): boolean {
+  if (left.state !== right.state) return false;
+  return left.state === "not-requested" ||
+    (right.state === "requested" &&
+      left.requestedAt === right.requestedAt &&
+      left.activeInterestDisposition === right.activeInterestDisposition);
+}
+
+function sameParticipantIntents(
+  left: ParticipantProfileMutationResult["intents"],
+  right: ParticipantProfileMutationResult["intents"],
+): boolean {
+  return left.length === right.length && left.every((intent, index) => {
+    const expected = right[index];
+    return expected !== undefined &&
+      intent.type === expected.type &&
+      intent.subject === expected.subject &&
+      intent.reason === expected.reason &&
+      intent.requestedAt === expected.requestedAt;
+  });
 }
 
 type ResourceResponseInput = Readonly<{
@@ -465,22 +699,25 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
     acknowledgment: input.acknowledgment,
     operationIds,
   });
-  const csrfToken = model.actionContracts.length === 0
+  const csrf = model.actionContracts.length === 0
     ? null
-    : await requiredCsrfToken(
+    : await requiredCsrfProof(
         await input.csrfTokenFor(input.context.request, input.account),
       );
 
   if (input.representation === "hypermedia-json") {
-    return hypermediaResponseWithCsrf(model.document, csrfToken);
+    return withSetCookie(
+      hypermediaResponseWithCsrf(model.document, csrf?.token ?? null),
+      csrf?.setCookie ?? null,
+    );
   }
-  return htmlResponse(
+  return withSetCookie(htmlResponse(
     renderParticipantProfileHtml(
       model,
-      csrfToken,
+      csrf?.token ?? null,
       input.context.campaign?.name ?? "Campaign",
     ),
-  );
+  ), csrf?.setCookie ?? null);
 }
 
 function profileOperationIds(
@@ -507,16 +744,30 @@ function profileOperationIds(
   });
 }
 
-async function requiredCsrfToken(value: unknown): Promise<string> {
-  if (typeof value !== "string") {
+async function requiredCsrfProof(
+  value: unknown,
+): Promise<Readonly<{ token: string; setCookie: string | null }>> {
+  const token = typeof value === "string"
+    ? value
+    : typeof value === "object" && value !== null && "token" in value
+    ? value.token
+    : null;
+  const setCookie = typeof value === "object" && value !== null &&
+      "setCookie" in value
+    ? value.setCookie
+    : null;
+  if (
+    typeof token !== "string" ||
+    (setCookie !== null && !validSetCookie(setCookie))
+  ) {
     throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
   }
   try {
-    await hashCsrfToken(value);
+    await hashCsrfToken(token);
   } catch (error) {
     throw new MutationSecurityFailure("SERVICE_UNAVAILABLE", { cause: error });
   }
-  return value;
+  return Object.freeze({ token, setCookie });
 }
 
 function hypermediaResponseWithCsrf(
@@ -594,25 +845,30 @@ function requireCurrentProfile(
   value: ParticipantProfileSnapshot | null,
   authorized: AuthorizedProfileRequest,
 ): ParticipantProfileSnapshot {
-  if (value === null) notFound();
-  if (!Number.isSafeInteger(value.revision) || value.revision < 1) unavailable();
-  requireOwnedProfile(value.snapshot, authorized.account);
-  validateParticipantProfileResourceState(
-    authorized.account,
-    value.snapshot,
-  );
+  const current = requireOwnedCurrentProfile(value, authorized.account);
   const deletionRequested =
-    value.snapshot.accountDeletionRequest.state === "requested";
+    current.snapshot.accountDeletionRequest.state === "requested";
   if (
-    value.snapshot.displayName !== authorized.access.displayName ||
-    value.snapshot.declaredInterest !== authorized.access.declaredInterest ||
-    value.snapshot.participationContext !==
+    current.snapshot.displayName !== authorized.access.displayName ||
+    current.snapshot.declaredInterest !== authorized.access.declaredInterest ||
+    current.snapshot.participationContext !==
       authorized.access.participationContext ||
     authorized.access.accountStatus !==
       (deletionRequested ? "deletion-requested" : "active")
   ) {
     unavailable();
   }
+  return current;
+}
+
+function requireOwnedCurrentProfile(
+  value: ParticipantProfileSnapshot | null,
+  account: ParticipantAccount,
+): ParticipantProfileSnapshot {
+  if (value === null) notFound();
+  if (!Number.isSafeInteger(value.revision) || value.revision < 1) unavailable();
+  requireOwnedProfile(value.snapshot, account);
+  validateParticipantProfileResourceState(account, value.snapshot);
   return value;
 }
 
@@ -1110,6 +1366,24 @@ function htmlResponse(html: string, status = 200): Response {
       Vary: "Accept",
       "X-Content-Type-Options": "nosniff",
     },
+  });
+}
+
+function validSetCookie(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 4_096 &&
+    !/[\r\n]/u.test(value);
+}
+
+function withSetCookie(response: Response, cookie: string | null): Response {
+  if (!validSetCookie(cookie)) return response;
+  const headers = new Headers(response.headers);
+  headers.append("Set-Cookie", cookie);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
 }
 

@@ -19,6 +19,7 @@ import {
   createParticipantRegistrationNoticeEvidence,
   participantRegistrationNoticesFromCampaignPolicy,
 } from "../domain/participant-registration-resource.ts";
+import { PARTICIPANT_PROFILE_PATH } from "../domain/participant-profile-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   parsePublicCampaignConfiguration,
@@ -81,6 +82,7 @@ import {
   createInvestmentInterestRouteHandler,
   createParticipantPackageAcknowledgmentRouteHandler,
   createParticipantPackageReaderRouteHandler,
+  createParticipantProfileRouteHandler,
   createParticipantRegistrationRouteHandler,
   createParticipantRouteHandler,
   MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
@@ -89,10 +91,12 @@ import {
   MAX_FOUNDER_INTEREST_MUTATION_FIELDS,
   MAX_REGISTRATION_MUTATION_BYTES,
   MAX_REGISTRATION_MUTATION_FIELDS,
+  participantProfileMutationLimits,
   type FounderInterestRouteDependencies,
   type InvestmentInterestRouteDependencies,
   type ParticipantPackageAcknowledgmentRouteDependencies,
   type ParticipantPackageReaderDependencies,
+  type ParticipantProfileRouteDependencies,
   type ParticipantRegistrationRouteDependencies,
 } from "./routes/participant.ts";
 import { createParticipantFounderInterestService } from "./founder-interest-service.ts";
@@ -221,6 +225,17 @@ export function createApplicationWorker(
         actor,
         participantAccessReader,
       );
+      const participantProfile = dependencies.dispatchRoute === undefined &&
+          applicationRuntime !== null
+        ? runtimeParticipantProfileRoute(
+            applicationRuntime,
+            actor,
+            isOwner,
+            participantAccess,
+            resourceUrl,
+            url.pathname,
+          )
+        : null;
       const participantFounderInterest = dependencies.dispatchRoute === undefined
         ? dependencies.participantFounderInterest ??
           await runtimeParticipantFounderInterestRoute(
@@ -278,6 +293,7 @@ export function createApplicationWorker(
 
       const hasInjectedRoutes = ownerPackageAvailable ||
         participantRegistration !== null ||
+        participantProfile !== null ||
         participantPackageReader !== undefined ||
         participantPackageAcknowledgment !== undefined ||
         ownerIndicationModerationAvailable ||
@@ -293,6 +309,7 @@ export function createApplicationWorker(
               campaignWorkspace,
               ownerOAuthProof,
               participantRegistration,
+              participantProfile,
               participantFounderInterest ?? null,
               {
                 owner: ownerPackage,
@@ -364,6 +381,7 @@ function createInjectedRouteDispatcher(
   campaignWorkspace: CampaignWorkspaceDeploymentCapability | null,
   ownerOAuthProof: OwnerOAuthProofRouteDependencies | null,
   participantRegistration: ParticipantRegistrationRouteDependencies | null,
+  participantProfile: ParticipantProfileRouteDependencies | null,
   participantFounderInterest: FounderInterestRouteDependencies | null,
   packageRoutes: ResolvedPackageRoutes,
   available: InjectedRouteAvailability,
@@ -377,6 +395,9 @@ function createInjectedRouteDispatcher(
           ? [createParticipantRegistrationRouteHandler(
               participantRegistration,
             )]
+          : []),
+        ...(participantProfile
+          ? [createParticipantProfileRouteHandler(participantProfile)]
           : []),
         ...(packageRoutes.participantReader
           ? [createParticipantPackageReaderRouteHandler(
@@ -452,6 +473,73 @@ function createInjectedRouteDispatcher(
       },
     ),
   });
+}
+
+function runtimeParticipantProfileRoute(
+  runtime: ApplicationRuntimeDeploymentCapability,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  participantAccess: AuthorizedParticipantAccess | null,
+  resourceUrl: string,
+  pathname: string,
+): ParticipantProfileRouteDependencies | null {
+  if (
+    pathname !== PARTICIPANT_PROFILE_PATH ||
+    actor === null ||
+    isOwner ||
+    participantAccess === null
+  ) {
+    return null;
+  }
+
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (
+    !account.ok ||
+    participantAccess.subject !== account.value.subject ||
+    participantAccess.email !== account.value.accountEmailLabel
+  ) {
+    return null;
+  }
+
+  try {
+    const repositories = runtime.repositoryFactory;
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "participant" as const,
+      subject: account.value.subject,
+    });
+    const sameAccount = (candidate: typeof account.value) =>
+      candidate.subject === account.value.subject &&
+      candidate.accountEmailLabel === account.value.accountEmailLabel;
+
+    return Object.freeze({
+      repositoryFor(candidate) {
+        if (!sameAccount(candidate)) {
+          throw new Error("Participant profile is unavailable.");
+        }
+        return repositories.participantRepository(account.value);
+      },
+      verifyMutation: (request: Request) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          participantProfileMutationLimits(request.method),
+        ),
+      csrfTokenFor: (request, candidate) =>
+        sameAccount(candidate)
+          ? runtime.mutationSession.issue(request, identity, appOrigin)
+          : Promise.resolve(null),
+      now: runtime.now,
+      createOperationId: (operation) =>
+        randomOperationId(`participant-profile-${operation}`),
+    });
+  } catch {
+    return null;
+  }
 }
 
 async function runtimeParticipantRegistrationRoute(

@@ -28,9 +28,16 @@ import {
   MUTATION_CSRF_FIELD,
   MUTATION_CSRF_HEADER,
   MUTATION_METHOD_FIELD,
+  MutationSecurityFailure,
   hashCsrfToken,
   type TrustedMutationSession,
 } from "../http/mutation-security.ts";
+import {
+  createBrowserMutationSession,
+  type BrowserMutationProof,
+  type BrowserMutationReplayClaim,
+  type TrustedSitesMutationIdentity,
+} from "../http/browser-mutation-session.ts";
 import {
   DevelopmentInMemoryParticipantRepository,
   type ParticipantProfileSnapshot,
@@ -38,7 +45,17 @@ import {
 } from "../repositories/in-memory-participant-repository.ts";
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
 import { createParticipantRouteHandler } from "../worker/routes/participant.ts";
-import { createParticipantProfileRouteHandler } from "../worker/routes/participant-profile.ts";
+import {
+  MAX_PROFILE_DELETE_MUTATION_BYTES,
+  MAX_PROFILE_DELETE_MUTATION_FIELDS,
+  MAX_PROFILE_PATCH_MUTATION_BYTES,
+  MAX_PROFILE_PATCH_MUTATION_FIELDS,
+  MAX_PROFILE_POST_MUTATION_BYTES,
+  MAX_PROFILE_POST_MUTATION_FIELDS,
+  createParticipantProfileRouteHandler,
+  participantProfileMutationLimits,
+  type ParticipantProfileMutationVerifier,
+} from "../worker/routes/participant-profile.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
 import {
   MemoryStorageAdapter,
@@ -55,6 +72,10 @@ const OWNER = subject("issuer.invalid/owner:campaign");
 const REGISTERED_AT = timestamp("2026-08-09T08:00:00.000Z");
 const PACKAGE_CREATED_AT = timestamp("2026-08-09T09:00:00.000Z");
 const PACKAGE_ID = stableId("package-version:participant-profile");
+const ISSUED_COOKIE =
+  "__Host-investor_mutation_profile=encrypted; Path=/; Max-Age=300; Secure; HttpOnly; SameSite=Strict";
+const CLEAR_COOKIE =
+  "__Host-investor_mutation_profile=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict";
 
 test("profile GET exposes equivalent HTML and hypermedia with only declared editable action fields", async () => {
   const harness = await createHarness({ marketingConsent: true });
@@ -704,6 +725,278 @@ test("mutations enforce actor binding, exact origin, CSRF, bounds, exact fields,
   assert.equal((await harness.profile(alice))?.revision, 1);
 });
 
+test("hosted profile discovery emits proof cookies only through response headers", async () => {
+  const proof = Object.freeze({
+    token: CSRF_TOKEN,
+    expiresAt: timestamp("2026-08-09T12:05:00.000Z"),
+    setCookie: ISSUED_COOKIE,
+  }) satisfies BrowserMutationProof;
+  const harness = await createHarness({ csrfToken: proof });
+  const alice = participant(ALICE, "alice@provider.example");
+
+  const jsonResponse = await harness.dispatch(getRequest(mediaType()), {
+    actor: alice,
+  });
+  assert.equal(jsonResponse.status, 200);
+  assert.equal(jsonResponse.headers.get("set-cookie"), ISSUED_COOKIE);
+  assert.equal(jsonResponse.headers.get(MUTATION_CSRF_HEADER), CSRF_TOKEN);
+  const json = await jsonResponse.text();
+  assert.doesNotMatch(json, new RegExp(CSRF_TOKEN, "u"));
+  assert.doesNotMatch(json, /set-cookie|encrypted|HttpOnly/iu);
+
+  const htmlResponse = await harness.dispatch(getRequest("text/html"), {
+    actor: alice,
+  });
+  assert.equal(htmlResponse.status, 200);
+  assert.equal(htmlResponse.headers.get("set-cookie"), ISSUED_COOKIE);
+  const html = await htmlResponse.text();
+  assert.equal(hiddenCsrfTokens(html).every((value) => value === CSRF_TOKEN), true);
+  assert.doesNotMatch(html, /set-cookie|encrypted|HttpOnly/iu);
+
+  const malformed = await createHarness({
+    csrfToken: Object.freeze({ ...proof, setCookie: "bad\r\ncookie" }),
+  });
+  const failure = await malformed.dispatch(getRequest(mediaType()), {
+    actor: alice,
+  });
+  assert.equal(failure.status, 503);
+  assert.equal(failure.headers.get("set-cookie"), null);
+  assert.doesNotMatch(await failure.text(), /bad|cookie|profile_csrf/iu);
+});
+
+test("verified hosted profile mutations clear proof cookies on success and later failures", async () => {
+  const alice = participant(ALICE, "alice@provider.example");
+  const updateBody = profileUpdateBody(
+    "participant-profile-operation:hosted-success",
+    1,
+  );
+  const success = await createHarness({
+    verifyMutation: profileVerifierFor("PATCH", updateBody, CLEAR_COOKIE),
+  });
+  const successResponse = await success.dispatch(
+    jsonMutation("PATCH", ALICE, updateBody),
+    { actor: alice },
+  );
+  assert.equal(successResponse.status, 200);
+  assertSingleCookie(successResponse, CLEAR_COOKIE);
+  assert.doesNotMatch(await successResponse.text(), /set-cookie|Max-Age=0/iu);
+
+  const parser = await createHarness({
+    verifyMutation: profileVerifierFor("PATCH", {
+      ...updateBody,
+      "operation-id": "participant-profile-operation:hosted-parser",
+      unexpected: "private parser value",
+    }, CLEAR_COOKIE),
+  });
+  const parserResponse = await parser.dispatch(
+    jsonMutation("PATCH", ALICE, updateBody),
+    { actor: alice },
+  );
+  assert.equal(parserResponse.status, 400);
+  assertSingleCookie(parserResponse, CLEAR_COOKIE);
+  assert.doesNotMatch(
+    await parserResponse.text(),
+    /private parser value|Max-Age=0/iu,
+  );
+
+  const repository = await createHarness({
+    verifyMutation: profileVerifierFor("PATCH", {
+      ...updateBody,
+      "operation-id": "participant-profile-operation:hosted-repository",
+    }, CLEAR_COOKIE),
+    repositoryFor() {
+      throw new Error("private repository failure");
+    },
+  });
+  const repositoryResponse = await repository.dispatch(
+    jsonMutation("PATCH", ALICE, updateBody),
+    { actor: alice },
+  );
+  assert.equal(repositoryResponse.status, 503);
+  assertSingleCookie(repositoryResponse, CLEAR_COOKIE);
+  assert.doesNotMatch(
+    await repositoryResponse.text(),
+    /private repository failure|Max-Age=0/iu,
+  );
+});
+
+test("profile hosted verification never clears before verification and requires a valid clear cookie", async () => {
+  const alice = participant(ALICE, "alice@provider.example");
+  const requestBody = profileUpdateBody(
+    "participant-profile-operation:hosted-clear",
+    1,
+  );
+  const rejected = await createHarness({
+    async verifyMutation() {
+      throw new MutationSecurityFailure("REQUEST_REJECTED");
+    },
+  });
+  const rejectedResponse = await rejected.dispatch(
+    jsonMutation("PATCH", ALICE, requestBody),
+    { actor: alice },
+  );
+  assert.equal(rejectedResponse.status, 403);
+  assert.equal(rejectedResponse.headers.get("set-cookie"), null);
+
+  for (const [name, clearCookie] of [
+    ["missing", undefined],
+    ["malformed", "bad\r\nclear-cookie"],
+  ] as const) {
+    let repositoryCalls = 0;
+    const verified = await profileVerifierFor(
+      "PATCH",
+      { ...requestBody, "operation-id": `participant-profile:${name}` },
+      CLEAR_COOKIE,
+    )(jsonMutation("PATCH", ALICE, requestBody));
+    const harness = await createHarness({
+      verifyMutation: (async () => {
+        if (clearCookie === undefined) {
+          return {
+            actor: verified.actor,
+            method: verified.method,
+            mediaType: verified.mediaType,
+            body: verified.body,
+          } as never;
+        }
+        return { ...verified, clearCookie } as never;
+      }) as ParticipantProfileMutationVerifier,
+      repositoryFor(account) {
+        repositoryCalls += 1;
+        return new DevelopmentInMemoryParticipantRepository(
+          new MemoryStorageAdapter(),
+          account,
+        );
+      },
+    });
+    const response = await harness.dispatch(
+      jsonMutation("PATCH", ALICE, requestBody),
+      { actor: alice },
+    );
+    assert.equal(response.status, 503, name);
+    assert.equal(response.headers.get("set-cookie"), null, name);
+    assert.equal(repositoryCalls, 0, name);
+  }
+});
+
+test("hosted profile limits reject oversized, excess, and repeated fields before replay or persistence", async () => {
+  assert.deepEqual(participantProfileMutationLimits("POST"), {
+    maxBodyBytes: MAX_PROFILE_POST_MUTATION_BYTES,
+    maxFields: MAX_PROFILE_POST_MUTATION_FIELDS,
+    repeatedFormFields: [],
+  });
+  assert.deepEqual(participantProfileMutationLimits("PATCH"), {
+    maxBodyBytes: MAX_PROFILE_PATCH_MUTATION_BYTES,
+    maxFields: MAX_PROFILE_PATCH_MUTATION_FIELDS,
+    repeatedFormFields: [],
+  });
+  assert.deepEqual(participantProfileMutationLimits("DELETE"), {
+    maxBodyBytes: MAX_PROFILE_DELETE_MUTATION_BYTES,
+    maxFields: MAX_PROFILE_DELETE_MUTATION_FIELDS,
+    repeatedFormFields: [],
+  });
+
+  const alice = participant(ALICE, "alice@provider.example");
+  const identity = Object.freeze({
+    type: "participant",
+    subject: ALICE,
+  }) satisfies TrustedSitesMutationIdentity;
+  const claims: BrowserMutationReplayClaim[] = [];
+  const session = createBrowserMutationSession({
+    appOrigin: APP_ORIGIN,
+    encryptionKey: await aesKey(47),
+    async claimReplay(claim) {
+      claims.push(claim);
+      return true;
+    },
+    now: () => new Date("2026-08-09T09:00:00.000Z"),
+    randomBytes: (length) => Uint8Array.from(
+      { length },
+      (_, index) => (index + 31) % 256,
+    ),
+    ttlSeconds: 300,
+  });
+  const proof = await session.issue(getRequest("text/html"), identity, APP_ORIGIN);
+  let repositoryCalls = 0;
+  const route = createParticipantProfileRouteHandler({
+    repositoryFor(account) {
+      repositoryCalls += 1;
+      return new DevelopmentInMemoryParticipantRepository(
+        new MemoryStorageAdapter(),
+        account,
+      );
+    },
+    verifyMutation: (request) => session.verifyMutation(
+      request,
+      identity,
+      APP_ORIGIN,
+      participantProfileMutationLimits(request.method),
+    ),
+    csrfTokenFor: async () => proof,
+  });
+  const access = syntheticAccess(ALICE, "alice@provider.example");
+
+  const oversized = hostedProfileJsonMutation(proof, "PATCH", {
+    ...profileUpdateBody("participant-profile:oversized", 1),
+    "display-name": "x".repeat(MAX_PROFILE_PATCH_MUTATION_BYTES),
+  });
+  assert.equal(
+    (await route(routeContext(oversized, alice, access)))?.status,
+    413,
+  );
+
+  const excess = hostedProfileJsonMutation(proof, "PATCH", {
+    ...profileUpdateBody("participant-profile:excess", 1),
+    unexpected: "private",
+  });
+  assert.equal((await route(routeContext(excess, alice, access)))?.status, 400);
+
+  const repeated = hostedProfileFormMutation(proof, [
+    [MUTATION_METHOD_FIELD, "PATCH"],
+    ["operation-id", "participant-profile:repeated"],
+    ["expected-revision", "1"],
+    ["display-name", "Alice"],
+    ["display-name", "Alice again"],
+    ["country", "FI"],
+    ["declared-interest", "investor"],
+  ]);
+  assert.equal((await route(routeContext(repeated, alice, access)))?.status, 400);
+
+  const oversizedDelete = hostedProfileJsonMutation(proof, "DELETE", {
+    "operation-id": "participant-profile:delete-limit",
+    "expected-revision": 1,
+    "confirm-marketing-consent-withdrawal": "x".repeat(
+      MAX_PROFILE_DELETE_MUTATION_BYTES,
+    ),
+  });
+  assert.equal(
+    (await route(routeContext(oversizedDelete, alice, access)))?.status,
+    413,
+  );
+  assert.equal(repositoryCalls, 0);
+  assert.deepEqual(claims, []);
+});
+
+test("concurrent exact profile retries recover the persisted server timestamp", async () => {
+  const harness = await createHarness({ marketingConsent: true });
+  const alice = participant(ALICE, "alice@provider.example");
+  const body = profileUpdateBody(
+    "participant-profile-operation:concurrent-retry",
+    1,
+  );
+  const responses = await Promise.all([
+    harness.dispatch(jsonMutation("PATCH", ALICE, body), { actor: alice }),
+    harness.dispatch(jsonMutation("PATCH", ALICE, body), { actor: alice }),
+  ]);
+  assert.deepEqual(responses.map(({ status }) => status), [200, 200]);
+  const documents = await Promise.all(responses.map(jsonDocument));
+  assert.deepEqual(
+    documents.map((document) => resourceData(document).revision),
+    [2, 2],
+  );
+  assert.equal((await harness.profile(alice))?.revision, 2);
+  assert.equal(harness.nowCalls(), 2);
+});
+
 test("completed request-only state emits no operation IDs or CSRF proof", async () => {
   const harness = await createHarness({ marketingConsent: false });
   const alice = participant(ALICE, "alice@provider.example");
@@ -802,7 +1095,9 @@ type TestActor = Readonly<{
 type HarnessOptions = Readonly<{
   marketingConsent?: boolean;
   packageState?: "required" | "current" | "unavailable";
-  csrfToken?: string | null;
+  csrfToken?: string | BrowserMutationProof | null;
+  verifyMutation?: ParticipantProfileMutationVerifier;
+  repositoryFor?: (account: ParticipantAccount) => ParticipantRepository;
 }>;
 
 type DispatchIdentity = Readonly<{
@@ -838,7 +1133,7 @@ async function createHarness(
     new DevelopmentInMemoryParticipantRepository(storage, account);
   const routeRepositoryFor = (account: ParticipantAccount): ParticipantRepository => {
     repositoryCalls += 1;
-    return directRepository(account);
+    return options.repositoryFor?.(account) ?? directRepository(account);
   };
   const alice = participant(ALICE, "alice@provider.example");
   await directRepository(participantAccount(alice)).register({
@@ -858,23 +1153,27 @@ async function createHarness(
 
   const profileRoute = createParticipantProfileRouteHandler({
     repositoryFor: routeRepositoryFor,
-    mutationSecurity: {
-      allowedOrigins: [APP_ORIGIN, SECOND_ALLOWED_ORIGIN],
-      resolveSession: async (request) => {
-        const value = request.headers.get("x-test-auth-subject");
-        if (!value) return null;
-        return session(
-          subject(value),
-          csrfHash,
-          request.headers.get("x-test-session-type") === "owner"
-            ? "owner"
-            : "participant",
-        );
-      },
-      now: () => new Date("2026-08-09T09:30:00.000Z"),
-      maxBodyBytes: 1_024,
-      maxFields: 16,
-    },
+    ...(options.verifyMutation === undefined
+      ? {
+          mutationSecurity: {
+            allowedOrigins: [APP_ORIGIN, SECOND_ALLOWED_ORIGIN],
+            resolveSession: async (request: Request) => {
+              const value = request.headers.get("x-test-auth-subject");
+              if (!value) return null;
+              return session(
+                subject(value),
+                csrfHash,
+                request.headers.get("x-test-session-type") === "owner"
+                  ? "owner"
+                  : "participant",
+              );
+            },
+            now: () => new Date("2026-08-09T09:30:00.000Z"),
+            maxBodyBytes: 1_024,
+            maxFields: 16,
+          },
+        }
+      : { verifyMutation: options.verifyMutation }),
     csrfTokenFor: (request, account) => {
       csrfCalls += 1;
       return request.headers.get("x-test-auth-subject") === account.subject ||
@@ -1046,6 +1345,95 @@ function formMutation(
       "x-test-auth-subject": actorSubject,
     },
     body,
+  });
+}
+
+function hostedProfileJsonMutation(
+  proof: BrowserMutationProof,
+  method: "POST" | "PATCH" | "DELETE",
+  body: Readonly<Record<string, unknown>>,
+): Request {
+  return new Request(`${APP_ORIGIN}${PARTICIPANT_PROFILE_PATH}`, {
+    method,
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      cookie: proofCookieHeader(proof),
+      origin: APP_ORIGIN,
+      [MUTATION_CSRF_HEADER]: proof.token,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+function hostedProfileFormMutation(
+  proof: BrowserMutationProof,
+  entries: readonly (readonly [string, string])[],
+): Request {
+  const body = new URLSearchParams();
+  body.append(MUTATION_CSRF_FIELD, proof.token);
+  for (const [name, value] of entries) body.append(name, value);
+  return new Request(`${APP_ORIGIN}${PARTICIPANT_PROFILE_PATH}`, {
+    method: "POST",
+    headers: {
+      accept: "text/html",
+      "content-type": "application/x-www-form-urlencoded",
+      cookie: proofCookieHeader(proof),
+      origin: APP_ORIGIN,
+    },
+    body,
+  });
+}
+
+function proofCookieHeader(proof: BrowserMutationProof): string {
+  const value = proof.setCookie.split(";", 1)[0];
+  assert(value);
+  return value;
+}
+
+function profileVerifierFor(
+  method: "POST" | "PATCH" | "DELETE",
+  body: Readonly<Record<string, unknown>>,
+  clearCookie: string,
+): ParticipantProfileMutationVerifier {
+  return async () => Object.freeze({
+    actor: Object.freeze({ type: "participant" as const, subject: ALICE }),
+    method,
+    mediaType: "application/json" as const,
+    body: Object.freeze({ ...body }),
+    clearCookie,
+  });
+}
+
+function assertSingleCookie(response: Response, expected: string): void {
+  const value = response.headers.get("set-cookie");
+  assert.equal(value, expected);
+  assert.equal(value?.split(expected).length, 2);
+}
+
+async function aesKey(seed: number): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    "raw",
+    Uint8Array.from({ length: 32 }, (_, index) => (seed + index) % 256),
+    "AES-GCM",
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+function profileUpdateBody(
+  operationId: string,
+  expectedRevision: number,
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    "operation-id": operationId,
+    "expected-revision": expectedRevision,
+    "display-name": "Hosted profile participant",
+    country: "se",
+    "declared-interest": "investor",
+    "participation-context": "individual",
+    ...overrides,
   });
 }
 

@@ -31,6 +31,10 @@ import {
   parseParticipantRegistrationOperationId,
   type ParticipantRegistrationDocument,
 } from "../domain/participant-registration-resource.ts";
+import {
+  PARTICIPANT_PROFILE_PATH,
+  type ParticipantProfileDocument,
+} from "../domain/participant-profile-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   parseActorSubject,
@@ -2134,6 +2138,347 @@ test("hosted participant registration persists policy-bound submissions across r
   }
 });
 
+test("hosted participant profile self-service persists bounded actions across retries and restarts", async () => {
+  const service = new SyntheticAittaDBService();
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Hosted profile participant",
+    "participant-operation:profile-self-service",
+    { marketingConsent: true },
+  );
+  await registerHostedParticipant(
+    service,
+    "sites-foreign-participant",
+    "foreign@example.test",
+    "Foreign private profile",
+    "participant-operation:profile-foreign",
+  );
+  await registerHostedParticipant(
+    service,
+    OWNER.subject,
+    OWNER_EMAIL,
+    "Owner private profile",
+    "participant-operation:profile-owner",
+  );
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  let clockTick = 0;
+  const worker = hostedPackageWorker(
+    service,
+    () => new Date(NOW.valueOf() + clockTick++ * 1_000),
+  );
+
+  const anonymousReads = service.readRequests;
+  const anonymous = await worker.fetch(
+    new Request(`${APP_ORIGIN}${PARTICIPANT_PROFILE_PATH}`, {
+      headers: { accept: "application/json" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(anonymous.status, 404);
+  assert.equal(service.readRequests, anonymousReads + 1);
+
+  const ownerReads = service.readRequests;
+  const owner = await worker.fetch(
+    ownerRequest(PARTICIPANT_PROFILE_PATH),
+    env,
+    executionContext,
+  );
+  assert.equal(owner.status, 404);
+  assert.equal(service.readRequests, ownerReads + 1);
+  assert.doesNotMatch(await owner.text(), /Owner private profile/u);
+
+  const profileReads = service.readRequests;
+  const first = await participantProfile(worker, env);
+  assert.equal(service.readRequests, profileReads + 9);
+  assert.equal(first.document.data.revision, 1);
+  assert.equal(first.document.data.display_name, "Hosted profile participant");
+  assert.equal(first.document.data.account_email, PARTICIPANT_EMAIL);
+  assert.equal(first.document.data.marketing_consent_state, "granted");
+  assert.equal(first.document.data.account_deletion_state, "not-requested");
+  assert.deepEqual(actionNames(first.document), [
+    "update-participant-profile",
+    "withdraw-marketing-consent",
+    "request-account-deletion",
+  ]);
+
+  const html = await worker.fetch(
+    new Request(`${APP_ORIGIN}${PARTICIPANT_PROFILE_PATH}`, {
+      headers: {
+        accept: "text/html",
+        "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+        "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(html.status, 200);
+  assert.match(html.headers.get("set-cookie") ?? "", /HttpOnly/u);
+  const htmlBody = await html.text();
+  assert.match(htmlBody, /<h1>Your profile<\/h1>/u);
+  assert.match(htmlBody, /data-action-name="update-participant-profile"/u);
+  assert.doesNotMatch(
+    htmlBody,
+    /application-service-client-secret|synthetic-access-token|storage-runtime/iu,
+  );
+
+  const [retry, changed, stale] = await Promise.all([
+    participantProfile(worker, env),
+    participantProfile(worker, env),
+    participantProfile(worker, env),
+  ]);
+  const updateAction = requiredAction(first.document, "update-participant-profile");
+  const updateBody = actionBody(updateAction, {
+    "display-name": "Updated hosted participant",
+    country: "SE",
+    "declared-interest": "both",
+    "participation-context": "company",
+  });
+  const retryBody = actionBody(
+    requiredAction(retry.document, "update-participant-profile"),
+    {
+      ...updateBody,
+      "operation-id": updateBody["operation-id"],
+    },
+  );
+  const updateResponses = await Promise.all([
+    submitProfile(worker, env, first, updateAction, updateBody),
+    submitProfile(
+      worker,
+      env,
+      retry,
+      requiredAction(retry.document, "update-participant-profile"),
+      retryBody,
+    ),
+  ]);
+  assert.deepEqual(updateResponses.map(({ status }) => status), [200, 200]);
+  for (const response of updateResponses) {
+    assert.equal(
+      (response.headers.get("set-cookie")?.match(/Max-Age=0/gu) ?? []).length,
+      1,
+    );
+    const document = await response.json() as ParticipantProfileDocument;
+    assert.equal(document.data.revision, 2);
+    assert.equal(document.data.display_name, "Updated hosted participant");
+  }
+
+  const persistedUpdate = await hostedParticipantRepository(service).current();
+  assert(persistedUpdate);
+  assert.equal(persistedUpdate.revision, 2);
+  assert.equal(persistedUpdate.snapshot.subject, PARTICIPANT_SUBJECT);
+  assert.equal(persistedUpdate.snapshot.accountEmailLabel, PARTICIPANT_EMAIL);
+  assert.equal(
+    persistedUpdate.snapshot.processEmailNoticeAcknowledgedAt,
+    "2026-08-10T10:00:00.000Z",
+  );
+  assert.equal(persistedUpdate.snapshot.registeredAt, "2026-08-10T10:00:00.000Z");
+
+  const changedAction = requiredAction(
+    changed.document,
+    "update-participant-profile",
+  );
+  const changedResponse = await submitProfile(
+    worker,
+    env,
+    changed,
+    changedAction,
+    actionBody(changedAction, {
+      ...updateBody,
+      "operation-id": updateBody["operation-id"],
+      "display-name": "PRIVATE CHANGED RETRY VALUE",
+    }),
+  );
+  assert.equal(changedResponse.status, 409);
+  assert.equal(
+    (changedResponse.headers.get("set-cookie")?.match(/Max-Age=0/gu) ?? [])
+      .length,
+    1,
+  );
+  assert.doesNotMatch(
+    await changedResponse.text(),
+    /PRIVATE CHANGED RETRY VALUE|Hosted profile participant/u,
+  );
+
+  const staleAction = requiredAction(stale.document, "update-participant-profile");
+  const staleResponse = await submitProfile(
+    worker,
+    env,
+    stale,
+    staleAction,
+    actionBody(staleAction, {
+      ...updateBody,
+      "operation-id": "participant-profile-operation:hosted-stale",
+    }),
+  );
+  assert.equal(staleResponse.status, 412);
+  assert.equal(
+    (staleResponse.headers.get("set-cookie")?.match(/Max-Age=0/gu) ?? []).length,
+    1,
+  );
+  assert.doesNotMatch(await staleResponse.text(), /Updated hosted participant/u);
+
+  const restartEpoch = Date.parse("2026-08-11T12:00:00.000Z");
+  const restarted = hostedPackageWorker(service, () => new Date(restartEpoch));
+  const afterUpdate = await participantProfile(restarted, env);
+  assert.equal(afterUpdate.document.data.revision, 2);
+  assert.equal(afterUpdate.document.data.display_name, "Updated hosted participant");
+
+  const withdrawalRetry = await participantProfile(restarted, env);
+  const withdrawalAction = requiredAction(
+    afterUpdate.document,
+    "withdraw-marketing-consent",
+  );
+  const withdrawalBody = actionBody(withdrawalAction, {
+    "confirm-marketing-consent-withdrawal": true,
+  });
+  const withdrawalRetryAction = requiredAction(
+    withdrawalRetry.document,
+    "withdraw-marketing-consent",
+  );
+  const withdrawalResponses = await Promise.all([
+    submitProfile(
+      restarted,
+      env,
+      afterUpdate,
+      withdrawalAction,
+      withdrawalBody,
+    ),
+    submitProfile(
+      restarted,
+      env,
+      withdrawalRetry,
+      withdrawalRetryAction,
+      actionBody(withdrawalRetryAction, {
+        ...withdrawalBody,
+        "operation-id": withdrawalBody["operation-id"],
+      }),
+    ),
+  ]);
+  assert.deepEqual(
+    withdrawalResponses.map(({ status }) => status),
+    [200, 200],
+    JSON.stringify({
+      withdrawalBody,
+      withdrawalRetryAction,
+      responses: await Promise.all(
+        withdrawalResponses.map((response) => response.clone().text()),
+      ),
+    }),
+  );
+  for (const response of withdrawalResponses) {
+    assert.equal(
+      (response.headers.get("set-cookie")?.match(/Max-Age=0/gu) ?? []).length,
+      1,
+    );
+  }
+  const afterWithdrawal = await participantProfile(
+    hostedPackageWorker(service, () => new Date(restartEpoch + 60_000)),
+    env,
+  );
+  assert.equal(afterWithdrawal.document.data.revision, 3);
+  assert.equal(afterWithdrawal.document.data.marketing_consent_state, "withdrawn");
+  assert.deepEqual(actionNames(afterWithdrawal.document), [
+    "update-participant-profile",
+    "request-account-deletion",
+  ]);
+
+  const deletionRetry = await participantProfile(
+    hostedPackageWorker(service, () => new Date(restartEpoch + 60_000)),
+    env,
+  );
+  const deletionAction = requiredAction(
+    afterWithdrawal.document,
+    "request-account-deletion",
+  );
+  const deletionBody = actionBody(deletionAction, {
+    "confirm-account-deletion-request": true,
+  });
+  const deletionRetryAction = requiredAction(
+    deletionRetry.document,
+    "request-account-deletion",
+  );
+  const deletionWorker = hostedPackageWorker(
+    service,
+    () => new Date(restartEpoch + 120_000),
+  );
+  const deletionResponses = await Promise.all([
+    submitProfile(
+      deletionWorker,
+      env,
+      afterWithdrawal,
+      deletionAction,
+      deletionBody,
+    ),
+    submitProfile(
+      deletionWorker,
+      env,
+      deletionRetry,
+      deletionRetryAction,
+      actionBody(deletionRetryAction, {
+        ...deletionBody,
+        "operation-id": deletionBody["operation-id"],
+      }),
+    ),
+  ]);
+  assert.deepEqual(deletionResponses.map(({ status }) => status), [200, 200]);
+  for (const response of deletionResponses) {
+    assert.equal(
+      (response.headers.get("set-cookie")?.match(/Max-Age=0/gu) ?? []).length,
+      1,
+    );
+  }
+
+  const finalWorker = hostedPackageWorker(
+    service,
+    () => new Date(restartEpoch + 180_000),
+  );
+  const final = await participantProfile(finalWorker, env);
+  assert.equal(final.document.data.revision, 4);
+  assert.equal(final.document.data.account_deletion_state, "requested");
+  assert.equal(final.document.data.marketing_consent_state, "withdrawn");
+  assert.deepEqual(actionNames(final.document), []);
+  assert.equal(final.csrfToken, null);
+  assert.equal(final.cookie, null);
+  const deletionIntent = await hostedParticipantRepository(service)
+    .pendingDeletionIntent();
+  assert.deepEqual(deletionIntent, {
+    type: "withdraw-active-interest",
+    subject: PARTICIPANT_SUBJECT,
+    reason: "account-deletion-request",
+    requestedAt: final.document.data.account_deletion_requested_at,
+  });
+
+  const foreign = await participantProfileFor(
+    finalWorker,
+    env,
+    "sites-foreign-participant",
+    "foreign@example.test",
+  );
+  assert.equal(foreign.document.data.display_name, "Foreign private profile");
+  assert.doesNotMatch(
+    JSON.stringify(foreign.document),
+    /Updated hosted participant|Hosted profile participant/u,
+  );
+
+  const disclosureProbe = JSON.stringify({
+    first: first.document,
+    final: final.document,
+    foreign: foreign.document,
+  });
+  for (const privateValue of [
+    SERVICE_CLIENT_SECRET,
+    ACCESS_TOKEN,
+    MUTATION_KEY,
+    TRANSPORT_ORIGIN,
+    PRIVATE_POLICY_SENTINEL,
+  ]) {
+    assert.doesNotMatch(disclosureProbe, new RegExp(privateValue, "u"));
+  }
+});
+
 test("hosted package routes persist atomic private versions and current acknowledgments", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
@@ -3248,6 +3593,7 @@ async function registerHostedParticipant(
   options: Readonly<{
     country?: string;
     declaredInterest?: "founder" | "investor" | "both";
+    marketingConsent?: boolean;
   }> = {},
 ): Promise<void> {
   const result = await hostedParticipantRepositoryFor(
@@ -3264,7 +3610,7 @@ async function registerHostedParticipant(
       declaredInterest: options.declaredInterest ?? "investor",
       participationContext: "individual",
       processEmailNoticeAcknowledged: true,
-      marketingConsent: false,
+      marketingConsent: options.marketingConsent ?? false,
     },
     noticeEvidence: testParticipantRegistrationNoticeEvidence(),
   });
@@ -3705,6 +4051,78 @@ type ParticipantRegistrationResponse = Readonly<{
   csrfToken: string | null;
   cookie: string | null;
 }>;
+
+type ParticipantProfileResponse = Readonly<{
+  document: ParticipantProfileDocument;
+  csrfToken: string | null;
+  cookie: string | null;
+}>;
+
+async function participantProfile(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+): Promise<ParticipantProfileResponse> {
+  return participantProfileFor(
+    worker,
+    env,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+  );
+}
+
+async function participantProfileFor(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  subject: string,
+  email: string,
+): Promise<ParticipantProfileResponse> {
+  const response = await worker.fetch(
+    new Request(`${APP_ORIGIN}${PARTICIPANT_PROFILE_PATH}`, {
+      headers: {
+        accept: "application/json",
+        "oai-authenticated-user-id": subject,
+        "oai-authenticated-user-email": email,
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(response.status, 200);
+  const setCookie = response.headers.get("set-cookie");
+  return Object.freeze({
+    document: await response.json() as ParticipantProfileDocument,
+    csrfToken: response.headers.get(MUTATION_CSRF_HEADER),
+    cookie: setCookie === null ? null : cookieHeader(setCookie),
+  });
+}
+
+async function submitProfile(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  resource: ParticipantProfileResponse,
+  action: TestAction,
+  body: Readonly<Record<string, unknown>>,
+): Promise<Response> {
+  assert(resource.csrfToken);
+  assert(resource.cookie);
+  return worker.fetch(
+    new Request(action.href, {
+      method: action.method,
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        cookie: resource.cookie,
+        origin: APP_ORIGIN,
+        [MUTATION_CSRF_HEADER]: resource.csrfToken,
+        "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+        "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+      },
+      body: JSON.stringify(body),
+    }),
+    env,
+    executionContext,
+  );
+}
 
 async function participantRegistration(
   worker: TestWorker,
