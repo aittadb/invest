@@ -2367,10 +2367,24 @@ test("hosted participant profile self-service persists bounded actions across re
     withdrawalResponses[0]?.headers.get("content-type") ?? "",
     /^text\/html/iu,
   );
+  const withdrawalHtml = await withdrawalResponses[0]!.clone().text();
+  assert.match(withdrawalHtml, /<h1>Your profile<\/h1>/u);
   assert.match(
-    await withdrawalResponses[0]!.clone().text(),
-    /<h1>Your profile<\/h1>/u,
+    withdrawalHtml,
+    /<dt>Profile revision<\/dt>\s*<dd>3<\/dd>/u,
   );
+  assert.deepEqual(profileHtmlActionNames(withdrawalHtml), [
+    "update-participant-profile",
+    "request-account-deletion",
+  ]);
+  const withdrawalJson = await withdrawalResponses[1]!.clone().json() as
+    ParticipantProfileDocument;
+  assert.equal(withdrawalJson.data.revision, 3);
+  assert.equal(withdrawalJson.data.marketing_consent_state, "withdrawn");
+  assert.deepEqual(actionNames(withdrawalJson), [
+    "update-participant-profile",
+    "request-account-deletion",
+  ]);
   for (const [index, response] of withdrawalResponses.entries()) {
     assertProfileMutationCookieLifecycle(
       response,
@@ -2645,6 +2659,299 @@ test("hosted participant profile self-service persists bounded actions across re
   ]) {
     assert.doesNotMatch(disclosureProbe, new RegExp(privateValue, "u"));
   }
+});
+
+test("hosted delayed profile replays reject impossible consent ancestry and preserve valid withdrawal replay", async () => {
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  const impossibleService = new SyntheticAittaDBService();
+  await registerHostedParticipant(
+    impossibleService,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "No-consent hosted participant",
+    "participant-operation:no-consent-hosted-register",
+    false,
+  );
+  const impossibleEpoch = Date.parse("2026-08-12T12:00:00.000Z");
+  const impossibleWorker = hostedPackageWorker(
+    impossibleService,
+    () => new Date(impossibleEpoch),
+  );
+  const impossibleProofReads = impossibleService.readRequests;
+  const [commitUpdateProof, impossibleJsonProof, impossibleHtmlProof] =
+    await Promise.all([
+      participantProfile(impossibleWorker, env),
+      participantProfile(impossibleWorker, env),
+      participantProfile(impossibleWorker, env),
+    ]);
+  assert.equal(impossibleService.readRequests, impossibleProofReads + 27);
+  for (const proof of [
+    commitUpdateProof,
+    impossibleJsonProof,
+    impossibleHtmlProof,
+  ]) {
+    assert.equal(proof.document.data.revision, 1);
+    assert.equal(proof.document.data.marketing_consent_state, "not-granted");
+    assert.deepEqual(actionNames(proof.document), [
+      "update-participant-profile",
+      "request-account-deletion",
+    ]);
+  }
+
+  const commitUpdateAction = requiredAction(
+    commitUpdateProof.document,
+    "update-participant-profile",
+  );
+  const commitUpdateBody = actionBody(commitUpdateAction, {
+    "display-name": "Updated no-consent participant",
+    country: "SE",
+    "declared-interest": "both",
+    "participation-context": "company",
+  });
+  const commitUpdateResponse = await submitProfile(
+    impossibleWorker,
+    env,
+    commitUpdateProof,
+    commitUpdateAction,
+    commitUpdateBody,
+  );
+  assert.equal(commitUpdateResponse.status, 200);
+  assertProfileMutationCookieLifecycle(
+    commitUpdateResponse,
+    true,
+    commitUpdateProof.cookie,
+  );
+  const committedUpdate = await commitUpdateResponse.json() as
+    ParticipantProfileDocument;
+  assert.equal(committedUpdate.data.revision, 2);
+  assert.equal(committedUpdate.data.marketing_consent_state, "not-granted");
+
+  const impossibleRepository = hostedParticipantRepository(impossibleService);
+  const impossibleWithdrawal = await impossibleRepository
+    .withdrawMarketingConsent({
+      operationId: "participant-operation:impossible-hosted-withdrawal",
+      expectedRevision: 2,
+      withdrawnAt: "2026-08-12T12:01:00.000Z",
+    });
+  assert.equal(impossibleWithdrawal.revision, 3);
+  assert.equal(impossibleWithdrawal.snapshot.subject, PARTICIPANT_SUBJECT);
+  assert.equal(
+    impossibleWithdrawal.snapshot.accountEmailLabel,
+    PARTICIPANT_EMAIL,
+  );
+  assert.deepEqual(impossibleWithdrawal.snapshot.marketingConsent, {
+    state: "withdrawn",
+    withdrawnAt: "2026-08-12T12:01:00.000Z",
+  });
+
+  const impossibleProfileRecords = JSON.stringify([
+    ...recordsIn(impossibleService, "private-participant-profiles"),
+    ...recordsIn(impossibleService, "private-participant-profile-revisions"),
+  ]);
+  const impossibleReplayWorker = hostedPackageWorker(
+    impossibleService,
+    () => new Date(impossibleEpoch + 120_000),
+  );
+  const impossibleJsonReads = impossibleService.readRequests;
+  const impossibleJsonResponse = await submitProfile(
+    impossibleReplayWorker,
+    env,
+    impossibleJsonProof,
+    requiredAction(
+      impossibleJsonProof.document,
+      "update-participant-profile",
+    ),
+    commitUpdateBody,
+  );
+  assert.equal(impossibleJsonResponse.status, 503);
+  assert.equal(impossibleService.readRequests, impossibleJsonReads + 17);
+  assert.equal(impossibleJsonResponse.headers.get(MUTATION_CSRF_HEADER), null);
+  assertProfileMutationCookieLifecycle(
+    impossibleJsonResponse,
+    false,
+    impossibleJsonProof.cookie,
+  );
+  const impossibleJson = await impossibleJsonResponse.text();
+  assert.doesNotMatch(
+    impossibleJson,
+    /No-consent hosted participant|Updated no-consent participant|participant@example\.test|sites-participant-subject|2026-08-12T12:01:00\.000Z/u,
+  );
+
+  const impossibleHtmlReads = impossibleService.readRequests;
+  const impossibleHtmlResponse = await submitProfileForm(
+    impossibleReplayWorker,
+    env,
+    impossibleHtmlProof,
+    requiredAction(
+      impossibleHtmlProof.document,
+      "update-participant-profile",
+    ),
+    commitUpdateBody,
+  );
+  assert.equal(impossibleHtmlResponse.status, 503);
+  assert.equal(impossibleService.readRequests, impossibleHtmlReads + 17);
+  assert.equal(impossibleHtmlResponse.headers.get(MUTATION_CSRF_HEADER), null);
+  assertProfileMutationCookieLifecycle(
+    impossibleHtmlResponse,
+    false,
+    impossibleHtmlProof.cookie,
+  );
+  const impossibleHtml = await impossibleHtmlResponse.text();
+  assert.deepEqual(profileHtmlActionNames(impossibleHtml), []);
+  assert.deepEqual(profileHtmlCsrfTokens(impossibleHtml), []);
+  assert.doesNotMatch(
+    impossibleHtml,
+    /No-consent hosted participant|Updated no-consent participant|participant@example\.test|sites-participant-subject|2026-08-12T12:01:00\.000Z/u,
+  );
+  assert.equal(
+    JSON.stringify([
+      ...recordsIn(impossibleService, "private-participant-profiles"),
+      ...recordsIn(impossibleService, "private-participant-profile-revisions"),
+    ]),
+    impossibleProfileRecords,
+  );
+
+  const validService = new SyntheticAittaDBService();
+  await registerHostedParticipant(
+    validService,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Granted hosted participant",
+    "participant-operation:granted-hosted-register",
+    true,
+  );
+  const validEpoch = Date.parse("2026-08-13T12:00:00.000Z");
+  const validWorker = hostedPackageWorker(
+    validService,
+    () => new Date(validEpoch),
+  );
+  const validProofReads = validService.readRequests;
+  const [commitWithdrawalProof, validJsonProof, validHtmlProof] =
+    await Promise.all([
+      participantProfile(validWorker, env),
+      participantProfile(validWorker, env),
+      participantProfile(validWorker, env),
+    ]);
+  assert.equal(validService.readRequests, validProofReads + 27);
+  for (const proof of [
+    commitWithdrawalProof,
+    validJsonProof,
+    validHtmlProof,
+  ]) {
+    assert.equal(proof.document.data.revision, 1);
+    assert.equal(proof.document.data.marketing_consent_state, "granted");
+    assert.deepEqual(actionNames(proof.document), [
+      "update-participant-profile",
+      "withdraw-marketing-consent",
+      "request-account-deletion",
+    ]);
+  }
+
+  const commitWithdrawalAction = requiredAction(
+    commitWithdrawalProof.document,
+    "withdraw-marketing-consent",
+  );
+  const commitWithdrawalBody = actionBody(commitWithdrawalAction, {
+    "confirm-marketing-consent-withdrawal": true,
+  });
+  const commitWithdrawalResponse = await submitProfile(
+    validWorker,
+    env,
+    commitWithdrawalProof,
+    commitWithdrawalAction,
+    commitWithdrawalBody,
+  );
+  assert.equal(commitWithdrawalResponse.status, 200);
+  assertProfileMutationCookieLifecycle(
+    commitWithdrawalResponse,
+    true,
+    commitWithdrawalProof.cookie,
+  );
+  const committedWithdrawal = await commitWithdrawalResponse.json() as
+    ParticipantProfileDocument;
+  assert.equal(committedWithdrawal.data.revision, 2);
+  assert.equal(committedWithdrawal.data.marketing_consent_state, "withdrawn");
+  assert.deepEqual(actionNames(committedWithdrawal), [
+    "update-participant-profile",
+    "request-account-deletion",
+  ]);
+
+  const validRepository = hostedParticipantRepository(validService);
+  const validLatest = await validRepository.update({
+    operationId: "participant-operation:valid-hosted-intervening-update",
+    expectedRevision: 2,
+    updatedAt: "2026-08-13T12:01:00.000Z",
+    changes: { displayName: "Latest valid withdrawn participant" },
+  });
+  assert.equal(validLatest.revision, 3);
+  assert.equal(validLatest.snapshot.subject, PARTICIPANT_SUBJECT);
+  assert.equal(validLatest.snapshot.accountEmailLabel, PARTICIPANT_EMAIL);
+  assert.equal(validLatest.snapshot.marketingConsent.state, "withdrawn");
+
+  const validProfileRecords = JSON.stringify([
+    ...recordsIn(validService, "private-participant-profiles"),
+    ...recordsIn(validService, "private-participant-profile-revisions"),
+  ]);
+  const validReplayWorker = hostedPackageWorker(
+    validService,
+    () => new Date(validEpoch + 120_000),
+  );
+  const validJsonReads = validService.readRequests;
+  const validJsonResponse = await submitProfile(
+    validReplayWorker,
+    env,
+    validJsonProof,
+    requiredAction(validJsonProof.document, "withdraw-marketing-consent"),
+    commitWithdrawalBody,
+  );
+  assert.equal(validJsonResponse.status, 200);
+  assert.equal(validService.readRequests, validJsonReads + 17);
+  assert.notEqual(validJsonResponse.headers.get(MUTATION_CSRF_HEADER), null);
+  assertProfileMutationCookieLifecycle(
+    validJsonResponse,
+    true,
+    validJsonProof.cookie,
+  );
+  const validJson = await validJsonResponse.json() as ParticipantProfileDocument;
+  assert.equal(validJson.data.revision, 3);
+  assert.equal(validJson.data.display_name, "Latest valid withdrawn participant");
+  assert.equal(validJson.data.marketing_consent_state, "withdrawn");
+  assert.deepEqual(actionNames(validJson), [
+    "update-participant-profile",
+    "request-account-deletion",
+  ]);
+
+  const validHtmlReads = validService.readRequests;
+  const validHtmlResponse = await submitProfileForm(
+    validReplayWorker,
+    env,
+    validHtmlProof,
+    requiredAction(validHtmlProof.document, "withdraw-marketing-consent"),
+    commitWithdrawalBody,
+  );
+  assert.equal(validHtmlResponse.status, 200);
+  assert.equal(validService.readRequests, validHtmlReads + 17);
+  assert.equal(validHtmlResponse.headers.get(MUTATION_CSRF_HEADER), null);
+  assertProfileMutationCookieLifecycle(
+    validHtmlResponse,
+    true,
+    validHtmlProof.cookie,
+  );
+  const validHtml = await validHtmlResponse.text();
+  assert.match(validHtml, /Latest valid withdrawn participant/u);
+  assert.match(validHtml, /<dt>Profile revision<\/dt>\s*<dd>3<\/dd>/u);
+  assert.deepEqual(profileHtmlActionNames(validHtml), actionNames(validJson));
+  const validHtmlTokens = profileHtmlCsrfTokens(validHtml);
+  assert.equal(validHtmlTokens.length, 2);
+  assert.equal(new Set(validHtmlTokens).size, 1);
+  assert.ok(validHtmlTokens[0]?.length);
+  assert.equal(
+    JSON.stringify([
+      ...recordsIn(validService, "private-participant-profiles"),
+      ...recordsIn(validService, "private-participant-profile-revisions"),
+    ]),
+    validProfileRecords,
+  );
 });
 
 test("hosted package routes persist atomic private versions and current acknowledgments", async () => {

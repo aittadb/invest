@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { toStorageProtocolTransactionCommand } from "../domain/aittadb-storage-protocol.ts";
 import {
+  isParticipantProfileDescendantProjection,
   parseParticipantAccount,
   type ParticipantAccount,
 } from "../domain/participant-profile.ts";
@@ -519,6 +520,68 @@ test("maximum notice evidence stays within profile record and transaction ceilin
   assert.deepEqual(
     await new StorageParticipantRepository(storage, account).current(),
     { revision: 1, snapshot: result.snapshot },
+  );
+});
+
+test("stored consent withdrawal replays require a granted ancestor", async () => {
+  const impossibleRepository = new DevelopmentInMemoryParticipantRepository(
+    new DeterministicMemoryStorageAdapter(new MemoryStorageState(), true),
+    aliceAccount(),
+  );
+  const notGranted = await impossibleRepository.register(registerRequest(
+    "participant-operation:not-granted-register",
+    profileRegistration({ marketingConsent: false }),
+  ));
+  const impossibleRequest = withdrawRequest(
+    "participant-operation:not-granted-withdrawal",
+    1,
+  );
+  const impossible = await impossibleRepository.withdrawMarketingConsent(
+    impossibleRequest,
+  );
+  const impossibleReplay = await impossibleRepository.withdrawMarketingConsent(
+    impossibleRequest,
+  );
+  assert.equal(impossibleReplay.replayed, true);
+  assert.deepEqual(impossibleReplay.snapshot, impossible.snapshot);
+  assert.deepEqual(impossible.snapshot.marketingConsent, {
+    state: "withdrawn",
+    withdrawnAt: CONSENT_WITHDRAWN_AT,
+  });
+  assert.equal(
+    isParticipantProfileDescendantProjection(
+      notGranted.snapshot,
+      impossible.snapshot,
+      1,
+    ),
+    false,
+  );
+
+  const validRepository = new DevelopmentInMemoryParticipantRepository(
+    new DeterministicMemoryStorageAdapter(new MemoryStorageState(), true),
+    aliceAccount(),
+  );
+  const granted = await validRepository.register(registerRequest(
+    "participant-operation:granted-register",
+    profileRegistration({ marketingConsent: true }),
+  ));
+  const validRequest = withdrawRequest(
+    "participant-operation:granted-withdrawal",
+    1,
+  );
+  const valid = await validRepository.withdrawMarketingConsent(validRequest);
+  const validReplay = await validRepository.withdrawMarketingConsent(
+    validRequest,
+  );
+  assert.equal(validReplay.replayed, true);
+  assert.deepEqual(validReplay.snapshot, valid.snapshot);
+  assert.equal(
+    isParticipantProfileDescendantProjection(
+      granted.snapshot,
+      valid.snapshot,
+      1,
+    ),
+    true,
   );
 });
 
@@ -1494,6 +1557,7 @@ test("participant module exports only repositories and writes only participant r
 
 type RegistrationOverrides = Readonly<{
   displayName?: string;
+  marketingConsent?: boolean;
 }>;
 
 function profileRegistration(
@@ -1505,7 +1569,7 @@ function profileRegistration(
     declaredInterest: "both",
     participationContext: "company",
     processEmailNoticeAcknowledged: true,
-    marketingConsent: true,
+    marketingConsent: overrides.marketingConsent ?? true,
   };
 }
 

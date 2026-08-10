@@ -193,6 +193,29 @@ test("marketing consent withdrawal is independent and idempotent", () => {
   assert.equal(withdrawMarketingConsent(withdrawn, DELETION_AT), withdrawn);
 });
 
+test("descendant ancestry requires prior marketing consent before withdrawal", () => {
+  const notGranted = registeredProfile(false);
+  const impossibleWithdrawal = withdrawMarketingConsent(
+    notGranted,
+    WITHDRAWN_AT,
+  );
+  assert.equal(
+    isParticipantProfileDescendantProjection(
+      notGranted,
+      impossibleWithdrawal,
+      1,
+    ),
+    false,
+  );
+
+  const granted = registeredProfile(true);
+  const validWithdrawal = withdrawMarketingConsent(granted, WITHDRAWN_AT);
+  assert.equal(
+    isParticipantProfileDescendantProjection(granted, validWithdrawal, 1),
+    true,
+  );
+});
+
 test("deletion requests produce a retry-stable active-interest withdrawal intent", () => {
   const profile = registeredProfile(false);
   const transition = requestParticipantAccountDeletion(profile, DELETION_AT);

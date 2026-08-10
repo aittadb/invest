@@ -430,10 +430,7 @@ function isMarketingConsentDescendant(
   ancestorUpdatedAt: Timestamp,
 ): boolean {
   if (ancestor.state === "not-granted") {
-    return descendant.state === "not-granted" ||
-      (descendant.state === "withdrawn" &&
-        descendant.grantedAt === undefined &&
-        descendant.withdrawnAt >= ancestorUpdatedAt);
+    return descendant.state === "not-granted";
   }
   if (ancestor.state === "granted") {
     return descendant.state === "granted"
