@@ -1242,6 +1242,217 @@ test("hosted founder applications persist their complete lifecycle across worker
   }
 });
 
+test("hosted founder applications remain readable and withdrawable after interest and phase changes", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  const privateNote = "PRIVATE RETAINED FOUNDER APPLICATION";
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-interest-change",
+    { declaredInterest: "founder" },
+  );
+
+  const initial = await founderResource(hostedPackageWorker(service), env);
+  const created = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    initial,
+    "POST",
+    actionBody(
+      requiredAction(initial.document, "create-founder-application"),
+      founderFields({ note: privateNote }),
+    ),
+  );
+  assert.equal(created.status, 201);
+
+  await updateHostedParticipantInterest(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "investor",
+    "participant-operation:founder-to-investor",
+  );
+  await configureHostedFounderCampaign(service, "closed");
+
+  const participantHome = await hostedPackageWorker(service).fetch(
+    participantRequest("/participant"),
+    env,
+    executionContext,
+  );
+  assert.equal(participantHome.status, 200);
+  const homeDocument = await participantHome.json() as Readonly<{
+    links: readonly Readonly<{ rel: readonly string[]; href: string }>[];
+  }>;
+  assert.ok(homeDocument.links.some((link) =>
+    link.rel.includes("founder-interest") &&
+    link.href === `${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`
+  ));
+
+  const retained = await founderResource(hostedPackageWorker(service), env);
+  assert.equal(retained.document.data.status, "received");
+  assert.equal(retained.document.data.fields?.note, privateNote);
+  assert.deepEqual(
+    actionNames(retained.document).sort(),
+    ["edit-founder-application", "withdraw-founder-application"],
+  );
+  assert.equal(
+    actionNames(retained.document).includes("create-founder-application"),
+    false,
+  );
+
+  const investorSubject = "sites-investor-without-founder-application";
+  const investorEmail = "investor-without-founder@example.test";
+  await registerHostedParticipant(
+    service,
+    investorSubject,
+    investorEmail,
+    "Investor participant",
+    "participant-operation:investor-without-founder",
+    { declaredInterest: "investor" },
+  );
+  const ineligibleNew = await founderResource(
+    hostedPackageWorker(service),
+    env,
+    investorSubject,
+    investorEmail,
+  );
+  assert.equal(ineligibleNew.document.data.status, "not_submitted");
+  assert.deepEqual(actionNames(ineligibleNew.document), []);
+  assert.doesNotMatch(JSON.stringify(ineligibleNew.document), new RegExp(privateNote, "u"));
+
+  const owner = await hostedPackageWorker(service).fetch(
+    ownerRequest(FOUNDER_INTEREST_PATH),
+    env,
+    executionContext,
+  );
+  assert.equal(owner.status, 404);
+  assert.doesNotMatch(await owner.text(), new RegExp(privateNote, "u"));
+
+  const withdraw = requiredAction(
+    retained.document,
+    "withdraw-founder-application",
+  );
+  const withdrawn = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    retained,
+    "DELETE",
+    actionBody(withdraw, { "confirm-withdrawal": true }),
+  );
+  assert.equal(withdrawn.status, 200);
+  const final = await founderResource(hostedPackageWorker(service), env);
+  assert.equal(final.document.data.status, "withdrawn");
+  assert.deepEqual(actionNames(final.document), []);
+});
+
+test("unsupported founder PUT leaves hosted JSON and HTML proofs reusable", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-put-proof",
+    { declaredInterest: "founder" },
+  );
+  const worker = hostedPackageWorker(service);
+
+  const jsonProof = await founderResource(worker, env);
+  const createBody = actionBody(
+    requiredAction(jsonProof.document, "create-founder-application"),
+    founderFields(),
+  );
+  const claimsBeforeJsonPut = recordsIn(
+    service,
+    "browser-mutation-replays",
+  ).length;
+  const jsonPut = await submitUnsupportedFounderPut(
+    worker,
+    env,
+    jsonProof,
+    "application/json",
+    JSON.stringify(createBody),
+  );
+  assert.equal(jsonPut.status, 405);
+  assert.equal(jsonPut.headers.get("allow"), "GET, POST, PATCH, DELETE");
+  assert.equal(jsonPut.headers.get("set-cookie"), null);
+  assert.match(
+    jsonPut.headers.get("content-type") ?? "",
+    /^application\/vnd\.aittadb-invest\+json/u,
+  );
+  assert.equal(
+    (await jsonPut.json() as Readonly<{ data: Readonly<{ code: string }> }>).data
+      .code,
+    "method_not_allowed",
+  );
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    claimsBeforeJsonPut,
+  );
+
+  const created = await submitFounderMutation(
+    worker,
+    env,
+    jsonProof,
+    "POST",
+    createBody,
+  );
+  assert.equal(created.status, 201);
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    claimsBeforeJsonPut + 1,
+  );
+
+  const htmlProof = await founderHtmlResource(worker, env);
+  const claimsBeforeHtmlPut = recordsIn(
+    service,
+    "browser-mutation-replays",
+  ).length;
+  const htmlBody = new URLSearchParams([
+    [MUTATION_CSRF_FIELD, htmlProof.csrfToken],
+  ]);
+  const htmlPut = await submitUnsupportedFounderPut(
+    worker,
+    env,
+    htmlProof,
+    "text/html",
+    htmlBody,
+  );
+  assert.equal(htmlPut.status, 405);
+  assert.equal(htmlPut.headers.get("allow"), "GET, POST, PATCH, DELETE");
+  assert.equal(htmlPut.headers.get("set-cookie"), null);
+  assert.match(htmlPut.headers.get("content-type") ?? "", /^text\/html/u);
+  assert.match(await htmlPut.text(), /request method is not available/u);
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    claimsBeforeHtmlPut,
+  );
+
+  const withdrawn = await submitFounderHtmlMutation(
+    worker,
+    env,
+    htmlProof.cookie,
+    [
+      [MUTATION_CSRF_FIELD, htmlProof.csrfToken],
+      [MUTATION_METHOD_FIELD, "DELETE"],
+      ["operation-id", "founder-operation:proof-after-html-put"],
+      ["expected-revision", "1"],
+      ["confirm-withdrawal", "true"],
+    ],
+  );
+  assert.equal(withdrawn.status, 200);
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    claimsBeforeHtmlPut + 1,
+  );
+});
+
 test("hosted founder creation rechecks campaign policy after action discovery", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
@@ -2754,6 +2965,26 @@ async function registerHostedParticipant(
   assert.equal(result.revision, 1);
 }
 
+async function updateHostedParticipantInterest(
+  service: SyntheticAittaDBService,
+  subject: string,
+  email: string,
+  declaredInterest: "founder" | "investor" | "both",
+  operationId: string,
+): Promise<void> {
+  const repository = hostedParticipantRepositoryFor(service, subject, email);
+  const current = await repository.current();
+  assert(current);
+  const result = await repository.update({
+    operationId,
+    expectedRevision: current.revision,
+    updatedAt: "2026-08-10T11:00:00.000Z",
+    changes: { declaredInterest },
+  });
+  assert.equal(result.revision, current.revision + 1);
+  assert.equal(result.snapshot.declaredInterest, declaredInterest);
+}
+
 async function configureHostedFounderCampaign(
   service: SyntheticAittaDBService,
   phaseState: "closed" | "open" = "open",
@@ -2884,6 +3115,39 @@ async function submitFounderMutation(
         "oai-authenticated-user-email": overrides.email ?? PARTICIPANT_EMAIL,
       },
       body: JSON.stringify(body),
+    }),
+    env,
+    executionContext,
+  );
+}
+
+async function submitUnsupportedFounderPut(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  proof: Readonly<{ csrfToken: string | null; cookie: string | null }>,
+  accept: "application/json" | "text/html",
+  body: BodyInit,
+): Promise<Response> {
+  if (proof.cookie === null || proof.csrfToken === null) {
+    assert.fail("Founder mutation proof is unavailable.");
+  }
+  return worker.fetch(
+    new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+      method: "PUT",
+      headers: {
+        accept,
+        "content-type": accept === "application/json"
+          ? "application/json"
+          : "application/x-www-form-urlencoded",
+        cookie: proof.cookie,
+        origin: APP_ORIGIN,
+        ...(accept === "application/json"
+          ? { [MUTATION_CSRF_HEADER]: proof.csrfToken }
+          : {}),
+        "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+        "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+      },
+      body,
     }),
     env,
     executionContext,

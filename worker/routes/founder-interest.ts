@@ -53,6 +53,7 @@ import {
 const OPERATION_ID_FIELD = "operation-id";
 const EXPECTED_REVISION_FIELD = "expected-revision";
 const CONFIRM_WITHDRAWAL_FIELD = "confirm-withdrawal";
+const FOUNDER_INTEREST_ALLOW = "GET, POST, PATCH, DELETE";
 
 const FOUNDER_FIELD_NAMES = Object.freeze([
   "expertise-summary",
@@ -208,7 +209,7 @@ export function createFounderInterestRouteHandler(
       }
     }
 
-    if (!isMutationRequestMethod(context.request.method)) {
+    if (!isSupportedMutationMethod(context.request.method)) {
       const response = errorResponse(
         routeError(
           context.resourceUrl,
@@ -219,7 +220,7 @@ export function createFounderInterestRouteHandler(
         representation.kind,
       );
       const headers = new Headers(response.headers);
-      headers.set("Allow", "GET, POST, PATCH, DELETE");
+      headers.set("Allow", FOUNDER_INTEREST_ALLOW);
       return new Response(response.body, {
         status: response.status,
         headers,
@@ -929,8 +930,8 @@ function participantSubject(value: unknown): ActorSubject | null {
   return parsed.ok ? parsed.value : null;
 }
 
-function isMutationRequestMethod(value: string): boolean {
-  return value === "POST" || value === "PUT" || value === "PATCH" || value === "DELETE";
+function isSupportedMutationMethod(value: string): boolean {
+  return value === "POST" || value === "PATCH" || value === "DELETE";
 }
 
 function assertExactResourceOrigin(request: Request, resourceUrl: string): void {

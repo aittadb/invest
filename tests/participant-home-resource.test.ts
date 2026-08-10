@@ -206,7 +206,12 @@ test("participant documents expose only configured and permitted interest workfl
   assert.ok(investorPackage);
   assert.deepEqual(
     investorPackage.actions.map((action) => action.name),
-    ["open-participant-home", "open-investment-interests", "sign-out"],
+    [
+      "open-participant-home",
+      "open-founder-interest",
+      "open-investment-interests",
+      "sign-out",
+    ],
   );
 
   const deletionRequested = {

@@ -430,9 +430,7 @@ export function participantWorkflowAccess(
 ): Readonly<{ founderInterest: boolean; investmentInterests: boolean }> {
   const active = participant.accountStatus === "active";
   return {
-    founderInterest: active && capabilities.founderInterest === true &&
-      (participant.declaredInterest === "founder" ||
-        participant.declaredInterest === "both"),
+    founderInterest: active && capabilities.founderInterest === true,
     investmentInterests:
       active && capabilities.investmentInterests === true &&
       (participant.declaredInterest === "investor" ||

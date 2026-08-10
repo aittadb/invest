@@ -10,7 +10,6 @@ import type {
 import { isConfiguredOwner } from "../domain/owner-identity.ts";
 import {
   authorizeParticipantAccess,
-  participantWorkflowAccess,
   type AuthorizedParticipantAccess,
   type ParticipantAccessStateReader,
 } from "../domain/participant-home-resource.ts";
@@ -452,8 +451,7 @@ async function runtimeParticipantFounderInterestRoute(
     isOwner ||
     participantAccess === null ||
     participantAccess.subject !== actor.userId ||
-    !participantWorkflowAccess(participantAccess, { founderInterest: true })
-      .founderInterest
+    participantAccess.accountStatus !== "active"
   ) {
     return unavailableRoute;
   }
