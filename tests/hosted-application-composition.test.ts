@@ -2275,6 +2275,7 @@ test("hosted participant profile self-service persists bounded actions across re
     "2026-08-10T10:00:00.000Z",
   );
   assert.equal(persistedUpdate.snapshot.registeredAt, "2026-08-10T10:00:00.000Z");
+  const committedUpdateTimestamp = persistedUpdate.snapshot.updatedAt;
 
   const changedAction = requiredAction(
     changed.document,
@@ -2393,12 +2394,47 @@ test("hosted participant profile self-service persists bounded actions across re
     "request-account-deletion",
   ]);
 
-  const deletionRetry = await participantProfile(
+  const delayedAfterWithdrawalResponse = await submitProfile(
     hostedPackageWorker(service, () => new Date(restartEpoch + 60_000)),
     env,
+    afterWithdrawal,
+    requiredAction(afterWithdrawal.document, "update-participant-profile"),
+    updateBody,
   );
+  assert.equal(delayedAfterWithdrawalResponse.status, 200);
+  assert.equal(
+    (delayedAfterWithdrawalResponse.headers.get("set-cookie")
+      ?.match(/Max-Age=0/gu) ?? []).length,
+    1,
+  );
+  assert.notEqual(
+    delayedAfterWithdrawalResponse.headers.get(MUTATION_CSRF_HEADER),
+    null,
+  );
+  const delayedAfterWithdrawal = await delayedAfterWithdrawalResponse.json() as
+    ParticipantProfileDocument;
+  assert.equal(delayedAfterWithdrawal.data.revision, 3);
+  assert.equal(delayedAfterWithdrawal.data.marketing_consent_state, "withdrawn");
+  assert.deepEqual(actionNames(delayedAfterWithdrawal), [
+    "update-participant-profile",
+    "request-account-deletion",
+  ]);
+  const historicalUpdate = await hostedParticipantRepository(service).revision(2);
+  assert(historicalUpdate);
+  assert.equal(historicalUpdate.snapshot.updatedAt, committedUpdateTimestamp);
+
+  const deletionDiscoveryWorker = hostedPackageWorker(
+    service,
+    () => new Date(restartEpoch + 60_000),
+  );
+  const [deletionFirst, deletionRetry, delayedAfterDeletionProof] =
+    await Promise.all([
+      participantProfile(deletionDiscoveryWorker, env),
+      participantProfile(deletionDiscoveryWorker, env),
+      participantProfile(deletionDiscoveryWorker, env),
+    ]);
   const deletionAction = requiredAction(
-    afterWithdrawal.document,
+    deletionFirst.document,
     "request-account-deletion",
   );
   const deletionBody = actionBody(deletionAction, {
@@ -2416,7 +2452,7 @@ test("hosted participant profile self-service persists bounded actions across re
     submitProfile(
       deletionWorker,
       env,
-      afterWithdrawal,
+      deletionFirst,
       deletionAction,
       deletionBody,
     ),
@@ -2438,6 +2474,55 @@ test("hosted participant profile self-service persists bounded actions across re
       1,
     );
   }
+
+  const participantRecordsBeforeClosedReplay = JSON.stringify([
+    ...recordsIn(service, "participant-profiles"),
+    ...recordsIn(service, "participant-profile-revisions"),
+  ]);
+  const delayedAfterDeletionResponse = await submitProfile(
+    deletionWorker,
+    env,
+    delayedAfterDeletionProof,
+    requiredAction(
+      delayedAfterDeletionProof.document,
+      "update-participant-profile",
+    ),
+    updateBody,
+  );
+  assert.equal(delayedAfterDeletionResponse.status, 200);
+  assert.equal(
+    delayedAfterDeletionResponse.headers.get(MUTATION_CSRF_HEADER),
+    null,
+  );
+  const delayedAfterDeletionSetCookie =
+    delayedAfterDeletionResponse.headers.get("set-cookie") ?? "";
+  assert.equal(
+    (delayedAfterDeletionSetCookie.match(/Max-Age=0/gu) ?? []).length,
+    1,
+  );
+  assert.equal(
+    (delayedAfterDeletionSetCookie.match(
+      /__Host-investor_app_mutation_/gu,
+    ) ?? []).length,
+    1,
+  );
+  const delayedAfterDeletion = await delayedAfterDeletionResponse.json() as
+    ParticipantProfileDocument;
+  assert.equal(delayedAfterDeletion.data.revision, 4);
+  assert.equal(delayedAfterDeletion.data.account_deletion_state, "requested");
+  assert.equal(delayedAfterDeletion.data.marketing_consent_state, "withdrawn");
+  assert.deepEqual(actionNames(delayedAfterDeletion), []);
+  assert.equal(
+    JSON.stringify([
+      ...recordsIn(service, "participant-profiles"),
+      ...recordsIn(service, "participant-profile-revisions"),
+    ]),
+    participantRecordsBeforeClosedReplay,
+  );
+  assert.equal(
+    (await hostedParticipantRepository(service).revision(2))?.snapshot.updatedAt,
+    committedUpdateTimestamp,
+  );
 
   const finalWorker = hostedPackageWorker(
     service,

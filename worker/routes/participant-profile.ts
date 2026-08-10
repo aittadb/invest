@@ -286,15 +286,18 @@ export function createParticipantProfileRouteHandler(
         applied.occurredAt,
         authorized.account,
       );
+      const latest = requireLatestProfileAfterMutation(
+        await repository.current(),
+        authorized.account,
+        current,
+        applied.result,
+      );
 
       return withSetCookie(await resourceResponse({
         context,
         representation: representation.kind,
         account: authorized.account,
-        current: Object.freeze({
-          revision: applied.result.revision,
-          snapshot: applied.result.snapshot,
-        }),
+        current: latest,
         acknowledgment: acknowledgmentState(authorized.access),
         csrfTokenFor: dependencies.csrfTokenFor,
         createOperationId,
@@ -594,6 +597,26 @@ function requireMutationResult(
     !sameParticipantProfile(result.snapshot, expected.profile) ||
     !sameParticipantIntents(result.intents, expected.intents)
   ) unavailable();
+}
+
+function requireLatestProfileAfterMutation(
+  value: ParticipantProfileSnapshot | null,
+  account: ParticipantAccount,
+  current: ParticipantProfileSnapshot,
+  result: ParticipantProfileMutationResult,
+): ParticipantProfileSnapshot {
+  const latest = requireOwnedCurrentProfile(value, account);
+  if (
+    latest.revision < current.revision ||
+    latest.revision < result.revision ||
+    (latest.revision === current.revision &&
+      !sameParticipantProfile(latest.snapshot, current.snapshot)) ||
+    (latest.revision === result.revision &&
+      !sameParticipantProfile(latest.snapshot, result.snapshot))
+  ) {
+    unavailable();
+  }
+  return latest;
 }
 
 function expectedProfileTransition(

@@ -359,7 +359,13 @@ test("profile mutations preserve exact retries and reject changed or stale opera
     { actor: alice },
   );
   assert.equal(delayedReplay.status, 200);
-  assert.equal(resourceData(await jsonDocument(delayedReplay)).revision, 2);
+  assert.equal(delayedReplay.headers.get(MUTATION_CSRF_HEADER), CSRF_TOKEN);
+  const delayedDocument = await jsonDocument(delayedReplay);
+  assert.equal(resourceData(delayedDocument).revision, 3);
+  assert.deepEqual(
+    actionsOf(delayedDocument).map(({ name }) => name),
+    ["update-participant-profile", "request-account-deletion"],
+  );
   assert.equal(harness.nowCalls(), 2);
   const delayedChangedRetry = await harness.dispatch(
     jsonMutation("PATCH", ALICE, {
@@ -392,6 +398,110 @@ test("profile mutations preserve exact retries and reject changed or stale opera
   );
   assert.equal(harness.nowCalls(), 3);
   assert.equal((await harness.profile(alice))?.revision, 4);
+
+  const csrfCallsBeforeClosedReplay = harness.csrfCalls();
+  const delayedClosedReplay = await harness.dispatch(
+    jsonMutation("PATCH", ALICE, updateBody),
+    { actor: alice },
+  );
+  assert.equal(delayedClosedReplay.status, 200);
+  assert.equal(delayedClosedReplay.headers.get(MUTATION_CSRF_HEADER), null);
+  const delayedClosedDocument = await jsonDocument(delayedClosedReplay);
+  assert.equal(resourceData(delayedClosedDocument).revision, 4);
+  assert.deepEqual(actionsOf(delayedClosedDocument), []);
+  assert.equal(harness.csrfCalls(), csrfCallsBeforeClosedReplay);
+  assert.equal(harness.nowCalls(), 3);
+});
+
+test("post-replay projection rejects a regressed latest snapshot without issuing proof", async () => {
+  const alice = participant(ALICE, "alice@provider.example");
+  const account = participantAccount(alice);
+  const storage = new MemoryStorageAdapter(new MemoryStorageState());
+  const persisted = new DevelopmentInMemoryParticipantRepository(
+    storage,
+    account,
+  );
+  await persisted.register({
+    operationId: "participant-profile-operation:projection-register",
+    expectedRevision: null,
+    registeredAt: REGISTERED_AT,
+    registration: {
+      displayName: "Alice Participant",
+      country: "FI",
+      declaredInterest: "both",
+      participationContext: "company",
+      processEmailNoticeAcknowledged: true,
+      marketingConsent: true,
+    },
+  });
+  const updateBody = {
+    "operation-id": "participant-profile-operation:projection-update",
+    "expected-revision": 1,
+    "display-name": "Projection Stable",
+    country: "fi",
+    "declared-interest": "both",
+    "participation-context": "company",
+  } as const;
+  await persisted.update({
+    operationId: updateBody["operation-id"],
+    expectedRevision: updateBody["expected-revision"],
+    updatedAt: "2026-08-09T10:00:00.000Z",
+    changes: {
+      displayName: updateBody["display-name"],
+      country: updateBody.country,
+      declaredInterest: updateBody["declared-interest"],
+      participationContext: updateBody["participation-context"],
+    },
+  });
+  await persisted.withdrawMarketingConsent({
+    operationId: "participant-profile-operation:projection-withdrawal",
+    expectedRevision: 2,
+    withdrawnAt: "2026-08-09T10:01:00.000Z",
+  });
+  const withdrawn = await persisted.current();
+  assert(withdrawn);
+  await persisted.requestAccountDeletion({
+    operationId: "participant-profile-operation:projection-deletion",
+    expectedRevision: 3,
+    requestedAt: "2026-08-09T10:02:00.000Z",
+  });
+  const deleted = await persisted.current();
+  assert(deleted);
+
+  let currentCalls = 0;
+  const regressed: ParticipantRepository = {
+    current: async () => {
+      currentCalls += 1;
+      return currentCalls === 1 ? deleted : withdrawn;
+    },
+    revision: (revision) => persisted.revision(revision),
+    register: (request) => persisted.register(request),
+    update: (request) => persisted.update(request),
+    withdrawMarketingConsent: (request) =>
+      persisted.withdrawMarketingConsent(request),
+    requestAccountDeletion: (request) =>
+      persisted.requestAccountDeletion(request),
+    pendingDeletionIntent: () => persisted.pendingDeletionIntent(),
+  };
+  const harness = await createHarness({
+    marketingConsent: true,
+    verifyMutation: profileVerifierFor("PATCH", updateBody, CLEAR_COOKIE),
+    repositoryFor: () => regressed,
+  });
+  const response = await harness.dispatch(
+    jsonMutation("PATCH", ALICE, updateBody),
+    { actor: alice, access: accessFromProfile(alice, deleted, "required") },
+  );
+  assert.equal(response.status, 503);
+  assertSingleCookie(response, CLEAR_COOKIE);
+  assert.equal(response.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.equal(harness.csrfCalls(), 0);
+  assert.equal(harness.operationIdCalls(), 0);
+  assert.equal(currentCalls, 2);
+  assert.doesNotMatch(
+    await response.text(),
+    /Projection Stable|alice@provider|issuer\.invalid\/participant:alice/u,
+  );
 });
 
 test("marketing withdrawal remains independent after deletion while profile edits close", async () => {
