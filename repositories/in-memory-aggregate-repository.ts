@@ -38,6 +38,7 @@ import {
   type StorageDocument,
   type JsonValue,
   type StorageKey,
+  type StorageMutation,
   type StorageOperationId,
   type StorageRecord,
 } from "../domain/storage-adapter.ts";
@@ -125,6 +126,14 @@ export type ApplyAggregateContributionResult = Readonly<{
   replayed: boolean;
 }>;
 
+export type PreparedAtomicAggregateContribution = Readonly<{
+  operationId: StorageOperationId;
+  operationFingerprint: string;
+  contribution: InvestmentAggregateContribution;
+  result: Omit<ApplyAggregateContributionResult, "replayed">;
+  mutations: readonly StorageMutation[];
+}>;
+
 export type ApplyAggregateCorrectionRequest = Readonly<{
   operationId: unknown;
   confirmation: unknown;
@@ -187,6 +196,129 @@ type StoredOperationResult =
   | Omit<ApplyAggregateContributionResult, "replayed">
   | Omit<ApplyAggregateCorrectionResult, "replayed">
   | Omit<ApplyAuditedAggregateCorrectionResult, "replayed">;
+
+type ParsedAggregateContributionRequest = Readonly<{
+  operationId: StorageOperationId;
+  expectedStoredRevision: number;
+  contribution: InvestmentAggregateContribution;
+  fingerprint: string;
+}>;
+
+/**
+ * Prepare the aggregate side of a larger atomic indication transaction.
+ * Unlike the reconciliation-oriented development path, this reads only the
+ * current aggregate, this indication's prior contribution, and the operation
+ * slot. Every accepted indication revision must advance its contribution by
+ * exactly one revision.
+ */
+export async function prepareAtomicAggregateContribution(
+  storage: Pick<StorageAdapter, "read">,
+  request: ApplyAggregateContributionRequest,
+  currency: CurrencyCode,
+): Promise<PreparedAtomicAggregateContribution> {
+  const parsed = await parseAggregateContributionRequest(request, currency);
+  const operationKey = operationStorageKey(parsed.operationId);
+  const operationRecord = await storage.read(operationKey);
+  if (operationRecord !== null) {
+    decodeOperationRecord(
+      operationRecord,
+      operationKey,
+      "contribution",
+      parsed.fingerprint,
+      currency,
+    );
+    unavailable();
+  }
+
+  const aggregateRecord = await storage.read(CURRENT_AGGREGATE_KEY);
+  const stored = aggregateRecord === null
+    ? zeroStoredSnapshot(currency)
+    : decodeAggregateRecord(aggregateRecord, currency);
+  if (stored.revision !== parsed.expectedStoredRevision) {
+    preconditionFailed();
+  }
+
+  const contributionKey = contributionStorageKey(
+    parsed.contribution.indicationId,
+  );
+  const currentRecord = await storage.read(contributionKey);
+  const current = currentRecord === null
+    ? null
+    : decodeContributionRecord(currentRecord, currency);
+  if (
+    current === null
+      ? parsed.contribution.indicationRevision !== 1
+      : currentRecord?.revision !== current.indicationRevision ||
+        parsed.contribution.indicationRevision !==
+          current.indicationRevision + 1
+  ) {
+    unavailable();
+  }
+
+  const nextStored = applyContributionDelta(
+    stored,
+    current,
+    parsed.contribution,
+  );
+  const result = deepFreeze({
+    disposition: "applied" as const,
+    stored: nextStored,
+    calculated: summaryFromStored(nextStored),
+  });
+  const mutations = Object.freeze([
+    Object.freeze({
+      type: "put" as const,
+      key: CURRENT_AGGREGATE_KEY,
+      expectedRevision: aggregateRecord?.revision ?? null,
+      value: aggregateDocument(nextStored),
+    }),
+    Object.freeze({
+      type: "put" as const,
+      key: contributionKey,
+      expectedRevision: currentRecord?.revision ?? null,
+      value: contributionDocument(parsed.contribution),
+    }),
+    Object.freeze({
+      type: "put" as const,
+      key: operationKey,
+      expectedRevision: null,
+      value: operationDocument(
+        "contribution",
+        parsed.fingerprint,
+        result,
+      ),
+    }),
+  ] satisfies readonly StorageMutation[]);
+  return Object.freeze({
+    operationId: parsed.operationId,
+    operationFingerprint: parsed.fingerprint,
+    contribution: parsed.contribution,
+    result,
+    mutations,
+  });
+}
+
+/** Verify the immutable aggregate receipt for a completed atomic operation. */
+export async function readAtomicAggregateContributionReplay(
+  storage: Pick<StorageAdapter, "read">,
+  request: ApplyAggregateContributionRequest,
+  currency: CurrencyCode,
+): Promise<ApplyAggregateContributionResult | null> {
+  const parsed = await parseAggregateContributionRequest(request, currency);
+  const key = operationStorageKey(parsed.operationId);
+  const record = await storage.read(key);
+  if (record === null) return null;
+  return contributionResult(
+    decodeOperationRecord(
+      record,
+      key,
+      "contribution",
+      parsed.fingerprint,
+      currency,
+    ),
+    true,
+  );
+}
 
 /**
  * Deterministic development repository composed entirely through StorageAdapter.
@@ -669,6 +801,59 @@ function classifyContribution(
     throw new StorageFailure("CONFLICT");
   }
   return "duplicate";
+}
+
+async function parseAggregateContributionRequest(
+  request: ApplyAggregateContributionRequest,
+  currency: CurrencyCode,
+): Promise<ParsedAggregateContributionRequest> {
+  const operationId = requiredOperationId(request.operationId);
+  const expectedStoredRevision = requiredStoredRevision(
+    request.expectedStoredRevision,
+  );
+  const contribution = requiredContribution(request.contribution, currency);
+  const fingerprint = await operationFingerprint({
+    kind: "contribution",
+    operationId,
+    expectedStoredRevision,
+    contribution: contributionDocument(contribution),
+  });
+  return deepFreeze({
+    operationId,
+    expectedStoredRevision,
+    contribution,
+    fingerprint,
+  });
+}
+
+function applyContributionDelta(
+  stored: StoredInvestmentAggregateSnapshot,
+  current: InvestmentAggregateContribution | null,
+  candidate: InvestmentAggregateContribution,
+): StoredInvestmentAggregateSnapshot {
+  if (stored.revision === Number.MAX_SAFE_INTEGER) preconditionFailed();
+  const priorAmount = current?.status === "active" ? current.amount : 0;
+  const nextAmount = candidate.status === "active" ? candidate.amount : 0;
+  const priorCount = current?.status === "active" ? 1 : 0;
+  const nextCount = candidate.status === "active" ? 1 : 0;
+  if (
+    stored.totalAmount < priorAmount ||
+    stored.contributingIndicationCount < priorCount
+  ) {
+    unavailable();
+  }
+  const withoutPrior = stored.totalAmount - priorAmount;
+  if (withoutPrior > Number.MAX_SAFE_INTEGER - nextAmount) invalidRequest();
+  const countWithoutPrior = stored.contributingIndicationCount - priorCount;
+  if (countWithoutPrior > Number.MAX_SAFE_INTEGER - nextCount) {
+    invalidRequest();
+  }
+  return deepFreeze({
+    revision: stored.revision + 1,
+    totalAmount: (withoutPrior + nextAmount) as MinorUnits,
+    currency: stored.currency,
+    contributingIndicationCount: countWithoutPrior + nextCount,
+  });
 }
 
 function requiredContribution(

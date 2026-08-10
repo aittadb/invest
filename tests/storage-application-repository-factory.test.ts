@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { parseAmountAggregateConfiguration } from "../domain/amount-aggregate-configuration.ts";
 import { parseActorSubject, parseTimestamp } from "../domain/foundation.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
@@ -195,6 +196,7 @@ test("factory exposes only named application repository capabilities", async () 
     "publicCampaignReader",
     "ownerPackageWorkspace",
     "participantRequest",
+    "participantInvestmentRepository",
   ]);
   assert.equal(
     factory.campaignRepository(),
@@ -257,6 +259,30 @@ test("factory exposes only named application repository capabilities", async () 
     (error) => storageFailure(error, "UNAVAILABLE"),
   );
   assertNoGenericStorageSurface(participantRequest, storage);
+  const amount = parseAmountAggregateConfiguration({
+    amount: {
+      currency: "EUR",
+      minimum: 1_000,
+      increment: 250,
+      maximum: 10_000,
+    },
+    publicAggregate: { visibility: "hidden" },
+  });
+  assert(amount.ok);
+  const investment = factory.participantInvestmentRepository(
+    subject.value,
+    amount.value.amount,
+  );
+  assert.notEqual(
+    factory.participantInvestmentRepository(subject.value, amount.value.amount),
+    investment,
+  );
+  assert.deepEqual(Object.keys(investment), ["mutationConsistency"]);
+  assert.equal(
+    investment.mutationConsistency,
+    "atomic-indication-aggregate-audit",
+  );
+  assertNoGenericStorageSurface(investment, storage);
   assert.doesNotMatch(
     Object.getOwnPropertyNames(Object.getPrototypeOf(factory)).join(" "),
     /adapter|storage|create/iu,

@@ -9,6 +9,8 @@ import {
   parseParticipantAccount,
   type ParticipantAccount,
 } from "../domain/participant-profile.ts";
+import type { AmountConfiguration } from "../domain/amount-aggregate-configuration.ts";
+import type { InvestmentIndicationParsingOptions } from "../domain/investment-indication.ts";
 import {
   StorageFailure,
   parseStorageCollection,
@@ -51,6 +53,7 @@ import {
   StorageParticipantRepository,
   type ParticipantRepository,
 } from "./in-memory-participant-repository.ts";
+import { StorageParticipantInvestmentInterestRepository } from "./storage-participant-investment-repository.ts";
 
 const REPLAY_SCHEMA_VERSION = 1;
 const REPLAY_COLLECTION = storageCollection("browser-mutation-replays");
@@ -108,6 +111,7 @@ export type ParticipantRequestRepositoryScope = Readonly<{
  * wiring task after that repository contract is proven.
  */
 export class StorageApplicationRepositoryFactory {
+  readonly #storage: StorageAdapter;
   readonly #claimBrowserMutationReplay: BrowserMutationReplayClaimer;
   readonly #campaignRepository: AtomicCampaignAuditRepository;
   readonly #publicCampaignReader: PublicCampaignPresentationReader;
@@ -118,6 +122,7 @@ export class StorageApplicationRepositoryFactory {
 
   constructor(storage: StorageAdapter, now: () => Date) {
     const adapter = requiredStorageAdapter(storage);
+    this.#storage = adapter;
     const clock = requiredClock(now);
     const packageVersions = new StoragePackageVersionRepository(adapter);
     this.#ownerPackageWorkspace = new RepositoryOwnerPackageWorkspaceService(
@@ -156,6 +161,19 @@ export class StorageApplicationRepositoryFactory {
     account: ParticipantAccount,
   ): ParticipantRequestRepositoryScope {
     return this.#participantRequest(account);
+  }
+
+  participantInvestmentRepository(
+    participantSubject: ActorSubject,
+    amountConfiguration: AmountConfiguration,
+    parsingOptions: InvestmentIndicationParsingOptions = {},
+  ): StorageParticipantInvestmentInterestRepository {
+    return new StorageParticipantInvestmentInterestRepository(
+      this.#storage,
+      participantSubject,
+      amountConfiguration,
+      parsingOptions,
+    );
   }
 }
 

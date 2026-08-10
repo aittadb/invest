@@ -114,6 +114,30 @@ export type RejectIndicationRequest = IndicationMutationRequest &
     reason: unknown;
   }>;
 
+export type ParticipantIndicationMutationKind =
+  | "create"
+  | "edit"
+  | "withdraw"
+  | "reactivate";
+
+export type ParticipantIndicationMutationRequest =
+  | CreateIndicationRequest
+  | EditIndicationRequest
+  | WithdrawIndicationRequest
+  | ReactivateIndicationRequest;
+
+/** Closed descriptor shared with the atomic participant mutation coordinator. */
+export type PreparedParticipantIndicationMutation = Readonly<{
+  kind: ParticipantIndicationMutationKind;
+  participantSubject: ActorSubject;
+  operationId: StorageOperationId;
+  id: InvestmentIndicationId;
+  occurredAt: Timestamp;
+  expectedRevision: number | null;
+  resultingRevision: number;
+  fingerprint: string;
+}>;
+
 /** Subject-bound persistence contract for participant and configured-owner use. */
 export interface IndicationRepository {
   create(
@@ -135,6 +159,46 @@ export interface IndicationRepository {
   reject(
     request: RejectIndicationRequest,
   ): Promise<IndicationMutationResult<RejectedInvestmentIndication>>;
+}
+
+/** Validate and fingerprint one participant mutation without touching storage. */
+export async function prepareParticipantIndicationMutation(
+  kind: ParticipantIndicationMutationKind,
+  participantSubject: unknown,
+  request: ParticipantIndicationMutationRequest,
+  amountConfiguration: AmountConfiguration,
+  parsingOptions: InvestmentIndicationParsingOptions = {},
+): Promise<PreparedParticipantIndicationMutation> {
+  if (
+    kind !== "create" &&
+    kind !== "edit" &&
+    kind !== "withdraw" &&
+    kind !== "reactivate"
+  ) invalidRequest();
+  const subject = requiredActorSubject(participantSubject);
+  const amount = requiredAmountConfiguration(amountConfiguration);
+  const options = Object.freeze({ ...parsingOptions });
+  const parsed = kind === "create"
+    ? parseCreateRequest(request as CreateIndicationRequest, amount, options)
+    : kind === "edit"
+    ? parseEditRequest(request as EditIndicationRequest, amount, options)
+    : parseTransitionRequest(
+        request as WithdrawIndicationRequest | ReactivateIndicationRequest,
+      );
+  const actor = Object.freeze({
+    type: "participant" as const,
+    subject,
+  });
+  return Object.freeze({
+    kind,
+    participantSubject: subject,
+    operationId: parsed.operationId,
+    id: parsed.id,
+    occurredAt: parsed.occurredAt,
+    expectedRevision: parsed.expectedRevision,
+    resultingRevision: nextRevision(parsed.expectedRevision),
+    fingerprint: await operationFingerprint(kind, actor, parsed),
+  });
 }
 
 type MutationKind =
@@ -179,14 +243,14 @@ export class DevelopmentInMemoryIndicationRepository
 
   readonly #storage: StorageAdapter;
   readonly #authenticatedSubject: ActorSubject | null;
-  readonly #configuredOwnerSubject: ActorSubject;
+  readonly #configuredOwnerSubject: ActorSubject | null;
   readonly #amountConfiguration: AmountConfiguration;
   readonly #parsingOptions: InvestmentIndicationParsingOptions;
 
   constructor(
     storage: StorageAdapter,
     authenticatedSubject: ActorSubject | null,
-    configuredOwnerSubject: ActorSubject,
+    configuredOwnerSubject: ActorSubject | null,
     amountConfiguration: AmountConfiguration,
     parsingOptions: InvestmentIndicationParsingOptions = {},
   ) {
@@ -194,7 +258,9 @@ export class DevelopmentInMemoryIndicationRepository
     this.#authenticatedSubject = authenticatedSubject === null
       ? null
       : requiredActorSubject(authenticatedSubject);
-    this.#configuredOwnerSubject = requiredActorSubject(configuredOwnerSubject);
+    this.#configuredOwnerSubject = configuredOwnerSubject === null
+      ? null
+      : requiredActorSubject(configuredOwnerSubject);
     this.#amountConfiguration = requiredAmountConfiguration(amountConfiguration);
     this.#parsingOptions = Object.freeze({ ...parsingOptions });
   }
@@ -245,6 +311,63 @@ export class DevelopmentInMemoryIndicationRepository
       subject === this.#configuredOwnerSubject ? "owner" : "participant",
       subject,
     ).then((stored) => stored?.indication ?? null);
+  }
+
+  /** Reopen one immutable operation result without projecting a later head. */
+  async readPreparedParticipantMutation(
+    prepared: PreparedParticipantIndicationMutation,
+  ): Promise<IndicationMutationResult | null> {
+    const subject = this.#authenticatedSubject;
+    if (
+      subject === null ||
+      subject === this.#configuredOwnerSubject ||
+      prepared.participantSubject !== subject ||
+      prepared.resultingRevision !== nextRevision(prepared.expectedRevision) ||
+      !isSha256(prepared.fingerprint)
+    ) {
+      return null;
+    }
+    const key = await indicationHistoryKey(
+      prepared.id,
+      prepared.resultingRevision,
+    );
+    const record = await this.#storage.read(key);
+    if (record === null) return null;
+    const stored = await decodeStoredIndication(
+      record,
+      key,
+      "history",
+      prepared.id,
+      prepared.resultingRevision,
+      this.#configuredOwnerSubject,
+      this.#amountConfiguration,
+      this.#parsingOptions,
+    );
+    if (
+      stored.operationId !== prepared.operationId ||
+      stored.operationFingerprint !== prepared.fingerprint ||
+      stored.indication.history[prepared.resultingRevision - 1]?.occurredAt !==
+        prepared.occurredAt
+    ) {
+      throw new StorageFailure("CONFLICT");
+    }
+    if (stored.indication.participantSubject !== subject) return null;
+    return mutationResult(stored.indication, true);
+  }
+
+  /** Read one current collection item without scanning immutable ancestry. */
+  async readCurrentParticipantProjection(
+    id: InvestmentIndicationId,
+  ): Promise<InvestmentIndication | null> {
+    const subject = this.#authenticatedSubject;
+    if (subject === null || subject === this.#configuredOwnerSubject) return null;
+    const stored = await this.#readCurrent(
+      requiredIndicationId(id),
+      "participant",
+      subject,
+      false,
+    );
+    return stored?.indication ?? null;
   }
 
   async edit(
@@ -413,6 +536,7 @@ export class DevelopmentInMemoryIndicationRepository
 
   #requiredOwnerActor(): OwnerIndicationActor {
     if (
+      this.#configuredOwnerSubject === null ||
       this.#authenticatedSubject === null ||
       this.#authenticatedSubject !== this.#configuredOwnerSubject
     ) {
@@ -428,6 +552,7 @@ export class DevelopmentInMemoryIndicationRepository
     id: InvestmentIndicationId,
     access: "participant" | "owner",
     subject: ActorSubject,
+    verifyHistory = true,
   ): Promise<StoredIndication | null> {
     const key = await currentIndicationKey(id);
     const record = await this.#storage.read(key);
@@ -456,7 +581,7 @@ export class DevelopmentInMemoryIndicationRepository
     ) {
       return null;
     }
-    await this.#verifyImmutableHistory(stored.indication);
+    if (verifyHistory) await this.#verifyImmutableHistory(stored.indication);
     await this.#verifyActiveLease(stored.indication);
     return stored;
   }
@@ -813,7 +938,7 @@ async function decodeStoredIndication(
   recordKind: "current" | "history",
   expectedId: InvestmentIndicationId,
   expectedIndicationRevision: number | null,
-  configuredOwnerSubject: ActorSubject,
+  configuredOwnerSubject: ActorSubject | null,
   amountConfiguration: AmountConfiguration,
   parsingOptions: InvestmentIndicationParsingOptions,
 ): Promise<StoredIndication> {
@@ -872,7 +997,7 @@ async function decodeStoredIndication(
 
 function reconstructIndication(
   value: unknown,
-  configuredOwnerSubject: ActorSubject,
+  configuredOwnerSubject: ActorSubject | null,
   amountConfiguration: AmountConfiguration,
   parsingOptions: InvestmentIndicationParsingOptions,
 ): InvestmentIndication {
@@ -895,7 +1020,7 @@ function reconstructIndication(
 
 function reconstructHistory(
   history: readonly unknown[],
-  configuredOwnerSubject: ActorSubject,
+  configuredOwnerSubject: ActorSubject | null,
   amountConfiguration: AmountConfiguration,
   parsingOptions: InvestmentIndicationParsingOptions,
 ): InvestmentIndication {
@@ -998,7 +1123,7 @@ function reconstructHistory(
 
 function previousIndication(
   indication: InvestmentIndication,
-  configuredOwnerSubject: ActorSubject,
+  configuredOwnerSubject: ActorSubject | null,
   amountConfiguration: AmountConfiguration,
   parsingOptions: InvestmentIndicationParsingOptions,
 ): InvestmentIndication | null {
@@ -1027,12 +1152,15 @@ function storedParticipantActor(value: unknown): ParticipantIndicationActor {
 
 function storedOwnerActor(
   value: unknown,
-  configuredOwnerSubject: ActorSubject,
+  configuredOwnerSubject: ActorSubject | null,
 ): OwnerIndicationActor {
   const source = objectRecord(value);
   if (source === null || source.type !== "owner") unavailable();
   const subject = parseActorSubject(source.subject);
-  if (!subject.ok || subject.value !== configuredOwnerSubject) unavailable();
+  if (
+    !subject.ok ||
+    (configuredOwnerSubject !== null && subject.value !== configuredOwnerSubject)
+  ) unavailable();
   return Object.freeze({ type: "owner", subject: subject.value });
 }
 
