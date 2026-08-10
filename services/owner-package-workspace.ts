@@ -18,9 +18,8 @@ import {
   type StorageOperationId,
 } from "../domain/storage-adapter.ts";
 import type {
-  AppendPackageVersionRequest,
+  AtomicPackageVersionAuditRepository,
   RepositoryMutationResult,
-  RevisionedSnapshot,
 } from "../repositories/in-memory-content-repository.ts";
 
 export type TrustedOwnerActor = Readonly<{
@@ -103,15 +102,8 @@ export interface OwnerPackageWorkspaceService {
   ): Promise<RepositoryMutationResult<PackageVersion>>;
 }
 
-export interface OwnerPackageWorkspaceRepository {
-  append(
-    request: AppendPackageVersionRequest & Readonly<{
-      mutationFingerprint: string;
-    }>,
-  ): Promise<RepositoryMutationResult<PackageVersion>>;
-  current(): Promise<RevisionedSnapshot<PackageVersion> | null>;
-  get(id: StableId<"package-version">): Promise<PackageVersion | null>;
-}
+export type OwnerPackageWorkspaceRepository =
+  AtomicPackageVersionAuditRepository;
 
 type VersionContent = Readonly<{
   sections: readonly PackageSectionDraft[];
@@ -158,6 +150,9 @@ export class RepositoryOwnerPackageWorkspaceService
     repository: OwnerPackageWorkspaceRepository,
     options: Readonly<{ now?: () => Date }> = {},
   ) {
+    if (repository.mutationConsistency !== "atomic-package-version-audit") {
+      throw new Error("Owner package persistence must be atomic with audit.");
+    }
     this.#repository = repository;
     this.#now = options.now ?? (() => new Date());
   }
@@ -360,10 +355,11 @@ export class RepositoryOwnerPackageWorkspaceService
 
     const existing = await this.#repository.get(versionId);
     if (existing !== null) {
-      return this.#repository.append({
+      return this.#repository.appendWithAudit({
         operationId: metadata.operationId,
         expectedRevision: metadata.expectedRevision,
         mutationFingerprint,
+        ownerSubject: subject,
         draft: versionDraft(existing),
       });
     }
@@ -376,10 +372,11 @@ export class RepositoryOwnerPackageWorkspaceService
     );
     const createdAt = currentTimestamp(this.#now);
 
-    return this.#repository.append({
+    return this.#repository.appendWithAudit({
       operationId: metadata.operationId,
       expectedRevision: metadata.expectedRevision,
       mutationFingerprint,
+      ownerSubject: subject,
       draft: {
         id: versionId,
         createdAt,

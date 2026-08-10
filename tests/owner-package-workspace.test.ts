@@ -5,13 +5,27 @@ import {
   parseActorSubject,
   type ActorSubject,
 } from "../domain/foundation.ts";
-import { StorageFailure } from "../domain/storage-adapter.ts";
-import { InMemoryPackageVersionRepository } from "../repositories/in-memory-content-repository.ts";
+import {
+  StorageFailure,
+  type StorageAdapter,
+  type StorageTransactionRequest,
+  type StorageTransactionResult,
+} from "../domain/storage-adapter.ts";
+import {
+  type AppendPackageVersionRequest,
+  type AppendPackageVersionWithAuditRequest,
+  type AtomicPackageVersionAuditRepository,
+  InMemoryPackageVersionRepository,
+  StoragePackageVersionRepository,
+} from "../repositories/in-memory-content-repository.ts";
 import {
   RepositoryOwnerPackageWorkspaceService,
   type TrustedOwnerActor,
 } from "../services/owner-package-workspace.ts";
-import { MemoryStorageAdapter } from "./support/memory-storage-adapter.ts";
+import {
+  MemoryStorageAdapter,
+  MemoryStorageState,
+} from "./support/memory-storage-adapter.ts";
 
 test("the owner workspace lists, creates, reorders, enables, previews, and versions sections", async () => {
   const fixture = workspaceFixture();
@@ -186,6 +200,146 @@ test("package workspace retries are stable and stale or changed writes do not ad
   assert.equal((await fixture.workspace.read(fixture.owner))?.revision, 2);
 });
 
+test("owner workspace retry reuses the persisted intent timestamp after restart", async () => {
+  const state = new MemoryStorageState();
+  const durable = new MemoryStorageAdapter(state);
+  const failing = new FailAfterIntentCommitStorageAdapter(durable);
+  const owner = Object.freeze({
+    type: "owner" as const,
+    subject: actorSubject("oidc:configured-owner"),
+  });
+  const timestamps = [
+    "2026-08-09T12:00:00.000Z",
+    "2026-08-09T12:05:00.000Z",
+    "2026-08-09T12:10:00.000Z",
+    "2026-08-09T12:15:00.000Z",
+  ] as const;
+  let clockCalls = 0;
+  const now = () => {
+    const timestamp = timestamps[Math.min(clockCalls, timestamps.length - 1)];
+    clockCalls += 1;
+    return new Date(timestamp);
+  };
+  const request = createInput("package-operation:intent-clock-retry", 0, {
+    title: "Restart-safe overview",
+    markdown: "Private package content persisted in bounded records.",
+    enabled: true,
+    acknowledgmentText: "I acknowledge this private package.",
+    changeSummary: "Created restart-safe package content",
+  });
+
+  const firstWorkspace = new RepositoryOwnerPackageWorkspaceService(
+    new StoragePackageVersionRepository(failing),
+    { now },
+  );
+  await rejectsStorage(
+    () => firstWorkspace.createSection(owner, request),
+    "UNAVAILABLE",
+  );
+  assert.equal(clockCalls, 1);
+  assert.equal(state.records.size, 1);
+  const intent = requiredStoredRecord(
+    state,
+    "private-package-operation-intents",
+  );
+  assert.equal(intent.value.createdAt, timestamps[0]);
+  assert.equal(storedRecords(state, "private-package-versions").length, 0);
+  assert.equal(storedRecords(state, "audit-events").length, 0);
+
+  const restartedRepository = new StoragePackageVersionRepository(
+    new MemoryStorageAdapter(state),
+  );
+  const intentRecordCount = state.records.size;
+  const extraDraftWorkspace = new RepositoryOwnerPackageWorkspaceService(
+    new DecoratingOwnerPackageRepository(restartedRepository, (draft) => ({
+      ...(draft as Record<string, unknown>),
+      unexpected: "must remain rejected",
+    })),
+    { now },
+  );
+  await rejectsStorage(
+    () => extraDraftWorkspace.createSection(owner, request),
+    "INVALID_REQUEST",
+  );
+  assert.equal(clockCalls, 2);
+  assert.equal(state.records.size, intentRecordCount);
+
+  let accessorReads = 0;
+  const accessorDraftWorkspace = new RepositoryOwnerPackageWorkspaceService(
+    new DecoratingOwnerPackageRepository(restartedRepository, (draft) => {
+      const decorated = { ...(draft as Record<string, unknown>) };
+      Object.defineProperty(decorated, "changeSummary", {
+        enumerable: true,
+        get: () => {
+          accessorReads += 1;
+          return request.changeSummary;
+        },
+      });
+      return decorated;
+    }),
+    { now },
+  );
+  await rejectsStorage(
+    () => accessorDraftWorkspace.createSection(owner, request),
+    "INVALID_REQUEST",
+  );
+  assert.equal(accessorReads, 0);
+  assert.equal(clockCalls, 3);
+  assert.equal(state.records.size, intentRecordCount);
+
+  const restartedWorkspace = new RepositoryOwnerPackageWorkspaceService(
+    restartedRepository,
+    { now },
+  );
+  const completed = await restartedWorkspace.createSection(owner, request);
+  assert.equal(clockCalls, 4);
+  assert.equal(completed.replayed, false);
+  assert.equal(completed.snapshot.createdAt, timestamps[0]);
+  assert.equal(
+    (await restartedWorkspace.read(owner))?.version.createdAt,
+    timestamps[0],
+  );
+  assert.equal(
+    requiredStoredRecord(state, "private-package-versions").value.createdAt,
+    timestamps[0],
+  );
+  const auditEvent = requiredStoredRecord(state, "audit-events").value.event;
+  assert.equal(typeof auditEvent, "object");
+  assert(auditEvent !== null && !Array.isArray(auditEvent));
+  assert.equal(
+    (auditEvent as Record<string, unknown>).occurredAt,
+    timestamps[0],
+  );
+
+  const completedRecords = serializeStoredRecords(state);
+  const replayWorkspace = new RepositoryOwnerPackageWorkspaceService(
+    new StoragePackageVersionRepository(new MemoryStorageAdapter(state)),
+    { now },
+  );
+  const replay = await replayWorkspace.createSection(owner, request);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.snapshot, completed.snapshot);
+  assert.equal(clockCalls, 4);
+  assert.equal(serializeStoredRecords(state), completedRecords);
+
+  const recordCount = state.records.size;
+  await rejectsStorage(
+    () => replayWorkspace.createSection(owner, {
+      ...request,
+      changeSummary: "Changed owner-controlled retry metadata",
+    }),
+    "CONFLICT",
+  );
+  await rejectsStorage(
+    () => replayWorkspace.createSection(owner, {
+      ...request,
+      markdown: "Changed owner-controlled retry content.",
+    }),
+    "CONFLICT",
+  );
+  assert.equal(state.records.size, recordCount);
+});
+
 test("unsafe Markdown and untrusted actors are rejected without creating a package", async () => {
   const fixture = workspaceFixture();
   const unsafe = createInput("package-operation:unsafe", 0, {
@@ -278,4 +432,100 @@ async function rejectsStorage(
     return;
   }
   assert.fail("Expected a StorageFailure.");
+}
+
+class FailAfterIntentCommitStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  #failed = false;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+  }
+
+  read(key: Parameters<StorageAdapter["read"]>[0]) {
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]) {
+    return this.#delegate.list(request);
+  }
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    const result = await this.#delegate.transact(request);
+    if (
+      !this.#failed &&
+      request.mutations.some((mutation) =>
+        mutation.key.collection === "private-package-operation-intents"
+      )
+    ) {
+      this.#failed = true;
+      throw new StorageFailure("UNAVAILABLE");
+    }
+    return result;
+  }
+}
+
+class DecoratingOwnerPackageRepository
+  implements AtomicPackageVersionAuditRepository
+{
+  readonly mutationConsistency = "atomic-package-version-audit" as const;
+  readonly #delegate: AtomicPackageVersionAuditRepository;
+  readonly #decorate: (draft: unknown) => unknown;
+
+  constructor(
+    delegate: AtomicPackageVersionAuditRepository,
+    decorate: (draft: unknown) => unknown,
+  ) {
+    this.#delegate = delegate;
+    this.#decorate = decorate;
+  }
+
+  append(request: AppendPackageVersionRequest) {
+    return this.#delegate.append({
+      ...request,
+      draft: this.#decorate(request.draft),
+    });
+  }
+
+  appendWithAudit(request: AppendPackageVersionWithAuditRequest) {
+    return this.#delegate.appendWithAudit({
+      ...request,
+      draft: this.#decorate(request.draft),
+    });
+  }
+
+  current() {
+    return this.#delegate.current();
+  }
+
+  get(id: Parameters<AtomicPackageVersionAuditRepository["get"]>[0]) {
+    return this.#delegate.get(id);
+  }
+}
+
+function storedRecords(state: MemoryStorageState, collection: string) {
+  return [...state.records.values()].filter(
+    (record) => record.key.collection === collection,
+  );
+}
+
+function requiredStoredRecord(
+  state: MemoryStorageState,
+  collection: string,
+) {
+  const records = storedRecords(state, collection);
+  assert.equal(records.length, 1);
+  const record = records[0];
+  assert(record);
+  return record;
+}
+
+function serializeStoredRecords(state: MemoryStorageState): string {
+  return JSON.stringify(
+    [...state.records.entries()].sort(([left], [right]) =>
+      left.localeCompare(right)
+    ),
+  );
 }

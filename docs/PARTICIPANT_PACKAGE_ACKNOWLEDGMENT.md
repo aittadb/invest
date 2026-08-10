@@ -28,8 +28,17 @@ no-referrer policy, and same-origin resource policy.
 The route obtains one injected repository pair after authorization. The package
 repository supplies the immutable current `PackageVersion`; the acknowledgment
 repository is already bound to the authenticated participant subject. The
-package head is read before and after the latest acknowledgment so a changing
-head fails its precondition instead of producing a mixed projection.
+route performs one current-package/latest-acknowledgment/current-package read.
+Both package reads must match exactly; an interleaved publication fails that
+single attempt with a precondition error. The route does not retry this state
+read before a mutation.
+
+Separately, the read-side `requiresCurrentAcceptance` repository method used by
+participant authorization samples the private package-current gate before and
+after its latest-acknowledgment read. It retries that read sequence a small
+bounded number of times and returns a result only when both gate samples bind
+the same revision, version, content hash, and required-acceptance hash.
+Continuing gate movement fails closed.
 
 The repository state must also match the request's trusted participant access
 projection, including package identity, creation time, change summary,
@@ -80,6 +89,19 @@ also actionless for the accepted requirement.
 
 The route factory accepts request-safe package and subject-scoped
 acknowledgment repositories plus mutation security, CSRF issuance, clock, and
-operation-ID capabilities. This slice does not install global or production
-persistence. Hosted AittaDB composition and navigation/export wiring belong to
-the later persistent package integration task.
+operation-ID capabilities. Hosted composition supplies those repositories from
+the credential-bound AittaDB adapter and projects them only into the participant
+route group. It does not treat package or acceptance records as participant
+authority. Until TASK-070 supplies the persistent `participantAccess` reader,
+the route remains non-disclosing and unavailable without opening package
+persistence.
+
+The package-current gate is a private synchronization record separate from the
+owner-visible package head. Every package publish updates its exact version and
+required-acceptance hash. Acknowledgment compare-and-set writes the unchanged
+gate in the same transaction as immutable evidence and the participant head,
+so a material or editorial publish between the route's read and transaction
+causes the stale attempt to fail. The acceptance record retains the original
+expected gate revision only for exact adapter replay; that metadata is never
+part of participant representations. Successful acknowledgment does not change
+the owner-visible package revision.

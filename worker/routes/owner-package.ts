@@ -22,8 +22,9 @@ import {
   MUTATION_CSRF_HEADER,
   MutationSecurityFailure,
   toPublicMutationSecurityFailure,
-  type BrowserMutationGuard,
+  type VerifiedMutationRequest,
 } from "../../http/mutation-security.ts";
+import type { BrowserMutationProof } from "../../http/browser-mutation-session.ts";
 import type {
   OwnerPackageWorkspaceService,
   TrustedOwnerActor,
@@ -46,11 +47,17 @@ import {
 export type OwnerPackageCsrfTokenProvider = (
   request: Request,
   actor: TrustedOwnerActor,
-) => Promise<string | null>;
+) => Promise<string | BrowserMutationProof | null>;
+
+export type OwnerPackageMutationVerifier = (
+  request: Request,
+) => Promise<
+  VerifiedMutationRequest & Readonly<{ clearCookie?: string }>
+>;
 
 export type OwnerPackageRouteDependencies = Readonly<{
   workspace: OwnerPackageWorkspaceService;
-  verifyMutation: BrowserMutationGuard;
+  verifyMutation: OwnerPackageMutationVerifier;
   csrfToken: OwnerPackageCsrfTokenProvider;
   issueOperationId: OperationIdIssuer;
 }>;
@@ -78,6 +85,10 @@ const VERSION_REQUIRED_BODY_FIELDS = Object.freeze([
   "change-summary",
 ]);
 const VERSION_OPTIONAL_BODY_FIELDS = Object.freeze(["material-change"]);
+
+/** Supports every domain-valid Unicode package form without inheriting 1 MiB setup limits. */
+export const MAX_OWNER_PACKAGE_MUTATION_BYTES = 524_288;
+export const MAX_OWNER_PACKAGE_MUTATION_FIELDS = 9;
 
 export function createOwnerPackageRouteHandler(
   dependencies: OwnerPackageRouteDependencies,
@@ -143,15 +154,19 @@ async function readWorkspace(
       state,
       checkedOperationIssuer(dependencies.issueOperationId),
     );
-    const csrfToken = await dependencies.csrfToken(context.request, actor);
-    if (!validCsrfToken(csrfToken)) throw new StorageFailure("UNAVAILABLE");
+    const csrf = requiredCsrfProof(
+      await dependencies.csrfToken(context.request, actor),
+    );
     if (representation === "hypermedia-json") {
       const response = hypermediaResponse(model.document);
-      response.headers.set(MUTATION_CSRF_HEADER, csrfToken);
-      return response;
+      response.headers.set(MUTATION_CSRF_HEADER, csrf.token);
+      return withSetCookie(response, csrf.setCookie);
     }
 
-    return ownerPackageWorkspaceHtmlResponse(model, csrfToken);
+    return withSetCookie(
+      ownerPackageWorkspaceHtmlResponse(model, csrf.token),
+      csrf.setCookie,
+    );
   } catch (error) {
     return mappedFailureResponse(representation, context.resourceUrl, error);
   }
@@ -185,8 +200,12 @@ async function mutateWorkspace(
   route: PackageMutationRoute,
   dependencies: OwnerPackageRouteDependencies,
 ): Promise<Response> {
+  let clearCookie: string | null = null;
   try {
     const verified = await dependencies.verifyMutation(context.request);
+    clearCookie = validSetCookie(verified.clearCookie)
+      ? verified.clearCookie
+      : null;
     if (
       verified.actor.type !== "owner" ||
       verified.actor.subject !== actor.subject
@@ -245,14 +264,14 @@ async function mutateWorkspace(
     }
 
     if (representation === "html") {
-      return new Response(null, {
+      return withSetCookie(new Response(null, {
         status: 303,
         headers: {
           "Cache-Control": "no-store",
           Location: new URL("/owner/package", context.resourceUrl).href,
           Vary: "Accept",
         },
-      });
+      }), clearCookie);
     }
 
     const state = await dependencies.workspace.read(actor);
@@ -261,13 +280,17 @@ async function mutateWorkspace(
       state,
       checkedOperationIssuer(dependencies.issueOperationId),
     );
-    const csrfToken = await dependencies.csrfToken(context.request, actor);
-    if (!validCsrfToken(csrfToken)) throw new StorageFailure("UNAVAILABLE");
+    const csrf = requiredCsrfProof(
+      await dependencies.csrfToken(context.request, actor),
+    );
     const response = hypermediaResponse(model.document);
-    response.headers.set(MUTATION_CSRF_HEADER, csrfToken);
-    return response;
+    response.headers.set(MUTATION_CSRF_HEADER, csrf.token);
+    return withSetCookies(response, [clearCookie, csrf.setCookie]);
   } catch (error) {
-    return mappedFailureResponse(representation, context.resourceUrl, error);
+    return withSetCookie(
+      mappedFailureResponse(representation, context.resourceUrl, error),
+      clearCookie,
+    );
   }
 }
 
@@ -466,6 +489,50 @@ function validCsrfToken(value: string | null): value is string {
     value.length >= 32 &&
     value.length <= 256 &&
     /^[A-Za-z0-9_-]+$/.test(value);
+}
+
+function requiredCsrfProof(
+  value: string | BrowserMutationProof | null,
+): Readonly<{ token: string; setCookie: string | null }> {
+  if (typeof value === "string") {
+    if (!validCsrfToken(value)) throw new StorageFailure("UNAVAILABLE");
+    return Object.freeze({ token: value, setCookie: null });
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !validCsrfToken(value.token) ||
+    !validSetCookie(value.setCookie)
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return Object.freeze({ token: value.token, setCookie: value.setCookie });
+}
+
+function validSetCookie(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 4_096 &&
+    !/[\r\n]/u.test(value);
+}
+
+function withSetCookie(response: Response, cookie: string | null): Response {
+  return withSetCookies(response, [cookie]);
+}
+
+function withSetCookies(
+  response: Response,
+  cookies: readonly (string | null)[],
+): Response {
+  const selected = cookies.filter(validSetCookie);
+  if (selected.length === 0) return response;
+  const headers = new Headers(response.headers);
+  for (const cookie of selected) headers.append("Set-Cookie", cookie);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function mappedFailureResponse(

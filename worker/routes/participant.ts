@@ -25,13 +25,20 @@ export {
   type ParticipantPackageReaderDependencies,
 } from "./participant-package-reader.ts";
 
+export {
+  createParticipantPackageAcknowledgmentRouteHandler,
+  MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
+  MAX_ACKNOWLEDGMENT_MUTATION_FIELDS,
+  type ParticipantPackageAcknowledgmentRouteDependencies,
+} from "./participant-package-acknowledgment.ts";
+
 export function createParticipantRouteHandler(
   resourceHandlers: readonly ApplicationRouteHandler[] = [],
   capabilities: ParticipantRouteCapabilities = {},
 ): ApplicationRouteHandler {
   return composeRouteHandlers([
-    createParticipantHomeRouteHandler(capabilities),
     ...resourceHandlers,
+    createParticipantHomeRouteHandler(capabilities),
   ]);
 }
 

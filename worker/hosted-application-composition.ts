@@ -97,6 +97,7 @@ async function composeHostedApplicationRuntime(
       repositoryFactory,
       mutationSession,
       publicationReady: configuration.publicationReady,
+      now,
     });
   } catch {
     return null;

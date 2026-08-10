@@ -63,6 +63,12 @@ export type VerifiedBrowserMutationRequest = VerifiedMutationRequest &
     clearCookie: string;
   }>;
 
+export type BrowserMutationVerificationLimits = Readonly<{
+  maxBodyBytes?: number;
+  maxFields?: number;
+  repeatedFormFields?: readonly string[];
+}>;
+
 export type BrowserMutationSessionDependencies = Readonly<{
   appOrigin: string;
   encryptionKey: CryptoKey | null | undefined;
@@ -73,12 +79,6 @@ export type BrowserMutationSessionDependencies = Readonly<{
   cookiePrefix?: string;
   maxBodyBytes?: number;
   maxFields?: number;
-  repeatedFormFields?: readonly string[];
-}>;
-
-export type BrowserMutationVerificationLimits = Readonly<{
-  maxBodyBytes: number;
-  maxFields: number;
   repeatedFormFields?: readonly string[];
 }>;
 
@@ -183,7 +183,7 @@ export function createBrowserMutationSession(
       request: Request,
       identity: TrustedSitesMutationIdentity | null,
       appOriginValue: string,
-      requestedLimits?: BrowserMutationVerificationLimits,
+      limits: BrowserMutationVerificationLimits = {},
     ) {
       const actor = requiredContext(
         config,
@@ -191,9 +191,9 @@ export function createBrowserMutationSession(
         identity,
         appOriginValue,
       );
-      const limits = verificationLimits(config, requestedLimits);
+      const verification = verificationLimits(config, limits);
       const submitted = parseCapabilityToken(
-        await submittedProofToken(request, limits.maxBodyBytes),
+        await submittedProofToken(request, verification.maxBodyBytes),
       );
       const cookieName = sessionCookieName(config, submitted.capabilityId);
       const cookie = findSessionCookie(
@@ -226,11 +226,11 @@ export function createBrowserMutationSession(
         allowedOrigins: [config.appOrigin],
         resolveSession: async () => session,
         now: () => now,
-        maxBodyBytes: limits.maxBodyBytes,
-        maxFields: limits.maxFields,
-        ...(limits.repeatedFormFields.length === 0
+        maxBodyBytes: verification.maxBodyBytes,
+        maxFields: verification.maxFields,
+        ...(verification.repeatedFormFields.length === 0
           ? {}
-          : { repeatedFormFields: limits.repeatedFormFields }),
+          : { repeatedFormFields: verification.repeatedFormFields }),
       });
       const verified = await guard(request);
       if (
@@ -264,6 +264,51 @@ export function createBrowserMutationSession(
         clearCookie: expiredSessionCookie(cookieName),
       });
     },
+  });
+}
+
+function verificationLimits(
+  config: ValidatedConfiguration,
+  input: BrowserMutationVerificationLimits,
+): Readonly<{
+  maxBodyBytes: number;
+  maxFields: number;
+  repeatedFormFields: readonly string[];
+}> {
+  const maxBodyBytes = input.maxBodyBytes ?? config.maxBodyBytes;
+  const maxFields = input.maxFields ?? config.maxFields;
+  const repeatedFormFields = input.repeatedFormFields ??
+    config.repeatedFormFields;
+  if (
+    !Number.isSafeInteger(maxBodyBytes) ||
+    maxBodyBytes < 1 ||
+    maxBodyBytes > config.maxBodyBytes ||
+    !Number.isSafeInteger(maxFields) ||
+    maxFields < 1 ||
+    maxFields > config.maxFields ||
+    !Array.isArray(repeatedFormFields) ||
+    repeatedFormFields.some((field) =>
+      !config.repeatedFormFields.includes(field)
+    )
+  ) {
+    unavailable();
+  }
+  const candidate = {
+    allowedOrigins: [config.appOrigin],
+    resolveSession: async () => null,
+    maxBodyBytes,
+    maxFields,
+    repeatedFormFields,
+  };
+  try {
+    createBrowserMutationGuard(candidate);
+  } catch {
+    unavailable();
+  }
+  return Object.freeze({
+    maxBodyBytes,
+    maxFields,
+    repeatedFormFields: Object.freeze([...repeatedFormFields]),
   });
 }
 
@@ -324,53 +369,7 @@ function validateConfiguration(
     cookiePrefix,
     maxBodyBytes,
     maxFields,
-    repeatedFormFields,
-  });
-}
-
-function verificationLimits(
-  config: ValidatedConfiguration,
-  requested: BrowserMutationVerificationLimits | undefined,
-): Readonly<{
-  maxBodyBytes: number;
-  maxFields: number;
-  repeatedFormFields: readonly string[];
-}> {
-  if (requested === undefined) {
-    return Object.freeze({
-      maxBodyBytes: config.maxBodyBytes,
-      maxFields: config.maxFields,
-      repeatedFormFields: config.repeatedFormFields,
-    });
-  }
-  if (
-    !Number.isSafeInteger(requested.maxBodyBytes) ||
-    requested.maxBodyBytes < 1 ||
-    requested.maxBodyBytes > config.maxBodyBytes ||
-    !Number.isSafeInteger(requested.maxFields) ||
-    requested.maxFields < 1 ||
-    requested.maxFields > config.maxFields
-  ) {
-    unavailable();
-  }
-  const repeatedFormFields = Object.freeze([
-    ...(requested.repeatedFormFields ?? []),
-  ]);
-  try {
-    createBrowserMutationGuard({
-      allowedOrigins: [config.appOrigin],
-      resolveSession: async () => null,
-      maxBodyBytes: requested.maxBodyBytes,
-      maxFields: requested.maxFields,
-      ...(repeatedFormFields.length === 0 ? {} : { repeatedFormFields }),
-    });
-  } catch {
-    unavailable();
-  }
-  return Object.freeze({
-    maxBodyBytes: requested.maxBodyBytes,
-    maxFields: requested.maxFields,
-    repeatedFormFields,
+    repeatedFormFields: Object.freeze([...repeatedFormFields]),
   });
 }
 

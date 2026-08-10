@@ -559,6 +559,62 @@ test("route verification limits stay narrower than the shared session ceiling", 
   assert.equal(harness.claims.calls.length, 0);
 });
 
+test("per-route verification limits can only narrow shared fields and repeats", async () => {
+  const harness = await configuredHarness({
+    maxBodyBytes: 512,
+    maxFields: 4,
+    repeatedFormFields: ["tag", "choice"],
+  });
+  const invalidLimits = [
+    { maxBodyBytes: 513, maxFields: 4, repeatedFormFields: ["tag"] },
+    { maxBodyBytes: 256, maxFields: 5, repeatedFormFields: ["tag"] },
+    { maxBodyBytes: 256, maxFields: 3, repeatedFormFields: ["other"] },
+    { maxBodyBytes: 256, maxFields: 1, repeatedFormFields: ["tag", "choice"] },
+    { maxBodyBytes: 256, maxFields: 3, repeatedFormFields: ["tag", "tag"] },
+  ] as const;
+  for (const limits of invalidLimits) {
+    const malformed = new Request(`${APP_ORIGIN}/participant/action`, {
+      method: "POST",
+      headers: {
+        origin: APP_ORIGIN,
+        "content-type": "application/json",
+        [MUTATION_CSRF_HEADER]: "not-a-capability",
+      },
+      body: "{",
+    });
+    assert.equal(
+      (await captureFailure(() => harness.session.verifyMutation(
+        malformed,
+        PARTICIPANT,
+        APP_ORIGIN,
+        limits,
+      ))).code,
+      "SERVICE_UNAVAILABLE",
+    );
+  }
+  assert.equal(harness.claims.calls.length, 0);
+  assert.equal(harness.claims.claimed.size, 0);
+
+  const proof = await issue(harness.session);
+  const request = rawRequest(
+    proof,
+    `${MUTATION_CSRF_FIELD}=${proof.token}&tag=first&tag=second`,
+    "application/x-www-form-urlencoded",
+  );
+  const verified = await harness.session.verifyMutation(
+    request,
+    PARTICIPANT,
+    APP_ORIGIN,
+    {
+      maxBodyBytes: 256,
+      maxFields: 3,
+      repeatedFormFields: ["tag"],
+    },
+  );
+  assert.deepEqual(verified.body.tag, ["first", "second"]);
+  assert.equal(harness.claims.claimed.size, 1);
+});
+
 test("missing, shared, or unsuitable hosted key material creates no capability", async () => {
   const claims = new AtomicClaims();
   assert.throws(
@@ -683,6 +739,7 @@ type HarnessOptions = Readonly<{
   now?: () => Date;
   maxBodyBytes?: number;
   maxFields?: number;
+  repeatedFormFields?: readonly string[];
   claims?: AtomicClaims;
   claimReplay?: (claim: BrowserMutationReplayClaim) => Promise<boolean>;
 }>;
@@ -712,6 +769,9 @@ async function configuredHarness(
     ...(options.maxFields === undefined
       ? {}
       : { maxFields: options.maxFields }),
+    ...(options.repeatedFormFields === undefined
+      ? {}
+      : { repeatedFormFields: options.repeatedFormFields }),
   });
   return Object.freeze({ session, claims });
 }

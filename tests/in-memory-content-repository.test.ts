@@ -28,6 +28,7 @@ import {
 import {
   InMemoryAcknowledgmentRepository,
   InMemoryPackageVersionRepository,
+  type CurrentPackageAcceptanceBinding,
   type RecordPackageAcceptanceRequest,
 } from "../repositories/in-memory-content-repository.ts";
 
@@ -295,6 +296,171 @@ test("snapshots stay immutable and material changes renew acceptance", async () 
   );
 });
 
+test("acceptance gate rejects a package published after the acceptance read", async () => {
+  const state = new MemoryStorageState();
+  const ownerStorage = new DeterministicMemoryStorageAdapter(
+    state,
+    () => true,
+    () => true,
+  );
+  const participantStorage = new DeterministicMemoryStorageAdapter(
+    state,
+    () => true,
+    () => true,
+  );
+  const interleavedStorage = new InterleavingStorageAdapter(participantStorage);
+  const ownerPackages = new InMemoryPackageVersionRepository(ownerStorage);
+  const participantPackages = new InMemoryPackageVersionRepository(
+    interleavedStorage,
+  );
+  const acknowledgments = new InMemoryAcknowledgmentRepository(
+    interleavedStorage,
+    participantPackages,
+    actorSubject("oidc:acceptance-race"),
+  );
+  const first = await ownerPackages.append({
+    operationId: operationId("operation:acceptance-race-v1"),
+    expectedRevision: null,
+    draft: packageDraft(
+      "package:acceptance-race-v1",
+      "2026-08-02T12:00:00.000Z",
+      true,
+      "Initial requirement",
+    ),
+  });
+
+  interleavedStorage.beforeNextAcceptanceTransaction(async () => {
+    await ownerPackages.append({
+      operationId: operationId("operation:acceptance-race-v2"),
+      expectedRevision: first.revision,
+      draft: packageDraft(
+        "package:acceptance-race-v2",
+        "2026-08-02T12:01:00.000Z",
+        true,
+        "Replacement requirement",
+      ),
+    });
+  });
+
+  const staleAcceptanceId = stableId<"package-acceptance">(
+    "acceptance:package-race",
+  );
+  await rejectsStorage(
+    () => acknowledgments.record({
+      operationId: operationId("operation:acceptance-package-race"),
+      expectedRevision: null,
+      id: staleAcceptanceId,
+      acceptedAt: timestamp("2026-08-02T12:02:00.000Z"),
+      acceptedVersionId: first.snapshot.id,
+    }),
+    "PRECONDITION_FAILED",
+  );
+
+  assert.equal(await acknowledgments.get(staleAcceptanceId), null);
+  assert.equal(await acknowledgments.latest(), null);
+  assert.equal(await acknowledgments.requiresCurrentAcceptance(), true);
+  assert.equal((await ownerPackages.current())?.revision, 2);
+
+  const current = await ownerPackages.current();
+  assert(current);
+  await acknowledgments.record(
+    acceptanceRequest(
+      "acceptance:package-race-current",
+      current.snapshot.id,
+      "2026-08-02T12:03:00.000Z",
+      "operation:acceptance-package-race-current",
+      null,
+    ),
+  );
+  assert.equal((await ownerPackages.current())?.revision, 2);
+  assert.equal(await acknowledgments.requiresCurrentAcceptance(), false);
+});
+
+test("acceptance status retries an interleaved gate and never satisfies an obsolete requirement", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(
+    state,
+    () => true,
+    () => true,
+  );
+  const packages = new InMemoryPackageVersionRepository(storage);
+  const subject = actorSubject("oidc:acceptance-status-race");
+  const acknowledgments = new InMemoryAcknowledgmentRepository(
+    storage,
+    packages,
+    subject,
+  );
+  const first = await packages.append({
+    operationId: operationId("operation:acceptance-status-v1"),
+    expectedRevision: null,
+    draft: packageDraft(
+      "package:acceptance-status-v1",
+      "2026-08-02T13:00:00.000Z",
+      true,
+      "Accepted old requirement",
+    ),
+  });
+  await acknowledgments.record(
+    acceptanceRequest(
+      "acceptance:status-v1",
+      first.snapshot.id,
+      "2026-08-02T13:01:00.000Z",
+      "operation:acceptance-status-record-v1",
+      null,
+    ),
+  );
+  const second = await packages.append({
+    operationId: operationId("operation:acceptance-status-v2"),
+    expectedRevision: first.revision,
+    draft: packageDraft(
+      "package:acceptance-status-v2",
+      "2026-08-02T13:02:00.000Z",
+      true,
+      "New current requirement",
+    ),
+  });
+  const oldBinding = Object.freeze({
+    bindingRevision: 2,
+    snapshot: first.snapshot,
+  });
+  const currentBinding = Object.freeze({
+    bindingRevision: 3,
+    snapshot: second.snapshot,
+  });
+  const interleavedPackages = new SequencedAcceptanceBindingRepository(
+    storage,
+    [oldBinding, currentBinding, currentBinding, currentBinding],
+  );
+  const interleavedAcknowledgments = new InMemoryAcknowledgmentRepository(
+    storage,
+    interleavedPackages,
+    subject,
+  );
+  assert.equal(
+    await interleavedAcknowledgments.requiresCurrentAcceptance(),
+    true,
+  );
+  assert.equal(interleavedPackages.bindingReads, 4);
+
+  const churningPackages = new SequencedAcceptanceBindingRepository(
+    storage,
+    Array.from({ length: 6 }, (_, index) => Object.freeze({
+      bindingRevision: 10 + index,
+      snapshot: second.snapshot,
+    })),
+  );
+  const churningAcknowledgments = new InMemoryAcknowledgmentRepository(
+    storage,
+    churningPackages,
+    subject,
+  );
+  await rejectsStorage(
+    () => churningAcknowledgments.requiresCurrentAcceptance(),
+    "UNAVAILABLE",
+  );
+  assert.equal(churningPackages.bindingReads, 6);
+});
+
 test("subjects and adapter grants prevent private or foreign disclosure", async () => {
   const fixture = createFixture();
   const privateDraft = packageDraft(
@@ -387,6 +553,332 @@ test("subjects and adapter grants prevent private or foreign disclosure", async 
   );
 });
 
+test("stored package records reject hostile envelopes and closed-document drift", async () => {
+  const fixture = await createStrictRecordFixture();
+  const collections = [
+    "private-package-versions",
+    "private-package-operation-intents",
+    "private-package-version-sections",
+    "private-package-section-chunks",
+    "private-package-version-heads",
+    "private-package-acceptance-bindings",
+    "private-package-acceptances",
+    "private-package-acceptance-heads",
+  ] as const;
+  const immutable = new Set<string>([
+    "private-package-versions",
+    "private-package-operation-intents",
+    "private-package-version-sections",
+    "private-package-section-chunks",
+    "private-package-acceptances",
+  ]);
+  const mutations = [
+    {
+      name: "wrong requested key",
+      mutate: (record: StorageRecord) => freezeRecord({
+        key: {
+          ...record.key,
+          id: stableId<"storage-record">("hostile-record-key"),
+        },
+        revision: record.revision,
+        value: record.value,
+      }),
+    },
+    {
+      name: "extra document field",
+      mutate: (record: StorageRecord) => freezeRecord({
+        key: record.key,
+        revision: record.revision,
+        value: { ...record.value, hostile: true },
+      }),
+    },
+    {
+      name: "wrong schema",
+      mutate: (record: StorageRecord) => freezeRecord({
+        key: record.key,
+        revision: record.revision,
+        value: { ...record.value, schemaVersion: 2 },
+      }),
+    },
+    {
+      name: "wrong kind",
+      mutate: (record: StorageRecord) => freezeRecord({
+        key: record.key,
+        revision: record.revision,
+        value: { ...record.value, kind: "hostile-record" },
+      }),
+    },
+  ];
+
+  for (const collection of collections) {
+    for (const mutation of mutations) {
+      const adapter = new ReadTamperingStorageAdapter(
+        fixture.storage,
+        collection,
+        mutation.mutate,
+      );
+      await rejectsStorage(
+        () => probeStoredCollection(adapter, fixture.subject, collection),
+        "UNAVAILABLE",
+      );
+    }
+    if (immutable.has(collection)) {
+      const revisionTwo = new ReadTamperingStorageAdapter(
+        fixture.storage,
+        collection,
+        (record) => freezeRecord({
+          key: record.key,
+          revision: 2,
+          value: record.value,
+        }),
+      );
+      await rejectsStorage(
+        () => probeStoredCollection(revisionTwo, fixture.subject, collection),
+        "UNAVAILABLE",
+      );
+    }
+  }
+
+  const semanticDrift = [
+    {
+      collection: "private-package-versions",
+      mutate: (record: StorageRecord) => withRecordValue(record, {
+        ...record.value,
+        sectionRecordIds: [
+          ...(record.value.sectionRecordIds as string[]),
+          ...(record.value.sectionRecordIds as string[]),
+        ],
+      }),
+    },
+    {
+      collection: "private-package-version-sections",
+      mutate: (record: StorageRecord) => withRecordValue(record, {
+        ...record.value,
+        order: 1,
+      }),
+    },
+    {
+      collection: "private-package-section-chunks",
+      mutate: (record: StorageRecord) => withRecordValue(record, {
+        ...record.value,
+        index: 1,
+      }),
+    },
+    {
+      collection: "private-package-acceptance-bindings",
+      mutate: (record: StorageRecord) => withRecordValue(record, {
+        ...record.value,
+        requiredAcceptanceHash: `sha256:${"f".repeat(64)}`,
+      }),
+    },
+    {
+      collection: "private-package-operation-intents",
+      mutate: (record: StorageRecord) => withRecordValue(record, {
+        ...record.value,
+        normalizedMutationHash: `sha256:${"e".repeat(64)}`,
+      }),
+    },
+    {
+      collection: "private-package-operation-intents",
+      mutate: (record: StorageRecord) => withRecordValue(record, {
+        ...record.value,
+        createdAt: "2026-08-03T11:00:00.000Z",
+      }),
+    },
+    {
+      collection: "private-package-acceptances",
+      mutate: (record: StorageRecord) => withRecordValue(record, {
+        ...record.value,
+        acceptedContentHash: `sha256:${"d".repeat(64)}`,
+      }),
+    },
+  ] as const;
+  for (const drift of semanticDrift) {
+    const adapter = new ReadTamperingStorageAdapter(
+      fixture.storage,
+      drift.collection,
+      drift.mutate,
+    );
+    await rejectsStorage(
+      () => probeStoredCollection(adapter, fixture.subject, drift.collection),
+      "UNAVAILABLE",
+    );
+  }
+
+  const oversizedChunk = new ReadTamperingStorageAdapter(
+    fixture.storage,
+    "private-package-section-chunks",
+    (record) => withRecordValue(record, {
+      ...record.value,
+      markdown: "x".repeat(60_000),
+    }),
+  );
+  await rejectsStorage(
+    () => probeStoredCollection(
+      oversizedChunk,
+      fixture.subject,
+      "private-package-section-chunks",
+    ),
+    "UNAVAILABLE",
+  );
+});
+
+test("64 section manifests with 64 chunks each fail before chunk allocation", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(
+    state,
+    () => true,
+    () => true,
+  );
+  const packages = new InMemoryPackageVersionRepository(storage);
+  await packages.append({
+    operationId: operationId("operation:hostile-64x64-package"),
+    expectedRevision: null,
+    draft: {
+      id: "package:hostile-64x64",
+      createdAt: "2026-08-03T10:00:00.000Z",
+      changeSummary: "Created a maximum section package",
+      materialChange: true,
+      acknowledgmentText: "I acknowledge the maximum section package.",
+      sections: Array.from({ length: 64 }, (_, index) => ({
+        id: `section:hostile-64x64-${index}`,
+        order: index,
+        title: `Section ${index + 1}`,
+        markdown: "Bounded content",
+        enabled: true,
+      })),
+    },
+  });
+  const chunkIds = Array.from({ length: 64 }, (_, index) =>
+    stableId<"storage-record">(`hostile-chunk-${index}`)
+  );
+  const tampered = new ReadTamperingStorageAdapter(
+    storage,
+    "private-package-version-sections",
+    (record) => withRecordValue(record, {
+      ...record.value,
+      chunkRecordIds: chunkIds,
+    }),
+  );
+  await rejectsStorage(
+    () => new InMemoryPackageVersionRepository(tampered).current(),
+    "UNAVAILABLE",
+  );
+  assert.equal(
+    tampered.readsByCollection.get("private-package-section-chunks") ?? 0,
+    0,
+  );
+});
+
+test("intent, stage, package, audit, and acknowledgment reject malformed transaction results", async () => {
+  const variants: readonly Readonly<{
+    name: string;
+    tamper: (
+      result: StorageTransactionResult,
+    ) => unknown;
+  }>[] = [
+    {
+      name: "non-boolean replay",
+      tamper: (result) => ({ ...result, replayed: "false" }),
+    },
+    {
+      name: "extra result field",
+      tamper: (result) => ({ ...result, extra: true }),
+    },
+    {
+      name: "missing result record",
+      tamper: (result) => ({ ...result, records: result.records.slice(0, -1) }),
+    },
+    {
+      name: "extra result record",
+      tamper: (result) => ({
+        ...result,
+        records: [...result.records, result.records[0] ?? null],
+      }),
+    },
+    {
+      name: "null positional record",
+      tamper: (result) => ({
+        ...result,
+        records: [null, ...result.records.slice(1)],
+      }),
+    },
+    {
+      name: "mismatched positional key",
+      tamper: (result) => ({
+        ...result,
+        records: replaceTransactionRecord(result, 0, (record) => ({
+          ...record,
+          key: { ...record.key, id: "hostile-result-key" },
+        })),
+      }),
+    },
+    {
+      name: "mismatched positional revision",
+      tamper: (result) => ({
+        ...result,
+        records: replaceTransactionRecord(result, 0, (record) => ({
+          ...record,
+          revision: record.revision + 1,
+        })),
+      }),
+    },
+    {
+      name: "mismatched positional value",
+      tamper: (result) => ({
+        ...result,
+        records: replaceTransactionRecord(result, 0, (record) => ({
+          ...record,
+          value: { ...record.value, hostile: true },
+        })),
+      }),
+    },
+    {
+      name: "extra record envelope field",
+      tamper: (result) => ({
+        ...result,
+        records: replaceTransactionRecord(result, 0, (record) => ({
+          ...record,
+          hostile: true,
+        })),
+      }),
+    },
+    {
+      name: "mismatched final audit value",
+      tamper: (result) => ({
+        ...result,
+        records: replaceTransactionRecord(
+          result,
+          result.records.length - 1,
+          (record) => ({
+            ...record,
+            value: { ...record.value, hostile: true },
+          }),
+        ),
+      }),
+    },
+  ];
+  const targets = [
+    "private-package-operation-intents",
+    "private-package-section-chunks",
+    "private-package-versions",
+    "private-package-acceptances",
+  ] as const;
+
+  for (const [targetIndex, target] of targets.entries()) {
+    for (const [variantIndex, variant] of variants.entries()) {
+      await rejectsStorage(
+        () => runMalformedTransactionResult(
+          target,
+          variant.tamper,
+          targetIndex * variants.length + variantIndex,
+        ),
+        "UNAVAILABLE",
+      );
+    }
+  }
+});
+
 type Fixture = Readonly<{
   alice: ActorSubject;
   bob: ActorSubject;
@@ -397,6 +889,149 @@ type Fixture = Readonly<{
   bobAcknowledgments: InMemoryAcknowledgmentRepository;
   visitorAcknowledgments: InMemoryAcknowledgmentRepository;
 }>;
+
+async function createStrictRecordFixture(): Promise<Readonly<{
+  storage: StorageAdapter;
+  subject: ActorSubject;
+}>> {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(
+    state,
+    () => true,
+    () => true,
+  );
+  const packages = new InMemoryPackageVersionRepository(storage);
+  const subject = actorSubject("oidc:strict-record-fixture");
+  const acknowledgments = new InMemoryAcknowledgmentRepository(
+    storage,
+    packages,
+    subject,
+  );
+  const version = await packages.append({
+    operationId: operationId("operation:strict-record-package"),
+    expectedRevision: null,
+    draft: packageDraft(
+      "package:strict-record",
+      "2026-08-03T09:30:00.000Z",
+      true,
+      "Strict stored package",
+    ),
+  });
+  await acknowledgments.record(
+    acceptanceRequest(
+      "acceptance:strict-record",
+      version.snapshot.id,
+      "2026-08-03T09:31:00.000Z",
+      "operation:strict-record-acceptance",
+      null,
+    ),
+  );
+  return Object.freeze({ storage, subject });
+}
+
+async function probeStoredCollection(
+  storage: StorageAdapter,
+  subject: ActorSubject,
+  collection: string,
+): Promise<unknown> {
+  const packages = new InMemoryPackageVersionRepository(storage);
+  if (collection === "private-package-acceptance-bindings") {
+    return packages.currentAcceptanceBinding();
+  }
+  if (
+    collection === "private-package-acceptances" ||
+    collection === "private-package-acceptance-heads"
+  ) {
+    return new InMemoryAcknowledgmentRepository(
+      storage,
+      packages,
+      subject,
+    ).latest();
+  }
+  return packages.current();
+}
+
+function withRecordValue(
+  record: StorageRecord,
+  value: StorageDocument,
+): StorageRecord {
+  return freezeRecord({ key: record.key, revision: record.revision, value });
+}
+
+function replaceTransactionRecord(
+  result: StorageTransactionResult,
+  index: number,
+  replace: (record: StorageRecord) => unknown,
+): readonly unknown[] {
+  const record = result.records[index];
+  assert(record);
+  return result.records.map((candidate, candidateIndex) =>
+    candidateIndex === index ? replace(record) : candidate
+  );
+}
+
+async function runMalformedTransactionResult(
+  targetCollection: string,
+  tamper: (result: StorageTransactionResult) => unknown,
+  suffix: number,
+): Promise<unknown> {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(
+    state,
+    () => true,
+    () => true,
+  );
+  const owner = actorSubject(`oidc:malformed-result-owner-${suffix}`);
+  if (targetCollection === "private-package-acceptances") {
+    const packages = new InMemoryPackageVersionRepository(storage);
+    const version = await packages.append({
+      operationId: operationId(`operation:malformed-ack-package-${suffix}`),
+      expectedRevision: null,
+      draft: packageDraft(
+        `package:malformed-ack-${suffix}`,
+        "2026-08-03T11:00:00.000Z",
+        true,
+        "Malformed acknowledgment result",
+      ),
+    });
+    const tampered = new TransactionResultTamperingAdapter(
+      storage,
+      targetCollection,
+      tamper,
+    );
+    const participantPackages = new InMemoryPackageVersionRepository(tampered);
+    return new InMemoryAcknowledgmentRepository(
+      tampered,
+      participantPackages,
+      owner,
+    ).record(
+      acceptanceRequest(
+        `acceptance:malformed-result-${suffix}`,
+        version.snapshot.id,
+        "2026-08-03T11:01:00.000Z",
+        `operation:malformed-ack-result-${suffix}`,
+        null,
+      ),
+    );
+  }
+
+  const tampered = new TransactionResultTamperingAdapter(
+    storage,
+    targetCollection,
+    tamper,
+  );
+  return new InMemoryPackageVersionRepository(tampered).appendWithAudit({
+    operationId: operationId(`operation:malformed-package-result-${suffix}`),
+    expectedRevision: null,
+    ownerSubject: owner,
+    draft: packageDraft(
+      `package:malformed-result-${suffix}`,
+      "2026-08-03T11:00:00.000Z",
+      true,
+      "Malformed package transaction result",
+    ),
+  });
+}
 
 function createFixture(): Fixture {
   const state = new MemoryStorageState();
@@ -643,6 +1278,149 @@ class DeterministicMemoryStorageAdapter implements StorageAdapter {
     });
     this.#state.operations.set(operationKey, { fingerprint, result });
     return cloneResult(result, false);
+  }
+}
+
+class InterleavingStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  #beforeAcceptanceTransaction: (() => Promise<void>) | null = null;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+  }
+
+  beforeNextAcceptanceTransaction(callback: () => Promise<void>): void {
+    this.#beforeAcceptanceTransaction = callback;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    const callback = request.mutations.some(
+        (mutation) =>
+          mutation.key.collection === "private-package-acceptances",
+      )
+      ? this.#beforeAcceptanceTransaction
+      : null;
+    if (callback !== null) {
+      this.#beforeAcceptanceTransaction = null;
+      await callback();
+    }
+    return this.#delegate.transact(request);
+  }
+}
+
+class ReadTamperingStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #collection: string;
+  readonly #mutate: (record: StorageRecord) => StorageRecord;
+  readonly readsByCollection = new Map<string, number>();
+
+  constructor(
+    delegate: StorageAdapter,
+    collection: string,
+    mutate: (record: StorageRecord) => StorageRecord,
+  ) {
+    this.#delegate = delegate;
+    this.#collection = collection;
+    this.#mutate = mutate;
+  }
+
+  async read(key: StorageKey): Promise<StorageRecord | null> {
+    this.readsByCollection.set(
+      key.collection,
+      (this.readsByCollection.get(key.collection) ?? 0) + 1,
+    );
+    const record = await this.#delegate.read(key);
+    return record !== null && key.collection === this.#collection
+      ? this.#mutate(record)
+      : record;
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    return this.#delegate.transact(request);
+  }
+}
+
+class TransactionResultTamperingAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #collection: string;
+  readonly #tamper: (result: StorageTransactionResult) => unknown;
+  #tampered = false;
+
+  constructor(
+    delegate: StorageAdapter,
+    collection: string,
+    tamper: (result: StorageTransactionResult) => unknown,
+  ) {
+    this.#delegate = delegate;
+    this.#collection = collection;
+    this.#tamper = tamper;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    const result = await this.#delegate.transact(request);
+    if (
+      !this.#tampered &&
+      request.mutations.some(
+        (mutation) => mutation.key.collection === this.#collection,
+      )
+    ) {
+      this.#tampered = true;
+      return this.#tamper(result) as StorageTransactionResult;
+    }
+    return result;
+  }
+}
+
+class SequencedAcceptanceBindingRepository
+  extends InMemoryPackageVersionRepository
+{
+  readonly #bindings: readonly CurrentPackageAcceptanceBinding[];
+  bindingReads = 0;
+
+  constructor(
+    storage: StorageAdapter,
+    bindings: readonly CurrentPackageAcceptanceBinding[],
+  ) {
+    super(storage);
+    assert.ok(bindings.length > 0);
+    this.#bindings = bindings;
+  }
+
+  override async currentAcceptanceBinding(): Promise<
+    CurrentPackageAcceptanceBinding | null
+  > {
+    const binding = this.#bindings[
+      Math.min(this.bindingReads, this.#bindings.length - 1)
+    ];
+    this.bindingReads += 1;
+    assert(binding);
+    return binding;
   }
 }
 

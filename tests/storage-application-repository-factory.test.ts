@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseTimestamp } from "../domain/foundation.ts";
+import { parseActorSubject, parseTimestamp } from "../domain/foundation.ts";
 import {
   StorageFailure,
   type StorageAdapter,
@@ -165,11 +165,13 @@ test("factory rejects anything other than a complete adapter", () => {
   );
 });
 
-test("factory exposes only named replay and campaign capabilities", () => {
+test("factory exposes only named application repository capabilities", () => {
   const storage = new MemoryStorageAdapter();
   const factory = new StorageApplicationRepositoryFactory(storage, () => NOW);
   const campaignRepository = factory.campaignRepository();
   const publicCampaignReader = factory.publicCampaignReader();
+  const subject = parseActorSubject("issuer.invalid/participant:factory");
+  assert(subject.ok);
 
   assert.deepEqual(Object.getOwnPropertyNames(
     Object.getPrototypeOf(factory) as object,
@@ -178,6 +180,9 @@ test("factory exposes only named replay and campaign capabilities", () => {
     "browserMutationReplayClaimer",
     "campaignRepository",
     "publicCampaignReader",
+    "ownerPackageWorkspace",
+    "participantPackageReader",
+    "participantPackageAcknowledgments",
   ]);
   assert.equal(
     factory.campaignRepository(),
@@ -203,6 +208,23 @@ test("factory exposes only named replay and campaign capabilities", () => {
   assertNoGenericStorageSurface(publicCampaignReader, storage);
   assert.equal("storage" in factory, false);
   assert.equal("create" in factory, false);
+  assert.deepEqual(
+    Object.keys(factory.participantPackageReader(subject.value)),
+    ["current"],
+  );
+  const acknowledgment = factory.participantPackageAcknowledgments(
+    subject.value,
+  );
+  assert.deepEqual(Object.keys(acknowledgment), ["packages", "acknowledgments"]);
+  assert.deepEqual(Object.keys(acknowledgment.packages), ["current"]);
+  assert.deepEqual(
+    Object.keys(acknowledgment.acknowledgments),
+    ["get", "latest", "record"],
+  );
+  assert.doesNotMatch(
+    Object.getOwnPropertyNames(Object.getPrototypeOf(factory)).join(" "),
+    /adapter|storage|create/iu,
+  );
   assert.equal(Object.isFrozen(factory), true);
   assert.deepEqual(JSON.parse(JSON.stringify(factory)), {});
 });

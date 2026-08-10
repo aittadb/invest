@@ -7,14 +7,18 @@ boundary for Investor App persistence. It composes one confidential service
 token provider, one bounded AittaDB `StorageAdapter`, one backend repository
 factory, and one browser-mutation session per immutable Sites environment.
 
-The runtime now composes persistent campaign setup and presentation capabilities
-over that adapter. `createApplicationWorker` installs `/owner/setup`, its
-preview, and the campaign editor/preview/publish/unpublish resources only in the
-owner route group. Package, participant, founder, indication, aggregate,
-moderation, export, and deletion workflows still require their own named
-persistent capabilities.
+The runtime now composes named persistent campaign and package capabilities over
+that adapter. `createApplicationWorker` installs `/owner/setup`, campaign
+editing, draft preview, publish/unpublish, and owner package management only in
+the configured-owner route group. Registered-participant package reading and
+current-package acknowledgment are subject-bound and additionally require the
+trusted `participantAccess` projection. Until TASK-090 supplies that persistent
+projection, those participant routes remain non-disclosing and unavailable
+without opening the package repository. Founder, indication, aggregate,
+moderation, export, deletion, registration, and profile composition still
+require their own named persistent capabilities.
 
-This source composition and its deterministic protocol service are not hosted
+This source composition and its deterministic protocol services are not hosted
 acceptance evidence. Activation remains blocked until the configured AittaDB
 deployment passes the required storage, authorization, quota, retention, and
 credential-boundary proof.
@@ -77,6 +81,7 @@ only:
   repositoryFactory,
   mutationSession,
   publicationReady,
+  now,
 }
 ```
 
@@ -96,14 +101,17 @@ redirect and carry the bearer value only to the validated transport target.
 ## Repository Factory
 
 `StorageApplicationRepositoryFactory` closes over the single credential-bound
-adapter and exposes only named, narrow capability methods. It intentionally has
-no generic builder or adapter accessor. Its methods return the browser-mutation
-replay claimer, the atomic campaign/audit repository, and the public campaign
-projection reader. The Worker calls these methods centrally and passes routes
+adapter and exposes only named, narrow capability methods for browser-mutation
+replay, the atomic campaign/audit repository, the public campaign projection
+reader, the owner package workspace, a participant package reader, and
+subject-bound package acknowledgment. It intentionally has no generic builder
+or adapter accessor. The Worker calls these methods centrally and passes routes
 only their declared interfaces and mutation session; it never passes the
 adapter or factory into route context. The factory does not infer persistence
 from a hostname, owner, campaign, D1, R2, browser store, file, or process-memory
-map.
+map. `StoragePackageVersionRepository` and
+`StorageAcknowledgmentRepository` retain no local authority; their historical
+`InMemory*` names remain compatibility exports for deterministic fixtures.
 
 `StorageCampaignRepository` is production-neutral and retains no state outside
 its supplied adapter. Hosted composition supplies only `AittaDBStorageAdapter`.
@@ -141,6 +149,66 @@ flag and the exact record count, mutation order, keys, revisions, and values.
 Extra, null, missing, reordered, or mismatched records fail closed. Hosted quota
 and retention policy must account for bounded cleanup of unreachable content.
 
+## Package Storage and Publication
+
+Before any section or chunk is staged, the repository creates an immutable
+operation intent keyed by the owner operation ID. It binds the audited actor or
+explicit unaudited mode, expected owner revision, supplied-versus-computed
+fingerprint, prior package and gate state, the first validated server timestamp,
+and a digest of every normalized metadata and content field. Every retry must
+match that intent before further staging, including after a partial-stage or
+failed-final-publication response. A later clock reading is replaced by the
+persisted timestamp only for that exact operation; owner-controlled fields stay
+fingerprinted and hash-bound. A retry draft first passes closed exact-key,
+data-only validation at every object and array level, so unknown properties,
+accessors, custom prototypes, and decorated arrays fail before staging.
+
+Every immutable package section is then staged under a per-version private
+record. Large Markdown values are divided on Unicode boundaries into
+deterministic immutable chunk records capped below the advertised 65,536-byte
+record limit. Each staged record uses a derived retry-stable operation and a
+one-record transaction, so a 64-section package stays below both record and
+transaction mutation limits. A compact immutable version manifest references
+the section records; it does not inline private section content.
+
+Only the final transaction makes a staged version reachable. That transaction
+atomically creates the version manifest, advances the owner-visible package
+head, advances the package-current gate, and appends closed owner audit
+evidence. A failed prewrite or final transaction leaves no reachable version,
+head, gate, or audit event. Exact retry after failure or Worker reconstruction
+replays completed stages and safely finishes publication only when it matches
+the intent; changed actor, revision, metadata, material flag, fingerprint mode
+or value, staged content, or unstaged content remains conflicting.
+
+All package and acknowledgment records use closed versioned schemas. Reads
+verify the exact requested key and record envelope, immutable or mutable
+revision rule, kind, identifiers, order, count, byte bound, and cross-record
+hashes. Chunk lengths are accumulated against the Markdown limit before
+concatenation or allocation. Every intent, stage, final publication, and
+acknowledgment transaction response must contain an exact boolean replay flag
+and the exact positional key, revision, and value for every requested record;
+prepared audit output is verified separately. Extra, missing, null, reordered,
+or mutated backend results fail closed.
+
+The package-current gate is separate from the owner-visible head and binds the
+exact current version plus required-acceptance hash. Every editorial and
+material publish updates it. An acknowledgment transaction atomically creates
+immutable evidence, advances only that participant's acknowledgment head, and
+compare-and-set writes the unchanged gate value. Owner publication and stale
+acceptance therefore cannot both commit. Private version and acceptance
+metadata retain the original expected gate revision solely to reconstruct an
+exact transaction on replay. Acknowledgment never advances the owner-visible
+package revision, and gate metadata never enters HTML, hypermedia, logs, or
+exports.
+
+The read-side `requiresCurrentAcceptance` repository method samples the exact
+gate before and after reading the latest participant acknowledgment. It returns
+a result only when both samples bind the same gate revision, version, content
+hash, and acceptance requirement; a small bounded retry handles one concurrent
+publication, and continuing gate movement fails closed. The acknowledgment
+route uses a separate single current/latest/current attempt and fails its
+precondition on change rather than running that bounded loop.
+
 ## Browser-Mutation Replay
 
 The factory supplies the first production repository capability: an atomic
@@ -174,9 +242,13 @@ records and receipts cannot exhaust the isolated namespace.
 `worker/index.ts` installs one resolver. `createApplicationWorker` resolves it
 fail-closed but does not place the runtime in `ApplicationRouteContext` or pass
 it to public, participant, image, or framework-rendering code. The Worker calls
-the factory's named campaign methods centrally, then installs setup and editor
-handlers only inside `createOwnerRouteHandler`. Owner capability headers are
-server-replaced and are never authorization by themselves.
+the factory's named campaign and package methods centrally. It installs setup,
+campaign editor, and owner package handlers only inside
+`createOwnerRouteHandler`, and projects only subject-bound package capabilities
+into the participant route group after trusted participant authorization. Owner
+capability headers are server-replaced and are never authorization by
+themselves; generic runtime availability adds no browser header or navigation
+item.
 
 Public route composition receives only `publicCampaignReader()`. That reader is
 bound to `campaign-public-presentation/configured-campaign`; it cannot read the
@@ -212,6 +284,17 @@ Future wiring must preserve these rules:
    D1, R2, or process memory as production persistence. Participant state
    readers are explicit composition dependencies, never environment authority.
 
+The hosted browser-mutation session supports the larger setup envelope, while
+each package route narrows it again. A route's body limit and field-count limit
+cannot exceed the shared policy, and its repeated fields must be a subset of
+the shared repeated-field allowlist. Invalid or wider limits fail before proof
+parsing or replay claim. Owner package mutations accept at most 524,288 bytes,
+nine non-repeated fields, and enough room for the maximum valid URL-encoded
+Unicode package form. Participant acknowledgment remains limited to 512 bytes
+and two non-repeated fields. Body and field failures also occur before the
+replay capability is claimed, so the same proof remains usable for a corrected
+bounded request.
+
 ## Verification
 
 Focused tests cover all-or-nothing configuration, exact readiness parsing,
@@ -224,7 +307,13 @@ campaign/audit atomicity, exact retries, competing revisions, restart behavior,
 unpublish, near-limit UTF-8 forms, the 61,440-byte chunk-record boundary,
 65,536-byte chunk-transaction ceiling, interrupted staging, changed retry
 identity before further writes, lost final responses, and exact hostile
-intent/chunk/final storage-result rejection. The synthetic hosted service implements and enforces
-the discovered AittaDB read/list/transaction controls rather than bypassing the
-adapter. Source and built-artifact scans complement `npm run instances:check`,
-which rejects tracked runtime env files and active Sites bindings.
+intent/chunk/final storage-result rejection. Package coverage includes
+owner/participant route scoping, restart reconstruction, immutable intent
+conflicts, advancing-clock retry recovery, 64-section and maximum-size Unicode
+records, failed-stage and failed-final-publication recovery, hostile record and
+transaction-result matrices, package/acceptance concurrency, stable gate
+sampling, exact material gating, and narrowing-only route mutation limits. The
+synthetic hosted services implement and enforce the discovered AittaDB
+read/list/transaction controls rather than bypassing the adapter. Source
+and built-artifact scans complement `npm run instances:check`, which rejects
+tracked runtime env files and active Sites bindings.

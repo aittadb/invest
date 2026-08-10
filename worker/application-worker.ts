@@ -1,4 +1,7 @@
-import { parseActorSubject } from "../domain/foundation.ts";
+import {
+  parseActorSubject,
+  type ActorSubject,
+} from "../domain/foundation.ts";
 import { isConfiguredOwner } from "../domain/owner-identity.ts";
 import {
   authorizeParticipantAccess,
@@ -20,6 +23,10 @@ import {
   type RuntimeCampaignPreview,
 } from "../http/runtime-preview.ts";
 import type { PublicCampaignPresentationReader } from "../repositories/in-memory-campaign-repository.ts";
+import {
+  parseStorageOperationId,
+  type StorageOperationId,
+} from "../domain/storage-adapter.ts";
 import type {
   ApplicationFetcher,
   ApplicationRouteContext,
@@ -47,14 +54,22 @@ import { createOwnerInitialSetupRouteHandler } from "./routes/owner-initial-setu
 import { createOwnerRouteHandler } from "./routes/owner.ts";
 import {
   createOwnerPackageRouteHandler,
+  MAX_OWNER_PACKAGE_MUTATION_BYTES,
+  MAX_OWNER_PACKAGE_MUTATION_FIELDS,
   type OwnerPackageRouteDependencies,
 } from "./routes/owner-package.ts";
 import {
   createFounderInterestRouteHandler,
   createInvestmentInterestRouteHandler,
+  createParticipantPackageAcknowledgmentRouteHandler,
+  createParticipantPackageReaderRouteHandler,
   createParticipantRouteHandler,
+  MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
+  MAX_ACKNOWLEDGMENT_MUTATION_FIELDS,
   type FounderInterestRouteDependencies,
   type InvestmentInterestRouteDependencies,
+  type ParticipantPackageAcknowledgmentRouteDependencies,
+  type ParticipantPackageReaderDependencies,
 } from "./routes/participant.ts";
 import {
   createOwnerOAuthProofRouteHandler,
@@ -75,6 +90,8 @@ export type ApplicationWorkerDependencies = Readonly<{
   ownerReviewExports?: OwnerReviewExportRouteDependencies;
   participantFounderInterest?: FounderInterestRouteDependencies;
   participantInvestmentInterests?: InvestmentInterestRouteDependencies;
+  participantPackageReader?: ParticipantPackageReaderDependencies;
+  participantPackageAcknowledgment?: ParticipantPackageAcknowledgmentRouteDependencies;
   participantAccessReader?: ParticipantAccessStateReader;
   ownerOAuthProof?: OwnerOAuthProofRouteDependencies;
   resolveOwnerOAuthProof?: (
@@ -99,19 +116,6 @@ export function createApplicationWorker(
     context: WorkerExecutionContext,
   ): Promise<Response>;
 }> {
-  const ownerPackageAvailable = dependencies.dispatchRoute === undefined &&
-    dependencies.ownerPackage !== undefined;
-  const ownerIndicationModerationAvailable =
-    dependencies.dispatchRoute === undefined &&
-    dependencies.ownerIndicationModeration !== undefined;
-  const ownerReviewExportsAvailable = dependencies.dispatchRoute === undefined &&
-    dependencies.ownerReviewExports !== undefined;
-  const participantFounderInterestAvailable =
-    dependencies.dispatchRoute === undefined &&
-    dependencies.participantFounderInterest !== undefined;
-  const participantInvestmentInterestsAvailable =
-    dependencies.dispatchRoute === undefined &&
-    dependencies.participantInvestmentInterests !== undefined;
   return {
     async fetch(request, env, executionContext) {
       const url = new URL(request.url);
@@ -123,6 +127,39 @@ export function createApplicationWorker(
         dependencies,
         env,
       );
+      const packageRoutes = dependencies.dispatchRoute === undefined &&
+          applicationRuntime !== null
+        ? runtimePackageRoutes(
+            applicationRuntime,
+            actor,
+            isOwner,
+            resourceUrl,
+          )
+        : null;
+      const ownerPackage = dependencies.dispatchRoute === undefined
+        ? dependencies.ownerPackage ?? packageRoutes?.owner
+        : undefined;
+      const participantPackageReader = dependencies.dispatchRoute === undefined
+        ? dependencies.participantPackageReader ?? packageRoutes?.participantReader
+        : undefined;
+      const participantPackageAcknowledgment =
+        dependencies.dispatchRoute === undefined
+          ? dependencies.participantPackageAcknowledgment ??
+            packageRoutes?.participantAcknowledgment
+          : undefined;
+      const ownerPackageAvailable = ownerPackage !== undefined;
+      const ownerIndicationModerationAvailable =
+        dependencies.dispatchRoute === undefined &&
+        dependencies.ownerIndicationModeration !== undefined;
+      const ownerReviewExportsAvailable =
+        dependencies.dispatchRoute === undefined &&
+        dependencies.ownerReviewExports !== undefined;
+      const participantFounderInterestAvailable =
+        dependencies.dispatchRoute === undefined &&
+        dependencies.participantFounderInterest !== undefined;
+      const participantInvestmentInterestsAvailable =
+        dependencies.dispatchRoute === undefined &&
+        dependencies.participantInvestmentInterests !== undefined;
       const ownerOAuthProof = dependencies.dispatchRoute === undefined
         ? await resolveOwnerOAuthProof(dependencies, env)
         : null;
@@ -159,7 +196,8 @@ export function createApplicationWorker(
               ? options.campaign ?? null
               : campaign,
             {
-              ownerPackageWorkspace: normalApplication && ownerPackageAvailable,
+              ownerPackageWorkspace:
+                normalApplication && ownerPackageAvailable && isOwner,
               ownerIndicationModeration:
                 normalApplication && ownerIndicationModerationAvailable,
               ownerReviewExports:
@@ -183,6 +221,8 @@ export function createApplicationWorker(
       };
 
       const hasInjectedRoutes = ownerPackageAvailable ||
+        participantPackageReader !== undefined ||
+        participantPackageAcknowledgment !== undefined ||
         ownerIndicationModerationAvailable ||
         ownerReviewExportsAvailable ||
         participantFounderInterestAvailable ||
@@ -195,6 +235,11 @@ export function createApplicationWorker(
               dependencies,
               campaignWorkspace,
               ownerOAuthProof,
+              {
+                owner: ownerPackage,
+                participantReader: participantPackageReader,
+                participantAcknowledgment: participantPackageAcknowledgment,
+              },
               {
                 ownerPackageAvailable,
                 ownerIndicationModerationAvailable,
@@ -249,10 +294,17 @@ type InjectedRouteAvailability = Readonly<{
   ownerOAuthProofAvailable: boolean;
 }>;
 
+type ResolvedPackageRoutes = Readonly<{
+  owner?: OwnerPackageRouteDependencies;
+  participantReader?: ParticipantPackageReaderDependencies;
+  participantAcknowledgment?: ParticipantPackageAcknowledgmentRouteDependencies;
+}>;
+
 function createInjectedRouteDispatcher(
   dependencies: ApplicationWorkerDependencies,
   campaignWorkspace: CampaignWorkspaceDeploymentCapability | null,
   ownerOAuthProof: OwnerOAuthProofRouteDependencies | null,
+  packageRoutes: ResolvedPackageRoutes,
   available: InjectedRouteAvailability,
 ): ApplicationRouteHandler {
   const issueCampaignOperationId = campaignWorkspace?.issueOperationId;
@@ -260,6 +312,16 @@ function createInjectedRouteDispatcher(
     public: handlePublicRoutes,
     participant: createParticipantRouteHandler(
       [
+        ...(packageRoutes.participantReader
+          ? [createParticipantPackageReaderRouteHandler(
+              packageRoutes.participantReader,
+            )]
+          : []),
+        ...(packageRoutes.participantAcknowledgment
+          ? [createParticipantPackageAcknowledgmentRouteHandler(
+              packageRoutes.participantAcknowledgment,
+            )]
+          : []),
         ...(dependencies.participantFounderInterest
           ? [createFounderInterestRouteHandler(
               dependencies.participantFounderInterest,
@@ -278,8 +340,8 @@ function createInjectedRouteDispatcher(
     ),
     owner: createOwnerRouteHandler(
       [
-        ...(dependencies.ownerPackage
-          ? [createOwnerPackageRouteHandler(dependencies.ownerPackage)]
+        ...(packageRoutes.owner
+          ? [createOwnerPackageRouteHandler(packageRoutes.owner)]
           : []),
         ...(dependencies.ownerIndicationModeration
           ? [createOwnerIndicationModerationRouteHandler(
@@ -324,6 +386,82 @@ function createInjectedRouteDispatcher(
       },
     ),
   });
+}
+
+function runtimePackageRoutes(
+  runtime: ApplicationRuntimeDeploymentCapability,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  resourceUrl: string,
+): ResolvedPackageRoutes | null {
+  try {
+    const appOrigin = new URL(resourceUrl).origin;
+    const ownerIdentity = actor !== null && isOwner
+      ? Object.freeze({ type: "owner" as const, subject: actor.userId })
+      : null;
+    const participantIdentity = actor !== null && !isOwner
+      ? Object.freeze({ type: "participant" as const, subject: actor.userId })
+      : null;
+    const repositories = runtime.repositoryFactory;
+    const session = runtime.mutationSession;
+
+    return Object.freeze({
+      owner: Object.freeze({
+        workspace: repositories.ownerPackageWorkspace(),
+        verifyMutation: (request: Request) =>
+          session.verifyMutation(request, ownerIdentity, appOrigin, {
+            maxBodyBytes: MAX_OWNER_PACKAGE_MUTATION_BYTES,
+            maxFields: MAX_OWNER_PACKAGE_MUTATION_FIELDS,
+            repeatedFormFields: [],
+          }),
+        csrfToken: (request: Request, owner: Readonly<{ subject: string }>) =>
+          ownerIdentity !== null && owner.subject === ownerIdentity.subject
+            ? session.issue(request, ownerIdentity, appOrigin)
+            : Promise.resolve(null),
+        issueOperationId: () => randomOperationId("package-operation"),
+      }),
+      participantReader: Object.freeze({
+        repositoryFor: (participantSubject: ActorSubject) =>
+          repositories.participantPackageReader(participantSubject),
+      }),
+      participantAcknowledgment: Object.freeze({
+        repositoryFor: (participantSubject: ActorSubject) =>
+          repositories.participantPackageAcknowledgments(participantSubject),
+        verifyMutation: (request: Request) =>
+          session.verifyMutation(
+            request,
+            participantIdentity,
+            appOrigin,
+            {
+              maxBodyBytes: MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
+              maxFields: MAX_ACKNOWLEDGMENT_MUTATION_FIELDS,
+              repeatedFormFields: [],
+            },
+          ),
+        csrfTokenFor: (
+          request: Request,
+          participantSubject: string,
+        ) =>
+          participantIdentity !== null &&
+            participantSubject === participantIdentity.subject
+            ? session.issue(request, participantIdentity, appOrigin)
+            : Promise.resolve(null),
+        now: runtime.now,
+        createOperationId: () =>
+          randomOperationId("package-acknowledgment"),
+      }),
+    });
+  } catch {
+    return null;
+  }
+}
+
+function randomOperationId(namespace: string): StorageOperationId {
+  const parsed = parseStorageOperationId(
+    `${namespace}:${crypto.randomUUID()}`,
+  );
+  if (!parsed.ok) throw new Error("Unable to issue a package operation ID.");
+  return parsed.value;
 }
 
 async function resolveApplicationRuntime(
@@ -434,6 +572,7 @@ function resolveCampaignWorkspace(
       checkPublicationReadiness: async () => runtime.publicationReady === true,
       mutationSession: runtime.mutationSession,
       appOrigin,
+      now: runtime.now,
     });
   } catch {
     return null;

@@ -44,6 +44,7 @@ import {
   type BrowserMutationGuardOptions,
   type VerifiedMutationRequest,
 } from "../../http/mutation-security.ts";
+import type { BrowserMutationProof } from "../../http/browser-mutation-session.ts";
 import type {
   AcknowledgmentRepository,
   PackageVersionRepository,
@@ -60,8 +61,8 @@ import {
 } from "./responses.ts";
 
 const OPERATION_ID_FIELD = "operation-id";
-const MAX_ACKNOWLEDGMENT_MUTATION_BYTES = 512;
-const MAX_ACKNOWLEDGMENT_MUTATION_FIELDS = 2;
+export const MAX_ACKNOWLEDGMENT_MUTATION_BYTES = 512;
+export const MAX_ACKNOWLEDGMENT_MUTATION_FIELDS = 2;
 
 export type ParticipantPackageAcknowledgmentRepositories = Readonly<{
   packages: Pick<PackageVersionRepository, "current">;
@@ -78,11 +79,22 @@ export type ParticipantPackageAcknowledgmentRepositoryFactory = (
 export type ParticipantPackageAcknowledgmentCsrfTokenProvider = (
   request: Request,
   participantSubject: ActorSubject,
-) => string | null | Promise<string | null>;
+) =>
+  | string
+  | BrowserMutationProof
+  | null
+  | Promise<string | BrowserMutationProof | null>;
+
+export type ParticipantPackageAcknowledgmentMutationVerifier = (
+  request: Request,
+) => Promise<
+  VerifiedMutationRequest & Readonly<{ clearCookie?: string }>
+>;
 
 export type ParticipantPackageAcknowledgmentRouteDependencies = Readonly<{
   repositoryFor: ParticipantPackageAcknowledgmentRepositoryFactory;
-  mutationSecurity: BrowserMutationGuardOptions;
+  mutationSecurity?: BrowserMutationGuardOptions;
+  verifyMutation?: ParticipantPackageAcknowledgmentMutationVerifier;
   csrfTokenFor: ParticipantPackageAcknowledgmentCsrfTokenProvider;
   now?: () => Date;
   createOperationId?: () => string;
@@ -94,7 +106,9 @@ export function createParticipantPackageAcknowledgmentRouteHandler(
 ): ApplicationRouteHandler {
   if (
     typeof dependencies.repositoryFor !== "function" ||
-    typeof dependencies.csrfTokenFor !== "function"
+    typeof dependencies.csrfTokenFor !== "function" ||
+    (dependencies.verifyMutation === undefined) ===
+      (dependencies.mutationSecurity === undefined)
   ) {
     throw new Error("Invalid package-acknowledgment route configuration.");
   }
@@ -103,12 +117,14 @@ export function createParticipantPackageAcknowledgmentRouteHandler(
   if (typeof now !== "function" || typeof createOperationId !== "function") {
     throw new Error("Invalid package-acknowledgment route configuration.");
   }
-  const mutationGuard = createBrowserMutationGuard({
-    ...dependencies.mutationSecurity,
-    maxBodyBytes: MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
-    maxFields: MAX_ACKNOWLEDGMENT_MUTATION_FIELDS,
-    repeatedFormFields: [],
-  });
+  const mutationGuard: ParticipantPackageAcknowledgmentMutationVerifier =
+    dependencies.verifyMutation ??
+    createBrowserMutationGuard({
+      ...(dependencies.mutationSecurity as BrowserMutationGuardOptions),
+      maxBodyBytes: MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
+      maxFields: MAX_ACKNOWLEDGMENT_MUTATION_FIELDS,
+      repeatedFormFields: [],
+    });
 
   return async (context) => {
     if (context.url.pathname !== PARTICIPANT_PACKAGE_ACKNOWLEDGMENT_PATH) {
@@ -168,8 +184,12 @@ export function createParticipantPackageAcknowledgmentRouteHandler(
       return methodNotAllowedResponse(context.resourceUrl, representation.kind);
     }
 
+    let clearCookie: string | null = null;
     try {
       const verified = await mutationGuard(context.request);
+      clearCookie = validSetCookie(verified.clearCookie)
+        ? verified.clearCookie
+        : null;
       assertExactResourceOrigin(context.request, context.resourceUrl);
       const subject = requiredParticipantSubject(context);
       if (
@@ -189,14 +209,14 @@ export function createParticipantPackageAcknowledgmentRouteHandler(
 
       if (existing !== null) {
         requireOwnAcceptance(existing, acceptanceId, subject, current.currentVersion);
-        return await resourceResponse({
+        return withSetCookie(await resourceResponse({
           context,
           representation: representation.kind,
           state: current,
           csrfTokenFor: dependencies.csrfTokenFor,
           createOperationId,
           status: 200,
-        });
+        }), clearCookie);
       }
       if (!current.acceptanceRequired) {
         throw new StorageFailure("CONFLICT");
@@ -231,14 +251,14 @@ export function createParticipantPackageAcknowledgmentRouteHandler(
               replay,
             );
             if (replayState.acceptanceRequired) unavailable();
-            return await resourceResponse({
+            return withSetCookie(await resourceResponse({
               context,
               representation: representation.kind,
               state: replayState,
               csrfTokenFor: dependencies.csrfTokenFor,
               createOperationId,
               status: 200,
-            });
+            }), clearCookie);
           }
         }
         throw error;
@@ -257,19 +277,19 @@ export function createParticipantPackageAcknowledgmentRouteHandler(
         result.snapshot,
       );
       if (acceptedState.acceptanceRequired) unavailable();
-      return await resourceResponse({
+      return withSetCookie(await resourceResponse({
         context,
         representation: representation.kind,
         state: acceptedState,
         csrfTokenFor: dependencies.csrfTokenFor,
         createOperationId,
         status: result.replayed ? 200 : 201,
-      });
+      }), clearCookie);
     } catch (error) {
-      return errorResponse(
+      return withSetCookie(errorResponse(
         publicRouteError(error, context.resourceUrl),
         representation.kind,
-      );
+      ), clearCookie);
     }
   };
 }
@@ -459,8 +479,8 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
   const hasMutation = model.actionContracts.some(
     (action) => action.method !== "GET",
   );
-  const csrfToken = hasMutation
-    ? await requiredCsrfToken(
+  const csrf = hasMutation
+    ? await requiredCsrfProof(
         await input.csrfTokenFor(
           input.context.request,
           input.state.participantSubject,
@@ -469,28 +489,49 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
     : null;
 
   if (input.representation === "hypermedia-json") {
-    return hypermediaResponseWithCsrf(model.document, input.status, csrfToken);
+    return withSetCookie(
+      hypermediaResponseWithCsrf(
+        model.document,
+        input.status,
+        csrf?.token ?? null,
+      ),
+      csrf?.setCookie ?? null,
+    );
   }
-  return htmlResponse(
+  return withSetCookie(htmlResponse(
     renderAcknowledgmentHtml(
       model,
-      csrfToken,
+      csrf?.token ?? null,
       input.context.campaign?.name ?? "Campaign",
     ),
     input.status,
-  );
+  ), csrf?.setCookie ?? null);
 }
 
-async function requiredCsrfToken(value: unknown): Promise<string> {
-  if (typeof value !== "string") {
+async function requiredCsrfProof(
+  value: unknown,
+): Promise<Readonly<{ token: string; setCookie: string | null }>> {
+  const token = typeof value === "string"
+    ? value
+    : typeof value === "object" && value !== null && "token" in value
+    ? value.token
+    : null;
+  const setCookie = typeof value === "object" && value !== null &&
+      "setCookie" in value
+    ? value.setCookie
+    : null;
+  if (
+    typeof token !== "string" ||
+    (setCookie !== null && !validSetCookie(setCookie))
+  ) {
     throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
   }
   try {
-    await hashCsrfToken(value);
+    await hashCsrfToken(token);
   } catch (error) {
     throw new MutationSecurityFailure("SERVICE_UNAVAILABLE", { cause: error });
   }
-  return value;
+  return Object.freeze({ token, setCookie });
 }
 
 function hypermediaResponseWithCsrf(
@@ -915,6 +956,24 @@ function htmlResponse(html: string, status: number): Response {
       Vary: "Accept",
       "X-Content-Type-Options": "nosniff",
     },
+  });
+}
+
+function validSetCookie(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 4_096 &&
+    !/[\r\n]/u.test(value);
+}
+
+function withSetCookie(response: Response, cookie: string | null): Response {
+  if (!validSetCookie(cookie)) return response;
+  const headers = new Headers(response.headers);
+  headers.append("Set-Cookie", cookie);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
 }
 

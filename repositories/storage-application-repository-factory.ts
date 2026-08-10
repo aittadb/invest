@@ -1,4 +1,8 @@
-import { parseTimestamp } from "../domain/foundation.ts";
+import {
+  parseActorSubject,
+  parseTimestamp,
+  type ActorSubject,
+} from "../domain/foundation.ts";
 import {
   StorageFailure,
   parseStorageCollection,
@@ -14,18 +18,33 @@ import type {
   BrowserMutationReplayClaim,
   BrowserMutationReplayClaimer,
 } from "../http/browser-mutation-session.ts";
+import { RepositoryOwnerPackageWorkspaceService } from "../services/owner-package-workspace.ts";
 import {
   StorageCampaignRepository,
   StoragePublicCampaignPresentationReader,
   type AtomicCampaignAuditRepository,
   type PublicCampaignPresentationReader,
 } from "./in-memory-campaign-repository.ts";
+import {
+  StorageAcknowledgmentRepository,
+  StoragePackageVersionRepository,
+  type AcknowledgmentRepository,
+  type PackageVersionRepository,
+} from "./in-memory-content-repository.ts";
 
 const REPLAY_SCHEMA_VERSION = 1;
 const REPLAY_COLLECTION = storageCollection("browser-mutation-replays");
 const REPLAY_CAPABILITY_PATTERN =
   /^browser-mutation:v1:[A-Za-z0-9_-]{43}$/u;
 const MAX_REPLAY_TTL_SECONDS = 600;
+
+type ParticipantPackageAcknowledgmentRepositories = Readonly<{
+  packages: Pick<PackageVersionRepository, "current">;
+  acknowledgments: Pick<
+    AcknowledgmentRepository,
+    "get" | "latest" | "record"
+  >;
+}>;
 
 /**
  * Factory for production repository capabilities backed by one credential-bound
@@ -36,10 +55,42 @@ export class StorageApplicationRepositoryFactory {
   readonly #claimBrowserMutationReplay: BrowserMutationReplayClaimer;
   readonly #campaignRepository: AtomicCampaignAuditRepository;
   readonly #publicCampaignReader: PublicCampaignPresentationReader;
+  readonly #ownerPackageWorkspace: RepositoryOwnerPackageWorkspaceService;
+  readonly #participantPackageReader: Pick<PackageVersionRepository, "current">;
+  readonly #participantPackageAcknowledgments: (
+    participantSubject: ActorSubject,
+  ) => ParticipantPackageAcknowledgmentRepositories;
 
   constructor(storage: StorageAdapter, now: () => Date) {
     const adapter = requiredStorageAdapter(storage);
     const clock = requiredClock(now);
+    const packageVersions = new StoragePackageVersionRepository(adapter);
+    this.#ownerPackageWorkspace = new RepositoryOwnerPackageWorkspaceService(
+      packageVersions,
+      { now: clock },
+    );
+    this.#participantPackageReader = Object.freeze({
+      current: () => packageVersions.current(),
+    });
+    this.#participantPackageAcknowledgments = (participantSubject) => {
+      const subject = requiredActorSubject(participantSubject);
+      const acknowledgments = new StorageAcknowledgmentRepository(
+        adapter,
+        packageVersions,
+        subject,
+      );
+      return Object.freeze({
+        packages: this.#participantPackageReader,
+        acknowledgments: Object.freeze({
+          get: (id: Parameters<AcknowledgmentRepository["get"]>[0]) =>
+            acknowledgments.get(id),
+          latest: () => acknowledgments.latest(),
+          record: (
+            request: Parameters<AcknowledgmentRepository["record"]>[0],
+          ) => acknowledgments.record(request),
+        }),
+      });
+    };
     this.#claimBrowserMutationReplay = Object.freeze(
       (claim: BrowserMutationReplayClaim) => claimReplay(adapter, clock, claim),
     );
@@ -60,6 +111,23 @@ export class StorageApplicationRepositoryFactory {
 
   publicCampaignReader(): PublicCampaignPresentationReader {
     return this.#publicCampaignReader;
+  }
+
+  ownerPackageWorkspace(): RepositoryOwnerPackageWorkspaceService {
+    return this.#ownerPackageWorkspace;
+  }
+
+  participantPackageReader(
+    participantSubject: ActorSubject,
+  ): Pick<PackageVersionRepository, "current"> {
+    requiredActorSubject(participantSubject);
+    return this.#participantPackageReader;
+  }
+
+  participantPackageAcknowledgments(
+    participantSubject: ActorSubject,
+  ): ParticipantPackageAcknowledgmentRepositories {
+    return this.#participantPackageAcknowledgments(participantSubject);
   }
 }
 
@@ -267,6 +335,12 @@ function requiredStorageAdapter(value: StorageAdapter): StorageAdapter {
 function requiredClock(value: () => Date): () => Date {
   if (typeof value !== "function") invalidRequest();
   return value;
+}
+
+function requiredActorSubject(value: unknown): ActorSubject {
+  const parsed = parseActorSubject(value);
+  if (!parsed.ok) invalidRequest();
+  return parsed.value;
 }
 
 function currentTime(now: () => Date): number {
