@@ -1,3 +1,4 @@
+import { FOUNDER_SECONDARY_AREAS_FIELD } from "../domain/participant-founder-interest-resource.ts";
 import {
   createBrowserMutationSession,
   type BrowserMutationRandomBytes,
@@ -92,6 +93,7 @@ async function composeHostedApplicationRuntime(
       ttlSeconds: BROWSER_MUTATION_TTL_SECONDS,
       maxBodyBytes: MAX_MUTATION_BODY_BYTES,
       maxFields: MAX_MUTATION_FIELDS,
+      repeatedFormFields: [FOUNDER_SECONDARY_AREAS_FIELD],
     });
     return Object.freeze({
       repositoryFactory,

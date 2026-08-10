@@ -7,14 +7,17 @@ boundary for Investor App persistence. It composes one confidential service
 token provider, one bounded AittaDB `StorageAdapter`, one backend repository
 factory, and one browser-mutation session per immutable Sites environment.
 
-The runtime now composes named persistent campaign, package, and participant
-access capabilities over that adapter. `createApplicationWorker` installs
+The runtime now composes named persistent campaign, package, participant-access,
+and participant founder-application capabilities over that adapter.
+`createApplicationWorker` installs
 `/owner/setup`, campaign editing, draft preview, publish/unpublish, and owner
 package management only in the configured-owner route group. For a signed-in
 non-owner, it derives the trusted `participantAccess` projection from that
 subject's persistent profile, current package, and current acknowledgment gate.
 An unregistered subject stops after the profile read without opening package or
-acknowledgment storage. Founder, indication, aggregate, moderation, export,
+acknowledgment storage. Founder composition opens private campaign policy and a
+fresh subject-bound profile/application pair only for the exact founder resource
+after participant authorization. Indication, aggregate, moderation, export,
 deletion coordination, registration-route, and profile-route composition still
 require their own named persistent capabilities.
 
@@ -104,7 +107,8 @@ redirect and carry the bearer value only to the validated transport target.
 adapter and exposes only named, narrow capability methods for browser-mutation
 replay, the atomic campaign/audit repository, the public campaign projection
 reader, the owner package workspace, a participant package reader,
-subject-bound package acknowledgment, and one participant-access state reader.
+subject-bound package acknowledgment, one participant-access state reader, and
+one participant-bound founder-application pair.
 That reader creates fresh profile and acknowledgment repositories for each
 trusted account and combines them only through the bounded projection service.
 It intentionally has no generic builder or adapter accessor. The Worker calls
@@ -117,7 +121,9 @@ map. `StoragePackageVersionRepository` and
 `InMemory*` names remain compatibility exports for deterministic fixtures.
 
 `StorageCampaignRepository` is production-neutral and retains no state outside
-its supplied adapter. Hosted composition supplies only `AittaDBStorageAdapter`.
+its supplied adapter. `StorageFounderApplicationRepository` follows the same
+production-neutral rule. Hosted composition supplies both only through
+`AittaDBStorageAdapter`.
 The development-labeled compatibility subclass remains available to tests and
 cannot enter hosted composition. The older direct HTTP campaign repository is
 not used because it cannot atomically commit campaign revision, history,
@@ -287,10 +293,11 @@ records and receipts cannot exhaust the isolated namespace.
 `worker/index.ts` installs one resolver. `createApplicationWorker` resolves it
 fail-closed but does not place the runtime in `ApplicationRouteContext` or pass
 it to public, participant, image, or framework-rendering code. The Worker calls
-the factory's named campaign and package methods centrally. It installs setup,
+the factory's named campaign, package, and founder methods centrally. It installs setup,
 campaign editor, and owner package handlers only inside
-`createOwnerRouteHandler`, and projects only subject-bound package capabilities
-into the participant route group after trusted participant authorization. Owner
+`createOwnerRouteHandler`, and projects only subject-bound package and founder
+capabilities into the participant route group after trusted participant
+authorization. Owner
 capability headers are server-replaced and are never authorization by
 themselves; generic runtime availability adds no browser header or navigation
 item.
@@ -303,9 +310,11 @@ authorization. Anonymous callers receive `401`; authenticated non-owners receive
 the generic `404` surface before a private repository read.
 
 The one shared mutation session is configured to the largest currently composed
-owner form as an absolute ceiling. Setup and editor adapters pass their own byte
-and field limits to every verification. Those limits are validated before form
-proof extraction, so the larger setup allowance cannot widen another route.
+form as an absolute ceiling and explicitly permits only the founder route's
+repeated secondary-contribution field. Setup, editor, package, acknowledgment,
+and founder adapters pass their own byte, field, and repeated-field limits to
+every verification. Those limits are validated before form proof extraction, so
+the larger setup allowance cannot widen another route.
 The editor accepts at most 262,144 wire bytes and then enforces a 65,536-byte
 decoded campaign presentation. Initial setup accepts at most 1,048,576 wire
 bytes and then enforces a 262,144-byte decoded setup. Successful HTML and JSON
@@ -330,13 +339,15 @@ Future wiring must preserve these rules:
    readers are explicit composition dependencies, never environment authority.
 
 The hosted browser-mutation session supports the larger setup envelope, while
-each package route narrows it again. A route's body limit and field-count limit
+each feature route narrows it again. A route's body limit and field-count limit
 cannot exceed the shared policy, and its repeated fields must be a subset of
 the shared repeated-field allowlist. Invalid or wider limits fail before proof
 parsing or replay claim. Owner package mutations accept at most 524,288 bytes,
 nine non-repeated fields, and enough room for the maximum valid URL-encoded
 Unicode package form. Participant acknowledgment remains limited to 512 bytes
-and two non-repeated fields. Body and field failures also occur before the
+and two non-repeated fields. Founder mutations accept at most 262,144 bytes and
+13 distinct fields, with repeated values allowed only for configured secondary
+contribution areas. Body and field failures also occur before the
 replay capability is claimed, so the same proof remains usable for a corrected
 bounded request.
 
@@ -361,7 +372,11 @@ sampling, accepted and unaccepted maximum-history aggregate read counts, nested
 publication retry counts, exact maximum-package GET and acknowledgment GET
 totals, the complete nested-plus-outer 547-read envelope, the read-556 cutoff,
 cached ancestry and reconstruction recharge, exact material gating, and
-narrowing-only route mutation limits. The
+narrowing-only route mutation limits.
+Founder coverage adds configured-choice projection, create/retry/edit/stale/
+withdraw history, policy closure between action discovery and mutation, foreign
+and owner non-disclosure, origin and proof rejection, investment-state
+independence, and reconstruction through a fresh Worker. The
 synthetic hosted services implement and enforce the discovered AittaDB
 read/list/transaction controls rather than bypassing the adapter. Source
 and built-artifact scans complement `npm run instances:check`, which rejects

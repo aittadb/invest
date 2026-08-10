@@ -137,13 +137,13 @@ type StoredFounderApplication = Readonly<{
 type MutationKind = "create" | "edit" | "withdraw";
 
 /**
- * Development repository composed entirely through a supplied StorageAdapter.
+ * Subject-bound repository composed entirely through a supplied StorageAdapter.
  * A new instance can reopen every record; no application state lives here.
  */
-export class DevelopmentInMemoryFounderApplicationRepository
+export class StorageFounderApplicationRepository
   implements FounderApplicationRepository
 {
-  readonly storageKind = "development-in-memory" as const;
+  readonly storageKind = "storage-adapter" as const;
 
   readonly #storage: StorageAdapter;
   readonly #applicantSubject: ActorSubject | null;
@@ -359,7 +359,27 @@ export class DevelopmentInMemoryFounderApplicationRepository
       request.operationId,
       fingerprint,
     );
-    return this.#transactSnapshot(document, application, request, subject);
+    try {
+      return await this.#transactSnapshot(
+        document,
+        application,
+        request,
+        subject,
+      );
+    } catch (error) {
+      if (
+        error instanceof StorageFailure &&
+        (error.code === "CONFLICT" || error.code === "PRECONDITION_FAILED")
+      ) {
+        const replay = await this.#replayIfKnown(
+          request,
+          subject,
+          fingerprint,
+        );
+        if (replay !== null) return replay;
+      }
+      throw error;
+    }
   }
 
   async #transactSnapshot(
@@ -919,7 +939,6 @@ async function operationFingerprint(
     applicantSubject: subject,
     expectedRevision: request.expectedRevision,
     id: request.id,
-    occurredAt: request.occurredAt,
     historyEntryId: request.historyEntryId,
     ...(request.fields === undefined
       ? {}
@@ -940,6 +959,11 @@ async function operationFingerprint(
     .join("");
   return `sha256:${hexadecimal}`;
 }
+
+/** Compatibility name retained for deterministic development fixtures. */
+export {
+  StorageFounderApplicationRepository as DevelopmentInMemoryFounderApplicationRepository,
+};
 
 async function currentApplicationKey(
   subject: ActorSubject,

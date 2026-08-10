@@ -4,6 +4,7 @@ import {
   type ActorSubject,
 } from "../domain/foundation.ts";
 import type { ParticipantAccessStateReader } from "../domain/participant-home-resource.ts";
+import type { ContributionAreaChoice } from "../domain/founder-application.ts";
 import {
   parseParticipantAccount,
   type ParticipantAccount,
@@ -42,7 +43,14 @@ import {
   type AcknowledgmentRepository,
   type PackageVersionRepository,
 } from "./in-memory-content-repository.ts";
-import { StorageParticipantRepository } from "./in-memory-participant-repository.ts";
+import {
+  StorageFounderApplicationRepository,
+  type FounderApplicationRepository,
+} from "./in-memory-founder-application-repository.ts";
+import {
+  StorageParticipantRepository,
+  type ParticipantRepository,
+} from "./in-memory-participant-repository.ts";
 
 const REPLAY_SCHEMA_VERSION = 1;
 const REPLAY_COLLECTION = storageCollection("browser-mutation-replays");
@@ -76,6 +84,11 @@ export type ParticipantPackageAcknowledgmentRepositories = Readonly<{
   >;
 }>;
 
+export type ParticipantFounderApplicationRepositories = Readonly<{
+  participant: Pick<ParticipantRepository, "current">;
+  applications: FounderApplicationRepository;
+}>;
+
 export type ParticipantRequestRepositoryScope = Readonly<{
   participantAccessReader(): ParticipantAccessStateReader;
   participantPackageReader(
@@ -84,6 +97,9 @@ export type ParticipantRequestRepositoryScope = Readonly<{
   participantPackageAcknowledgments(
     participantSubject: ActorSubject,
   ): ParticipantPackageAcknowledgmentRepositories;
+  participantFounderApplications(
+    contributionAreaChoices: readonly ContributionAreaChoice[],
+  ): ParticipantFounderApplicationRepositories;
 }>;
 
 /**
@@ -220,6 +236,18 @@ function createParticipantRequestRepositoryScope(
       requireSubject(participantSubject);
       return packageAcknowledgments;
     },
+    participantFounderApplications: (
+      contributionAreaChoices: readonly ContributionAreaChoice[],
+    ) => Object.freeze({
+      participant: Object.freeze({
+        current: () => participant.current(),
+      }),
+      applications: new StorageFounderApplicationRepository(
+        mutationStorage,
+        account.subject,
+        contributionAreaChoices,
+      ),
+    }),
   });
 }
 

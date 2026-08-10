@@ -1,18 +1,29 @@
 import {
   parseActorSubject,
+  parseStableId,
   type ActorSubject,
 } from "../domain/foundation.ts";
+import type {
+  ContributionAreaChoice,
+  FounderApplicationId,
+} from "../domain/founder-application.ts";
 import { isConfiguredOwner } from "../domain/owner-identity.ts";
 import {
   authorizeParticipantAccess,
+  participantWorkflowAccess,
   type AuthorizedParticipantAccess,
   type ParticipantAccessStateReader,
 } from "../domain/participant-home-resource.ts";
+import { isPhaseAcceptingParticipation } from "../domain/phase-configuration.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   parsePublicCampaignConfiguration,
   type PublicCampaignConfiguration,
 } from "../domain/public-campaign-configuration.ts";
+import {
+  FOUNDER_INTEREST_PATH,
+  FOUNDER_SECONDARY_AREAS_FIELD,
+} from "../domain/participant-founder-interest-resource.ts";
 import { resolveAppOrigin, withAppOrigin } from "../http/app-origin.ts";
 import { withRuntimeCapabilities } from "../http/runtime-capabilities.ts";
 import { withRuntimeCampaign } from "../http/runtime-campaign.ts";
@@ -24,6 +35,7 @@ import {
 } from "../http/runtime-preview.ts";
 import type { PublicCampaignPresentationReader } from "../repositories/in-memory-campaign-repository.ts";
 import type { ParticipantRequestRepositoryScope } from "../repositories/storage-application-repository-factory.ts";
+import type { ParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
 import {
   parseStorageOperationId,
   type StorageOperationId,
@@ -67,11 +79,14 @@ import {
   createParticipantRouteHandler,
   MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
   MAX_ACKNOWLEDGMENT_MUTATION_FIELDS,
+  MAX_FOUNDER_INTEREST_MUTATION_BYTES,
+  MAX_FOUNDER_INTEREST_MUTATION_FIELDS,
   type FounderInterestRouteDependencies,
   type InvestmentInterestRouteDependencies,
   type ParticipantPackageAcknowledgmentRouteDependencies,
   type ParticipantPackageReaderDependencies,
 } from "./routes/participant.ts";
+import { createParticipantFounderInterestService } from "./founder-interest-service.ts";
 import {
   createOwnerOAuthProofRouteHandler,
   type OwnerOAuthProofRouteDependencies,
@@ -162,9 +177,6 @@ export function createApplicationWorker(
       const ownerReviewExportsAvailable =
         dependencies.dispatchRoute === undefined &&
         dependencies.ownerReviewExports !== undefined;
-      const participantFounderInterestAvailable =
-        dependencies.dispatchRoute === undefined &&
-        dependencies.participantFounderInterest !== undefined;
       const participantInvestmentInterestsAvailable =
         dependencies.dispatchRoute === undefined &&
         dependencies.participantInvestmentInterests !== undefined;
@@ -190,6 +202,21 @@ export function createApplicationWorker(
         actor,
         participantAccessReader,
       );
+      const participantFounderInterest = dependencies.dispatchRoute === undefined
+        ? dependencies.participantFounderInterest ??
+          await runtimeParticipantFounderInterestRoute(
+            applicationRuntime,
+            actor,
+            isOwner,
+            participantAccess,
+            resourceUrl,
+            url.pathname,
+            participantRequest,
+          )
+        : undefined;
+      const participantFounderInterestAvailable =
+        participantFounderInterest !== undefined &&
+        participantFounderInterest !== null;
       const renderEnvironment = applicationRenderEnvironment(env);
       const campaignEditorAvailable = campaignWorkspace !== null;
       const renderApplication: ApplicationRouteContext["renderApplication"] = (
@@ -245,6 +272,7 @@ export function createApplicationWorker(
               dependencies,
               campaignWorkspace,
               ownerOAuthProof,
+              participantFounderInterest ?? null,
               {
                 owner: ownerPackage,
                 participantReader: participantPackageReader,
@@ -314,6 +342,7 @@ function createInjectedRouteDispatcher(
   dependencies: ApplicationWorkerDependencies,
   campaignWorkspace: CampaignWorkspaceDeploymentCapability | null,
   ownerOAuthProof: OwnerOAuthProofRouteDependencies | null,
+  participantFounderInterest: FounderInterestRouteDependencies | null,
   packageRoutes: ResolvedPackageRoutes,
   available: InjectedRouteAvailability,
 ): ApplicationRouteHandler {
@@ -332,9 +361,9 @@ function createInjectedRouteDispatcher(
               packageRoutes.participantAcknowledgment,
             )]
           : []),
-        ...(dependencies.participantFounderInterest
+        ...(participantFounderInterest
           ? [createFounderInterestRouteHandler(
-              dependencies.participantFounderInterest,
+              participantFounderInterest,
             )]
           : []),
         ...(dependencies.participantInvestmentInterests
@@ -396,6 +425,170 @@ function createInjectedRouteDispatcher(
       },
     ),
   });
+}
+
+async function runtimeParticipantFounderInterestRoute(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  participantAccess: AuthorizedParticipantAccess | null,
+  resourceUrl: string,
+  pathname: string,
+  participantRequest: ParticipantRequestRepositoryScope | null,
+): Promise<FounderInterestRouteDependencies | null> {
+  if (
+    runtime === null ||
+    actor === null ||
+    isOwner ||
+    pathname !== FOUNDER_INTEREST_PATH ||
+    participantAccess === null ||
+    participantAccess.subject !== actor.userId ||
+    !participantWorkflowAccess(participantAccess, { founderInterest: true })
+      .founderInterest
+  ) {
+    return null;
+  }
+
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (!account.ok) return null;
+
+  try {
+    const repositories = runtime.repositoryFactory;
+    const campaign = await repositories.campaignRepository().readSetup();
+    if (campaign === null) return null;
+    const contributionAreaChoices =
+      campaign.setup.campaignPolicy.founderContributionChoices;
+    if (contributionAreaChoices.length === 0) return null;
+
+    const founder = requiredParticipantRequest(participantRequest)
+      .participantFounderApplications(
+      contributionAreaChoices,
+    );
+    const participant = await founder.participant.current();
+    if (
+      participant === null ||
+      !profilePermitsFounder(
+        participant.snapshot,
+        account.value.subject,
+      )
+    ) {
+      return null;
+    }
+
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "participant" as const,
+      subject: account.value.subject,
+    });
+    const applicationId = selfFounderApplicationId();
+
+    return Object.freeze({
+      serviceFor(candidateSubject) {
+        if (candidateSubject !== account.value.subject) {
+          throw new Error("Founder application is unavailable.");
+        }
+        return createParticipantFounderInterestService({
+          actorSubject: account.value.subject,
+          applicationId,
+          contributionAreaChoices,
+          repository: founder.applications,
+          canCreate: () => founderCreationAllowed(
+            repositories,
+            founder.participant,
+            account.value.subject,
+            contributionAreaChoices,
+          ),
+          now: runtime.now,
+        });
+      },
+      verifyMutation: (request: Request) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          {
+            maxBodyBytes: MAX_FOUNDER_INTEREST_MUTATION_BYTES,
+            maxFields: MAX_FOUNDER_INTEREST_MUTATION_FIELDS,
+            repeatedFormFields: [FOUNDER_SECONDARY_AREAS_FIELD],
+          },
+        ),
+      csrfTokenFor: (request, candidateSubject) =>
+        candidateSubject === account.value.subject
+          ? runtime.mutationSession.issue(request, identity, appOrigin)
+          : Promise.resolve(null),
+      createOperationId: () => randomOperationId("founder-operation"),
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function founderCreationAllowed(
+  repositories: ApplicationRuntimeDeploymentCapability["repositoryFactory"],
+  participant: Pick<ParticipantRepository, "current">,
+  subject: ActorSubject,
+  expectedChoices: readonly ContributionAreaChoice[],
+): Promise<boolean> {
+  const [campaign, currentParticipant] = await Promise.all([
+    repositories.campaignRepository().readSetup(),
+    participant.current(),
+  ]);
+  if (
+    campaign === null ||
+    currentParticipant === null ||
+    !profilePermitsFounder(currentParticipant.snapshot, subject) ||
+    campaign.setup.publicCampaign.published !== true ||
+    campaign.setup.publicCampaign.status !== "open" ||
+    !sameContributionAreaChoices(
+      campaign.setup.campaignPolicy.founderContributionChoices,
+      expectedChoices,
+    )
+  ) {
+    return false;
+  }
+
+  return campaign.setup.phases.some((phase) => {
+    const result = isPhaseAcceptingParticipation(
+      phase,
+      "founder",
+      currentParticipant.snapshot.country,
+    );
+    return result.ok && result.value;
+  });
+}
+
+function profilePermitsFounder(
+  profile: Readonly<{
+    subject: ActorSubject;
+    declaredInterest: string;
+    accountDeletionRequest: Readonly<{ state: string }>;
+  }>,
+  subject: ActorSubject,
+): boolean {
+  return profile.subject === subject &&
+    profile.accountDeletionRequest.state === "not-requested" &&
+    (profile.declaredInterest === "founder" ||
+      profile.declaredInterest === "both");
+}
+
+function sameContributionAreaChoices(
+  left: readonly ContributionAreaChoice[],
+  right: readonly ContributionAreaChoice[],
+): boolean {
+  return left.length === right.length && left.every((choice, index) =>
+    choice.id === right[index]?.id && choice.label === right[index]?.label
+  );
+}
+
+function selfFounderApplicationId(): FounderApplicationId {
+  const parsed = parseStableId<"founder-application">(
+    "founder-application:self",
+  );
+  if (!parsed.ok) throw new Error("Founder application is unavailable.");
+  return parsed.value;
 }
 
 function runtimePackageRoutes(

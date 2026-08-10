@@ -222,9 +222,9 @@ The scope also owns one package reader with at most 64 verified immutable recons
 
 Founder applications do not import, create, mutate, or gate investment indications. An account may therefore hold either record type or both, and application services compose them only when a participant-facing resource needs both projections.
 
-### Development founder repository
+### Persistent founder repository
 
-`DevelopmentInMemoryFounderApplicationRepository` binds current and history storage keys to the trusted applicant subject and composes only through a development/test `StorageAdapter`. Create, edit, and withdrawal call the founder domain transitions with deployment-supplied contribution choices. The subject is never accepted from mutation input, and foreign, anonymous, denied, and missing records remain observationally equivalent.
+`StorageFounderApplicationRepository` binds current and history storage keys to the trusted applicant subject and composes through a supplied `StorageAdapter`. Hosted runtime composition supplies only the credential-closed AittaDB adapter; `DevelopmentInMemoryFounderApplicationRepository` remains a compatibility export for deterministic fixtures. Create, edit, and withdrawal call the founder domain transitions with deployment-supplied contribution choices. The subject is never accepted from mutation input, and foreign, anonymous, denied, and missing records remain observationally equivalent.
 
 Each mutation atomically compare-and-sets the current application and creates an immutable cumulative-history revision. Stored snapshots are reconstructed by replaying the domain transitions, verified against their operation fingerprint and storage revision, and compared with every prior immutable history prefix before use. The repository has no investment-indication import or side effect.
 
@@ -238,7 +238,9 @@ The owner review collection and detail handlers project one resource model into 
 
 `worker/founder-interest-service.ts` is a narrow, framework-independent orchestration boundary over `FounderApplicationRepository`. A request-scoped factory supplies the trusted actor, subject-bound repository, opaque application identifier, contribution choices, campaign creation policy, and clock. Operation IDs become retry-stable history IDs; when a response is retried, the service recovers the original timestamp from immutable history instead of relying on process memory. Existing applications remain readable even when creation policy is closed or temporarily irrelevant.
 
-`worker/routes/founder-interest.ts` owns content negotiation, strict request-field allowlists, and response projection. Mutations pass through the shared same-origin, CSRF, body-bound, and trusted-session guard before feature parsing. Only the verified participant subject selects a mutation service. Storage failures map to fixed public HTML and JSON errors, while inaccessible foreign and missing state remain non-disclosing. Production composition must inject an AittaDB-backed factory; the route creates no process-local production repository.
+`worker/routes/founder-interest.ts` owns content negotiation, strict request-field allowlists, and response projection. Mutations pass through the shared same-origin, CSRF, body-bound, and trusted-session guard before feature parsing. Only the verified participant subject selects a mutation service. Storage failures map to fixed public HTML and JSON errors, while inaccessible foreign and missing state remain non-disclosing.
+
+Hosted composition installs this route only at the exact founder resource for an active non-owner profile declaring founder or combined interest. It reads contribution choices from private campaign setup, creates a fresh subject-bound profile/application pair through `StorageApplicationRepositoryFactory`, and rechecks publication, phase, country, profile, and unchanged choices immediately before creation. Existing applications remain editable and withdrawable after the creation phase closes. Founder transactions use only founder collections, leaving investment indications and aggregates independent.
 
 ### Investment indications
 

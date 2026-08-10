@@ -17,6 +17,11 @@ import {
 } from "../http/mutation-security.ts";
 import { OWNER_PACKAGE_WORKSPACE_HEADER } from "../http/runtime-capabilities.ts";
 import type { OwnerPackageDocument } from "../domain/owner-package-resource.ts";
+import {
+  FOUNDER_INTEREST_PATH,
+  FOUNDER_SECONDARY_AREAS_FIELD,
+  type FounderInterestDocument,
+} from "../domain/participant-founder-interest-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   parseActorSubject,
@@ -32,6 +37,7 @@ import {
   type StorageRecord,
 } from "../domain/storage-adapter.ts";
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
+import { StorageCampaignRepository } from "../repositories/in-memory-campaign-repository.ts";
 import {
   StorageAcknowledgmentRepository,
   StoragePackageVersionRepository,
@@ -53,6 +59,7 @@ import {
   MAX_OWNER_PACKAGE_MUTATION_BYTES,
   MAX_OWNER_PACKAGE_MUTATION_FIELDS,
 } from "../worker/routes/owner-package.ts";
+import { explicitCampaignSetup } from "./support/campaign-repository-contract.ts";
 
 const APP_ORIGIN = "https://invest.example.test";
 const ISSUER = "https://storage.example.test";
@@ -958,6 +965,312 @@ test("request-scoped cache rejects over-limit hosted ancestry like a fresh reade
     (error) => error instanceof StorageFailure && error.code === "UNAVAILABLE",
   );
   assert.equal(freshReads.count(), 33);
+});
+
+test("hosted founder applications persist their complete lifecycle across workers", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:hosted-founder-participant",
+    { declaredInterest: "both" },
+  );
+  const worker = hostedPackageWorker(service);
+
+  const initial = await founderResource(worker, env);
+  assert.equal(initial.document.data.status, "not_submitted");
+  const createAction = requiredAction(
+    initial.document,
+    "create-founder-application",
+  );
+  assert.deepEqual(
+    createAction.fields.find(({ name }) =>
+      name === "primary-contribution-area-id"
+    )?.choices,
+    [
+      { value: "area:engineering", title: "Engineering" },
+      { value: "area:product", title: "Product" },
+    ],
+  );
+  const createBody = actionBody(createAction, founderFields({
+    note: "Private hosted founder note.",
+    [FOUNDER_SECONDARY_AREAS_FIELD]: ["area:product"],
+  }));
+  const createdResponse = await submitFounderMutation(
+    worker,
+    env,
+    initial,
+    "POST",
+    createBody,
+  );
+  assert.equal(createdResponse.status, 201);
+  assert.match(createdResponse.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+  const created = await createdResponse.json() as FounderInterestDocument;
+  assert.equal(created.data.status, "received");
+  assert.equal(created.data.revision, 1);
+  assert.equal(created.data.history.length, 1);
+  assert.deepEqual(
+    created.data.fields?.secondary_contribution_area_ids,
+    ["area:product"],
+  );
+
+  const replayProof = await founderResource(worker, env);
+  const replay = await submitFounderMutation(
+    worker,
+    env,
+    replayProof,
+    "POST",
+    createBody,
+  );
+  assert.equal(replay.status, 200);
+  assert.equal(
+    (await replay.json() as FounderInterestDocument).data.history.length,
+    1,
+  );
+
+  const editResource = await founderResource(worker, env);
+  const editAction = requiredAction(
+    editResource.document,
+    "edit-founder-application",
+  );
+  const editBody = actionBody(editAction, founderFields({
+    "expected-revision": 1,
+    "intended-contribution": "Lead hosted product and engineering delivery.",
+    note: "Updated private hosted founder note.",
+    [FOUNDER_SECONDARY_AREAS_FIELD]: ["area:product"],
+  }));
+  const editedResponse = await submitFounderMutation(
+    worker,
+    env,
+    editResource,
+    "PATCH",
+    editBody,
+  );
+  assert.equal(editedResponse.status, 200);
+  const edited = await editedResponse.json() as FounderInterestDocument;
+  assert.equal(edited.data.revision, 2);
+  assert.deepEqual(
+    edited.data.history.map(({ kind }) => kind),
+    ["created", "edited"],
+  );
+  assert.equal(
+    edited.data.history[0]?.fields.note,
+    "Private hosted founder note.",
+  );
+
+  const staleResource = await founderResource(worker, env);
+  const staleAction = requiredAction(
+    staleResource.document,
+    "edit-founder-application",
+  );
+  const staleResponse = await submitFounderMutation(
+    worker,
+    env,
+    staleResource,
+    "PATCH",
+    actionBody(staleAction, founderFields({
+      "operation-id": "founder-operation:hosted-stale",
+      "expected-revision": 1,
+      note: "A stale write must not be stored.",
+      [FOUNDER_SECONDARY_AREAS_FIELD]: ["area:product"],
+    })),
+  );
+  assert.equal(staleResponse.status, 412);
+
+  const restartedWorker = hostedPackageWorker(service);
+  const reopened = await founderResource(restartedWorker, env);
+  assert.equal(reopened.document.data.revision, 2);
+  assert.equal(reopened.document.data.history.length, 2);
+  const withdrawAction = requiredAction(
+    reopened.document,
+    "withdraw-founder-application",
+  );
+  const withdrawnResponse = await submitFounderMutation(
+    restartedWorker,
+    env,
+    reopened,
+    "DELETE",
+    actionBody(withdrawAction, { "confirm-withdrawal": true }),
+  );
+  assert.equal(withdrawnResponse.status, 200);
+
+  const final = await founderResource(hostedPackageWorker(service), env);
+  assert.equal(final.document.data.status, "withdrawn");
+  assert.equal(final.document.data.revision, 3);
+  assert.deepEqual(
+    final.document.data.history.map(({ kind }) => kind),
+    ["created", "edited", "withdrawn"],
+  );
+  assert.deepEqual(actionNames(final.document), []);
+  assert.equal(recordsIn(service, "founder-applications").length, 1);
+  assert.equal(recordsIn(service, "founder-application-history").length, 3);
+  for (const collection of [
+    "investment-indications",
+    "investment-indication-history",
+    "investment-aggregate-states",
+    "investment-aggregate-operations",
+  ]) {
+    assert.deepEqual(recordsIn(service, collection), []);
+  }
+});
+
+test("hosted founder creation rechecks campaign policy after action discovery", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:hosted-founder-policy",
+    { declaredInterest: "founder" },
+  );
+  const worker = hostedPackageWorker(service);
+  const discovered = await founderResource(worker, env);
+  const action = requiredAction(
+    discovered.document,
+    "create-founder-application",
+  );
+
+  await configureHostedFounderCampaign(service, "closed");
+  const denied = await submitFounderMutation(
+    worker,
+    env,
+    discovered,
+    "POST",
+    actionBody(action, founderFields()),
+  );
+  assert.equal(denied.status, 412);
+  assert.deepEqual(recordsIn(service, "founder-applications"), []);
+  assert.deepEqual(recordsIn(service, "founder-application-history"), []);
+
+  const closed = await founderResource(hostedPackageWorker(service), env);
+  assert.equal(closed.document.data.status, "not_submitted");
+  assert.deepEqual(actionNames(closed.document), []);
+});
+
+test("hosted founder state and mutation proofs remain participant-bound", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  const privateNote = "PRIMARY PARTICIPANT PRIVATE FOUNDER NOTE";
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:hosted-founder-primary",
+    { declaredInterest: "founder" },
+  );
+  await registerHostedParticipant(
+    service,
+    "sites-foreign-founder",
+    "foreign-founder@example.test",
+    "Foreign founder",
+    "participant-operation:hosted-founder-foreign",
+    { declaredInterest: "founder" },
+  );
+  await registerHostedParticipant(
+    service,
+    OWNER.subject,
+    OWNER_EMAIL,
+    "Configured owner",
+    "participant-operation:hosted-founder-owner",
+    { declaredInterest: "founder" },
+  );
+  const worker = hostedPackageWorker(service);
+  const primary = await founderResource(worker, env);
+  const create = requiredAction(primary.document, "create-founder-application");
+  const createResponse = await submitFounderMutation(
+    worker,
+    env,
+    primary,
+    "POST",
+    actionBody(create, founderFields({ note: privateNote })),
+  );
+  assert.equal(createResponse.status, 201);
+
+  const foreign = await founderResource(
+    hostedPackageWorker(service),
+    env,
+    "sites-foreign-founder",
+    "foreign-founder@example.test",
+  );
+  assert.equal(foreign.document.data.status, "not_submitted");
+  assert.doesNotMatch(JSON.stringify(foreign.document), new RegExp(privateNote, "u"));
+
+  for (const request of [
+    new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+      headers: { accept: "application/json" },
+    }),
+    ownerRequest(FOUNDER_INTEREST_PATH),
+  ]) {
+    const response = await hostedPackageWorker(service).fetch(
+      request,
+      env,
+      executionContext,
+    );
+    assert.equal(response.status, 404);
+    assert.doesNotMatch(await response.text(), new RegExp(privateNote, "u"));
+  }
+
+  const subjectProof = await founderResource(worker, env);
+  const mismatched = await submitFounderMutation(
+    worker,
+    env,
+    subjectProof,
+    "PATCH",
+    actionBody(
+      requiredAction(subjectProof.document, "edit-founder-application"),
+      founderFields({
+        "expected-revision": 1,
+        note: "Foreign mutation must be denied.",
+      }),
+    ),
+    {
+      subject: "sites-foreign-founder",
+      email: "foreign-founder@example.test",
+    },
+  );
+  assert.equal(mismatched.status, 403);
+  assert.doesNotMatch(await mismatched.text(), new RegExp(privateNote, "u"));
+
+  const originProof = await founderResource(worker, env);
+  const crossOrigin = await submitFounderMutation(
+    worker,
+    env,
+    originProof,
+    "PATCH",
+    actionBody(
+      requiredAction(originProof.document, "edit-founder-application"),
+      founderFields({ "expected-revision": 1 }),
+    ),
+    { origin: "https://attacker.example.test" },
+  );
+  assert.equal(crossOrigin.status, 403);
+
+  const missingCookieProof = await founderResource(worker, env);
+  const missingCookie = await submitFounderMutation(
+    worker,
+    env,
+    missingCookieProof,
+    "PATCH",
+    actionBody(
+      requiredAction(missingCookieProof.document, "edit-founder-application"),
+      founderFields({ "expected-revision": 1 }),
+    ),
+    { cookie: "" },
+  );
+  assert.equal(missingCookie.status, 403);
+
+  const unchanged = await founderResource(hostedPackageWorker(service), env);
+  assert.equal(unchanged.document.data.revision, 1);
+  assert.equal(unchanged.document.data.history.length, 1);
 });
 
 test("hosted package routes persist atomic private versions and current acknowledgments", async () => {
@@ -2065,6 +2378,10 @@ async function registerHostedParticipant(
   email: string,
   displayName: string,
   operationId: string,
+  options: Readonly<{
+    country?: string;
+    declaredInterest?: "founder" | "investor" | "both";
+  }> = {},
 ): Promise<void> {
   const result = await hostedParticipantRepositoryFor(
     service,
@@ -2076,14 +2393,32 @@ async function registerHostedParticipant(
     registeredAt: "2026-08-10T10:00:00.000Z",
     registration: {
       displayName,
-      country: "FI",
-      declaredInterest: "investor",
+      country: options.country ?? "FI",
+      declaredInterest: options.declaredInterest ?? "investor",
       participationContext: "individual",
       processEmailNoticeAcknowledged: true,
       marketingConsent: false,
     },
   });
   assert.equal(result.revision, 1);
+}
+
+async function configureHostedFounderCampaign(
+  service: SyntheticAittaDBService,
+  phaseState: "closed" | "open" = "open",
+): Promise<void> {
+  const repository = new StorageCampaignRepository(hostedStorageAdapter(service));
+  const current = await repository.readSetup();
+  const expectedRevision = current?.revision ?? null;
+  const result = await repository.saveSetup({
+    operationId: `campaign-operation:hosted-founder-${phaseState}-${
+      expectedRevision ?? "new"
+    }`,
+    expectedRevision,
+    recordedAt: "2026-08-10T10:30:00.000Z",
+    setup: explicitCampaignSetup({ phaseState }),
+  });
+  assert.equal(result.setup.phases[0]?.state, phaseState);
 }
 
 function hostedStorageAdapter(
@@ -2107,7 +2442,14 @@ type TestAction = Readonly<{
     name: string;
     value?: unknown;
     default?: unknown;
+    choices?: readonly Readonly<{ value: string; title: string }>[];
   }>[];
+}>;
+
+type FounderResourceResponse = Readonly<{
+  document: FounderInterestDocument;
+  csrfToken: string | null;
+  cookie: string | null;
 }>;
 
 type OwnerWorkspaceResponse = Readonly<{
@@ -2115,6 +2457,90 @@ type OwnerWorkspaceResponse = Readonly<{
   csrfToken: string;
   cookie: string;
 }>;
+
+async function founderResource(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  subject = PARTICIPANT_SUBJECT,
+  email = PARTICIPANT_EMAIL,
+): Promise<FounderResourceResponse> {
+  const response = await worker.fetch(
+    new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+      headers: {
+        accept: "application/json",
+        "oai-authenticated-user-id": subject,
+        "oai-authenticated-user-email": email,
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(response.status, 200);
+  const csrfToken = response.headers.get(MUTATION_CSRF_HEADER);
+  const setCookie = response.headers.get("set-cookie");
+  return Object.freeze({
+    document: await response.json() as FounderInterestDocument,
+    csrfToken,
+    cookie: setCookie === null ? null : cookieHeader(setCookie),
+  });
+}
+
+async function submitFounderMutation(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  resource: FounderResourceResponse,
+  method: "POST" | "PATCH" | "DELETE",
+  body: Readonly<Record<string, unknown>>,
+  overrides: Readonly<{
+    cookie?: string;
+    csrfToken?: string;
+    origin?: string;
+    subject?: string;
+    email?: string;
+  }> = {},
+): Promise<Response> {
+  const cookie = Object.hasOwn(overrides, "cookie")
+    ? overrides.cookie ?? ""
+    : resource.cookie;
+  const csrfToken = overrides.csrfToken ?? resource.csrfToken;
+  if (cookie === null || csrfToken === null) {
+    assert.fail("Founder mutation proof is unavailable.");
+  }
+  return worker.fetch(
+    new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+      method,
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        cookie,
+        origin: overrides.origin ?? APP_ORIGIN,
+        [MUTATION_CSRF_HEADER]: csrfToken,
+        "oai-authenticated-user-id": overrides.subject ?? PARTICIPANT_SUBJECT,
+        "oai-authenticated-user-email": overrides.email ?? PARTICIPANT_EMAIL,
+      },
+      body: JSON.stringify(body),
+    }),
+    env,
+    executionContext,
+  );
+}
+
+function founderFields(
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    "expertise-summary": "Experience developing hosted data products.",
+    "intended-contribution": "Contribute to product delivery and validation.",
+    "primary-contribution-area-id": "area:engineering",
+    [FOUNDER_SECONDARY_AREAS_FIELD]: ["area:product"],
+    "approximate-availability": "Three days each week.",
+    "possible-start-timing": "After mutual confirmation.",
+    "compensation-expectation": "Open to discussion.",
+    "professional-profile-links": "https://profiles.invalid/founder",
+    note: "Initial hosted founder note.",
+    ...overrides,
+  });
+}
 
 async function ownerWorkspace(
   worker: TestWorker,

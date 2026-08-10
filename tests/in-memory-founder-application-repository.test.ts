@@ -177,13 +177,12 @@ export async function verifyFounderApplicationRepositoryContract(
   assert.deepEqual(withdrawn.snapshot.history[0], created.snapshot.history[0]);
   assert.deepEqual(withdrawn.snapshot.history[1], edited.snapshot.history[1]);
 
-  await rejectsStorage(
-    () => fixture.owner.withdraw({
-      ...withdraw,
-      occurredAt: "2026-08-09T12:01:00.000Z",
-    }),
-    "CONFLICT",
-  );
+  const resampledWithdrawReplay = await fixture.owner.withdraw({
+    ...withdraw,
+    occurredAt: "2026-08-09T12:01:00.000Z",
+  });
+  assert.equal(resampledWithdrawReplay.replayed, true);
+  assert.deepEqual(resampledWithdrawReplay.snapshot, withdrawn.snapshot);
 
   assert.equal(await fixture.foreign.get(APPLICATION_ID), null);
   assert.equal(await fixture.anonymous.get(APPLICATION_ID), null);
@@ -312,6 +311,32 @@ test("current records are checked against immutable adapter history", async () =
     () => repository(adapter, ALICE_SUBJECT).get(APPLICATION_ID),
     "UNAVAILABLE",
   );
+});
+
+test("concurrent exact creates recover one immutable server-timed result", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new ConcurrentTransactionStorageAdapter(
+    new DeterministicMemoryStorageAdapter(state, true),
+  );
+  const first = repository(adapter, ALICE_SUBJECT);
+  const second = repository(adapter, ALICE_SUBJECT);
+  const request = createRequest();
+
+  const results = await Promise.all([
+    first.create(request),
+    second.create({
+      ...request,
+      occurredAt: "2026-08-10T10:01:00.000Z",
+    }),
+  ]);
+
+  assert.deepEqual(results[0]?.snapshot, results[1]?.snapshot);
+  assert.deepEqual(
+    results.map((result) => result.replayed).sort(),
+    [false, true],
+  );
+  assert.equal(state.operations.size, 1);
+  assert.equal(state.records.size, 2);
 });
 
 test("configured owner can page and inspect opaque founder review records", async () => {
@@ -582,6 +607,37 @@ class DeterministicMemoryStorageAdapter implements StorageAdapter {
     });
     this.#state.operations.set(operationKey, { fingerprint, result });
     return cloneResult(result, false);
+  }
+}
+
+class ConcurrentTransactionStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #ready: Promise<void>;
+  #release: (() => void) | null = null;
+  #arrivals = 0;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+    this.#ready = new Promise((resolve) => {
+      this.#release = resolve;
+    });
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    this.#arrivals += 1;
+    if (this.#arrivals === 2) this.#release?.();
+    await this.#ready;
+    return await this.#delegate.transact(request);
   }
 }
 

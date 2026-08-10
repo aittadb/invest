@@ -7,6 +7,8 @@ import {
 
 export {
   createFounderInterestRouteHandler,
+  MAX_FOUNDER_INTEREST_MUTATION_BYTES,
+  MAX_FOUNDER_INTEREST_MUTATION_FIELDS,
   type FounderInterestRouteDependencies,
 } from "./founder-interest.ts";
 
