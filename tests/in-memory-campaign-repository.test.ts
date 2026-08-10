@@ -410,6 +410,46 @@ test("an initial audit failure leaves only an intent and unreachable immutable s
 test("campaign transactions reject a compact malformed result matrix", async (context) => {
   const commonCorruptions: readonly TransactionResultCorruption[] = [
     {
+      name: "custom result prototype",
+      corrupt: (result) => withCustomObjectPrototype(result),
+    },
+    {
+      name: "custom records array prototype",
+      corrupt: (result) => ({
+        ...result,
+        records: withCustomArrayPrototype(result.records),
+      }),
+    },
+    {
+      name: "sparse records array",
+      corrupt: (result) => ({
+        ...result,
+        records: sparseArray(result.records),
+      }),
+    },
+    {
+      name: "records array accessor",
+      corrupt: (result) => ({
+        ...result,
+        records: withArrayAccessor(result.records, 0),
+      }),
+    },
+    {
+      name: "records array symbol",
+      corrupt: (result) => ({
+        ...result,
+        records: withArraySymbol(result.records),
+      }),
+    },
+    {
+      name: "result accessor",
+      corrupt: (result) => withObjectAccessor(result, "replayed"),
+    },
+    {
+      name: "result symbol",
+      corrupt: (result) => withObjectSymbol(result),
+    },
+    {
       name: "extra result member",
       corrupt: (result) => ({ ...result, ignored: true }),
     },
@@ -434,6 +474,65 @@ test("campaign transactions reject a compact malformed result matrix", async (co
     {
       name: "null record",
       corrupt: (result) => replaceTransactionRecord(result, 0, null),
+    },
+    {
+      name: "custom record prototype",
+      corrupt: (result) => replaceTransactionRecord(
+        result,
+        0,
+        withCustomObjectPrototype(requiredTransactionRecord(result, 0)),
+      ),
+    },
+    {
+      name: "custom key prototype",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 0);
+        return replaceTransactionRecord(result, 0, {
+          ...record,
+          key: withCustomObjectPrototype(record.key),
+        });
+      },
+    },
+    {
+      name: "custom value prototype",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 0);
+        return replaceTransactionRecord(result, 0, {
+          ...record,
+          value: withCustomObjectPrototype(record.value),
+        });
+      },
+    },
+    {
+      name: "record accessor",
+      corrupt: (result) => replaceTransactionRecord(
+        result,
+        0,
+        withObjectAccessor(requiredTransactionRecord(result, 0), "revision"),
+      ),
+    },
+    {
+      name: "key symbol",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 0);
+        return replaceTransactionRecord(result, 0, {
+          ...record,
+          key: withObjectSymbol(record.key),
+        });
+      },
+    },
+    {
+      name: "value accessor",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 0);
+        return replaceTransactionRecord(result, 0, {
+          ...record,
+          value: withObjectAccessor(
+            record.value,
+            requiredObjectKey(record.value),
+          ),
+        });
+      },
     },
     {
       name: "extra record member",
@@ -475,6 +574,65 @@ test("campaign transactions reject a compact malformed result matrix", async (co
     },
   ];
   const finalCorruptions: readonly TransactionResultCorruption[] = [
+    {
+      name: "custom audit record prototype",
+      corrupt: (result) => replaceTransactionRecord(
+        result,
+        4,
+        withCustomObjectPrototype(requiredTransactionRecord(result, 4)),
+      ),
+    },
+    {
+      name: "custom audit key prototype",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 4);
+        return replaceTransactionRecord(result, 4, {
+          ...record,
+          key: withCustomObjectPrototype(record.key),
+        });
+      },
+    },
+    {
+      name: "custom audit value prototype",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 4);
+        return replaceTransactionRecord(result, 4, {
+          ...record,
+          value: withCustomObjectPrototype(record.value),
+        });
+      },
+    },
+    {
+      name: "audit record accessor",
+      corrupt: (result) => replaceTransactionRecord(
+        result,
+        4,
+        withObjectAccessor(requiredTransactionRecord(result, 4), "revision"),
+      ),
+    },
+    {
+      name: "audit key symbol",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 4);
+        return replaceTransactionRecord(result, 4, {
+          ...record,
+          key: withObjectSymbol(record.key),
+        });
+      },
+    },
+    {
+      name: "audit value accessor",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 4);
+        return replaceTransactionRecord(result, 4, {
+          ...record,
+          value: withObjectAccessor(
+            record.value,
+            requiredObjectKey(record.value),
+          ),
+        });
+      },
+    },
     {
       name: "campaign and audit out of order",
       corrupt: (result) => {
@@ -555,11 +713,92 @@ test("campaign transactions reject a compact malformed result matrix", async (co
   }
 });
 
+test("campaign transactions accept canonical null-prototype JSON objects", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true);
+  const nullPrototypeAdapter: StorageAdapter = Object.freeze({
+    read: adapter.read.bind(adapter),
+    list: adapter.list.bind(adapter),
+    async transact(request: StorageTransactionRequest) {
+      return toNullPrototypeJson(
+        await adapter.transact(request),
+      ) as StorageTransactionResult;
+    },
+  });
+  const repository = new DevelopmentInMemoryCampaignRepository(
+    nullPrototypeAdapter,
+  );
+  const result = await repository.saveSetupWithAudit({
+    operationId: "campaign-operation:null-prototype-result",
+    ownerSubject: "owner-subject",
+    recordedAt: FIRST_SAVE,
+    expectedRevision: null,
+    setup: {
+      ...explicitSetup(),
+      publicCampaign: { ...syntheticPublicCampaign, published: false },
+    },
+    transition: "created",
+  });
+
+  assert.equal(result.campaign.revision, 1);
+  assert.equal(result.replayed, false);
+});
+
 test("stored operation intents reject malformed envelopes, identity, and bytes", async (context) => {
   const corruptions: readonly Readonly<{
     name: string;
     corrupt(record: StorageRecord): StorageRecord;
   }>[] = [
+    {
+      name: "custom record prototype",
+      corrupt: (record) =>
+        withCustomObjectPrototype(record) as StorageRecord,
+    },
+    {
+      name: "custom key prototype",
+      corrupt: (record) => ({
+        ...record,
+        key: withCustomObjectPrototype(record.key),
+      }) as StorageRecord,
+    },
+    {
+      name: "custom value prototype",
+      corrupt: (record) => ({
+        ...record,
+        value: withCustomObjectPrototype(record.value),
+      }) as StorageRecord,
+    },
+    {
+      name: "custom actor prototype",
+      corrupt: (record) => ({
+        ...record,
+        value: {
+          ...record.value,
+          actor: withCustomObjectPrototype(
+            requiredObjectMember(record.value, "actor"),
+          ),
+        },
+      }) as StorageRecord,
+    },
+    {
+      name: "record accessor",
+      corrupt: (record) =>
+        withObjectAccessor(record, "revision") as StorageRecord,
+    },
+    {
+      name: "key symbol",
+      corrupt: (record) => ({
+        ...record,
+        key: withObjectSymbol(record.key),
+      }) as StorageRecord,
+    },
+    {
+      name: "value accessor",
+      corrupt: (record) => ({
+        ...record,
+        value: withObjectAccessor(record.value, "mode"),
+      }) as StorageRecord,
+    },
     {
       name: "extra record member",
       corrupt: (record) => ({ ...record, ignored: true }) as StorageRecord,
@@ -1164,6 +1403,107 @@ function replaceTransactionRecord(
   const records: unknown[] = [...result.records];
   records[index] = replacement;
   return { ...result, records };
+}
+
+function withCustomObjectPrototype(value: object): unknown {
+  return Object.create(
+    Object.freeze({ inherited: true }),
+    Object.getOwnPropertyDescriptors(value),
+  ) as unknown;
+}
+
+function withCustomArrayPrototype(
+  values: readonly unknown[],
+): unknown[] {
+  const copy = [...values];
+  Object.setPrototypeOf(copy, Object.create(Array.prototype) as object);
+  return copy;
+}
+
+function sparseArray(values: readonly unknown[]): unknown[] {
+  const sparse = new Array<unknown>(values.length);
+  for (let index = 1; index < values.length; index += 1) {
+    sparse[index] = values[index];
+  }
+  return sparse;
+}
+
+function withArrayAccessor(
+  values: readonly unknown[],
+  index: number,
+): unknown[] {
+  const copy = [...values];
+  Object.defineProperty(copy, String(index), {
+    configurable: true,
+    enumerable: true,
+    get: unexpectedAccessor,
+  });
+  return copy;
+}
+
+function withArraySymbol(values: readonly unknown[]): unknown[] {
+  const copy = [...values];
+  Object.defineProperty(copy, Symbol("ignored"), {
+    configurable: true,
+    enumerable: true,
+    value: true,
+  });
+  return copy;
+}
+
+function withObjectAccessor(value: object, key: string): unknown {
+  const source = value as Record<PropertyKey, unknown>;
+  const descriptors = Object.getOwnPropertyDescriptors(source);
+  assert.ok(Object.hasOwn(descriptors, key));
+  delete descriptors[key];
+  const copy = Object.create(Object.prototype, descriptors) as object;
+  Object.defineProperty(copy, key, {
+    configurable: true,
+    enumerable: true,
+    get: unexpectedAccessor,
+  });
+  return copy;
+}
+
+function withObjectSymbol(value: object): unknown {
+  const copy = Object.create(
+    Object.getPrototypeOf(value) as object | null,
+    Object.getOwnPropertyDescriptors(value),
+  ) as object;
+  Object.defineProperty(copy, Symbol("ignored"), {
+    configurable: true,
+    enumerable: true,
+    value: true,
+  });
+  return copy;
+}
+
+function unexpectedAccessor(): never {
+  throw new Error("The exact-data validator invoked a hostile accessor.");
+}
+
+function requiredObjectKey(value: object): string {
+  const key = Object.keys(value)[0];
+  assert.ok(key);
+  return key;
+}
+
+function requiredObjectMember(value: object, key: string): object {
+  const member = (value as Record<string, unknown>)[key];
+  assert.equal(typeof member, "object");
+  assert.notEqual(member, null);
+  assert.equal(Array.isArray(member), false);
+  return member as object;
+}
+
+function toNullPrototypeJson(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  if (Array.isArray(value)) return value.map(toNullPrototypeJson);
+  const copy = Object.create(null) as Record<string, unknown>;
+  for (const [key, child] of Object.entries(value)) {
+    copy[key] = toNullPrototypeJson(child);
+  }
+  return copy;
 }
 
 function cloneResult(

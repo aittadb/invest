@@ -620,11 +620,7 @@ function decodeCampaignOperationIntentRecord(
   value: unknown,
 ): CampaignOperationIntent {
   const envelope = exactDataObject(value, ["key", "revision", "value"]);
-  if (
-    envelope === null ||
-    envelope.revision !== 1 ||
-    jsonByteLength(envelope.value) > CAMPAIGN_OPERATION_INTENT_MAX_RECORD_BYTES
-  ) {
+  if (envelope === null || envelope.revision !== 1) {
     throw new StorageFailure("UNAVAILABLE");
   }
   const key = exactDataObject(envelope.key, ["collection", "id"]);
@@ -633,7 +629,9 @@ function decodeCampaignOperationIntentRecord(
   if (
     key === null ||
     key.collection !== expectedKey.collection ||
-    key.id !== expectedKey.id
+    key.id !== expectedKey.id ||
+    jsonByteLength(encodeCampaignOperationIntent(intent)) >
+      CAMPAIGN_OPERATION_INTENT_MAX_RECORD_BYTES
   ) {
     throw new StorageFailure("UNAVAILABLE");
   }
@@ -1173,8 +1171,8 @@ function verifyPreparedSetupChunk(
     key.collection !== chunk.key.collection ||
     key.id !== chunk.key.id ||
     envelope.revision !== 1 ||
-    jsonByteLength(envelope.value) > MAX_SETUP_CHUNK_RECORD_BYTES ||
-    !exactJsonDataEqual(envelope.value, chunk.value)
+    !exactJsonDataEqual(envelope.value, chunk.value) ||
+    jsonByteLength(envelope.value) > MAX_SETUP_CHUNK_RECORD_BYTES
   ) {
     throw new StorageFailure("UNAVAILABLE");
   }
@@ -1555,9 +1553,17 @@ function hasExactKeys(
 }
 
 function exactObject(value: unknown): Record<PropertyKey, unknown> | null {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<PropertyKey, unknown>
-    : null;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null
+      ? value as Record<PropertyKey, unknown>
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function exactDataObject(
@@ -1617,7 +1623,17 @@ function exactArrayValues(
   expectedLength: number,
 ): readonly unknown[] | null {
   try {
-    if (!Array.isArray(value) || value.length !== expectedLength) return null;
+    if (
+      !Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype
+    ) return null;
+    const length = Object.getOwnPropertyDescriptor(value, "length");
+    if (
+      length === undefined ||
+      length.enumerable ||
+      !("value" in length) ||
+      length.value !== expectedLength
+    ) return null;
     const keys = Reflect.ownKeys(value);
     const expectedKeys = [
       ...Array.from({ length: expectedLength }, (_, index) => String(index)),
@@ -1639,13 +1655,6 @@ function exactArrayValues(
       ) return null;
       values.push(descriptor.value);
     }
-    const length = Object.getOwnPropertyDescriptor(value, "length");
-    if (
-      length === undefined ||
-      length.enumerable ||
-      !("value" in length) ||
-      length.value !== expectedLength
-    ) return null;
     return Object.freeze(values);
   } catch {
     return null;
