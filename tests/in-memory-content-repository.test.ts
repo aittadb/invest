@@ -631,6 +631,87 @@ test("package reconstruction read budget blocks publication and caps storage rea
   );
 });
 
+test("request cache recharges a dense subtree's logical reconstruction reads", async () => {
+  const childState = new MemoryStorageState();
+  const childStorage = new DeterministicMemoryStorageAdapter(
+    childState,
+    () => true,
+    () => true,
+  );
+  const childPackages = new InMemoryPackageVersionRepository(childStorage);
+  await childPackages.append({
+    operationId: operationId("operation:cached-dense-child-1"),
+    expectedRevision: null,
+    draft: densePackageDraft(
+      "package:cached-dense-child-1",
+      "2026-08-05T09:01:00.000Z",
+    ),
+  });
+  await childPackages.append({
+    operationId: operationId("operation:cached-dense-child-2"),
+    expectedRevision: 1,
+    draft: densePackageDraft(
+      "package:cached-dense-child-2",
+      "2026-08-05T09:02:00.000Z",
+    ),
+  });
+
+  const parentState = new MemoryStorageState();
+  const parentStorage = new DeterministicMemoryStorageAdapter(
+    parentState,
+    () => true,
+    () => true,
+  );
+  const parentPackages = new InMemoryPackageVersionRepository(parentStorage);
+  await parentPackages.append({
+    operationId: operationId("operation:cached-dense-parent-1"),
+    expectedRevision: null,
+    draft: densePackageDraft(
+      "package:cached-dense-parent-1",
+      "2026-08-05T08:01:00.000Z",
+    ),
+  });
+  await parentPackages.append({
+    operationId: operationId("operation:cached-dense-parent-2"),
+    expectedRevision: 1,
+    draft: densePackageDraft(
+      "package:cached-dense-parent-2",
+      "2026-08-05T08:02:00.000Z",
+    ),
+  });
+  attachStandalonePackageParent(
+    childState,
+    "package:cached-dense-child-1",
+    parentState,
+    "package:cached-dense-parent-2",
+    2,
+  );
+
+  let headReads = 0;
+  const switchingStorage: StorageAdapter = Object.freeze({
+    read: (key: StorageKey) =>
+      key.collection === "private-package-version-heads" && ++headReads === 1
+        ? parentStorage.read(key)
+        : childStorage.read(key),
+    list: (request: Parameters<StorageAdapter["list"]>[0]) =>
+      childStorage.list(request),
+    transact: (request: Parameters<StorageAdapter["transact"]>[0]) =>
+      childStorage.transact(request),
+  });
+  const cached = InMemoryPackageVersionRepository.requestScopedReader(
+    switchingStorage,
+  );
+  assert.equal(
+    (await cached.current())?.snapshot.id,
+    "package:cached-dense-parent-2",
+  );
+  await rejectsStorage(() => cached.current(), "UNAVAILABLE");
+  await rejectsStorage(
+    () => new InMemoryPackageVersionRepository(childStorage).current(),
+    "UNAVAILABLE",
+  );
+});
+
 test("subjects and adapter grants prevent private or foreign disclosure", async () => {
   const fixture = createFixture();
   const privateDraft = packageDraft(
@@ -1304,6 +1385,7 @@ function attachStandalonePackageParent(
   childVersionId: string,
   parentState: MemoryStorageState,
   parentVersionId: string,
+  parentRevision = 1,
 ): void {
   const packageCollections = new Set([
     "private-package-versions",
@@ -1327,7 +1409,7 @@ function attachStandalonePackageParent(
       state.records.set(key, withRecordValue(record, {
         ...record.value,
         previousVersionId: parentVersionId,
-        acceptanceBindingExpectedRevision: 1,
+        acceptanceBindingExpectedRevision: parentRevision,
       }));
       manifestUpdated = true;
     }
@@ -1337,9 +1419,9 @@ function attachStandalonePackageParent(
     ) {
       state.records.set(key, withRecordValue(record, {
         ...record.value,
-        expectedOwnerRevision: 1,
+        expectedOwnerRevision: parentRevision,
         previousVersionId: parentVersionId,
-        acceptanceBindingExpectedRevision: 1,
+        acceptanceBindingExpectedRevision: parentRevision,
       }));
       intentUpdated = true;
     }

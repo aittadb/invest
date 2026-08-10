@@ -5,6 +5,10 @@ import {
 } from "../domain/foundation.ts";
 import type { ParticipantAccessStateReader } from "../domain/participant-home-resource.ts";
 import {
+  parseParticipantAccount,
+  type ParticipantAccount,
+} from "../domain/participant-profile.ts";
+import {
   StorageFailure,
   parseStorageCollection,
   parseStorageKey,
@@ -20,7 +24,10 @@ import type {
   BrowserMutationReplayClaimer,
 } from "../http/browser-mutation-session.ts";
 import { RepositoryOwnerPackageWorkspaceService } from "../services/owner-package-workspace.ts";
-import { createRepositoryParticipantAccessStateReader } from "../services/participant-access.ts";
+import {
+  MAX_PARTICIPANT_PROJECTION_ATTEMPTS,
+  createRepositoryParticipantAccessStateReader,
+} from "../services/participant-access.ts";
 import {
   StorageCampaignRepository,
   StoragePublicCampaignPresentationReader,
@@ -28,6 +35,7 @@ import {
   type PublicCampaignPresentationReader,
 } from "./in-memory-campaign-repository.ts";
 import {
+  MAX_ACCEPTANCE_GATE_READ_ATTEMPTS,
   PACKAGE_STORAGE_READ_LIMITS,
   StorageAcknowledgmentRepository,
   StoragePackageVersionRepository,
@@ -41,15 +49,41 @@ const REPLAY_COLLECTION = storageCollection("browser-mutation-replays");
 const REPLAY_CAPABILITY_PATTERN =
   /^browser-mutation:v1:[A-Za-z0-9_-]{43}$/u;
 const MAX_REPLAY_TTL_SECONDS = 600;
-export const PARTICIPANT_ACCESS_STORAGE_READ_LIMIT =
-  PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads + 16;
+const MAX_PROFILE_READS_PER_PROJECTION_ATTEMPT = 4;
+const MAX_PACKAGE_HEAD_READS_PER_PROJECTION_ATTEMPT = 2;
+const MAX_ACCEPTANCE_READS_PER_GATE_ATTEMPT = 4;
+const MAX_ACKNOWLEDGMENT_ROUTE_STATE_READS = 4;
+const MAX_ACKNOWLEDGMENT_ROUTE_OPERATION_READS = 4;
+export const PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT =
+  PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads - 1 +
+  MAX_PARTICIPANT_PROJECTION_ATTEMPTS *
+    (MAX_PROFILE_READS_PER_PROJECTION_ATTEMPT +
+      MAX_PACKAGE_HEAD_READS_PER_PROJECTION_ATTEMPT +
+      MAX_ACCEPTANCE_GATE_READ_ATTEMPTS *
+        MAX_ACCEPTANCE_READS_PER_GATE_ATTEMPT);
+export const PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT =
+  MAX_ACKNOWLEDGMENT_ROUTE_STATE_READS +
+  MAX_ACKNOWLEDGMENT_ROUTE_OPERATION_READS;
+export const PARTICIPANT_REQUEST_STORAGE_READ_LIMIT =
+  PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT +
+  PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT;
 
-type ParticipantPackageAcknowledgmentRepositories = Readonly<{
+export type ParticipantPackageAcknowledgmentRepositories = Readonly<{
   packages: Pick<PackageVersionRepository, "current">;
   acknowledgments: Pick<
     AcknowledgmentRepository,
     "get" | "latest" | "record"
   >;
+}>;
+
+export type ParticipantRequestRepositoryScope = Readonly<{
+  participantAccessReader(): ParticipantAccessStateReader;
+  participantPackageReader(
+    participantSubject: ActorSubject,
+  ): Pick<PackageVersionRepository, "current">;
+  participantPackageAcknowledgments(
+    participantSubject: ActorSubject,
+  ): ParticipantPackageAcknowledgmentRepositories;
 }>;
 
 /**
@@ -62,11 +96,9 @@ export class StorageApplicationRepositoryFactory {
   readonly #campaignRepository: AtomicCampaignAuditRepository;
   readonly #publicCampaignReader: PublicCampaignPresentationReader;
   readonly #ownerPackageWorkspace: RepositoryOwnerPackageWorkspaceService;
-  readonly #participantPackageReader: Pick<PackageVersionRepository, "current">;
-  readonly #participantPackageAcknowledgments: (
-    participantSubject: ActorSubject,
-  ) => ParticipantPackageAcknowledgmentRepositories;
-  readonly #participantAccessReader: ParticipantAccessStateReader;
+  readonly #participantRequest: (
+    account: ParticipantAccount,
+  ) => ParticipantRequestRepositoryScope;
 
   constructor(storage: StorageAdapter, now: () => Date) {
     const adapter = requiredStorageAdapter(storage);
@@ -76,56 +108,8 @@ export class StorageApplicationRepositoryFactory {
       packageVersions,
       { now: clock },
     );
-    this.#participantPackageReader = Object.freeze({
-      current: () => packageVersions.current(),
-    });
-    this.#participantPackageAcknowledgments = (participantSubject) => {
-      const subject = requiredActorSubject(participantSubject);
-      const acknowledgments = new StorageAcknowledgmentRepository(
-        adapter,
-        packageVersions,
-        subject,
-      );
-      return Object.freeze({
-        packages: this.#participantPackageReader,
-        acknowledgments: Object.freeze({
-          get: (id: Parameters<AcknowledgmentRepository["get"]>[0]) =>
-            acknowledgments.get(id),
-          latest: () => acknowledgments.latest(),
-          record: (
-            request: Parameters<AcknowledgmentRepository["record"]>[0],
-          ) => acknowledgments.record(request),
-        }),
-      });
-    };
-    this.#participantAccessReader = createRepositoryParticipantAccessStateReader(
-      (account) => {
-        const requestStorage = participantAccessStorage(adapter);
-        const participant = new StorageParticipantRepository(
-          requestStorage,
-          account,
-        );
-        const requestPackages =
-          StoragePackageVersionRepository.requestScopedReader(requestStorage);
-        const acknowledgments = new StorageAcknowledgmentRepository(
-          requestStorage,
-          requestPackages,
-          account.subject,
-        );
-        return Object.freeze({
-          participant: Object.freeze({
-            current: () => participant.current(),
-          }),
-          packages: Object.freeze({
-            current: () => requestPackages.current(),
-          }),
-          acknowledgments: Object.freeze({
-            currentAcceptanceStatus: () =>
-              acknowledgments.currentAcceptanceStatus(),
-          }),
-        });
-      },
-    );
+    this.#participantRequest = (account) =>
+      createParticipantRequestRepositoryScope(adapter, account);
     this.#claimBrowserMutationReplay = Object.freeze(
       (claim: BrowserMutationReplayClaim) => claimReplay(adapter, clock, claim),
     );
@@ -152,37 +136,110 @@ export class StorageApplicationRepositoryFactory {
     return this.#ownerPackageWorkspace;
   }
 
-  participantPackageReader(
-    participantSubject: ActorSubject,
-  ): Pick<PackageVersionRepository, "current"> {
-    requiredActorSubject(participantSubject);
-    return this.#participantPackageReader;
-  }
-
-  participantPackageAcknowledgments(
-    participantSubject: ActorSubject,
-  ): ParticipantPackageAcknowledgmentRepositories {
-    return this.#participantPackageAcknowledgments(participantSubject);
-  }
-
-  participantAccessReader(): ParticipantAccessStateReader {
-    return this.#participantAccessReader;
+  participantRequest(
+    account: ParticipantAccount,
+  ): ParticipantRequestRepositoryScope {
+    return this.#participantRequest(account);
   }
 }
 
-function participantAccessStorage(storage: StorageAdapter): StorageAdapter {
-  let remainingReads = PARTICIPANT_ACCESS_STORAGE_READ_LIMIT;
+type ParticipantRequestReadBudget = {
+  remainingReads: number;
+};
+
+function createParticipantRequestRepositoryScope(
+  storage: StorageAdapter,
+  input: ParticipantAccount,
+): ParticipantRequestRepositoryScope {
+  const account = requiredParticipantAccount(input);
+  const budget: ParticipantRequestReadBudget = {
+    remainingReads: PARTICIPANT_REQUEST_STORAGE_READ_LIMIT,
+  };
+  const readStorage = participantRequestStorage(storage, budget, false);
+  const mutationStorage = participantRequestStorage(storage, budget, true);
+  const participant = new StorageParticipantRepository(readStorage, account);
+  const packages = StoragePackageVersionRepository.requestScopedReader(
+    readStorage,
+  );
+  const readAcknowledgments = new StorageAcknowledgmentRepository(
+    readStorage,
+    packages,
+    account.subject,
+  );
+  const mutationAcknowledgments = new StorageAcknowledgmentRepository(
+    mutationStorage,
+    packages,
+    account.subject,
+  );
+  const packageReader = Object.freeze({
+    current: () => packages.current(),
+  });
+  const packageAcknowledgments = Object.freeze({
+    packages: packageReader,
+    acknowledgments: Object.freeze({
+      get: (id: Parameters<AcknowledgmentRepository["get"]>[0]) =>
+        readAcknowledgments.get(id),
+      latest: () => readAcknowledgments.latest(),
+      record: (request: Parameters<AcknowledgmentRepository["record"]>[0]) =>
+        mutationAcknowledgments.record(request),
+    }),
+  });
+  const accessReader = createRepositoryParticipantAccessStateReader(
+    (candidate) => {
+      const requestedAccount = requiredParticipantAccount(candidate);
+      if (
+        requestedAccount.subject !== account.subject ||
+        requestedAccount.accountEmailLabel !== account.accountEmailLabel
+      ) {
+        unavailable();
+      }
+      return Object.freeze({
+        participant: Object.freeze({
+          current: () => participant.current(),
+        }),
+        packages: packageReader,
+        acknowledgments: Object.freeze({
+          currentAcceptanceStatus: () =>
+            readAcknowledgments.currentAcceptanceStatus(),
+        }),
+      });
+    },
+  );
+  const requireSubject = (value: ActorSubject): void => {
+    if (requiredActorSubject(value) !== account.subject) unavailable();
+  };
+  return Object.freeze({
+    participantAccessReader: () => accessReader,
+    participantPackageReader: (participantSubject: ActorSubject) => {
+      requireSubject(participantSubject);
+      return packageReader;
+    },
+    participantPackageAcknowledgments: (
+      participantSubject: ActorSubject,
+    ) => {
+      requireSubject(participantSubject);
+      return packageAcknowledgments;
+    },
+  });
+}
+
+function participantRequestStorage(
+  storage: StorageAdapter,
+  budget: ParticipantRequestReadBudget,
+  mutationAuthority: boolean,
+): StorageAdapter {
   return Object.freeze({
     async read(key: StorageKey) {
-      if (remainingReads <= 0) unavailable();
-      remainingReads -= 1;
+      if (budget.remainingReads <= 0) unavailable();
+      budget.remainingReads -= 1;
       return await storage.read(key);
     },
     async list() {
       unavailable();
     },
-    async transact() {
-      unavailable();
+    async transact(request: Parameters<StorageAdapter["transact"]>[0]) {
+      if (!mutationAuthority) unavailable();
+      return await storage.transact(request);
     },
   });
 }
@@ -395,6 +452,12 @@ function requiredClock(value: () => Date): () => Date {
 
 function requiredActorSubject(value: unknown): ActorSubject {
   const parsed = parseActorSubject(value);
+  if (!parsed.ok) invalidRequest();
+  return parsed.value;
+}
+
+function requiredParticipantAccount(value: unknown): ParticipantAccount {
+  const parsed = parseParticipantAccount(value);
   if (!parsed.ok) invalidRequest();
   return parsed.value;
 }

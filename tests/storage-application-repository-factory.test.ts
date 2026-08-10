@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { parseActorSubject, parseTimestamp } from "../domain/foundation.ts";
+import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   StorageFailure,
   type StorageAdapter,
@@ -165,13 +166,25 @@ test("factory rejects anything other than a complete adapter", () => {
   );
 });
 
-test("factory exposes only named application repository capabilities", () => {
+test("factory exposes only named application repository capabilities", async () => {
   const storage = new MemoryStorageAdapter();
   const factory = new StorageApplicationRepositoryFactory(storage, () => NOW);
   const campaignRepository = factory.campaignRepository();
   const publicCampaignReader = factory.publicCampaignReader();
   const subject = parseActorSubject("issuer.invalid/participant:factory");
+  const account = parseParticipantAccount({
+    subject: "issuer.invalid/participant:factory",
+    accountEmailLabel: "factory@example.test",
+  });
+  const foreignSubject = parseActorSubject("issuer.invalid/participant:foreign");
+  const foreignAccount = parseParticipantAccount({
+    subject: "issuer.invalid/participant:foreign",
+    accountEmailLabel: "foreign@example.test",
+  });
   assert(subject.ok);
+  assert(account.ok);
+  assert(foreignSubject.ok);
+  assert(foreignAccount.ok);
 
   assert.deepEqual(Object.getOwnPropertyNames(
     Object.getPrototypeOf(factory) as object,
@@ -181,9 +194,7 @@ test("factory exposes only named application repository capabilities", () => {
     "campaignRepository",
     "publicCampaignReader",
     "ownerPackageWorkspace",
-    "participantPackageReader",
-    "participantPackageAcknowledgments",
-    "participantAccessReader",
+    "participantRequest",
   ]);
   assert.equal(
     factory.campaignRepository(),
@@ -209,11 +220,21 @@ test("factory exposes only named application repository capabilities", () => {
   assertNoGenericStorageSurface(publicCampaignReader, storage);
   assert.equal("storage" in factory, false);
   assert.equal("create" in factory, false);
+  const participantRequest = factory.participantRequest(account.value);
+  assert.notEqual(
+    factory.participantRequest(account.value),
+    participantRequest,
+  );
+  assert.deepEqual(Object.keys(participantRequest), [
+    "participantAccessReader",
+    "participantPackageReader",
+    "participantPackageAcknowledgments",
+  ]);
   assert.deepEqual(
-    Object.keys(factory.participantPackageReader(subject.value)),
+    Object.keys(participantRequest.participantPackageReader(subject.value)),
     ["current"],
   );
-  const acknowledgment = factory.participantPackageAcknowledgments(
+  const acknowledgment = participantRequest.participantPackageAcknowledgments(
     subject.value,
   );
   assert.deepEqual(Object.keys(acknowledgment), ["packages", "acknowledgments"]);
@@ -222,10 +243,19 @@ test("factory exposes only named application repository capabilities", () => {
     Object.keys(acknowledgment.acknowledgments),
     ["get", "latest", "record"],
   );
-  const accessReader = factory.participantAccessReader();
-  assert.equal(factory.participantAccessReader(), accessReader);
+  const accessReader = participantRequest.participantAccessReader();
+  assert.equal(participantRequest.participantAccessReader(), accessReader);
   assert.deepEqual(Object.keys(accessReader), ["read"]);
   assert.equal(Object.isFrozen(accessReader), true);
+  assert.throws(
+    () => participantRequest.participantPackageReader(foreignSubject.value),
+    (error) => storageFailure(error, "UNAVAILABLE"),
+  );
+  await assert.rejects(
+    accessReader.read(foreignAccount.value),
+    (error) => storageFailure(error, "UNAVAILABLE"),
+  );
+  assertNoGenericStorageSurface(participantRequest, storage);
   assert.doesNotMatch(
     Object.getOwnPropertyNames(Object.getPrototypeOf(factory)).join(" "),
     /adapter|storage|create/iu,

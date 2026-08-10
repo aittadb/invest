@@ -193,6 +193,10 @@ manifests, sections, chunks, and operation intents. Publication refuses a new
 version when the resulting reachable head would cross either limit. Existing
 over-limit or cyclic storage fails closed before another record is read; the
 reader retains one bounded visited set instead of copying it at each ancestor.
+Request-local immutable cache entries retain the complete ancestry ID list and
+logical reconstruction-record charge. Reusing an entry checks and adds that
+lineage and debits the fresh reconstruction context, so cached and uncached
+topologies enforce the same 32-version and 512-record limits.
 Every intent, stage, final publication, and
 acknowledgment transaction response must contain an exact boolean replay flag
 and the exact positional key, revision, and value for every requested record;
@@ -223,15 +227,32 @@ evidence-bearing read. The acknowledgment route uses a separate single
 current/latest/current attempt and fails its precondition on change rather than
 running that bounded loop.
 
-Participant-access composition additionally creates one read-only adapter and
-one package reader per authorization projection. The adapter admits at most 528
-storage-record reads across profile, package, gate, and acknowledgment work.
-Within that request only, the package reader reuses up to 64 already verified
-immutable version reconstructions; mutable profile records, package and
-acceptance heads, and the acceptance gate are always sampled again. A nested
-gate or outer projection retry therefore shares one finite budget without
-turning immutable history into repeated outbound reads. The cache cannot survive
-the use case, enter another participant request, or authorize a mutation.
+Hosted composition calls `participantRequest(account)` once for each eligible
+participant HTTP request. Authorization and the subsequently selected package
+or acknowledgment route receive the same subject-bound scope; route repository
+factories cannot reopen the underlying uncapped adapter. A second HTTP request
+receives a new scope.
+
+That scope admits at most 555 participant-private storage-record reads. The
+maximum valid authorization envelope is 547: 511 unique immutable package
+records plus two outer attempts, each containing four profile reads, two package
+head reads, and three four-read accepted gate attempts. The selected route owns
+the remaining eight reads. Package GET uses one cached-head read;
+acknowledgment GET uses at most four; the eight-read maximum also covers
+acknowledgment operation lookup, record preconditions, and conflict recovery.
+The next read fails before adapter access. Public campaign reads and storage
+transactions are outside this participant read counter, while all profile,
+package, gate, acceptance-head, acceptance-record, and acknowledgment-route
+reads are inside it.
+
+Within the scope, one read-only package reader reuses up to 64 verified immutable
+version reconstructions. Cache hits recharge complete ancestry and logical read
+metadata before reuse. Profile records, package and acceptance heads, and the
+acceptance gate remain mutable samples and are always read again. The cached
+reader cannot list or transact. A separate acknowledgment mutation adapter can
+transact and shares the same read counter and cached immutable binding, but it
+does not grant mutation authority to the cache. No adapter, counter, cache, or
+subject-bound repository survives the HTTP request.
 
 ## Browser-Mutation Replay
 
@@ -337,8 +358,10 @@ conflicts, advancing-clock retry recovery, 64-section and maximum-size Unicode
 records, failed-stage and failed-final-publication recovery, hostile record and
 transaction-result matrices, package/acceptance concurrency, stable gate
 sampling, accepted and unaccepted maximum-history aggregate read counts, nested
-publication retry counts, exact material gating, and narrowing-only route
-mutation limits. The
+publication retry counts, exact maximum-package GET and acknowledgment GET
+totals, the complete nested-plus-outer 547-read envelope, the read-556 cutoff,
+cached ancestry and reconstruction recharge, exact material gating, and
+narrowing-only route mutation limits. The
 synthetic hosted services implement and enforce the discovered AittaDB
 read/list/transaction controls rather than bypassing the adapter. Source
 and built-artifact scans complement `npm run instances:check`, which rejects

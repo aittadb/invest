@@ -23,6 +23,7 @@ import {
   type RuntimeCampaignPreview,
 } from "../http/runtime-preview.ts";
 import type { PublicCampaignPresentationReader } from "../repositories/in-memory-campaign-repository.ts";
+import type { ParticipantRequestRepositoryScope } from "../repositories/storage-application-repository-factory.ts";
 import {
   parseStorageOperationId,
   type StorageOperationId,
@@ -127,6 +128,12 @@ export function createApplicationWorker(
         dependencies,
         env,
       );
+      const participantRequest = runtimeParticipantRequest(
+        applicationRuntime,
+        actor,
+        isOwner,
+        url.pathname,
+      );
       const packageRoutes = dependencies.dispatchRoute === undefined &&
           applicationRuntime !== null
         ? runtimePackageRoutes(
@@ -134,6 +141,7 @@ export function createApplicationWorker(
             actor,
             isOwner,
             resourceUrl,
+            participantRequest,
           )
         : null;
       const ownerPackage = dependencies.dispatchRoute === undefined
@@ -177,12 +185,7 @@ export function createApplicationWorker(
         ? await resolveOwnerCampaign(campaignWorkspace, publicCampaign)
         : publicCampaign;
       const participantAccessReader = dependencies.participantAccessReader ??
-        runtimeParticipantAccessReader(
-          applicationRuntime,
-          actor,
-          isOwner,
-          url.pathname,
-        );
+        participantRequest?.participantAccessReader();
       const participantAccess = await resolveParticipantAccess(
         actor,
         participantAccessReader,
@@ -400,6 +403,7 @@ function runtimePackageRoutes(
   actor: AuthenticatedActor | null,
   isOwner: boolean,
   resourceUrl: string,
+  participantRequest: ParticipantRequestRepositoryScope | null,
 ): ResolvedPackageRoutes | null {
   try {
     const appOrigin = new URL(resourceUrl).origin;
@@ -429,11 +433,13 @@ function runtimePackageRoutes(
       }),
       participantReader: Object.freeze({
         repositoryFor: (participantSubject: ActorSubject) =>
-          repositories.participantPackageReader(participantSubject),
+          requiredParticipantRequest(participantRequest)
+            .participantPackageReader(participantSubject),
       }),
       participantAcknowledgment: Object.freeze({
         repositoryFor: (participantSubject: ActorSubject) =>
-          repositories.participantPackageAcknowledgments(participantSubject),
+          requiredParticipantRequest(participantRequest)
+            .participantPackageAcknowledgments(participantSubject),
         verifyMutation: (request: Request) =>
           session.verifyMutation(
             request,
@@ -612,25 +618,39 @@ async function resolveParticipantAccess(
   }
 }
 
-function runtimeParticipantAccessReader(
+function runtimeParticipantRequest(
   runtime: ApplicationRuntimeDeploymentCapability | null,
   actor: AuthenticatedActor | null,
   isOwner: boolean,
   pathname: string,
-): ParticipantAccessStateReader | undefined {
+): ParticipantRequestRepositoryScope | null {
   if (
     runtime === null ||
     actor === null ||
     isOwner ||
     !isParticipantAccessPath(pathname)
   ) {
-    return undefined;
+    return null;
   }
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (!account.ok) return null;
   try {
-    return runtime.repositoryFactory.participantAccessReader();
+    return runtime.repositoryFactory.participantRequest(account.value);
   } catch {
-    return undefined;
+    return null;
   }
+}
+
+function requiredParticipantRequest(
+  value: ParticipantRequestRepositoryScope | null,
+): ParticipantRequestRepositoryScope {
+  if (value === null) {
+    throw new Error("Participant request repositories are unavailable.");
+  }
+  return value;
 }
 
 function isParticipantAccessPath(pathname: string): boolean {

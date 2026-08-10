@@ -33,7 +33,7 @@ import type {
   ParticipantRepository,
 } from "../repositories/in-memory-participant-repository.ts";
 
-const MAX_PARTICIPANT_PROJECTION_ATTEMPTS = 2;
+export const MAX_PARTICIPANT_PROJECTION_ATTEMPTS = 2;
 const PROFILE_SNAPSHOT_KEYS = new Set(["revision", "snapshot"]);
 const PROFILE_KEYS = new Set([
   "subject",

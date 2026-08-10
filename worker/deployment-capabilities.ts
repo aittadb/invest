@@ -7,14 +7,10 @@ import type {
   AtomicCampaignAuditRepository,
   PublicCampaignPresentationReader,
 } from "../repositories/in-memory-campaign-repository.ts";
-import type {
-  AcknowledgmentRepository,
-  PackageVersionRepository,
-} from "../repositories/in-memory-content-repository.ts";
+import type { ParticipantAccount } from "../domain/participant-profile.ts";
+import type { ParticipantRequestRepositoryScope } from "../repositories/storage-application-repository-factory.ts";
 import type { OwnerCampaignEditorRepository } from "../services/owner-campaign-editor.ts";
 import type { OwnerPackageWorkspaceService } from "../services/owner-package-workspace.ts";
-import type { ActorSubject } from "../domain/foundation.ts";
-import type { ParticipantAccessStateReader } from "../domain/participant-home-resource.ts";
 
 export type CampaignWorkspaceOperationKind =
   | "setup"
@@ -27,19 +23,9 @@ export type ApplicationRepositoryFactory = Readonly<{
   campaignRepository(): AtomicCampaignAuditRepository;
   publicCampaignReader(): PublicCampaignPresentationReader;
   ownerPackageWorkspace(): OwnerPackageWorkspaceService;
-  participantPackageReader(
-    participantSubject: ActorSubject,
-  ): Pick<PackageVersionRepository, "current">;
-  participantPackageAcknowledgments(
-    participantSubject: ActorSubject,
-  ): Readonly<{
-    packages: Pick<PackageVersionRepository, "current">;
-    acknowledgments: Pick<
-      AcknowledgmentRepository,
-      "get" | "latest" | "record"
-    >;
-  }>;
-  participantAccessReader(): ParticipantAccessStateReader;
+  participantRequest(
+    account: ParticipantAccount,
+  ): ParticipantRequestRepositoryScope;
 }>;
 
 /** Backend-only deployment capability; it contains no serializable credential. */

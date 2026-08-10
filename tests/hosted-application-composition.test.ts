@@ -22,11 +22,14 @@ import {
   parseActorSubject,
   parseStableId,
   parseTimestamp,
+  type ActorSubject,
+  type StableId,
 } from "../domain/foundation.ts";
 import {
   StorageFailure,
   parseStorageOperationId,
   type StorageAdapter,
+  type StorageRecord,
 } from "../domain/storage-adapter.ts";
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
 import {
@@ -35,7 +38,9 @@ import {
 } from "../repositories/in-memory-content-repository.ts";
 import { StorageParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
 import {
-  PARTICIPANT_ACCESS_STORAGE_READ_LIMIT,
+  PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT,
+  PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT,
+  PARTICIPANT_REQUEST_STORAGE_READ_LIMIT,
   StorageApplicationRepositoryFactory,
 } from "../repositories/storage-application-repository-factory.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
@@ -410,15 +415,16 @@ test("participant access reconstructs maximum package history once per request",
     hostedStorageAdapter(service),
     () => NOW,
   );
+  const unacceptedRequest = unacceptedFactory.participantRequest(account.value);
   const beforeUnaccepted = service.readRequests;
-  const unaccepted = await unacceptedFactory.participantAccessReader().read(
+  const unaccepted = await unacceptedRequest.participantAccessReader().read(
     account.value,
   );
   const unacceptedReads = service.readRequests - beforeUnaccepted;
   assert.equal(unaccepted?.currentPackage?.id, current.snapshot.id);
   assert.equal(unaccepted?.currentPackage?.requiresCurrentAcceptance, true);
-  assert.ok(unacceptedReads < 160, `unexpected reads: ${unacceptedReads}`);
-  assert.ok(unacceptedReads <= PARTICIPANT_ACCESS_STORAGE_READ_LIMIT);
+  assert.equal(unacceptedReads, 137);
+  assert.ok(unacceptedReads <= PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT);
 
   const subject = parseActorSubject(PARTICIPANT_SUBJECT);
   const operationId = parseStorageOperationId(
@@ -450,14 +456,15 @@ test("participant access reconstructs maximum package history once per request",
     hostedStorageAdapter(service),
     () => NOW,
   );
+  const acceptedRequest = acceptedFactory.participantRequest(account.value);
   const beforeAccepted = service.readRequests;
-  const accepted = await acceptedFactory.participantAccessReader().read(
+  const accepted = await acceptedRequest.participantAccessReader().read(
     account.value,
   );
   const acceptedReads = service.readRequests - beforeAccepted;
   assert.equal(accepted?.currentPackage?.requiresCurrentAcceptance, false);
-  assert.ok(acceptedReads < 160, `unexpected reads: ${acceptedReads}`);
-  assert.ok(acceptedReads <= PARTICIPANT_ACCESS_STORAGE_READ_LIMIT);
+  assert.equal(acceptedReads, 138);
+  assert.ok(acceptedReads <= PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT);
 });
 
 test("participant access keeps nested package retry reads inside one budget", async () => {
@@ -500,12 +507,320 @@ test("participant access keeps nested package retry reads inside one budget", as
     racingStorage,
     () => NOW,
   );
+  const participantRequest = factory.participantRequest(account.value);
 
-  const state = await factory.participantAccessReader().read(account.value);
+  const state = await participantRequest.participantAccessReader().read(
+    account.value,
+  );
   assert.equal(publishedDuringGateRead, true);
   assert.equal(state?.currentPackage?.id, "package:budget-v9");
   assert.ok(delegatedReads < 100, `unexpected reads: ${delegatedReads}`);
-  assert.ok(delegatedReads <= PARTICIPANT_ACCESS_STORAGE_READ_LIMIT);
+  assert.ok(delegatedReads <= PARTICIPANT_REQUEST_STORAGE_READ_LIMIT);
+});
+
+test("participant request scope enforces exact maximum route and retry read budgets", async () => {
+  assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 547);
+  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 8);
+  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 555);
+
+  const service = new SyntheticAittaDBService();
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Maximum request participant",
+    "participant-operation:maximum-request-budget",
+  );
+  const current = await appendHostedMaximumReadPackage(service);
+  const account = parseParticipantAccount({
+    subject: PARTICIPANT_SUBJECT,
+    accountEmailLabel: PARTICIPANT_EMAIL,
+  });
+  const subject = parseActorSubject(PARTICIPANT_SUBJECT);
+  assert(account.ok);
+  assert(subject.ok);
+  await recordHostedAcceptance(
+    service,
+    subject.value,
+    current.snapshot.id,
+    "acceptance:maximum-request-budget",
+    "operation:maximum-request-budget-acceptance",
+  );
+
+  const packageReads = observeStorageReads(hostedStorageAdapter(service));
+  const packageRequest = new StorageApplicationRepositoryFactory(
+    packageReads.storage,
+    () => NOW,
+  ).participantRequest(account.value);
+  const packageAccess = await packageRequest.participantAccessReader().read(
+    account.value,
+  );
+  assert.equal(packageAccess?.currentPackage?.id, current.snapshot.id);
+  assert.equal(packageReads.count(), 521);
+  assert.equal(
+    (await packageRequest.participantPackageReader(subject.value).current())
+      ?.snapshot.id,
+    current.snapshot.id,
+  );
+  assert.equal(packageReads.count(), 522);
+
+  const acknowledgmentReads = observeStorageReads(hostedStorageAdapter(service));
+  const acknowledgmentRequest = new StorageApplicationRepositoryFactory(
+    acknowledgmentReads.storage,
+    () => NOW,
+  ).participantRequest(account.value);
+  await acknowledgmentRequest.participantAccessReader().read(account.value);
+  const acknowledgmentRepositories =
+    acknowledgmentRequest.participantPackageAcknowledgments(subject.value);
+  await acknowledgmentRepositories.packages.current();
+  await acknowledgmentRepositories.acknowledgments.latest();
+  await acknowledgmentRepositories.packages.current();
+  assert.equal(acknowledgmentReads.count(), 525);
+
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  const worker = hostedPackageWorker(service);
+  const packageReadsBefore = service.readRequests;
+  const packageResponse = await worker.fetch(
+    participantRequest("/participant/package?limit=1"),
+    env,
+    executionContext,
+  );
+  assert.equal(packageResponse.status, 200);
+  assert.equal(service.readRequests - packageReadsBefore, 523);
+  const acknowledgmentReadsBefore = service.readRequests;
+  const acknowledgmentResponse = await participantAcknowledgment(worker, env);
+  assert.equal(acknowledgmentResponse.document.data.status, "satisfied");
+  assert.equal(service.readRequests - acknowledgmentReadsBefore, 526);
+
+  const gateOffsets = [0, 1, 1, 2, 2, 2] as const;
+  let gateReadIndex = 0;
+  const gateReads = observeStorageReads(
+    hostedStorageAdapter(service),
+    (key, record) => {
+      if (key.collection !== "private-package-acceptance-bindings") {
+        return record;
+      }
+      const offset = gateOffsets[gateReadIndex];
+      assert.notEqual(offset, undefined);
+      gateReadIndex += 1;
+      return revisedStorageRecord(record, offset);
+    },
+  );
+  const gateRequest = new StorageApplicationRepositoryFactory(
+    gateReads.storage,
+    () => NOW,
+  ).participantRequest(account.value);
+  const gateState = await gateRequest.participantAccessReader().read(
+    account.value,
+  );
+  assert.equal(gateState?.currentPackage?.id, current.snapshot.id);
+  assert.equal(gateReadIndex, 6);
+  assert.equal(gateReads.count(), 529);
+
+  let profileUpdated = false;
+  const profileReads = observeStorageReads(
+    hostedStorageAdapter(service),
+    async (key, record) => {
+      if (
+        !profileUpdated &&
+        key.collection === "private-package-version-heads"
+      ) {
+        profileUpdated = true;
+        await hostedParticipantRepository(service).update({
+          operationId: "participant-operation:maximum-outer-retry",
+          expectedRevision: 1,
+          updatedAt: "2026-08-10T11:35:00.000Z",
+          changes: { displayName: "Maximum request participant updated" },
+        });
+      }
+      return record;
+    },
+  );
+  const profileRequest = new StorageApplicationRepositoryFactory(
+    profileReads.storage,
+    () => NOW,
+  ).participantRequest(account.value);
+  const profileState = await profileRequest.participantAccessReader().read(
+    account.value,
+  );
+  assert.equal(profileUpdated, true);
+  assert.equal(
+    profileState?.profile.displayName,
+    "Maximum request participant updated",
+  );
+  assert.equal(profileReads.count(), 531);
+
+  const combinedGateOffsets = [
+    0,
+    1,
+    1,
+    2,
+    2,
+    2,
+    2,
+    3,
+    3,
+    4,
+    4,
+    4,
+  ] as const;
+  let combinedGateReadIndex = 0;
+  let combinedProfileUpdated = false;
+  const combinedReads = observeStorageReads(
+    hostedStorageAdapter(service),
+    async (key, record) => {
+      if (
+        !combinedProfileUpdated &&
+        key.collection === "private-package-version-heads"
+      ) {
+        combinedProfileUpdated = true;
+        await hostedParticipantRepository(service).update({
+          operationId: "participant-operation:maximum-combined-retry",
+          expectedRevision: 2,
+          updatedAt: "2026-08-10T11:40:00.000Z",
+          changes: { displayName: "Maximum combined retry participant" },
+        });
+      }
+      if (key.collection !== "private-package-acceptance-bindings") {
+        return record;
+      }
+      const offset = combinedGateOffsets[combinedGateReadIndex];
+      assert.notEqual(offset, undefined);
+      combinedGateReadIndex += 1;
+      return revisedStorageRecord(record, offset);
+    },
+  );
+  const combinedRequest = new StorageApplicationRepositoryFactory(
+    combinedReads.storage,
+    () => NOW,
+  ).participantRequest(account.value);
+  const combinedState = await combinedRequest.participantAccessReader().read(
+    account.value,
+  );
+  assert.equal(combinedProfileUpdated, true);
+  assert.equal(combinedGateReadIndex, 12);
+  assert.equal(combinedState?.currentPackage?.id, current.snapshot.id);
+  assert.equal(combinedReads.count(), 547);
+
+  const combinedAcknowledgments =
+    combinedRequest.participantPackageAcknowledgments(subject.value);
+  await combinedAcknowledgments.packages.current();
+  await combinedAcknowledgments.acknowledgments.latest();
+  await combinedAcknowledgments.packages.current();
+  assert.equal(combinedReads.count(), 551);
+  for (let index = 0; index < 4; index += 1) {
+    await combinedRequest.participantPackageReader(subject.value).current();
+  }
+  assert.equal(combinedReads.count(), PARTICIPANT_REQUEST_STORAGE_READ_LIMIT);
+  await assert.rejects(
+    combinedRequest.participantPackageReader(subject.value).current(),
+    (error) => error instanceof StorageFailure && error.code === "UNAVAILABLE",
+  );
+  assert.equal(combinedReads.count(), PARTICIPANT_REQUEST_STORAGE_READ_LIMIT);
+});
+
+test("request-scoped cache rejects over-limit hosted ancestry like a fresh reader", async () => {
+  const childService = new SyntheticAittaDBService();
+  const parentService = new SyntheticAittaDBService();
+  await appendHostedNamedPackageHistory(
+    childService,
+    "cache-child",
+    31,
+    "2026-08-10T09:00:00.000Z",
+  );
+  await appendHostedNamedPackageHistory(
+    parentService,
+    "cache-parent",
+    10,
+    "2026-08-10T08:00:00.000Z",
+  );
+
+  const immutableCollections = new Set([
+    "private-package-versions",
+    "private-package-operation-intents",
+    "private-package-version-sections",
+    "private-package-section-chunks",
+  ]);
+  for (const [key, record] of parentService.records) {
+    if (immutableCollections.has(record.key.collection)) {
+      childService.records.set(key, record);
+    }
+  }
+  let manifestUpdated = false;
+  let intentUpdated = false;
+  for (const [key, record] of childService.records) {
+    if (
+      record.key.collection === "private-package-versions" &&
+      record.value.id === "package:cache-child-v1"
+    ) {
+      childService.records.set(key, Object.freeze({
+        ...record,
+        value: Object.freeze({
+          ...record.value,
+          previousVersionId: "package:cache-parent-v10",
+          acceptanceBindingExpectedRevision: 10,
+        }),
+      }));
+      manifestUpdated = true;
+    }
+    if (
+      record.key.collection === "private-package-operation-intents" &&
+      record.value.packageVersionId === "package:cache-child-v1"
+    ) {
+      childService.records.set(key, Object.freeze({
+        ...record,
+        value: Object.freeze({
+          ...record.value,
+          expectedOwnerRevision: 10,
+          previousVersionId: "package:cache-parent-v10",
+          acceptanceBindingExpectedRevision: 10,
+        }),
+      }));
+      intentUpdated = true;
+    }
+  }
+  assert.equal(manifestUpdated, true);
+  assert.equal(intentUpdated, true);
+
+  const childStorage = hostedStorageAdapter(childService);
+  const parentStorage = hostedStorageAdapter(parentService);
+  let delegatedReads = 0;
+  let headReads = 0;
+  const switchingStorage: StorageAdapter = Object.freeze({
+    async read(key: Parameters<StorageAdapter["read"]>[0]) {
+      delegatedReads += 1;
+      if (
+        key.collection === "private-package-version-heads" &&
+        ++headReads === 1
+      ) {
+        return await parentStorage.read(key);
+      }
+      return await childStorage.read(key);
+    },
+    list: (request: Parameters<StorageAdapter["list"]>[0]) =>
+      childStorage.list(request),
+    transact: (request: Parameters<StorageAdapter["transact"]>[0]) =>
+      childStorage.transact(request),
+  });
+  const cached = StoragePackageVersionRepository.requestScopedReader(
+    switchingStorage,
+  );
+  assert.equal(
+    (await cached.current())?.snapshot.id,
+    "package:cache-parent-v10",
+  );
+  await assert.rejects(
+    cached.current(),
+    (error) => error instanceof StorageFailure && error.code === "UNAVAILABLE",
+  );
+  assert.equal(delegatedReads, 73);
+
+  const freshReads = observeStorageReads(childStorage);
+  await assert.rejects(
+    new StoragePackageVersionRepository(freshReads.storage).current(),
+    (error) => error instanceof StorageFailure && error.code === "UNAVAILABLE",
+  );
+  assert.equal(freshReads.count(), 33);
 });
 
 test("hosted package routes persist atomic private versions and current acknowledgments", async () => {
@@ -1382,6 +1697,119 @@ function hostedPackageWorker(service: SyntheticAittaDBService) {
   });
 }
 
+type StorageReadObserver = (
+  key: Parameters<StorageAdapter["read"]>[0],
+  record: StorageRecord | null,
+) => StorageRecord | null | Promise<StorageRecord | null>;
+
+function observeStorageReads(
+  storage: StorageAdapter,
+  observer: StorageReadObserver = (_key, record) => record,
+): Readonly<{ storage: StorageAdapter; count(): number }> {
+  let readCount = 0;
+  return Object.freeze({
+    storage: Object.freeze({
+      async read(key: Parameters<StorageAdapter["read"]>[0]) {
+        readCount += 1;
+        return await observer(key, await storage.read(key));
+      },
+      list: (request: Parameters<StorageAdapter["list"]>[0]) =>
+        storage.list(request),
+      transact: (request: Parameters<StorageAdapter["transact"]>[0]) =>
+        storage.transact(request),
+    }),
+    count: () => readCount,
+  });
+}
+
+function revisedStorageRecord(
+  record: StorageRecord | null,
+  revisionOffset: number,
+): StorageRecord {
+  assert(record);
+  assert.ok(Number.isSafeInteger(revisionOffset));
+  assert.ok(revisionOffset >= 0);
+  return Object.freeze({
+    key: record.key,
+    revision: record.revision + revisionOffset,
+    value: record.value,
+  });
+}
+
+async function appendHostedMaximumReadPackage(
+  service: SyntheticAittaDBService,
+) {
+  const twoChunkMarkdown = "\u0800".repeat(30_000);
+  const sections = (
+    prefix: string,
+    count: number,
+    twoChunkIndex: number | null,
+  ) => Array.from({ length: count }, (_, index) => ({
+      id: `section:${prefix}-${index}`,
+      order: index,
+      title: `Bounded section ${index + 1}`,
+      markdown: index === twoChunkIndex
+        ? twoChunkMarkdown
+        : `Bounded package content ${index + 1}.`,
+      enabled: true,
+    }));
+  const repository = hostedPackageRepository(service);
+  let current: Awaited<ReturnType<typeof repository.append>> | null = null;
+  for (let index = 1; index <= 4; index += 1) {
+    const operationId = parseStorageOperationId(
+      `operation:maximum-request-package-v${index}`,
+    );
+    assert(operationId.ok);
+    current = await repository.append({
+      operationId: operationId.value,
+      expectedRevision: index === 1 ? null : index - 1,
+      draft: {
+        id: `package:maximum-request-v${index}`,
+        createdAt: new Date(
+          Date.parse("2026-08-10T10:00:00.000Z") + index * 10 * 60_000,
+        ).toISOString(),
+        changeSummary: `Maximum request package ${index}`,
+        materialChange: true,
+        acknowledgmentText: `I acknowledge maximum request package ${index}.`,
+        sections: sections(
+          `maximum-request-v${index}`,
+          index < 4 ? 64 : 59,
+          index === 4 ? 0 : null,
+        ),
+      },
+    });
+  }
+  assert(current);
+  return current;
+}
+
+async function recordHostedAcceptance(
+  service: SyntheticAittaDBService,
+  subject: ActorSubject,
+  versionId: StableId<"package-version">,
+  acceptanceValue: string,
+  operationValue: string,
+): Promise<void> {
+  const acceptanceId = parseStableId<"package-acceptance">(acceptanceValue);
+  const operationId = parseStorageOperationId(operationValue);
+  const acceptedAt = parseTimestamp("2026-08-10T11:30:00.000Z");
+  assert(acceptanceId.ok);
+  assert(operationId.ok);
+  assert(acceptedAt.ok);
+  const packages = hostedPackageRepository(service);
+  await new StorageAcknowledgmentRepository(
+    hostedStorageAdapter(service),
+    packages,
+    subject,
+  ).record({
+    operationId: operationId.value,
+    expectedRevision: null,
+    id: acceptanceId.value,
+    acceptedAt: acceptedAt.value,
+    acceptedVersionId: versionId,
+  });
+}
+
 function hostedPackageRepository(
   service: SyntheticAittaDBService,
 ): StoragePackageVersionRepository {
@@ -1400,6 +1828,41 @@ async function appendHostedPackageHistory(
   }
   assert(current);
   return current;
+}
+
+async function appendHostedNamedPackageHistory(
+  service: SyntheticAittaDBService,
+  prefix: string,
+  count: number,
+  start: string,
+): Promise<void> {
+  const repository = hostedPackageRepository(service);
+  for (let index = 1; index <= count; index += 1) {
+    const operationId = parseStorageOperationId(
+      `operation:${prefix}-v${index}`,
+    );
+    assert(operationId.ok);
+    await repository.append({
+      operationId: operationId.value,
+      expectedRevision: index === 1 ? null : index - 1,
+      draft: {
+        id: `package:${prefix}-v${index}`,
+        createdAt: new Date(
+          Date.parse(start) + index * 60_000,
+        ).toISOString(),
+        changeSummary: `${prefix} version ${index}`,
+        materialChange: true,
+        acknowledgmentText: `I acknowledge ${prefix} version ${index}.`,
+        sections: [{
+          id: `section:${prefix}-v${index}`,
+          order: 0,
+          title: `${prefix} version ${index}`,
+          markdown: `${prefix} private content ${index}.`,
+          enabled: true,
+        }],
+      },
+    });
+  }
 }
 
 async function appendHostedPackageVersion(

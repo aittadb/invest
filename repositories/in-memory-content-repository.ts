@@ -118,6 +118,7 @@ type StoredPackageVersion = Readonly<{
   mutationFingerprint: string;
   acceptanceBindingExpectedRevision: number | null;
   ancestryLength: number;
+  ancestryVersionIds: readonly string[];
   reconstructionReadCount: number;
 }>;
 
@@ -170,7 +171,7 @@ const PACKAGE_ACCEPTANCE_HEADS = storageCollection(
 const CURRENT_PACKAGE_ID = stableId<"storage-record">("current-package");
 const MAX_PACKAGE_SECTION_RECORD_BYTES = 60_000;
 const MAX_PACKAGE_SECTION_CHUNKS = 16;
-const MAX_ACCEPTANCE_GATE_READ_ATTEMPTS = 3;
+export const MAX_ACCEPTANCE_GATE_READ_ATTEMPTS = 3;
 const REQUEST_SCOPED_IMMUTABLE_READ_CACHE = Symbol(
   "request-scoped-immutable-package-read-cache",
 );
@@ -185,6 +186,28 @@ function createPackageReconstructionContext(): PackageReconstructionContext {
     remainingReads: PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads,
     versionIds: new Set<string>(),
   };
+}
+
+function rechargeCachedPackageReconstruction(
+  stored: StoredPackageVersion,
+  context: PackageReconstructionContext,
+  depth: number,
+): void {
+  if (
+    stored.ancestryVersionIds.length !== stored.ancestryLength ||
+    depth + stored.ancestryLength >
+      PACKAGE_STORAGE_READ_LIMITS.maxVersionAncestry ||
+    stored.reconstructionReadCount > context.remainingReads ||
+    stored.ancestryVersionIds.some((versionId) =>
+      context.versionIds.has(versionId)
+    )
+  ) {
+    unavailable();
+  }
+  context.remainingReads -= stored.reconstructionReadCount;
+  for (const versionId of stored.ancestryVersionIds) {
+    context.versionIds.add(versionId);
+  }
 }
 
 /**
@@ -611,7 +634,12 @@ export class StoragePackageVersionRepository
     if (context.versionIds.has(key.id)) unavailable();
     const cacheKey = key.id as string;
     const cached = this.#immutableReadCache?.get(cacheKey);
-    if (cached !== undefined) return await cached;
+    if (cached !== undefined) {
+      const stored = await cached;
+      if (stored === null) return null;
+      rechargeCachedPackageReconstruction(stored, context, depth);
+      return stored;
+    }
     if (
       this.#immutableReadCache !== null &&
       this.#immutableReadCache.size >=
@@ -621,7 +649,14 @@ export class StoragePackageVersionRepository
     const pending = this.#readStoredVersionUncached(key, context, depth);
     this.#immutableReadCache?.set(cacheKey, pending);
     try {
-      return await pending;
+      const stored = await pending;
+      if (
+        stored === null &&
+        this.#immutableReadCache?.get(cacheKey) === pending
+      ) {
+        this.#immutableReadCache.delete(cacheKey);
+      }
+      return stored;
     } catch (error) {
       if (this.#immutableReadCache?.get(cacheKey) === pending) {
         this.#immutableReadCache.delete(cacheKey);
@@ -714,6 +749,10 @@ export class StoragePackageVersionRepository
       mutationFingerprint,
       acceptanceBindingExpectedRevision,
       ancestryLength: (previous?.ancestryLength ?? 0) + 1,
+      ancestryVersionIds: Object.freeze([
+        record.key.id,
+        ...(previous?.ancestryVersionIds ?? []),
+      ]),
       reconstructionReadCount: remainingReadsBefore - context.remainingReads,
     });
   }
