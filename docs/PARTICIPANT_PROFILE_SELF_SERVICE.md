@@ -26,6 +26,12 @@ status is `required`, `current`, or `package_unavailable`; it comes from the
 trusted participant/package authorization projection rather than browser input.
 The participant subject is not serialized.
 
+The persisted profile also contains the bounded notice-evidence version,
+campaign revision, and exact process and marketing notice snapshots accepted at
+registration. That evidence is validated when profile state is reconstructed
+but remains registration-only: profile self-service neither advertises nor
+accepts it as an editable field.
+
 ## Actions
 
 The resource may advertise three independent actions:
@@ -41,9 +47,9 @@ Every action includes a separate server-issued `operation-id` and the exact
 current `expected-revision`. Consent withdrawal and deletion request each
 require their own explicit confirmation. Subject, account email, required
 process acknowledgment, registration and update timestamps, consent grant,
-and deletion system state never appear as editable action fields. Marketing
-consent cannot be granted or restored through this resource, and a deletion
-request cannot be cancelled through it.
+notice evidence, and deletion system state never appear as editable action
+fields. Marketing consent cannot be granted or restored through this resource,
+and a deletion request cannot be cancelled through it.
 
 After deletion is requested, profile editing and another deletion request are
 not available. A still-granted marketing consent remains independently

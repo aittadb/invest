@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { toStorageProtocolTransactionCommand } from "../domain/aittadb-storage-protocol.ts";
 import {
   parseParticipantAccount,
   type ParticipantAccount,
@@ -23,12 +24,14 @@ import {
 import {
   DevelopmentInMemoryParticipantRepository,
   StorageParticipantRepository,
+  type ParticipantRegistrationRepository,
   type ParticipantRepository,
   type RegisterParticipantRequest,
   type RequestParticipantDeletionRequest,
   type UpdateParticipantRequest,
   type WithdrawMarketingConsentRequest,
 } from "../repositories/in-memory-participant-repository.ts";
+import { testParticipantRegistrationNoticeEvidence } from "./support/participant-registration-notice-evidence.ts";
 
 const REGISTERED_AT = "2026-08-09T08:00:00.000Z";
 const UPDATED_AT = "2026-08-09T09:00:00.000Z";
@@ -36,10 +39,10 @@ const CONSENT_WITHDRAWN_AT = "2026-08-09T10:00:00.000Z";
 const DELETION_REQUESTED_AT = "2026-08-09T11:00:00.000Z";
 
 export type ParticipantRepositoryContractFixture = Readonly<{
-  participant: ParticipantRepository;
-  outsider: ParticipantRepository;
-  anonymous: ParticipantRepository;
-  reopenParticipant: () => ParticipantRepository;
+  participant: ParticipantRegistrationRepository;
+  outsider: ParticipantRegistrationRepository;
+  anonymous: ParticipantRegistrationRepository;
+  reopenParticipant: () => ParticipantRegistrationRepository;
 }>;
 
 export type ParticipantRepositoryContractFactory =
@@ -186,6 +189,7 @@ test("snapshots are immutable and only policy-approved fields can change", async
   const protectedChanges: readonly Record<string, unknown>[] = [
     { subject: bobAccount().subject },
     { accountEmailLabel: "attacker@example.test" },
+    { registrationNoticeEvidence: testParticipantRegistrationNoticeEvidence(2) },
     { processEmailNoticeAcknowledgedAt: UPDATED_AT },
     { marketingConsent: false },
     { accountDeletionRequest: { state: "requested" } },
@@ -340,6 +344,182 @@ test("operation IDs replay exactly and reject changed retries or stale writes", 
   assert.deepEqual(delayedUpdateReplay.snapshot, second.snapshot);
   assert.equal((await reopened.current())?.revision, 4);
   assert.equal(state.records.size, 5);
+});
+
+test("stale-policy recovery is read-only and returns only the exact registration result", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const operationId = "participant-operation:recover-registration";
+  const registration = profileRegistration();
+  const first = await new StorageParticipantRepository(
+    storage,
+    aliceAccount(),
+  ).register(registerRequest(operationId, registration));
+  assert.equal(state.operations.size, 1);
+
+  const reopened = new StorageParticipantRepository(storage, aliceAccount());
+  const replay = await reopened.recoverRegistration({
+    operationId,
+    registration,
+    noticeEvidenceVersion:
+      first.snapshot.registrationNoticeEvidence.version,
+  });
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.snapshot, first.snapshot);
+  assert.equal(state.operations.size, 1);
+
+  await rejectsStorage(
+    () => reopened.recoverRegistration({
+      operationId,
+      registration,
+      noticeEvidenceVersion: "malformed-private-evidence",
+    }),
+    "INVALID_REQUEST",
+  );
+  await rejectsStorage(
+    () => reopened.recoverRegistration({
+      operationId,
+      registration,
+      noticeEvidenceVersion:
+        testParticipantRegistrationNoticeEvidence(2).version,
+    }),
+    "PRECONDITION_FAILED",
+  );
+  await rejectsStorage(
+    () => reopened.recoverRegistration({
+      operationId,
+      registration: profileRegistration({ displayName: "Changed Retry" }),
+      noticeEvidenceVersion:
+        first.snapshot.registrationNoticeEvidence.version,
+    }),
+    "CONFLICT",
+  );
+  assert.equal(state.operations.size, 1);
+
+  const malformedStorage = new ReadTransformStorageAdapter(
+    storage,
+    (key, record) =>
+      record !== null &&
+        key.collection === "private-participant-profile-revisions"
+        ? mutateStoredProfile(record, (profile) => {
+            const evidence = mutableRecord(
+              profile.registrationNoticeEvidence,
+            );
+            evidence.version = "private-malformed-version";
+            profile.registrationNoticeEvidence = evidence;
+          })
+        : record,
+  );
+  const malformedFailure = await captureStorageFailure(() =>
+    new StorageParticipantRepository(
+      malformedStorage,
+      aliceAccount(),
+    ).recoverRegistration({
+      operationId,
+      registration,
+      noticeEvidenceVersion:
+        first.snapshot.registrationNoticeEvidence.version,
+    })
+  );
+  assert.equal(malformedFailure.code, "UNAVAILABLE");
+  assert.equal(malformedStorage.transactCalls, 0);
+
+  const foreignStorage = new ReadTransformStorageAdapter(
+    storage,
+    (key, record) =>
+      record !== null &&
+        key.collection === "private-participant-profile-revisions"
+        ? participantRecordWithSubjects(
+            record,
+            bobAccount().subject,
+            bobAccount().subject,
+          )
+        : record,
+  );
+  const foreignFailure = await captureStorageFailure(() =>
+    new StorageParticipantRepository(
+      foreignStorage,
+      aliceAccount(),
+    ).recoverRegistration({
+      operationId,
+      registration,
+      noticeEvidenceVersion:
+        first.snapshot.registrationNoticeEvidence.version,
+    })
+  );
+  const missingFailure = await captureStorageFailure(() =>
+    new StorageParticipantRepository(
+      new DeterministicMemoryStorageAdapter(
+        new MemoryStorageState(),
+        true,
+      ),
+      aliceAccount(),
+    ).recoverRegistration({
+      operationId,
+      registration,
+      noticeEvidenceVersion:
+        first.snapshot.registrationNoticeEvidence.version,
+    })
+  );
+  assert.equal(foreignFailure.code, "PRECONDITION_FAILED");
+  assert.equal(missingFailure.code, "PRECONDITION_FAILED");
+  assert.deepEqual(
+    toPublicStorageFailure(foreignFailure),
+    toPublicStorageFailure(missingFailure),
+  );
+  assert.equal(foreignStorage.transactCalls, 0);
+  assert.doesNotMatch(
+    JSON.stringify(toPublicStorageFailure(foreignFailure)),
+    /alice|bob|notice/u,
+  );
+});
+
+test("maximum notice evidence stays within profile record and transaction ceilings", async () => {
+  const maximumNotice = "\u754c".repeat(4_000);
+  assert.equal(new TextEncoder().encode(maximumNotice).byteLength, 12_000);
+  assert.throws(() => testParticipantRegistrationNoticeEvidence(1, {
+    processEmail: "x".repeat(4_001),
+    marketing: "bounded",
+  }));
+  const evidence = testParticipantRegistrationNoticeEvidence(
+    Number.MAX_SAFE_INTEGER,
+    { processEmail: maximumNotice, marketing: maximumNotice },
+  );
+  const subject = "\u754c".repeat(255);
+  const email = `${"\u754c".repeat(250)}@x.x`;
+  assert.equal(email.length, 254);
+  const account = participantAccount(subject, email);
+  const state = new MemoryStorageState();
+  const storage = new RecordingStorageAdapter(
+    new DeterministicMemoryStorageAdapter(state, true),
+  );
+  const repository = new StorageParticipantRepository(storage, account);
+  const result = await repository.register(registerRequest(
+    "r".repeat(127),
+    profileRegistration({ displayName: "\u754c".repeat(120) }),
+    evidence,
+  ));
+  assert.deepEqual(result.snapshot.registrationNoticeEvidence, evidence);
+
+  const recordBytes = [...state.records.values()].map(({ value }) =>
+    new TextEncoder().encode(JSON.stringify(value)).byteLength
+  );
+  assert.equal(recordBytes.length, 2);
+  assert.equal(recordBytes.every((bytes) => bytes <= 30_000), true);
+  assert.equal(recordBytes.every((bytes) => bytes > 24_000), true);
+  const transaction = storage.lastTransaction;
+  assert(transaction);
+  const inputBytes = new TextEncoder().encode(JSON.stringify(transaction))
+    .byteLength;
+  const wireBytes = new TextEncoder().encode(JSON.stringify(
+    toStorageProtocolTransactionCommand(transaction),
+  )).byteLength;
+  assert.equal(inputBytes <= 64_512, true);
+  assert.equal(wireBytes <= 65_536, true);
+  assert.deepEqual(
+    await new StorageParticipantRepository(storage, account).current(),
+    { revision: 1, snapshot: result.snapshot },
+  );
 });
 
 test("subject binding makes anonymous, foreign, and missing access non-disclosing", async () => {
@@ -782,9 +962,17 @@ test("stored profile records reject malformed data-only boundaries", async (t) =
       }),
     },
     {
+      name: "malformed registration notice evidence",
+      transform: (record) => mutateStoredProfile(record, (profile) => {
+        const evidence = mutableRecord(profile.registrationNoticeEvidence);
+        evidence.campaignRevision = 2;
+        profile.registrationNoticeEvidence = evidence;
+      }),
+    },
+    {
       name: "oversized stored value",
       transform: (record) => mutateStoredProfile(record, (profile) => {
-        profile.displayName = "x".repeat(8_193);
+        profile.displayName = "x".repeat(30_001);
       }),
     },
     {
@@ -839,7 +1027,7 @@ test("stored profile records enforce node, depth, and UTF-8 byte bounds", async 
     {
       name: "multibyte UTF-8 bytes",
       transform: (record) => mutateStoredProfile(record, (profile) => {
-        profile.displayName = "\u20ac".repeat(4_000);
+        profile.displayName = "\u20ac".repeat(10_001);
       }),
     },
   ];
@@ -1106,12 +1294,16 @@ function profileRegistration(
 function registerRequest(
   operationId: string,
   registration: unknown,
+  noticeEvidence: ReturnType<
+    typeof testParticipantRegistrationNoticeEvidence
+  > = testParticipantRegistrationNoticeEvidence(),
 ): RegisterParticipantRequest {
   return {
     operationId,
     expectedRevision: null,
     registeredAt: REGISTERED_AT,
     registration,
+    noticeEvidence,
   };
 }
 
@@ -1327,6 +1519,30 @@ class ReadTransformStorageAdapter implements StorageAdapter {
 
   get transactCalls(): number {
     return this.#transactCalls;
+  }
+}
+
+class RecordingStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  lastTransaction: StorageTransactionRequest | null = null;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    this.lastTransaction = request;
+    return this.#delegate.transact(request);
   }
 }
 

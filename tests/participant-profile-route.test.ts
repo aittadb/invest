@@ -44,6 +44,7 @@ import {
   MemoryStorageAdapter,
   MemoryStorageState,
 } from "./support/memory-storage-adapter.ts";
+import { testParticipantRegistrationNoticeEvidence } from "./support/participant-registration-notice-evidence.ts";
 
 const APP_ORIGIN = "https://campaign.example";
 const SECOND_ALLOWED_ORIGIN = "https://other-campaign.example";
@@ -852,6 +853,7 @@ async function createHarness(
       processEmailNoticeAcknowledged: true,
       marketingConsent: options.marketingConsent ?? false,
     },
+    noticeEvidence: testParticipantRegistrationNoticeEvidence(),
   });
 
   const profileRoute = createParticipantProfileRouteHandler({

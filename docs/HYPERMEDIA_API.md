@@ -83,6 +83,18 @@ relation and `read-private-package` action. These controls replace signed-out
 registration actions for that caller. A separately authorized owner-participant
 also retains `manage-campaign`.
 
+`GET /participant/registration` has resource type
+`participant-access-registration`. Before registration, HTML and JSON expose
+the same `register-participant-access` action, including a hidden server-derived
+notice-evidence version bound to the exact persisted process-email and optional
+marketing notices shown by both representations. `POST` rejects a stale version
+without creating participant state; only an exact already-committed operation
+may recover its immutable original result. After registration, `data` reports
+the stored evidence version, exact acknowledged process and marketing texts,
+process acknowledgment, and current marketing-consent state. Registered HTML
+shows that same state, and neither representation exposes another registration
+action or CSRF proof.
+
 `GET /participant` has resource type `participant-home`. Its `data` contains the
 authorized account label, declared interest and participation context, account
 status, public campaign name, and a bounded current-package status projection.

@@ -38,6 +38,7 @@ const PROFILE_KEYS = new Set([
   "country",
   "declaredInterest",
   "participationContext",
+  "registrationNoticeEvidence",
   "processEmailNoticeAcknowledgedAt",
   "marketingConsent",
   "accountDeletionRequest",
@@ -398,6 +399,7 @@ export function validateParticipantProfileResourceState(
           profile.marketingConsent.grantedAt !== undefined,
     },
     registeredAt,
+    profile.registrationNoticeEvidence,
   );
   if (
     !registration.ok ||

@@ -12,11 +12,13 @@ import {
   type ParticipantProfile,
 } from "../domain/participant-profile.ts";
 import { parseTimestamp, type Timestamp } from "../domain/foundation.ts";
+import { testParticipantRegistrationNoticeEvidence } from "./support/participant-registration-notice-evidence.ts";
 
 const REGISTERED_AT = timestamp("2026-01-01T00:00:00.000Z");
 const UPDATED_AT = timestamp("2026-01-02T00:00:00.000Z");
 const WITHDRAWN_AT = timestamp("2026-01-03T00:00:00.000Z");
 const DELETION_AT = timestamp("2026-01-04T00:00:00.000Z");
+const NOTICE_EVIDENCE = testParticipantRegistrationNoticeEvidence();
 
 test("first registration requires profile fields and server-supplied identity", () => {
   const invalidAccount = parseParticipantAccount({
@@ -40,6 +42,7 @@ test("first registration requires profile fields and server-supplied identity", 
     accountResult.value,
     registrationInput({ marketingConsent: undefined }),
     REGISTERED_AT,
+    NOTICE_EVIDENCE,
   );
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -51,6 +54,7 @@ test("first registration requires profile fields and server-supplied identity", 
     country: "AQ",
     declaredInterest: "both",
     participationContext: "individual",
+    registrationNoticeEvidence: NOTICE_EVIDENCE,
     processEmailNoticeAcknowledgedAt: REGISTERED_AT,
     marketingConsent: { state: "not-granted" },
     accountDeletionRequest: { state: "not-requested" },
@@ -68,7 +72,12 @@ test("first registration requires profile fields and server-supplied identity", 
     const input = registrationInput();
     delete input[field];
     assert.equal(
-      registerParticipantProfile(accountResult.value, input, REGISTERED_AT).ok,
+      registerParticipantProfile(
+        accountResult.value,
+        input,
+        REGISTERED_AT,
+        NOTICE_EVIDENCE,
+      ).ok,
       false,
       `${field} must be required`,
     );
@@ -79,6 +88,7 @@ test("first registration requires profile fields and server-supplied identity", 
       accountResult.value,
       registrationInput({ processEmailNoticeAcknowledged: false }),
       REGISTERED_AT,
+      NOTICE_EVIDENCE,
     ),
     {
       ok: false,
@@ -93,6 +103,7 @@ test("first registration requires profile fields and server-supplied identity", 
         accountEmailLabel: "replacement@example.invalid",
       },
       REGISTERED_AT,
+      NOTICE_EVIDENCE,
     ),
     {
       ok: false,
@@ -123,6 +134,7 @@ test("profile updates change only fields declared participant-editable", () => {
   assert.equal(result.value.subject, profile.subject);
   assert.equal(result.value.accountEmailLabel, profile.accountEmailLabel);
   assert.deepEqual(result.value.marketingConsent, profile.marketingConsent);
+  assert.equal(result.value.registrationNoticeEvidence, profile.registrationNoticeEvidence);
   assert.equal(result.value.updatedAt, UPDATED_AT);
 
   assert.deepEqual(
@@ -149,6 +161,21 @@ test("profile updates change only fields declared participant-editable", () => {
     "participant-editable",
   );
   assert.equal(PARTICIPANT_PROFILE_FIELD_RULES.marketingConsent, "withdraw-only");
+  assert.equal(
+    PARTICIPANT_PROFILE_FIELD_RULES.registrationNoticeEvidence,
+    "registration-only",
+  );
+  assert.deepEqual(
+    updateParticipantProfile(
+      profile,
+      { registrationNoticeEvidence: testParticipantRegistrationNoticeEvidence(2) },
+      UPDATED_AT,
+    ),
+    {
+      ok: false,
+      issues: [{ code: "invalid_rule", path: "registrationNoticeEvidence" }],
+    },
+  );
 });
 
 test("marketing consent withdrawal is independent and idempotent", () => {
@@ -193,6 +220,7 @@ function registeredProfile(marketingConsent: boolean): ParticipantProfile {
     participantAccount(),
     registrationInput({ marketingConsent }),
     REGISTERED_AT,
+    NOTICE_EVIDENCE,
   );
   assert.equal(result.ok, true);
   if (!result.ok) throw new Error("Test profile must be valid.");

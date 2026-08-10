@@ -40,6 +40,7 @@ import {
   MemoryStorageAdapter,
   MemoryStorageState,
 } from "./support/memory-storage-adapter.ts";
+import { testParticipantRegistrationNoticeEvidence } from "./support/participant-registration-notice-evidence.ts";
 
 test("participant authorization binds private state to the exact trusted account", () => {
   const alice = account("oidc:alice", "alice@example.test");
@@ -918,6 +919,7 @@ function registeredProfile(
       marketingConsent: false,
     },
     registeredAt.value,
+    testParticipantRegistrationNoticeEvidence(),
   );
   assert(profile.ok);
   return profile.value;

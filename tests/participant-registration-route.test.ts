@@ -36,7 +36,7 @@ import {
 } from "../http/browser-mutation-session.ts";
 import {
   DevelopmentInMemoryParticipantRepository,
-  type ParticipantRepository,
+  type ParticipantRegistrationRepository,
   type ParticipantProfileSnapshot,
 } from "../repositories/in-memory-participant-repository.ts";
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
@@ -52,6 +52,7 @@ import {
   MemoryStorageAdapter,
   MemoryStorageState,
 } from "./support/memory-storage-adapter.ts";
+import { testParticipantRegistrationNoticeEvidence } from "./support/participant-registration-notice-evidence.ts";
 
 const APP_ORIGIN = "https://campaign.example";
 const SECOND_ALLOWED_ORIGIN = "https://other-campaign.example";
@@ -63,6 +64,10 @@ const PROCESS_NOTICE =
   "Required <process> messages concern registration and campaign participation.";
 const MARKETING_NOTICE =
   "Optional marketing messages are separate from required process messages.";
+const NOTICE_EVIDENCE = testParticipantRegistrationNoticeEvidence(1, {
+  processEmail: PROCESS_NOTICE,
+  marketing: MARKETING_NOTICE,
+});
 const ISSUED_COOKIE =
   "__Host-investor_mutation_test=encrypted; Path=/; Max-Age=300; Secure; HttpOnly; SameSite=Strict";
 const CLEAR_COOKIE =
@@ -89,6 +94,7 @@ test("registration GET exposes equivalent HTML and versioned hypermedia without 
   const data = resourceData(document);
   assert.deepEqual(data, {
     status: "registration_required",
+    notice_evidence_version: NOTICE_EVIDENCE.version,
     account_email: "alice@provider.example",
     account_email_editable: false,
     display_name: null,
@@ -108,6 +114,7 @@ test("registration GET exposes equivalent HTML and versioned hypermedia without 
     actionFields.map((field) => field.name),
     [
       "operation-id",
+      "notice-evidence-version",
       "display-name",
       "country",
       "declared-interest",
@@ -177,10 +184,7 @@ test("registration capability requires an operation ID only while advertising re
     requestUrl: `${APP_ORIGIN}${PARTICIPANT_REGISTRATION_PATH}`,
     account,
     profile: null,
-    notices: {
-      processEmail: PROCESS_NOTICE,
-      marketing: MARKETING_NOTICE,
-    },
+    noticeEvidence: NOTICE_EVIDENCE,
   } as const;
   for (const operationId of [null, "not a stable operation id"] as const) {
     assert.throws(
@@ -227,6 +231,7 @@ test("trusted account registration accepts JSON and HTML while keeping marketing
   const created = await jsonDocument(createdResponse);
   assert.deepEqual(resourceData(created), {
     status: "registered",
+    notice_evidence_version: NOTICE_EVIDENCE.version,
     account_email: "alice@provider.example",
     account_email_editable: false,
     display_name: "Alice Example",
@@ -254,6 +259,7 @@ test("trusted account registration accepts JSON and HTML while keeping marketing
     formMutation(BOB, [
       [MUTATION_CSRF_FIELD, CSRF_TOKEN],
       ["operation-id", "participant-operation:bob-register"],
+      ["notice-evidence-version", NOTICE_EVIDENCE.version],
       ["display-name", "Bob Example"],
       ["country", "se"],
       ["declared-interest", "founder"],
@@ -321,6 +327,153 @@ test("registration preserves exact repository replay and duplicate behavior", as
   assert.equal(harness.nowCalls(), 1);
 });
 
+test("policy changes reject stale, malformed, and foreign notice evidence without writes", async () => {
+  const state = new MemoryStorageState();
+  const oldHarness = await createHarness({ state });
+  const alice = participant(ALICE, "alice@provider.example");
+  const discoveryResponse = await oldHarness.dispatch(
+    getRequest(ALICE, "application/json"),
+    alice,
+  );
+  const discovery = await jsonDocument(discoveryResponse);
+  const action = actionsOf(discovery)[0];
+  assert(action);
+  assert.equal(action.name, "register-participant-access");
+  const oldVersion = String(
+    fieldsOf(action).find(({ name }) => name === "notice-evidence-version")
+      ?.value,
+  );
+  assert.equal(oldVersion, NOTICE_EVIDENCE.version);
+
+  const changedEvidence = testParticipantRegistrationNoticeEvidence(2, {
+    processEmail: "Changed required process notice.",
+    marketing: "Changed optional marketing notice.",
+  });
+  const changedHarness = await createHarness({
+    state,
+    noticeEvidence: changedEvidence,
+  });
+  for (const [name, version, status] of [
+    ["stale", oldVersion, 412],
+    ["malformed", "not-a-notice-version", 400],
+    [
+      "foreign",
+      testParticipantRegistrationNoticeEvidence(3).version,
+      412,
+    ],
+  ] as const) {
+    const response = await changedHarness.dispatch(
+      jsonMutation(
+        ALICE,
+        registrationBody(`participant-operation:${name}-notice`, {
+          "notice-evidence-version": version,
+        }),
+      ),
+      alice,
+    );
+    assert.equal(response.status, status, name);
+    assert.doesNotMatch(
+      await response.text(),
+      /Changed required|alice@provider|participant:alice/u,
+    );
+    assert.equal(state.operations.size, 0, name);
+    assert.equal(await changedHarness.profile(alice), null, name);
+  }
+});
+
+test("an exact committed retry recovers its original notices after policy change and restart", async () => {
+  const state = new MemoryStorageState();
+  const alice = participant(ALICE, "alice@provider.example");
+  const operationId = "participant-operation:policy-restart-retry";
+  const body = registrationBody(operationId, { "marketing-consent": true });
+  const firstHarness = await createHarness({ state });
+  const first = await firstHarness.dispatch(jsonMutation(ALICE, body), alice);
+  assert.equal(first.status, 201);
+  assert.equal(state.operations.size, 1);
+
+  const changedEvidence = testParticipantRegistrationNoticeEvidence(2, {
+    processEmail: "New process notice must not replace old evidence.",
+    marketing: "New marketing notice must not replace old evidence.",
+  });
+  const restarted = await createHarness({
+    state,
+    noticeEvidence: changedEvidence,
+  });
+  const replay = await restarted.dispatch(jsonMutation(ALICE, body), alice);
+  assert.equal(replay.status, 200);
+  const replayData = resourceData(await jsonDocument(replay));
+  assert.equal(replayData.notice_evidence_version, NOTICE_EVIDENCE.version);
+  assert.equal(replayData.process_email_notice, PROCESS_NOTICE);
+  assert.equal(replayData.marketing_notice, MARKETING_NOTICE);
+  assert.equal(replayData.process_email_notice_acknowledged, true);
+  assert.equal(replayData.marketing_consent_state, "granted");
+  assert.equal(state.operations.size, 1);
+
+  const profile = await restarted.profile(alice);
+  assert(profile);
+  assert.deepEqual(profile.snapshot.registrationNoticeEvidence, NOTICE_EVIDENCE);
+  const reboundRetry = await restarted.dispatch(
+    jsonMutation(ALICE, {
+      ...body,
+      "notice-evidence-version": changedEvidence.version,
+    }),
+    alice,
+  );
+  assert.equal(reboundRetry.status, 409);
+  const changedRetry = await restarted.dispatch(
+    jsonMutation(ALICE, {
+      ...body,
+      "display-name": "Changed after committed policy retry",
+    }),
+    alice,
+  );
+  assert.equal(changedRetry.status, 409);
+  assert.equal(state.operations.size, 1);
+  assert.deepEqual(
+    (await restarted.profile(alice))?.snapshot.registrationNoticeEvidence,
+    NOTICE_EVIDENCE,
+  );
+});
+
+test("registered HTML and JSON expose the same immutable acknowledged notice state", async () => {
+  const harness = await createHarness();
+  const alice = participant(ALICE, "alice@provider.example");
+  const created = await harness.dispatch(
+    jsonMutation(
+      ALICE,
+      registrationBody("participant-operation:registered-parity"),
+    ),
+    alice,
+  );
+  assert.equal(created.status, 201);
+
+  const jsonResponse = await harness.dispatch(
+    getRequest(ALICE, "application/json"),
+    alice,
+  );
+  const document = await jsonDocument(jsonResponse);
+  const data = resourceData(document);
+  assert.equal(data.notice_evidence_version, NOTICE_EVIDENCE.version);
+  assert.equal(data.process_email_notice, PROCESS_NOTICE);
+  assert.equal(data.process_email_notice_acknowledged, true);
+  assert.equal(data.marketing_notice, MARKETING_NOTICE);
+  assert.deepEqual(actionsOf(document), []);
+  assert.equal(jsonResponse.headers.get(MUTATION_CSRF_HEADER), null);
+
+  const htmlResponse = await harness.dispatch(
+    getRequest(ALICE, "text/html"),
+    alice,
+  );
+  const html = await htmlResponse.text();
+  assert.equal(htmlResponse.status, 200);
+  assert.equal(htmlResponse.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.match(html, /Process notice acknowledged<\/dt><dd>Yes/u);
+  assert.match(html, new RegExp(NOTICE_EVIDENCE.version, "u"));
+  assert.match(html, /Required &lt;process&gt; messages/u);
+  assert.match(html, /Optional marketing messages are separate/u);
+  assert.doesNotMatch(html, /<form\b|name="_csrf"/u);
+});
+
 test("concurrent exact registration retries preserve the first server timestamp", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
@@ -346,6 +499,7 @@ test("concurrent exact registration retries preserve the first server timestamp"
           return current;
         },
         register: (request) => repository.register(request),
+        recoverRegistration: (request) => repository.recoverRegistration(request),
         update: (request) => repository.update(request),
         withdrawMarketingConsent: (request) =>
           repository.withdrawMarketingConsent(request),
@@ -764,10 +918,11 @@ test("hosted verification requires one valid cookie-clearing instruction", async
 
 test("hosted registration limits reject bodies, field counts, and repeats before replay or persistence", async () => {
   assert.equal(MAX_REGISTRATION_MUTATION_BYTES, 2_048);
-  assert.equal(MAX_REGISTRATION_MUTATION_FIELDS, 8);
+  assert.equal(MAX_REGISTRATION_MUTATION_FIELDS, 9);
   const maximumValidForm = new URLSearchParams({
     [MUTATION_CSRF_FIELD]: "x".repeat(65),
     "operation-id": `registration:${"x".repeat(114)}`,
+    "notice-evidence-version": NOTICE_EVIDENCE.version,
     "display-name": "\u{1F600}".repeat(120),
     country: "FI",
     "declared-interest": "investor",
@@ -823,7 +978,7 @@ test("hosted registration limits reject bodies, field counts, and repeats before
       },
     ),
     csrfTokenFor: async () => proof,
-    notices: { processEmail: PROCESS_NOTICE, marketing: MARKETING_NOTICE },
+    noticeEvidence: NOTICE_EVIDENCE,
   });
 
   const oversized = hostedJsonMutation(proof, registrationBody(
@@ -844,6 +999,7 @@ test("hosted registration limits reject bodies, field counts, and repeats before
 
   const repeated = hostedFormMutation(proof, [
     ["operation-id", "participant-operation:hosted-repeat"],
+    ["notice-evidence-version", NOTICE_EVIDENCE.version],
     ["display-name", "Alice"],
     ["display-name", "Alice again"],
     ["country", "FI"],
@@ -877,10 +1033,14 @@ async function createHarness(
   options: Readonly<{
     csrfToken?: string | BrowserMutationProof | null;
     verifyMutation?: ParticipantRegistrationMutationVerifier;
-    repositoryFor?: (account: ParticipantAccount) => ParticipantRepository;
+    repositoryFor?: (
+      account: ParticipantAccount,
+    ) => ParticipantRegistrationRepository;
+    state?: MemoryStorageState;
+    noticeEvidence?: typeof NOTICE_EVIDENCE;
   }> = {},
 ): Promise<TestHarness> {
-  const state = new MemoryStorageState();
+  const state = options.state ?? new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
   const csrfHash = await hashCsrfToken(CSRF_TOKEN);
   const issuedCsrfToken = Object.hasOwn(options, "csrfToken")
@@ -893,10 +1053,7 @@ async function createHarness(
     new DevelopmentInMemoryParticipantRepository(storage, account));
   const registrationRoute = createParticipantRegistrationRouteHandler({
     repositoryFor,
-    notices: {
-      processEmail: PROCESS_NOTICE,
-      marketing: MARKETING_NOTICE,
-    },
+    noticeEvidence: options.noticeEvidence ?? NOTICE_EVIDENCE,
     ...(options.verifyMutation === undefined
       ? {
           mutationSecurity: {
@@ -1101,7 +1258,7 @@ function verifierFor(
 
 function renderingFailureRepository(
   account: ParticipantAccount,
-): ParticipantRepository {
+): ParticipantRegistrationRepository {
   const snapshot = Object.freeze({
     subject: account.subject,
     accountEmailLabel: account.accountEmailLabel,
@@ -1111,7 +1268,9 @@ function renderingFailureRepository(
     country: "FI",
     declaredInterest: "investor",
     participationContext: "individual",
-    processEmailNoticeAcknowledged: true,
+    registrationNoticeEvidence: NOTICE_EVIDENCE,
+    processEmailNoticeAcknowledgedAt:
+      timestamp("2026-08-09T10:00:00.000Z"),
     marketingConsent: Object.freeze({ state: "not-granted" }),
     accountDeletionRequest: Object.freeze({ state: "not-requested" }),
     registeredAt: timestamp("2026-08-09T10:00:00.000Z"),
@@ -1128,6 +1287,9 @@ function renderingFailureRepository(
         replayed: false,
         intents: [],
       } as never;
+    },
+    async recoverRegistration() {
+      throw new Error("unused");
     },
     async update() {
       throw new Error("unused");
@@ -1166,6 +1328,7 @@ function registrationBody(
 ): Readonly<Record<string, unknown>> {
   return {
     "operation-id": operationId,
+    "notice-evidence-version": NOTICE_EVIDENCE.version,
     "display-name": "  Alice Example  ",
     country: "fi",
     "declared-interest": "both",

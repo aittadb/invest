@@ -42,6 +42,7 @@ const PROFILE_KEYS = new Set([
   "country",
   "declaredInterest",
   "participationContext",
+  "registrationNoticeEvidence",
   "processEmailNoticeAcknowledgedAt",
   "marketingConsent",
   "accountDeletionRequest",
@@ -273,6 +274,7 @@ function detachParticipantProfileSample(
       marketingConsent: marketingConsent.state === "granted",
     },
     registeredAt,
+    source.registrationNoticeEvidence as ParticipantProfile["registrationNoticeEvidence"],
   );
   if (
     !registration.ok ||
@@ -291,6 +293,7 @@ function detachParticipantProfileSample(
     country: registration.value.country,
     declaredInterest: registration.value.declaredInterest,
     participationContext: registration.value.participationContext,
+    registrationNoticeEvidence: registration.value.registrationNoticeEvidence,
     processEmailNoticeAcknowledgedAt,
     marketingConsent,
     accountDeletionRequest,
@@ -534,6 +537,14 @@ function sameParticipantProfile(
     left.country === right.country &&
     left.declaredInterest === right.declaredInterest &&
     left.participationContext === right.participationContext &&
+    left.registrationNoticeEvidence.version ===
+      right.registrationNoticeEvidence.version &&
+    left.registrationNoticeEvidence.campaignRevision ===
+      right.registrationNoticeEvidence.campaignRevision &&
+    left.registrationNoticeEvidence.processEmail ===
+      right.registrationNoticeEvidence.processEmail &&
+    left.registrationNoticeEvidence.marketing ===
+      right.registrationNoticeEvidence.marketing &&
     left.processEmailNoticeAcknowledgedAt ===
       right.processEmailNoticeAcknowledgedAt &&
     sameMarketingConsent(left.marketingConsent, right.marketingConsent) &&

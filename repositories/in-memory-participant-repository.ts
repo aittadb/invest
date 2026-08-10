@@ -11,6 +11,11 @@ import {
   type ParticipantProfileIntent,
 } from "../domain/participant-profile.ts";
 import {
+  defineParticipantRegistrationNoticeEvidence,
+  parseParticipantRegistrationNoticeEvidenceVersion,
+  type ParticipantRegistrationNoticeEvidence,
+} from "../domain/participant-registration-notice-evidence.ts";
+import {
   parseActorSubject,
   parseTimestamp,
   type ActorSubject,
@@ -30,8 +35,16 @@ import {
 } from "../domain/storage-adapter.ts";
 
 const PARTICIPANT_PROFILE_SCHEMA_VERSION = 1;
-const MAX_PARTICIPANT_PROFILE_RECORD_BYTES = 8_192;
-const MAX_PARTICIPANT_PROFILE_RECORD_NODES = 64;
+const PARTICIPANT_PROFILE_STORAGE_LIMITS = Object.freeze({
+  maxRecordBytes: 30_000,
+  maxTransactionBytes: 65_536,
+  maxTransactionEnvelopeBytes: 1_024,
+  maxNodes: 64,
+  maxDepth: 8,
+});
+const MAX_PARTICIPANT_PROFILE_TRANSACTION_INPUT_BYTES =
+  PARTICIPANT_PROFILE_STORAGE_LIMITS.maxTransactionBytes -
+  PARTICIPANT_PROFILE_STORAGE_LIMITS.maxTransactionEnvelopeBytes;
 const PARTICIPANT_PROFILES = storageCollection("private-participant-profiles");
 const PARTICIPANT_PROFILE_REVISIONS = storageCollection(
   "private-participant-profile-revisions",
@@ -51,6 +64,7 @@ const PROFILE_KEYS = new Set([
   "country",
   "declaredInterest",
   "participationContext",
+  "registrationNoticeEvidence",
   "processEmailNoticeAcknowledgedAt",
   "marketingConsent",
   "accountDeletionRequest",
@@ -107,6 +121,13 @@ export type RegisterParticipantRequest = Readonly<{
   expectedRevision: null;
   registeredAt: unknown;
   registration: unknown;
+  noticeEvidence: unknown;
+}>;
+
+export type RecoverParticipantRegistrationRequest = Readonly<{
+  operationId: unknown;
+  registration: unknown;
+  noticeEvidenceVersion: unknown;
 }>;
 
 export type UpdateParticipantRequest = Readonly<{
@@ -146,8 +167,17 @@ export interface ParticipantRepository {
   pendingDeletionIntent(): Promise<ParticipantProfileIntent | null>;
 }
 
+/** Registration-only extension for stale-policy exact-retry recovery. */
+export interface ParticipantRegistrationRepository
+  extends ParticipantRepository {
+  recoverRegistration(
+    request: RecoverParticipantRegistrationRequest,
+  ): Promise<ParticipantProfileMutationResult>;
+}
+
 /** Subject-bound participant persistence over a credential-bound StorageAdapter. */
-export class StorageParticipantRepository implements ParticipantRepository {
+export class StorageParticipantRepository
+  implements ParticipantRegistrationRepository {
   readonly storageKind = "storage-adapter" as const;
 
   readonly #storage: StorageAdapter;
@@ -200,6 +230,7 @@ export class StorageParticipantRepository implements ParticipantRepository {
     if (request.expectedRevision !== null) invalidRequest();
     const operationId = requiredOperationId(request.operationId);
     const registeredAt = requiredTimestamp(request.registeredAt);
+    const noticeEvidence = requiredNoticeEvidence(request.noticeEvidence);
 
     let parsed;
     try {
@@ -207,6 +238,7 @@ export class StorageParticipantRepository implements ParticipantRepository {
         account,
         request.registration,
         registeredAt,
+        noticeEvidence,
       );
     } catch {
       invalidRequest();
@@ -216,6 +248,7 @@ export class StorageParticipantRepository implements ParticipantRepository {
     const requestHash = await hashMutationRequest({
       action: "register",
       registration: request.registration,
+      noticeEvidence,
     });
     return this.#persist(
       parsed.value,
@@ -225,6 +258,69 @@ export class StorageParticipantRepository implements ParticipantRepository {
       requestHash,
       null,
     );
+  }
+
+  async recoverRegistration(
+    request: RecoverParticipantRegistrationRequest,
+  ): Promise<ParticipantProfileMutationResult> {
+    const account = this.#requireAccount();
+    const operationId = requiredOperationId(request.operationId);
+    const submittedEvidence = parseParticipantRegistrationNoticeEvidenceVersion(
+      request.noticeEvidenceVersion,
+    );
+    if (submittedEvidence === null) invalidRequest();
+
+    const historyKey = await participantProfileRevisionKey(account.subject, 1);
+    const record = await storageRead(this.#storage, historyKey);
+    if (record === null) preconditionFailed();
+    const replay = decodeHistoricalParticipantRecord(
+      record,
+      historyKey,
+      account.subject,
+      1,
+    );
+    if (replay === null) preconditionFailed();
+
+    const noticeEvidence = replay.snapshot.registrationNoticeEvidence;
+    if (noticeEvidence.version !== submittedEvidence.version) {
+      preconditionFailed();
+    }
+    let parsed;
+    try {
+      parsed = registerParticipantProfile(
+        account,
+        request.registration,
+        replay.snapshot.registeredAt,
+        noticeEvidence,
+      );
+    } catch {
+      invalidRequest();
+    }
+    if (!parsed.ok) invalidRequest();
+
+    const requestHash = await hashMutationRequest({
+      action: "register",
+      registration: request.registration,
+      noticeEvidence,
+    });
+    const stored = snapshotStorageRecord(record);
+    const mutationEvidence = participantMutationEvidence(stored.value);
+    const expectedValue = boundedParticipantProfileDocument(
+      parsed.value,
+      1,
+      "register",
+      operationId,
+      requestHash,
+    );
+    if (
+      mutationEvidence.operationId !== operationId ||
+      mutationEvidence.action !== "register" ||
+      mutationEvidence.requestHash !== requestHash ||
+      !equalData(stored.value, expectedValue)
+    ) {
+      throw new StorageFailure("CONFLICT");
+    }
+    return mutationResult(replay.revision, replay.snapshot, true, []);
   }
 
   async update(
@@ -381,7 +477,7 @@ export class StorageParticipantRepository implements ParticipantRepository {
       account.subject,
       nextRevision,
     );
-    const value = participantProfileDocument(
+    const value = boundedParticipantProfileDocument(
       profile,
       nextRevision,
       action,
@@ -405,7 +501,7 @@ export class StorageParticipantRepository implements ParticipantRepository {
     }
     let result: unknown;
     try {
-      result = await storageTransact(this.#storage, {
+      const transaction = boundedParticipantTransaction({
         operationId,
         mutations: [
           {
@@ -422,6 +518,7 @@ export class StorageParticipantRepository implements ParticipantRepository {
           },
         ],
       });
+      result = await storageTransact(this.#storage, transaction);
     } catch (error) {
       if (
         expectedRevision === null &&
@@ -622,6 +719,12 @@ function participantProfileDocument(
       country: profile.country,
       declaredInterest: profile.declaredInterest,
       participationContext: profile.participationContext,
+      registrationNoticeEvidence: {
+        version: profile.registrationNoticeEvidence.version,
+        campaignRevision: profile.registrationNoticeEvidence.campaignRevision,
+        processEmail: profile.registrationNoticeEvidence.processEmail,
+        marketing: profile.registrationNoticeEvidence.marketing,
+      },
       processEmailNoticeAcknowledgedAt:
         profile.processEmailNoticeAcknowledgedAt,
       marketingConsent: marketingConsentDocument(profile.marketingConsent),
@@ -633,6 +736,36 @@ function participantProfileDocument(
     },
     lastMutation: { action, operationId, requestHash },
   });
+}
+
+function boundedParticipantProfileDocument(
+  profile: ParticipantProfile,
+  profileRevision: number,
+  action: ParticipantMutationAction,
+  operationId: StorageOperationId,
+  requestHash: string,
+): StorageDocument {
+  return snapshotBoundedStorageDocument(participantProfileDocument(
+    profile,
+    profileRevision,
+    action,
+    operationId,
+    requestHash,
+  ));
+}
+
+function boundedParticipantTransaction(
+  request: Parameters<StorageAdapter["transact"]>[0],
+): Parameters<StorageAdapter["transact"]>[0] {
+  const serialized = JSON.stringify(request);
+  if (
+    typeof serialized !== "string" ||
+    new TextEncoder().encode(serialized).byteLength >
+      MAX_PARTICIPANT_PROFILE_TRANSACTION_INPUT_BYTES
+  ) {
+    unavailable();
+  }
+  return request;
 }
 
 function marketingConsentDocument(consent: MarketingConsent): StorageDocument {
@@ -791,6 +924,7 @@ function decodeParticipantProfile(
           marketingConsent.grantedAt !== undefined),
     },
     registeredAt,
+    requiredStoredNoticeEvidence(source.registrationNoticeEvidence),
   );
   if (!registration.ok) unavailable();
   if (
@@ -1032,6 +1166,26 @@ function requiredTimestamp(value: unknown): Timestamp {
   return parsed.value;
 }
 
+function requiredNoticeEvidence(
+  value: unknown,
+): ParticipantRegistrationNoticeEvidence {
+  try {
+    return defineParticipantRegistrationNoticeEvidence(value);
+  } catch {
+    invalidRequest();
+  }
+}
+
+function requiredStoredNoticeEvidence(
+  value: unknown,
+): ParticipantRegistrationNoticeEvidence {
+  try {
+    return defineParticipantRegistrationNoticeEvidence(value);
+  } catch {
+    unavailable();
+  }
+}
+
 function requiredStoredTimestamp(value: unknown): Timestamp {
   const parsed = parseTimestamp(value);
   if (!parsed.ok) unavailable();
@@ -1096,9 +1250,9 @@ function snapshotBoundedStorageDocument(value: unknown): StorageDocument {
   const serialized = JSON.stringify(snapshot);
   if (
     typeof serialized !== "string" ||
-    serialized.length > MAX_PARTICIPANT_PROFILE_RECORD_BYTES ||
+    serialized.length > PARTICIPANT_PROFILE_STORAGE_LIMITS.maxRecordBytes ||
     new TextEncoder().encode(serialized).byteLength >
-      MAX_PARTICIPANT_PROFILE_RECORD_BYTES
+      PARTICIPANT_PROFILE_STORAGE_LIMITS.maxRecordBytes
   ) {
     unavailable();
   }
@@ -1112,8 +1266,8 @@ function snapshotBoundedData(
 ): unknown {
   state.nodes += 1;
   if (
-    state.nodes > MAX_PARTICIPANT_PROFILE_RECORD_NODES ||
-    depth > 8
+    state.nodes > PARTICIPANT_PROFILE_STORAGE_LIMITS.maxNodes ||
+    depth > PARTICIPANT_PROFILE_STORAGE_LIMITS.maxDepth
   ) {
     unavailable();
   }
@@ -1151,9 +1305,13 @@ function accountStoredString(
   value: string,
   state: { stringCodeUnits: number },
 ): void {
-  if (value.length > MAX_PARTICIPANT_PROFILE_RECORD_BYTES) unavailable();
+  if (value.length > PARTICIPANT_PROFILE_STORAGE_LIMITS.maxRecordBytes) {
+    unavailable();
+  }
   state.stringCodeUnits += value.length;
-  if (state.stringCodeUnits > MAX_PARTICIPANT_PROFILE_RECORD_BYTES) {
+  if (
+    state.stringCodeUnits > PARTICIPANT_PROFILE_STORAGE_LIMITS.maxRecordBytes
+  ) {
     unavailable();
   }
 }
@@ -1190,7 +1348,7 @@ function dataRecordEntries(
   const source = value as Record<string, unknown>;
   const keys = Reflect.ownKeys(source);
   if (
-    keys.length > MAX_PARTICIPANT_PROFILE_RECORD_NODES ||
+    keys.length > PARTICIPANT_PROFILE_STORAGE_LIMITS.maxNodes ||
     keys.some((key) => typeof key !== "string")
   ) {
     unavailable();
@@ -1225,7 +1383,7 @@ function exactDataArray(
     !("value" in lengthDescriptor) ||
     !Number.isSafeInteger(lengthDescriptor.value) ||
     lengthDescriptor.value < 0 ||
-    lengthDescriptor.value > MAX_PARTICIPANT_PROFILE_RECORD_NODES ||
+    lengthDescriptor.value > PARTICIPANT_PROFILE_STORAGE_LIMITS.maxNodes ||
     (expectedLength !== undefined &&
       lengthDescriptor.value !== expectedLength)
   ) {

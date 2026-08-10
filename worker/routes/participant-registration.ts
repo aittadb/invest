@@ -6,9 +6,9 @@ import {
 import {
   PARTICIPANT_REGISTRATION_PATH,
   createParticipantRegistrationCapabilityModel,
-  defineParticipantRegistrationNotices,
+  defineParticipantRegistrationNoticeEvidence,
   type ParticipantRegistrationCapabilityModel,
-  type ParticipantRegistrationNotices,
+  type ParticipantRegistrationNoticeEvidence,
 } from "../../domain/participant-registration-resource.ts";
 import {
   parseParticipantAccount,
@@ -43,7 +43,7 @@ import {
 import type { BrowserMutationProof } from "../../http/browser-mutation-session.ts";
 import type {
   ParticipantProfileSnapshot,
-  ParticipantRepository,
+  ParticipantRegistrationRepository,
 } from "../../repositories/in-memory-participant-repository.ts";
 import type { ApplicationRouteHandler } from "../contracts.ts";
 import {
@@ -56,11 +56,12 @@ const DISPLAY_NAME_FIELD = "display-name";
 const COUNTRY_FIELD = "country";
 const DECLARED_INTEREST_FIELD = "declared-interest";
 const PARTICIPATION_CONTEXT_FIELD = "participation-context";
+const NOTICE_EVIDENCE_VERSION_FIELD = "notice-evidence-version";
 const PROCESS_NOTICE_FIELD = "process-email-notice-acknowledged";
 const MARKETING_CONSENT_FIELD = "marketing-consent";
 
 export const MAX_REGISTRATION_MUTATION_BYTES = 2_048;
-export const MAX_REGISTRATION_MUTATION_FIELDS = 8;
+export const MAX_REGISTRATION_MUTATION_FIELDS = 9;
 
 const REQUIRED_REGISTRATION_FIELDS = Object.freeze([
   OPERATION_ID_FIELD,
@@ -68,6 +69,7 @@ const REQUIRED_REGISTRATION_FIELDS = Object.freeze([
   COUNTRY_FIELD,
   DECLARED_INTEREST_FIELD,
   PARTICIPATION_CONTEXT_FIELD,
+  NOTICE_EVIDENCE_VERSION_FIELD,
   PROCESS_NOTICE_FIELD,
 ]);
 const ALLOWED_REGISTRATION_FIELDS = Object.freeze([
@@ -77,7 +79,7 @@ const ALLOWED_REGISTRATION_FIELDS = Object.freeze([
 
 export type ParticipantRegistrationRepositoryFactory = (
   account: ParticipantAccount,
-) => ParticipantRepository;
+) => ParticipantRegistrationRepository;
 
 export type ParticipantRegistrationCsrfTokenProvider = (
   request: Request,
@@ -99,7 +101,7 @@ export type ParticipantRegistrationRouteDependencies = Readonly<{
   mutationSecurity?: BrowserMutationGuardOptions;
   verifyMutation?: ParticipantRegistrationMutationVerifier;
   csrfTokenFor: ParticipantRegistrationCsrfTokenProvider;
-  notices: ParticipantRegistrationNotices;
+  noticeEvidence: ParticipantRegistrationNoticeEvidence;
   now?: () => Date;
   createOperationId?: () => string;
 }>;
@@ -116,7 +118,9 @@ export function createParticipantRegistrationRouteHandler(
   ) {
     throw new Error("Invalid participant-registration route configuration.");
   }
-  const notices = defineParticipantRegistrationNotices(dependencies.notices);
+  const noticeEvidence = defineParticipantRegistrationNoticeEvidence(
+    dependencies.noticeEvidence,
+  );
   const now = dependencies.now ?? (() => new Date());
   const createOperationId = dependencies.createOperationId ?? randomOperationId;
   if (typeof now !== "function" || typeof createOperationId !== "function") {
@@ -161,7 +165,7 @@ export function createParticipantRegistrationRouteHandler(
           representation: representation.kind,
           account,
           profile: current?.snapshot ?? null,
-          notices,
+          noticeEvidence,
           csrfTokenFor: dependencies.csrfTokenFor,
           createOperationId,
           status: 200,
@@ -210,15 +214,21 @@ export function createParticipantRegistrationRouteHandler(
         notFound();
       }
 
-      const repository = requiredRepository(dependencies.repositoryFor, account);
-      const current = requireOwnedSnapshot(await repository.current(), account);
       const mutation = parseRegistrationMutation(verified);
-      const result = await repository.register({
-        operationId: mutation.operationId,
-        expectedRevision: null,
-        registeredAt: current?.snapshot.registeredAt ?? currentTimestamp(now),
-        registration: mutation.registration,
-      });
+      const repository = requiredRepository(dependencies.repositoryFor, account);
+      const result = mutation.noticeEvidenceVersion === noticeEvidence.version
+        ? await registerWithCurrentNoticeEvidence(
+            repository,
+            account,
+            mutation,
+            noticeEvidence,
+            now,
+          )
+        : await repository.recoverRegistration({
+            operationId: mutation.operationId,
+            registration: mutation.registration,
+            noticeEvidenceVersion: mutation.noticeEvidenceVersion,
+          });
       requireOwnedProfile(result.snapshot, account);
 
       return withSetCookie(await resourceResponse({
@@ -226,7 +236,7 @@ export function createParticipantRegistrationRouteHandler(
         representation: representation.kind,
         account,
         profile: result.snapshot,
-        notices,
+        noticeEvidence,
         csrfTokenFor: dependencies.csrfTokenFor,
         createOperationId,
         status: result.replayed ? 200 : 201,
@@ -242,6 +252,7 @@ export function createParticipantRegistrationRouteHandler(
 
 type RegistrationMutation = Readonly<{
   operationId: string;
+  noticeEvidenceVersion: string;
   registration: Readonly<{
     displayName: string;
     country: string;
@@ -262,6 +273,9 @@ function parseRegistrationMutation(
   }
   return Object.freeze({
     operationId: requiredString(request.body[OPERATION_ID_FIELD]),
+    noticeEvidenceVersion: requiredString(
+      request.body[NOTICE_EVIDENCE_VERSION_FIELD],
+    ),
     registration: Object.freeze({
       displayName: requiredString(request.body[DISPLAY_NAME_FIELD]),
       country: requiredString(request.body[COUNTRY_FIELD]),
@@ -274,6 +288,23 @@ function parseRegistrationMutation(
         request.body[MARKETING_CONSENT_FIELD],
       ),
     }),
+  });
+}
+
+async function registerWithCurrentNoticeEvidence(
+  repository: ParticipantRegistrationRepository,
+  account: ParticipantAccount,
+  mutation: RegistrationMutation,
+  noticeEvidence: ParticipantRegistrationNoticeEvidence,
+  now: () => Date,
+) {
+  const current = requireOwnedSnapshot(await repository.current(), account);
+  return repository.register({
+    operationId: mutation.operationId,
+    expectedRevision: null,
+    registeredAt: current?.snapshot.registeredAt ?? currentTimestamp(now),
+    registration: mutation.registration,
+    noticeEvidence,
   });
 }
 
@@ -305,7 +336,7 @@ type ResourceResponseInput = Readonly<{
   representation: "html" | "hypermedia-json";
   account: ParticipantAccount;
   profile: ParticipantProfile | null;
-  notices: ParticipantRegistrationNotices;
+  noticeEvidence: ParticipantRegistrationNoticeEvidence;
   csrfTokenFor: ParticipantRegistrationCsrfTokenProvider;
   createOperationId: () => string;
   status: number;
@@ -316,7 +347,7 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
     requestUrl: input.context.resourceUrl,
     account: input.account,
     profile: input.profile,
-    notices: input.notices,
+    noticeEvidence: input.noticeEvidence,
     operationId: input.profile === null ? input.createOperationId() : null,
   });
   const hasMutationAction = model.actionContracts.some(
@@ -543,8 +574,18 @@ function renderParticipantRegistrationHtml(
           ${detail("Country", data.country ?? "")}
           ${detail("Interest", interestLabel(data.declared_interest))}
           ${detail("Context", contextLabel(data.participation_context))}
+          ${detail("Process notice acknowledged", data.process_email_notice_acknowledged ? "Yes" : "No")}
           ${detail("Marketing consent", consentLabel(data.marketing_consent_state))}
+          ${detail("Notice evidence version", data.notice_evidence_version)}
         </dl>
+        <div class="registration-notice">
+          <p><strong>Acknowledged process notice</strong></p>
+          <p>${escapeHtml(data.process_email_notice)}</p>
+        </div>
+        <div class="registration-notice">
+          <p><strong>Marketing consent notice at registration</strong></p>
+          <p>${escapeHtml(data.marketing_notice)}</p>
+        </div>
         <div class="registration-actions"><a class="registration-button" href="/participant/package">Read the information package</a><a href="/participant">Open participant view</a></div>
       </section>`
     : `<section class="registration-intro" aria-labelledby="registration-title">
@@ -695,8 +736,8 @@ function requiredParticipantAccount(
 function requiredRepository(
   factory: ParticipantRegistrationRepositoryFactory,
   account: ParticipantAccount,
-): ParticipantRepository {
-  let repository: ParticipantRepository;
+): ParticipantRegistrationRepository {
+  let repository: ParticipantRegistrationRepository;
   try {
     repository = factory(account);
   } catch (error) {
@@ -706,7 +747,8 @@ function requiredRepository(
     typeof repository !== "object" ||
     repository === null ||
     typeof repository.current !== "function" ||
-    typeof repository.register !== "function"
+    typeof repository.register !== "function" ||
+    typeof repository.recoverRegistration !== "function"
   ) {
     throw new StorageFailure("UNAVAILABLE");
   }

@@ -33,6 +33,7 @@ import {
   parseParticipantAccount,
   registerParticipantProfile,
 } from "../domain/participant-profile.ts";
+import { testParticipantRegistrationNoticeEvidence } from "./support/participant-registration-notice-evidence.ts";
 import { parsePhaseConfiguration } from "../domain/phase-configuration.ts";
 import { INVESTOR_APP_MEDIA_TYPE } from "../domain/public-campaign-resource.ts";
 import {
@@ -1080,7 +1081,7 @@ function createParticipant(): ParticipantProfileSnapshot {
     participationContext: "company",
     processEmailNoticeAcknowledged: true,
     marketingConsent: false,
-  }, registeredAt.value);
+  }, registeredAt.value, testParticipantRegistrationNoticeEvidence());
   assert.equal(profile.ok, true);
   if (!profile.ok) throw new Error("Invalid participant profile fixture.");
   return Object.freeze({ revision: 2, snapshot: profile.value });

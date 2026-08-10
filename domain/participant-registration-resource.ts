@@ -7,11 +7,14 @@ import {
   type ActionField,
   type HtmlFormAction,
 } from "./hypermedia-action.ts";
-import type { CampaignSetupPolicy } from "./campaign-setup-policy.ts";
 import {
   PARTICIPANT_HOME_PATH,
   PRIVATE_PACKAGE_PATH,
 } from "./participant-navigation.ts";
+import {
+  defineParticipantRegistrationNoticeEvidence,
+  type ParticipantRegistrationNoticeEvidence,
+} from "./participant-registration-notice-evidence.ts";
 import type {
   MarketingConsent,
   ParticipantAccount,
@@ -26,12 +29,15 @@ import { parseStorageOperationId } from "./storage-adapter.ts";
 
 export const PARTICIPANT_REGISTRATION_PATH = "/participant/registration";
 
-const MAX_NOTICE_LENGTH = 4_000;
-
-export type ParticipantRegistrationNotices = Readonly<{
-  processEmail: string;
-  marketing: string;
-}>;
+export {
+  createParticipantRegistrationNoticeEvidence,
+  defineParticipantRegistrationNoticeEvidence,
+  defineParticipantRegistrationNotices,
+  participantRegistrationNoticesFromCampaignPolicy,
+  PARTICIPANT_REGISTRATION_NOTICE_LIMITS,
+  type ParticipantRegistrationNoticeEvidence,
+  type ParticipantRegistrationNotices,
+} from "./participant-registration-notice-evidence.ts";
 
 export type ParticipantRegistrationDocument = Readonly<{
   api_version: typeof INVESTOR_APP_API_VERSION;
@@ -39,6 +45,7 @@ export type ParticipantRegistrationDocument = Readonly<{
   id: "access-registration";
   data: Readonly<{
     status: "registration_required" | "registered";
+    notice_evidence_version: string;
     account_email: string;
     account_email_editable: false;
     display_name: string | null;
@@ -64,37 +71,17 @@ export type ParticipantRegistrationResourceInput = Readonly<{
   requestUrl: string;
   account: ParticipantAccount;
   profile: ParticipantProfile | null;
-  notices: ParticipantRegistrationNotices;
+  noticeEvidence: ParticipantRegistrationNoticeEvidence;
   operationId: string | null;
 }>;
-
-/** Validate and freeze deployment-supplied notice text without adding defaults. */
-export function defineParticipantRegistrationNotices(
-  value: ParticipantRegistrationNotices,
-): ParticipantRegistrationNotices {
-  return Object.freeze({
-    processEmail: requiredNotice(value?.processEmail),
-    marketing: requiredNotice(value?.marketing),
-  });
-}
-
-/** Map the validated private campaign policy into the registration view. */
-export function participantRegistrationNoticesFromCampaignPolicy(
-  policy: CampaignSetupPolicy,
-): ParticipantRegistrationNotices {
-  const notices = policy?.notices;
-  if (notices === undefined) throw new ParticipantRegistrationResourceError();
-  return defineParticipantRegistrationNotices({
-    processEmail: notices.processEmail,
-    marketing: notices.marketingConsent,
-  });
-}
 
 /** Project one trusted account into equivalent hypermedia and HTML capabilities. */
 export function createParticipantRegistrationCapabilityModel(
   input: ParticipantRegistrationResourceInput,
 ): ParticipantRegistrationCapabilityModel {
-  const notices = defineParticipantRegistrationNotices(input.notices);
+  const currentNoticeEvidence = defineParticipantRegistrationNoticeEvidence(
+    input.noticeEvidence,
+  );
   const self = new URL(PARTICIPANT_REGISTRATION_PATH, input.requestUrl).href;
   const profile = input.profile;
   if (
@@ -112,10 +99,18 @@ export function createParticipantRegistrationCapabilityModel(
           method: "POST",
           href: self,
           requestMediaType: "application/x-www-form-urlencoded",
-          fields: registrationFields(requiredOperationId(input.operationId)),
+          fields: registrationFields(
+            requiredOperationId(input.operationId),
+            currentNoticeEvidence.version,
+          ),
         })
       : null,
   );
+  const acknowledgedNoticeEvidence = profile === null
+    ? currentNoticeEvidence
+    : defineParticipantRegistrationNoticeEvidence(
+        profile.registrationNoticeEvidence,
+      );
   const links: HypermediaLink[] = [
     Object.freeze({ rel: Object.freeze(["self"]), href: self }),
     Object.freeze({
@@ -144,15 +139,16 @@ export function createParticipantRegistrationCapabilityModel(
       status: profile === null
         ? "registration_required" as const
         : "registered" as const,
+      notice_evidence_version: acknowledgedNoticeEvidence.version,
       account_email: input.account.accountEmailLabel,
       account_email_editable: false as const,
       display_name: profile?.displayName ?? null,
       country: profile?.country ?? null,
       declared_interest: profile?.declaredInterest ?? null,
       participation_context: profile?.participationContext ?? null,
-      process_email_notice: notices.processEmail,
+      process_email_notice: acknowledgedNoticeEvidence.processEmail,
       process_email_notice_acknowledged: profile !== null,
-      marketing_notice: notices.marketing,
+      marketing_notice: acknowledgedNoticeEvidence.marketing,
       marketing_consent_state: profile?.marketingConsent.state ?? "not-granted",
     }),
     links: Object.freeze(links),
@@ -173,7 +169,10 @@ export class ParticipantRegistrationResourceError extends Error {
   }
 }
 
-function registrationFields(operationId: string): readonly ActionField[] {
+function registrationFields(
+  operationId: string,
+  noticeEvidenceVersion: string,
+): readonly ActionField[] {
   return [
     {
       name: "operation-id",
@@ -187,6 +186,19 @@ function registrationFields(operationId: string): readonly ActionField[] {
       maxLength: 127,
       maxBytes: 127,
       value: operationId,
+    },
+    {
+      name: "notice-evidence-version",
+      title: "Registration notice version",
+      type: "string",
+      format: "text",
+      location: "body",
+      required: true,
+      presentation: "hidden",
+      minLength: noticeEvidenceVersion.length,
+      maxLength: noticeEvidenceVersion.length,
+      maxBytes: noticeEvidenceVersion.length,
+      value: noticeEvidenceVersion,
     },
     {
       name: "display-name",
@@ -255,27 +267,4 @@ function requiredOperationId(value: unknown): string {
   const parsed = parseStorageOperationId(value);
   if (!parsed.ok) throw new ParticipantRegistrationResourceError();
   return parsed.value;
-}
-
-function requiredNotice(value: unknown): string {
-  if (
-    typeof value !== "string" ||
-    value.length < 1 ||
-    value.length > MAX_NOTICE_LENGTH ||
-    value.trim() !== value ||
-    hasControlCharacter(value)
-  ) {
-    throw new ParticipantRegistrationResourceError();
-  }
-  return value;
-}
-
-function hasControlCharacter(value: string): boolean {
-  for (const character of value) {
-    const codePoint = character.codePointAt(0);
-    if (codePoint !== undefined && (codePoint <= 31 || codePoint === 127)) {
-      return true;
-    }
-  }
-  return false;
 }

@@ -71,6 +71,7 @@ import {
   MAX_OWNER_PACKAGE_MUTATION_FIELDS,
 } from "../worker/routes/owner-package.ts";
 import { explicitCampaignSetup } from "./support/campaign-repository-contract.ts";
+import { testParticipantRegistrationNoticeEvidence } from "./support/participant-registration-notice-evidence.ts";
 
 const APP_ORIGIN = "https://invest.example.test";
 const ISSUER = "https://storage.example.test";
@@ -1886,12 +1887,13 @@ test("hosted participant registration persists policy-bound submissions across r
   assert.equal(service.readRequests, ownerReads + 1);
   assert.doesNotMatch(await owner.text(), /Persisted process|PRIVATE CAMPAIGN/u);
 
-  const [first, retry, changed] = await Promise.all([
+  const [first, retry, exactJson, changed] = await Promise.all([
+    participantRegistration(worker, env),
     participantRegistration(worker, env),
     participantRegistration(worker, env),
     participantRegistration(worker, env),
   ]);
-  for (const resource of [first, retry, changed]) {
+  for (const resource of [first, retry, exactJson, changed]) {
     assert.equal(resource.document.data.status, "registration_required");
     assert.equal(
       resource.document.data.process_email_notice,
@@ -1947,31 +1949,84 @@ test("hosted participant registration persists policy-bound submissions across r
   assert.equal(foreignOrigin.status, 403);
   assert.equal(await hostedParticipantRepository(service).current(), null);
 
-  const registrationResponses = await Promise.all([
-    submitRegistration(worker, env, first, body),
-    submitRegistration(worker, env, retry, retryBody),
-  ]);
-  assert.deepEqual(
-    registrationResponses
-      .map(({ status }) => status)
-      .sort((left, right) => left - right),
-    [200, 201],
-  );
-  for (const response of registrationResponses) {
-    assert.match(response.headers.get("set-cookie") ?? "", /Max-Age=0/u);
-  }
-  const created = registrationResponses.find(({ status }) => status === 201);
-  assert(created);
+  const created = await submitRegistration(worker, env, first, body);
+  assert.equal(created.status, 201);
+  assert.match(created.headers.get("set-cookie") ?? "", /Max-Age=0/u);
   const createdDocument = await created.json() as ParticipantRegistrationDocument;
   assert.equal(createdDocument.data.status, "registered");
   assert.deepEqual(actionNames(createdDocument), []);
+
+  await new StorageCampaignRepository(hostedStorageAdapter(service)).saveSetup({
+    operationId: "campaign-operation:registration-policy-update",
+    recordedAt: "2026-08-10T09:30:00.000Z",
+    expectedRevision: 1,
+    setup: {
+      ...setup,
+      campaignPolicy: {
+        ...setup.campaignPolicy,
+        notices: {
+          ...setup.campaignPolicy.notices,
+          processEmail: "Updated process notice after registration.",
+          marketingConsent: "Updated marketing notice after registration.",
+        },
+      },
+    },
+  });
+  const restarted = hostedPackageWorker(service);
+  const htmlRetry = await submitRegistration(
+    restarted,
+    env,
+    retry,
+    retryBody,
+    { accept: "text/html" },
+  );
+  assert.equal(htmlRetry.status, 200);
+  assert.match(htmlRetry.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+  const retryHtml = await htmlRetry.text();
+  assert.match(retryHtml, /Registration complete/u);
+  assert.match(retryHtml, /Process notice acknowledged<\/dt><dd>Yes/u);
+  assert.match(retryHtml, /Persisted process notice for registration/u);
+  assert.match(retryHtml, /Persisted optional marketing notice/u);
+  assert.doesNotMatch(
+    retryHtml,
+    /Updated process notice|Updated marketing notice|<form\b|name="_csrf"/u,
+  );
+
+  const exactJsonAction = requiredAction(
+    exactJson.document,
+    "register-participant-access",
+  );
+  const exactJsonResponse = await submitRegistration(
+    restarted,
+    env,
+    exactJson,
+    actionBody(exactJsonAction, {
+      ...body,
+      "operation-id": body["operation-id"],
+    }),
+  );
+  assert.equal(exactJsonResponse.status, 200);
+  const exactJsonDocument =
+    await exactJsonResponse.json() as ParticipantRegistrationDocument;
+  assert.equal(
+    exactJsonDocument.data.notice_evidence_version,
+    createdDocument.data.notice_evidence_version,
+  );
+  assert.equal(
+    exactJsonDocument.data.process_email_notice,
+    "Persisted process notice for registration.",
+  );
+  assert.equal(
+    exactJsonDocument.data.process_email_notice_acknowledged,
+    true,
+  );
 
   const changedAction = requiredAction(
     changed.document,
     "register-participant-access",
   );
   const duplicate = await submitRegistration(
-    worker,
+    restarted,
     env,
     changed,
     actionBody(changedAction, {
@@ -1983,10 +2038,22 @@ test("hosted participant registration persists policy-bound submissions across r
   assert.equal(duplicate.status, 409);
   assert.doesNotMatch(await duplicate.text(), /Hosted participant|Changed duplicate/u);
 
-  const restarted = hostedPackageWorker(service);
   const persisted = await participantRegistration(restarted, env);
   assert.equal(persisted.document.data.status, "registered");
   assert.equal(persisted.document.data.display_name, "Hosted participant");
+  assert.equal(
+    persisted.document.data.process_email_notice,
+    "Persisted process notice for registration.",
+  );
+  assert.equal(
+    persisted.document.data.marketing_notice,
+    "Persisted optional marketing notice.",
+  );
+  assert.equal(
+    persisted.document.data.notice_evidence_version,
+    createdDocument.data.notice_evidence_version,
+  );
+  assert.equal(persisted.document.data.process_email_notice_acknowledged, true);
   assert.equal(persisted.csrfToken, null);
   assert.equal(persisted.cookie, null);
   assert.deepEqual(actionNames(persisted.document), []);
@@ -1999,6 +2066,14 @@ test("hosted participant registration persists policy-bound submissions across r
   );
   assert.equal(foreign.document.data.status, "registration_required");
   assert.equal(foreign.document.data.display_name, null);
+  assert.equal(
+    foreign.document.data.process_email_notice,
+    "Updated process notice after registration.",
+  );
+  assert.notEqual(
+    foreign.document.data.notice_evidence_version,
+    persisted.document.data.notice_evidence_version,
+  );
   assert.doesNotMatch(
     JSON.stringify(foreign.document),
     /Hosted participant|PRIVATE CAMPAIGN POLICY/u,
@@ -2125,6 +2200,7 @@ test("hosted package routes persist atomic private versions and current acknowle
       processEmailNoticeAcknowledged: true,
       marketingConsent: false,
     },
+    noticeEvidence: testParticipantRegistrationNoticeEvidence(),
   });
   assert.equal(registration.revision, 1);
   const participantWorker = hostedPackageWorker(service);
@@ -3150,6 +3226,7 @@ async function registerHostedParticipant(
       processEmailNoticeAcknowledged: true,
       marketingConsent: false,
     },
+    noticeEvidence: testParticipantRegistrationNoticeEvidence(),
   });
   assert.equal(result.revision, 1);
 }
@@ -3635,6 +3712,7 @@ async function submitRegistration(
   options: Readonly<{
     cookie?: string | null;
     origin?: string;
+    accept?: "application/json" | "text/html";
   }> = {},
 ): Promise<Response> {
   const action = requiredAction(
@@ -3644,7 +3722,7 @@ async function submitRegistration(
   assert(resource.csrfToken);
   const cookie = options.cookie === undefined ? resource.cookie : options.cookie;
   const headers = new Headers({
-    accept: "application/json",
+    accept: options.accept ?? "application/json",
     "content-type": "application/json",
     origin: options.origin ?? APP_ORIGIN,
     [MUTATION_CSRF_HEADER]: resource.csrfToken,

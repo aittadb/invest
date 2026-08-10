@@ -9,6 +9,10 @@ import {
   type ValidationIssue,
   type ValidationResult,
 } from "./foundation.ts";
+import {
+  defineParticipantRegistrationNoticeEvidence,
+  type ParticipantRegistrationNoticeEvidence,
+} from "./participant-registration-notice-evidence.ts";
 
 declare const participantProfileBrand: unique symbol;
 
@@ -56,6 +60,7 @@ export type ParticipantProfile = Readonly<{
   country: CountryCode;
   declaredInterest: DeclaredInterest;
   participationContext: ParticipationContext;
+  registrationNoticeEvidence: ParticipantRegistrationNoticeEvidence;
   processEmailNoticeAcknowledgedAt: Timestamp;
   marketingConsent: MarketingConsent;
   accountDeletionRequest: AccountDeletionRequestState;
@@ -80,6 +85,7 @@ export const PARTICIPANT_PROFILE_FIELD_RULES = {
   country: "participant-editable",
   declaredInterest: "participant-editable",
   participationContext: "participant-editable",
+  registrationNoticeEvidence: "registration-only",
   processEmailNoticeAcknowledgedAt: "registration-only",
   marketingConsent: "withdraw-only",
   accountDeletionRequest: "request-only",
@@ -153,6 +159,7 @@ export function registerParticipantProfile(
   account: ParticipantAccount,
   value: unknown,
   registeredAt: Timestamp,
+  noticeEvidence: ParticipantRegistrationNoticeEvidence,
 ): ValidationResult<ParticipantProfile> {
   const source = record(value);
   if (!source) return invalid({ code: "invalid_type", path: "profile" });
@@ -172,6 +179,17 @@ export function registerParticipantProfile(
     source.processEmailNoticeAcknowledged,
   );
   const marketingConsent = parseOptionalConsent(source.marketingConsent, registeredAt);
+  let registrationNoticeEvidence: ParticipantRegistrationNoticeEvidence;
+  try {
+    registrationNoticeEvidence = defineParticipantRegistrationNoticeEvidence(
+      noticeEvidence,
+    );
+  } catch {
+    return invalid({
+      code: "invalid_rule",
+      path: "registrationNoticeEvidence",
+    });
+  }
   const issues = collectIssues(
     displayName,
     country,
@@ -200,6 +218,7 @@ export function registerParticipantProfile(
     country: country.value,
     declaredInterest: declaredInterest.value,
     participationContext: participationContext.value,
+    registrationNoticeEvidence,
     processEmailNoticeAcknowledgedAt: registeredAt,
     marketingConsent: marketingConsent.value,
     accountDeletionRequest: { state: "not-requested" },

@@ -16,6 +16,7 @@ import {
 import { isPhaseAcceptingParticipation } from "../domain/phase-configuration.ts";
 import {
   PARTICIPANT_REGISTRATION_PATH,
+  createParticipantRegistrationNoticeEvidence,
   participantRegistrationNoticesFromCampaignPolicy,
 } from "../domain/participant-registration-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
@@ -478,8 +479,11 @@ async function runtimeParticipantRegistrationRoute(
     const repositories = runtime.repositoryFactory;
     const currentCampaign = await repositories.campaignRepository().readSetup();
     if (currentCampaign === null) return null;
-    const notices = participantRegistrationNoticesFromCampaignPolicy(
-      currentCampaign.setup.campaignPolicy,
+    const noticeEvidence = createParticipantRegistrationNoticeEvidence(
+      currentCampaign.revision,
+      participantRegistrationNoticesFromCampaignPolicy(
+        currentCampaign.setup.campaignPolicy,
+      ),
     );
     const appOrigin = new URL(resourceUrl).origin;
     const identity = Object.freeze({
@@ -512,7 +516,7 @@ async function runtimeParticipantRegistrationRoute(
         sameAccount(candidate)
           ? runtime.mutationSession.issue(request, identity, appOrigin)
           : Promise.resolve(null),
-      notices,
+      noticeEvidence,
       now: runtime.now,
       createOperationId: () => randomOperationId("participant-operation"),
     });

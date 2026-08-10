@@ -17,8 +17,11 @@ subject's persistent profile, current package, and current acknowledgment gate.
 An unregistered subject stops after the profile read without opening package or
 acknowledgment storage. On `/participant/registration`, the runtime instead
 combines a fresh subject-bound participant repository, the hosted mutation
-session, and only the two registration notices mapped from persisted campaign
-policy. Founder composition opens private campaign policy and a fresh
+session, and versioned evidence derived from the persisted campaign revision
+and only its two registration notices. The participant repository stores the
+exact acknowledged snapshots and can recover an old exact committed retry after
+a policy update or Worker restart without accepting stale evidence for a new
+registration. Founder composition opens private campaign policy and a fresh
 subject-bound profile/application pair only for the exact founder resource after
 participant authorization. Indication, aggregate, moderation, export, deletion
 coordination, and profile-route composition still require their own named
@@ -116,7 +119,10 @@ That reader creates fresh profile and acknowledgment repositories for each
 trusted account and combines them only through the bounded projection service.
 The named `participantRepository(account)` capability returns a fresh repository
 bound to that validated account; registration composition additionally closes it
-over the request's trusted subject and provider email label.
+over the request's trusted subject and provider email label. Its
+registration-only recovery capability can read immutable profile revision 1 but
+cannot write a stale-policy submission. Notice snapshots remain inside the
+subject-bound profile records; no notice key contains participant identity.
 It intentionally has no generic builder or adapter accessor. The Worker calls
 these methods centrally and passes routes only their declared interfaces and
 mutation session; it never passes the adapter or factory into route context.
