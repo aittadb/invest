@@ -373,6 +373,99 @@ test("transaction result object-key order does not change semantic verification"
   assertAggregate(state, 1, 1_250, 1);
 });
 
+test("atomic transaction results reject a closed malformed envelope matrix", async (context) => {
+  const cases: readonly Readonly<{
+    name: string;
+    transform: (result: StorageTransactionResult) => unknown;
+  }>[] = [
+    {
+      name: "extra envelope member",
+      transform: (result) => ({ ...result, extra: true }),
+    },
+    {
+      name: "custom envelope prototype",
+      transform: (result) => Object.assign(Object.create({}), result),
+    },
+    {
+      name: "records accessor",
+      transform: (result) => Object.defineProperty(
+        { replayed: result.replayed },
+        "records",
+        { enumerable: true, get: () => result.records },
+      ),
+    },
+    {
+      name: "custom records prototype",
+      transform: (result) => ({
+        ...result,
+        records: Object.setPrototypeOf([...result.records], null),
+      }),
+    },
+    {
+      name: "sparse records",
+      transform: (result) => {
+        const records = new Array(result.records.length);
+        records[0] = result.records[0];
+        return { ...result, records };
+      },
+    },
+    {
+      name: "reversed record order",
+      transform: (result) => ({
+        ...result,
+        records: [...result.records].reverse(),
+      }),
+    },
+    {
+      name: "extra record member",
+      transform: (result) => replaceFirstResultRecord(
+        result,
+        (record) => ({ ...record, extra: true }),
+      ),
+    },
+    {
+      name: "extra key member",
+      transform: (result) => replaceFirstResultRecord(
+        result,
+        (record) => ({ ...record, key: { ...record.key, extra: true } }),
+      ),
+    },
+    {
+      name: "changed record value",
+      transform: (result) => replaceFirstResultRecord(
+        result,
+        (record) => ({ ...record, value: { changed: true } }),
+      ),
+    },
+  ];
+
+  for (const candidate of cases) {
+    await context.test(candidate.name, async () => {
+      const slug = candidate.name.replaceAll(" ", "-");
+      const repository = new StorageParticipantInvestmentInterestRepository(
+        new ResultTransformStorageAdapter(
+          new MemoryStorageAdapter(),
+          candidate.transform,
+        ),
+        ALICE,
+        AMOUNT,
+      );
+      const service = serviceFor(
+        repository,
+        ALICE,
+        await currentContext(ALICE, `malformed-${slug}`),
+        () => new Date("2026-08-12T10:00:00.000Z"),
+      );
+      const failure = await captureStorageFailure(() => service.create({
+        operationId: `investment-operation:malformed-${slug}`,
+        fields: personalFields(),
+      }));
+      assert.equal(failure.code, "UNAVAILABLE");
+      assert.doesNotMatch(String(failure), /malformed|private|extra|changed/iu);
+    });
+  }
+});
+
 test("a valid-looking changed aggregate receipt fails closed without writes", async () => {
   const state = new MemoryStorageState();
   const context = await currentContext(ALICE, "storage-corrupt-receipt");
@@ -492,6 +585,19 @@ function replaceAggregateOperationTotal(
     revision: record.revision,
     value: value as StorageDocument,
   }));
+}
+
+function replaceFirstResultRecord(
+  result: StorageTransactionResult,
+  transform: (record: NonNullable<StorageTransactionResult["records"][number]>) =>
+    unknown,
+): unknown {
+  const first = result.records[0];
+  assert(first);
+  return {
+    ...result,
+    records: [transform(first), ...result.records.slice(1)],
+  };
 }
 
 async function currentContext(
@@ -653,5 +759,28 @@ class ReorderedResultStorageAdapter implements StorageAdapter {
             })
       )),
     });
+  }
+}
+
+class ResultTransformStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #transform: (result: StorageTransactionResult) => unknown;
+
+  constructor(
+    delegate: StorageAdapter,
+    transform: (result: StorageTransactionResult) => unknown,
+  ) {
+    this.#delegate = delegate;
+    this.#transform = transform;
+  }
+
+  read: StorageAdapter["read"] = (key) => this.#delegate.read(key);
+  list: StorageAdapter["list"] = (request) => this.#delegate.list(request);
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    const result = await this.#delegate.transact(request);
+    return this.#transform(result) as StorageTransactionResult;
   }
 }

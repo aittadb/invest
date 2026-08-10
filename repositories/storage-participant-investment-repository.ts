@@ -93,6 +93,9 @@ const AGGREGATE_KEYS = new Set([
   "currency",
   "contributingIndicationCount",
 ]);
+const TRANSACTION_RESULT_KEYS = new Set(["replayed", "records"]);
+const STORAGE_RECORD_KEYS = new Set(["key", "revision", "value"]);
+const STORAGE_KEY_KEYS = new Set(["collection", "id"]);
 
 type ParticipantIndex = Readonly<{
   record: StorageRecord | null;
@@ -610,15 +613,14 @@ class StagedStorageTransaction implements StorageAdapter {
   }
 
   verify(result: StorageTransactionResult): void {
+    const source = exactRecord(result, TRANSACTION_RESULT_KEYS);
     if (
-      typeof result !== "object" ||
-      result === null ||
-      typeof result.replayed !== "boolean" ||
-      !Array.isArray(result.records) ||
-      result.records.length !== this.#records.length
+      typeof source.replayed !== "boolean"
     ) unavailable();
+    const records = exactDenseArray(source.records, this.#records.length);
+    if (records.length !== this.#records.length) unavailable();
     for (let index = 0; index < this.#records.length; index += 1) {
-      if (!sameRecord(result.records[index], this.#records[index])) unavailable();
+      if (!sameRecord(records[index], this.#records[index])) unavailable();
     }
   }
 
@@ -674,14 +676,22 @@ class StagedStorageTransaction implements StorageAdapter {
 }
 
 function sameRecord(
-  actual: StorageRecord | null | undefined,
+  actual: unknown,
   expected: StorageRecord | null | undefined,
 ): boolean {
-  if (actual === null || actual === undefined) return expected === null;
-  return expected !== null && expected !== undefined &&
-    storageKeyString(actual.key) === storageKeyString(expected.key) &&
-    actual.revision === expected.revision &&
-    sameDocument(actual.value, expected.value);
+  if (actual === null) return expected === null;
+  if (expected === null || expected === undefined) return false;
+  try {
+    const record = exactRecord(actual, STORAGE_RECORD_KEYS);
+    const key = exactRecord(record.key, STORAGE_KEY_KEYS);
+    return key.collection === expected.key.collection &&
+      key.id === expected.key.id &&
+      Number.isSafeInteger(record.revision) &&
+      record.revision === expected.revision &&
+      sameDocument(record.value, expected.value);
+  } catch {
+    return false;
+  }
 }
 
 function sameAggregate(
