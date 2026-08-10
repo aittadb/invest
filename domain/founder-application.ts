@@ -134,9 +134,11 @@ const MAX_CONTRIBUTION_AREA_LABEL_LENGTH = 120;
 export const MAX_SECONDARY_CONTRIBUTION_AREAS = 16;
 const MAX_LONG_TEXT_LENGTH = 4_000;
 const MAX_SHORT_TEXT_LENGTH = 500;
-const MAX_PROFILE_LINKS = 8;
-const MAX_PROFILE_LINK_LENGTH = 2_048;
-const MAX_CANONICAL_PROFILE_LINK_LENGTH = MAX_PROFILE_LINK_LENGTH * 9;
+export const MAX_PROFILE_LINKS = 8;
+export const MAX_PROFILE_LINK_LENGTH = 2_048;
+export const MAX_CANONICAL_PROFILE_LINK_LENGTH = MAX_PROFILE_LINK_LENGTH * 9;
+export const MAX_CANONICAL_PROFILE_LINK_BYTES =
+  MAX_CANONICAL_PROFILE_LINK_LENGTH;
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
 
@@ -392,12 +394,14 @@ function parseProfessionalProfileLinks(
       return invalid({ code: "invalid_format", path });
     }
 
+    const canonicalBytes = new TextEncoder().encode(parsed.href).byteLength;
     if (
       parsed.protocol !== "https:" ||
       parsed.hostname.length === 0 ||
       parsed.username.length > 0 ||
       parsed.password.length > 0 ||
       parsed.href.length > MAX_CANONICAL_PROFILE_LINK_LENGTH ||
+      canonicalBytes > MAX_CANONICAL_PROFILE_LINK_BYTES ||
       (candidate.length > MAX_PROFILE_LINK_LENGTH && candidate !== parsed.href) ||
       seenLinks.has(parsed.href)
     ) {

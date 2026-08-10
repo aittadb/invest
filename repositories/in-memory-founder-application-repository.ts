@@ -457,7 +457,11 @@ export class StorageFounderApplicationRepository
     if (storedFields === undefined) unavailable();
     const parsed = kind === "withdraw"
       ? requestWithoutFields(envelope)
-      : parseRequestFields(envelope, storedFields.choices);
+      : parseKnownOperationFields(
+          envelope,
+          storedFields.choices,
+          this.#contributionAreaChoices,
+        );
     const fingerprint = await operationFingerprint(kind, subject, parsed);
     if (terminal.operationFingerprint !== fingerprint) {
       throw new StorageFailure("CONFLICT");
@@ -589,13 +593,10 @@ export class StorageFounderApplicationRepository
       unavailable();
     }
 
-    const result = await this.#storage.transact(transaction);
-    if (
-      typeof result.replayed !== "boolean" ||
-      result.records.length !== mutations.length
-    ) {
-      unavailable();
-    }
+    const result = exactStorageTransactionResult(
+      await this.#storage.transact(transaction),
+      mutations.length,
+    );
     verifyExactRecord(
       result.records[0],
       currentKey,
@@ -1359,6 +1360,24 @@ function parseRequestFields(
     ParsedMutationRequest & Readonly<{ fields: FounderApplicationFields }>;
 }
 
+function parseKnownOperationFields(
+  envelope: ParsedMutationEnvelope,
+  historicalChoices: readonly ContributionAreaChoice[],
+  currentChoices: readonly ContributionAreaChoice[],
+): ParsedMutationRequest & Readonly<{ fields: FounderApplicationFields }> {
+  const historical = parseFounderApplicationFields(
+    envelope.fields,
+    historicalChoices,
+  );
+  if (!historical.ok) {
+    const current = parseFounderApplicationFields(envelope.fields, currentChoices);
+    if (current.ok) throw new StorageFailure("CONFLICT");
+    invalidRequest();
+  }
+  return Object.freeze({ ...envelope, fields: historical.value }) as
+    ParsedMutationRequest & Readonly<{ fields: FounderApplicationFields }>;
+}
+
 function requestWithoutFields(
   envelope: ParsedMutationEnvelope,
 ): ParsedMutationRequest {
@@ -1544,22 +1563,45 @@ function storedTransitionKind(value: unknown): TransitionKind {
 }
 
 function verifyExactRecord(
-  record: StorageRecord | null | undefined,
+  record: unknown,
   expectedKey: StorageKey,
   expectedRevision: number,
   expectedValue: StorageDocument,
 ): void {
+  const envelope = exactDataObject(record, ["key", "revision", "value"]);
+  const key = envelope === null
+    ? null
+    : exactDataObject(envelope.key, ["collection", "id"]);
   if (
-    record === null ||
-    record === undefined ||
-    storageKeyString(record.key) !== storageKeyString(expectedKey) ||
-    record.revision !== expectedRevision ||
-    canonicalJson(record.value) !== canonicalJson(expectedValue) ||
-    jsonByteLength(record.value) >
+    envelope === null ||
+    key === null ||
+    key.collection !== expectedKey.collection ||
+    key.id !== expectedKey.id ||
+    envelope.revision !== expectedRevision ||
+    !exactJsonDataEqual(envelope.value, expectedValue) ||
+    jsonByteLength(envelope.value) >
       MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES
   ) {
     unavailable();
   }
+}
+
+function exactStorageTransactionResult(
+  value: unknown,
+  expectedRecords: number,
+): Readonly<{ replayed: boolean; records: readonly unknown[] }> {
+  const source = exactDataObject(value, ["replayed", "records"]);
+  const records = source === null
+    ? null
+    : exactArrayValues(source.records, expectedRecords);
+  if (
+    source === null ||
+    typeof source.replayed !== "boolean" ||
+    records === null
+  ) {
+    unavailable();
+  }
+  return Object.freeze({ replayed: source.replayed, records });
 }
 
 function requireBoundedRecord(value: StorageDocument): void {
@@ -1723,6 +1765,125 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function exactDataObject(
+  value: unknown,
+  expectedKeys: readonly string[],
+): Readonly<Record<string, unknown>> | null {
+  try {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value)
+    ) {
+      return null;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.length !== expectedKeys.length ||
+      keys.some((key) =>
+        typeof key !== "string" || !expectedKeys.includes(key)
+      )
+    ) {
+      return null;
+    }
+    const source = value as Record<string, unknown>;
+    const result: Record<string, unknown> = {};
+    for (const key of expectedKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(source, key);
+      if (
+        descriptor === undefined ||
+        !descriptor.enumerable ||
+        !("value" in descriptor)
+      ) {
+        return null;
+      }
+      result[key] = descriptor.value;
+    }
+    return Object.freeze(result);
+  } catch {
+    return null;
+  }
+}
+
+function exactArrayValues(
+  value: unknown,
+  expectedLength: number,
+): readonly unknown[] | null {
+  try {
+    if (
+      !Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype
+    ) {
+      return null;
+    }
+    const length = Object.getOwnPropertyDescriptor(value, "length");
+    if (
+      length === undefined ||
+      length.enumerable ||
+      !("value" in length) ||
+      length.value !== expectedLength
+    ) {
+      return null;
+    }
+    const expectedKeys = [
+      ...Array.from({ length: expectedLength }, (_, index) => String(index)),
+      "length",
+    ];
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.length !== expectedKeys.length ||
+      keys.some((key) =>
+        typeof key !== "string" || !expectedKeys.includes(key)
+      )
+    ) {
+      return null;
+    }
+    const values: unknown[] = [];
+    for (let index = 0; index < expectedLength; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (
+        descriptor === undefined ||
+        !descriptor.enumerable ||
+        !("value" in descriptor)
+      ) {
+        return null;
+      }
+      values.push(descriptor.value);
+    }
+    return Object.freeze(values);
+  } catch {
+    return null;
+  }
+}
+
+function exactJsonDataEqual(actual: unknown, expected: unknown): boolean {
+  if (
+    actual === null ||
+    expected === null ||
+    typeof actual !== "object" ||
+    typeof expected !== "object"
+  ) {
+    return Object.is(actual, expected);
+  }
+  if (Array.isArray(actual) || Array.isArray(expected)) {
+    if (!Array.isArray(actual) || !Array.isArray(expected)) return false;
+    const values = exactArrayValues(actual, expected.length);
+    return values !== null && values.every((item, index) =>
+      exactJsonDataEqual(item, expected[index])
+    );
+  }
+  const expectedKeys = Object.keys(expected);
+  const source = exactDataObject(actual, expectedKeys);
+  return source !== null && expectedKeys.every((key) =>
+    exactJsonDataEqual(
+      source[key],
+      (expected as Record<string, unknown>)[key],
+    )
+  );
 }
 
 function jsonByteLength(value: unknown): number {

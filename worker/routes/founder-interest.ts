@@ -8,6 +8,7 @@ import { parseActorSubject, type ActorSubject } from "../../domain/foundation.ts
 import {
   FOUNDER_INTEREST_PATH,
   FOUNDER_SECONDARY_AREAS_FIELD,
+  MAX_PROFILE_LINK_FORM_BYTES,
   createFounderInterestCapabilityModel,
   type FounderInterestCapabilityModel,
 } from "../../domain/participant-founder-interest-resource.ts";
@@ -53,8 +54,6 @@ const OPERATION_ID_FIELD = "operation-id";
 const EXPECTED_REVISION_FIELD = "expected-revision";
 const CONFIRM_WITHDRAWAL_FIELD = "confirm-withdrawal";
 
-export const MAX_FOUNDER_INTEREST_MUTATION_BYTES = 262_144;
-
 const FOUNDER_FIELD_NAMES = Object.freeze([
   "expertise-summary",
   "intended-contribution",
@@ -78,6 +77,39 @@ export const MAX_FOUNDER_INTEREST_MUTATION_FIELDS =
   FOUNDER_EXPECTED_REVISION_FIELD_COUNT +
   FOUNDER_CSRF_FIELD_COUNT +
   FOUNDER_METHOD_OVERRIDE_FIELD_COUNT;
+
+const MAX_URL_ENCODED_BYTES_PER_UTF8_BYTE = 3;
+const MAX_UTF8_BYTES_PER_UTF16_CODE_UNIT = 3;
+const MAX_STABLE_ID_BYTES = 128;
+const MAX_CSRF_TOKEN_BYTES = 256;
+const MAX_REVISION_BYTES = String(Number.MAX_SAFE_INTEGER - 1).length;
+const MAX_METHOD_OVERRIDE_BYTES = "DELETE".length;
+const MAX_TEXT_VALUE_CODE_UNITS = 4_000 + 4_000 + 500 + 500 + 500 + 4_000;
+const MAX_NON_PROFILE_VALUE_BYTES =
+  MAX_TEXT_VALUE_CODE_UNITS * MAX_UTF8_BYTES_PER_UTF16_CODE_UNIT +
+  MAX_STABLE_ID_BYTES * (2 + MAX_SECONDARY_CONTRIBUTION_AREAS) +
+  MAX_CSRF_TOKEN_BYTES +
+  MAX_REVISION_BYTES +
+  MAX_METHOD_OVERRIDE_BYTES;
+const MAX_FORM_NAME_AND_SEPARATOR_BYTES =
+  FOUNDER_FIELD_NAMES.reduce((total, name) => total + name.length + 2, 0) +
+  (MAX_SECONDARY_CONTRIBUTION_AREAS - 1) *
+    (FOUNDER_SECONDARY_AREAS_FIELD.length + 2) +
+  OPERATION_ID_FIELD.length + 2 +
+  EXPECTED_REVISION_FIELD.length + 2 +
+  "_csrf".length + 2 +
+  "_method".length + 2;
+
+/**
+ * A browser may resubmit eight maximally expanded canonical URLs. Each raw
+ * UTF-8 byte can occupy three bytes in form encoding; other text can occupy
+ * three UTF-8 bytes per UTF-16 code unit. The final allowance includes every
+ * valid edit field name, equals sign, and separator once.
+ */
+export const MAX_FOUNDER_INTEREST_MUTATION_BYTES =
+  (MAX_PROFILE_LINK_FORM_BYTES + MAX_NON_PROFILE_VALUE_BYTES) *
+    MAX_URL_ENCODED_BYTES_PER_UTF8_BYTE +
+  MAX_FORM_NAME_AND_SEPARATOR_BYTES;
 
 export type FounderInterestCsrfTokenProvider = (
   request: Request,

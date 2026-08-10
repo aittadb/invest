@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MAX_CANONICAL_PROFILE_LINK_LENGTH,
+  MAX_PROFILE_LINK_LENGTH,
   parseContributionAreaChoices,
   type ContributionAreaChoice,
   type FounderApplicationId,
@@ -16,6 +18,8 @@ import {
 import {
   FOUNDER_INTEREST_PATH,
   FOUNDER_SECONDARY_AREAS_FIELD,
+  MAX_PROFILE_LINK_FORM_BYTES,
+  MAX_PROFILE_LINK_FORM_LENGTH,
 } from "../domain/participant-founder-interest-resource.ts";
 import {
   MUTATION_CSRF_FIELD,
@@ -26,7 +30,10 @@ import {
 } from "../http/mutation-security.ts";
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
 import { createParticipantFounderInterestService } from "../worker/founder-interest-service.ts";
-import { createFounderInterestRouteHandler } from "../worker/routes/founder-interest.ts";
+import {
+  MAX_FOUNDER_INTEREST_MUTATION_BYTES,
+  createFounderInterestRouteHandler,
+} from "../worker/routes/founder-interest.ts";
 import { createParticipantRouteHandler } from "../worker/routes/participant.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
 import {
@@ -279,6 +286,136 @@ test("founder resource keeps HTML forms and JSON actions in parity", async () =>
   assert.deepEqual(actionsOf(withdrawnJson), []);
 });
 
+test("canonical Unicode-expanded profile links remain present and editable", async () => {
+  const harness = await createHarness();
+  const profiles = unicodeExpandedProfileLinks();
+  const raw = profiles.map((profile) => profile.raw).join("\n");
+  const canonical = profiles.map((profile) => profile.canonical).join("\n");
+  assert.ok(canonical.length > 8 * MAX_PROFILE_LINK_LENGTH + 7);
+
+  const created = await harness.dispatch(
+    jsonMutation(
+      ALICE,
+      "POST",
+      founderBody("founder-operation:expanded-links-create", {
+        "professional-profile-links": raw,
+      }),
+    ),
+    ALICE,
+  );
+  assert.equal(created.status, 201);
+
+  const document = await jsonDocument(
+    await harness.dispatch(getRequest(ALICE, "application/json"), ALICE),
+  );
+  const edit = actionsOf(document).find(
+    (action) => action.name === "edit-founder-application",
+  );
+  assert(edit);
+  const fields = edit.fields;
+  assert(Array.isArray(fields));
+  const profileField = fields.map(dataOf).find(
+    (field) => field.name === "professional-profile-links",
+  );
+  assert(profileField);
+  assert.equal(profileField.value, canonical);
+  assert.equal(profileField.max_length, MAX_PROFILE_LINK_FORM_LENGTH);
+  assert.equal(profileField.max_bytes, MAX_PROFILE_LINK_FORM_BYTES);
+
+  const html = await (
+    await harness.dispatch(getRequest(ALICE, "text/html"), ALICE)
+  ).text();
+  assert.equal(html.includes(profiles[0]?.canonical ?? "never"), true);
+  assert.equal(html.includes(profiles.at(-1)?.canonical ?? "never"), true);
+
+  const edited = await harness.dispatch(
+    formMutation(ALICE, [
+      [MUTATION_CSRF_FIELD, CSRF_TOKEN],
+      [MUTATION_METHOD_FIELD, "PATCH"],
+      ["operation-id", "founder-operation:expanded-links-edit"],
+      ["expected-revision", "1"],
+      ["expertise-summary", "Experience with systems and product delivery."],
+      ["intended-contribution", "Support engineering and operating cadence."],
+      ["primary-contribution-area-id", "area:engineering"],
+      [FOUNDER_SECONDARY_AREAS_FIELD, "area:product"],
+      ["approximate-availability", "Three days each week."],
+      ["possible-start-timing", "After mutual confirmation."],
+      ["compensation-expectation", "Open to discussion."],
+      ["professional-profile-links", canonical],
+      ["note", "Canonical links survived the edit form."],
+    ]),
+    ALICE,
+  );
+  assert.equal(edited.status, 200);
+  const editedDocument = await jsonDocument(
+    await harness.dispatch(getRequest(ALICE, "application/json"), ALICE),
+  );
+  assert.deepEqual(
+    dataOf(resourceData(editedDocument).fields).professional_profile_links,
+    profiles.map((profile) => profile.canonical),
+  );
+});
+
+test("maximum founder form fields fit the bounded route and larger bodies fail", async () => {
+  const configuredChoices = maximumContributionChoices();
+  const harness = await createHarness(configuredChoices);
+  const created = await harness.dispatch(
+    jsonMutation(
+      ALICE,
+      "POST",
+      founderBody("founder-operation:maximum-form-create", {
+        "primary-contribution-area-id": configuredChoices[0]?.id,
+        [FOUNDER_SECONDARY_AREAS_FIELD]: [configuredChoices[1]?.id],
+      }),
+    ),
+    ALICE,
+  );
+  assert.equal(created.status, 201);
+
+  const maximumText = "\u0800";
+  const entries: (readonly [string, string])[] = [
+    [MUTATION_CSRF_FIELD, CSRF_TOKEN],
+    [MUTATION_METHOD_FIELD, "PATCH"],
+    ["operation-id", "o".repeat(128)],
+    ["expected-revision", "1"],
+    ["expertise-summary", maximumText.repeat(4_000)],
+    ["intended-contribution", maximumText.repeat(4_000)],
+    ["primary-contribution-area-id", configuredChoices[0]?.id ?? ""],
+    ...configuredChoices.slice(1, 17).map((choice) =>
+      [FOUNDER_SECONDARY_AREAS_FIELD, choice.id] as const
+    ),
+    ["approximate-availability", maximumText.repeat(500)],
+    ["possible-start-timing", maximumText.repeat(500)],
+    ["compensation-expectation", maximumText.repeat(500)],
+    ["professional-profile-links", maximumCanonicalProfileLinks().join("\n")],
+    ["note", maximumText.repeat(4_000)],
+  ];
+  const encoded = new URLSearchParams();
+  for (const [name, value] of entries) encoded.append(name, value);
+  assert.ok(
+    new TextEncoder().encode(encoded.toString()).byteLength <=
+      MAX_FOUNDER_INTEREST_MUTATION_BYTES,
+  );
+  const edited = await harness.dispatch(formMutation(ALICE, entries), ALICE);
+  assert.equal(edited.status, 200);
+
+  const oversized = await harness.dispatch(
+    new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        origin: APP_ORIGIN,
+        [MUTATION_CSRF_HEADER]: CSRF_TOKEN,
+        "x-test-auth-subject": ALICE,
+      },
+      body: "x".repeat(MAX_FOUNDER_INTEREST_MUTATION_BYTES + 1),
+    }),
+    ALICE,
+  );
+  assert.equal(oversized.status, 413);
+});
+
 test("founder route enforces negotiation, mutation security, and bounded validation", async () => {
   const harness = await createHarness();
 
@@ -397,7 +534,9 @@ type TestHarness = Readonly<{
   dispatch(request: Request, actor: ActorSubject | null): Promise<Response>;
 }>;
 
-async function createHarness(): Promise<TestHarness> {
+async function createHarness(
+  configuredChoices: readonly ContributionAreaChoice[] = CHOICES,
+): Promise<TestHarness> {
   const state = new FounderApplicationRepositoryFixtureState();
   const csrfHash = await hashCsrfToken(CSRF_TOKEN);
   let clockMinute = 0;
@@ -407,11 +546,11 @@ async function createHarness(): Promise<TestHarness> {
       createParticipantFounderInterestService({
         actorSubject,
         applicationId: APPLICATION_ID,
-        contributionAreaChoices: CHOICES,
+        contributionAreaChoices: configuredChoices,
         repository: new FounderApplicationRepositoryFixture(
           state,
           actorSubject,
-          CHOICES,
+          configuredChoices,
         ),
         canCreate: () => true,
         now: () => {
@@ -650,4 +789,42 @@ function contributionChoices(value: unknown): readonly ContributionAreaChoice[] 
   const parsed = parseContributionAreaChoices(value);
   assert(parsed.ok);
   return parsed.value;
+}
+
+function unicodeExpandedProfileLinks(): readonly Readonly<{
+  raw: string;
+  canonical: string;
+}>[] {
+  return Object.freeze(Array.from({ length: 8 }, (_, index) => {
+    const prefix = `https://profiles.invalid/${index}/`;
+    const raw = `${prefix}${"\u0800".repeat(
+      MAX_PROFILE_LINK_LENGTH - prefix.length,
+    )}`;
+    const canonical = new URL(raw).href;
+    assert.equal(raw.length, MAX_PROFILE_LINK_LENGTH);
+    assert.ok(canonical.length <= MAX_CANONICAL_PROFILE_LINK_LENGTH);
+    return Object.freeze({ raw, canonical });
+  }));
+}
+
+function maximumCanonicalProfileLinks(): readonly string[] {
+  return Object.freeze(Array.from({ length: 8 }, (_, index) => {
+    const prefix = `https://profiles.invalid/${index}/`;
+    const value = `${prefix}${"x".repeat(
+      MAX_CANONICAL_PROFILE_LINK_LENGTH - prefix.length,
+    )}`;
+    assert.equal(value.length, MAX_CANONICAL_PROFILE_LINK_LENGTH);
+    assert.equal(new URL(value).href, value);
+    return value;
+  }));
+}
+
+function maximumContributionChoices(): readonly ContributionAreaChoice[] {
+  return contributionChoices(Array.from({ length: 64 }, (_, index) => {
+    const prefix = `area:${index}:`;
+    return {
+      id: `${prefix}${"x".repeat(128 - prefix.length)}`,
+      label: `Area ${index}`,
+    };
+  }));
 }

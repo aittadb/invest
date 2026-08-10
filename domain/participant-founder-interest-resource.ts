@@ -5,6 +5,9 @@ import type {
   FounderApplicationHistoryEntry,
 } from "./founder-application.ts";
 import {
+  MAX_CANONICAL_PROFILE_LINK_BYTES,
+  MAX_CANONICAL_PROFILE_LINK_LENGTH,
+  MAX_PROFILE_LINKS,
   canEditFounderApplication,
   canWithdrawFounderApplication,
 } from "./founder-application.ts";
@@ -27,8 +30,12 @@ import {
 export const FOUNDER_INTEREST_PATH = "/participant/founder-interest";
 export const FOUNDER_SECONDARY_AREAS_FIELD =
   "secondary-contribution-area-ids";
-const MAX_PROFILE_LINK_FORM_LENGTH = 8 * 2_048 + 7;
-const MAX_PROFILE_LINK_FORM_BYTES = 8 * 2_048 * 3 + 7;
+export const MAX_PROFILE_LINK_FORM_LENGTH =
+  MAX_PROFILE_LINKS * MAX_CANONICAL_PROFILE_LINK_LENGTH +
+  (MAX_PROFILE_LINKS - 1);
+export const MAX_PROFILE_LINK_FORM_BYTES =
+  MAX_PROFILE_LINKS * MAX_CANONICAL_PROFILE_LINK_BYTES +
+  (MAX_PROFILE_LINKS - 1);
 
 export type FounderInterestFieldsData = Readonly<{
   expertise_summary: string;
@@ -241,12 +248,6 @@ function founderFields(
   ) ?? [];
   const currentProfileLinks = current?.professionalProfileLinks.join("\n") ??
     null;
-  const prefilledProfileLinks = currentProfileLinks !== null &&
-      currentProfileLinks.length <= MAX_PROFILE_LINK_FORM_LENGTH &&
-      new TextEncoder().encode(currentProfileLinks).byteLength <=
-        MAX_PROFILE_LINK_FORM_BYTES
-    ? currentProfileLinks
-    : null;
 
   return [
     requiredMultiline(
@@ -312,8 +313,8 @@ function founderFields(
       minLength: 0,
       maxLength: MAX_PROFILE_LINK_FORM_LENGTH,
       maxBytes: MAX_PROFILE_LINK_FORM_BYTES,
-      ...(prefilledProfileLinks !== null
-        ? { value: prefilledProfileLinks }
+      ...(currentProfileLinks !== null
+        ? { value: currentProfileLinks }
         : {}),
     },
     {

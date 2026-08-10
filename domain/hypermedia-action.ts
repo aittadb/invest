@@ -1,7 +1,7 @@
 export const MAX_ACTION_FIELDS = 32;
 export const MAX_ACTION_CHOICES = 64;
 export const MAX_ACTION_HREF_LENGTH = 2_048;
-export const MAX_ACTION_TEXT_LENGTH = 50_000;
+export const MAX_ACTION_TEXT_LENGTH = 262_144;
 export const MAX_ACTION_FIELD_BYTES = 262_144;
 
 export type ActionMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";

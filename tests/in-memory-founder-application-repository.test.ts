@@ -317,6 +317,153 @@ test("current records are checked against immutable adapter history", async () =
   );
 });
 
+test("compact founder records reject current, transition, reference, and chunk corruption", async (t) => {
+  const baseline = new MemoryStorageState();
+  const configuredChoices = maximumContributionAreaChoices();
+  const baselineAdapter = new DeterministicMemoryStorageAdapter(baseline, true);
+  await repository(
+    baselineAdapter,
+    ALICE_SUBJECT,
+    configuredChoices,
+  ).create({
+    ...createRequest(),
+    fields: maximumFields("\u0800", configuredChoices),
+  });
+  assert.ok(recordsIn(baseline, "founder-application-fields").length > 1);
+
+  const corruptions: readonly Readonly<{
+    name: string;
+    apply(state: MemoryStorageState): void;
+  }>[] = [
+    {
+      name: "current record",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "founder-applications"),
+        (document) => {
+          document.unexpected = true;
+        },
+      ),
+    },
+    {
+      name: "operation transition record",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "founder-application-history"),
+        (document) => {
+          document.status = "withdrawn";
+        },
+      ),
+    },
+    {
+      name: "field reference shape",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "founder-applications"),
+        (document) => {
+          const reference = document.fields as MutableRecord;
+          delete reference.hash;
+        },
+      ),
+    },
+    {
+      name: "field reference revision",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "founder-application-history"),
+        (document) => {
+          const reference = document.fields as MutableRecord;
+          reference.revision = 2;
+        },
+      ),
+    },
+    {
+      name: "missing chunk",
+      apply: (state) => {
+        const chunk = requiredRecordIn(state, "founder-application-fields");
+        state.records.delete(storageKeyString(chunk.key));
+      },
+    },
+    {
+      name: "reordered chunks",
+      apply: (state) => {
+        const chunks = sortedFieldChunks(state);
+        const first = chunks[0];
+        const second = chunks[1];
+        assert(first && second);
+        replaceStoredDocument(state, first, second.value);
+        replaceStoredDocument(state, second, first.value);
+      },
+    },
+    {
+      name: "cross-subject chunk",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "founder-application-fields"),
+        (document) => {
+          document.applicantSubject = BOB_SUBJECT;
+        },
+      ),
+    },
+    {
+      name: "chunk hash mismatch",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "founder-application-fields"),
+        (document) => {
+          document.fieldsHash = `sha256:${"0".repeat(64)}`;
+        },
+      ),
+    },
+    {
+      name: "chunk byte mismatch",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "founder-application-fields"),
+        (document) => {
+          document.fieldsBytes = Number(document.fieldsBytes) + 1;
+        },
+      ),
+    },
+    {
+      name: "chunk count mismatch",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "founder-application-fields"),
+        (document) => {
+          document.chunkCount = Number(document.chunkCount) + 1;
+        },
+      ),
+    },
+    {
+      name: "payload hash mismatch",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordIn(state, "founder-application-fields"),
+        (document) => {
+          const data = String(document.data);
+          document.data = `${data.startsWith("A") ? "B" : "A"}${data.slice(1)}`;
+        },
+      ),
+    },
+  ];
+
+  for (const corruption of corruptions) {
+    await t.test(corruption.name, async () => {
+      const state = cloneMemoryStorageState(baseline);
+      corruption.apply(state);
+      await rejectsStorage(
+        () => repository(
+          new DeterministicMemoryStorageAdapter(state, true),
+          ALICE_SUBJECT,
+          configuredChoices,
+        ).get(APPLICATION_ID),
+        "UNAVAILABLE",
+      );
+    });
+  }
+});
+
 test("concurrent exact creates recover one immutable server-timed result", async () => {
   const state = new MemoryStorageState();
   const adapter = new ConcurrentTransactionStorageAdapter(
@@ -346,6 +493,92 @@ test("concurrent exact creates recover one immutable server-timed result", async
   );
 });
 
+test("founder writes reject a malformed transaction result matrix", async (t) => {
+  const corruptions: readonly Readonly<{
+    name: string;
+    apply(result: StorageTransactionResult): unknown;
+  }>[] = [
+    {
+      name: "primitive envelope",
+      apply: () => null,
+    },
+    {
+      name: "non-boolean replay marker",
+      apply: (result) => ({ ...result, replayed: "false" }),
+    },
+    {
+      name: "missing result record",
+      apply: (result) => ({
+        ...result,
+        records: result.records.slice(0, -1),
+      }),
+    },
+    {
+      name: "sparse records array",
+      apply: (result) => {
+        const records = new Array(result.records.length);
+        for (let index = 1; index < result.records.length; index += 1) {
+          records[index] = result.records[index];
+        }
+        return { ...result, records };
+      },
+    },
+    {
+      name: "null current record",
+      apply: (result) => ({
+        ...result,
+        records: [null, ...result.records.slice(1)],
+      }),
+    },
+    {
+      name: "wrong current revision",
+      apply: (result) => corruptTransactionRecord(
+        result,
+        0,
+        (record) => {
+          record.revision = Number(record.revision) + 1;
+        },
+      ),
+    },
+    {
+      name: "wrong operation value",
+      apply: (result) => corruptTransactionRecord(
+        result,
+        1,
+        (record) => {
+          const value = record.value as MutableRecord;
+          value.operationFingerprint = `sha256:${"0".repeat(64)}`;
+        },
+      ),
+    },
+    {
+      name: "wrong chunk key",
+      apply: (result) => corruptTransactionRecord(
+        result,
+        2,
+        (record) => {
+          const key = record.key as MutableRecord;
+          key.id = "founder-fields:wrong";
+        },
+      ),
+    },
+  ];
+
+  for (const corruption of corruptions) {
+    await t.test(corruption.name, async () => {
+      const state = new MemoryStorageState();
+      const adapter = new MalformedTransactionResultStorageAdapter(
+        new DeterministicMemoryStorageAdapter(state, true),
+        corruption.apply,
+      );
+      await rejectsStorage(
+        () => repository(adapter, ALICE_SUBJECT).create(createRequest()),
+        "UNAVAILABLE",
+      );
+    });
+  }
+});
+
 test("maximum founder payloads stay within hosted record, transaction, restart, and retry budgets", async () => {
   const state = new MemoryStorageState();
   const observed = new ObservedStorageAdapter(
@@ -359,7 +592,7 @@ test("maximum founder payloads stay within hosted record, transaction, restart, 
     id: APPLICATION_ID,
     occurredAt: "2026-08-10T10:00:00.000Z",
     historyEntryId: "founder-history:maximum-create",
-    fields: maximumFields("\u0800"),
+    fields: maximumFields("\u0800", configuredChoices),
   } satisfies CreateFounderApplicationRequest;
 
   const created = await owner.create(create);
@@ -400,7 +633,7 @@ test("maximum founder payloads stay within hosted record, transaction, restart, 
     expectedRevision: 1,
     occurredAt: "2026-08-10T11:00:00.000Z",
     historyEntryId: "founder-history:maximum-edit",
-    fields: maximumFields("\u0801"),
+    fields: maximumFields("\u0801", configuredChoices),
   });
   const edited = await repository(
     observed,
@@ -456,45 +689,82 @@ test("founder ancestry is finite and always reserves the final transition for wi
   const observed = new ObservedStorageAdapter(
     new DeterministicMemoryStorageAdapter(state, true),
   );
-  const owner = repository(observed, ALICE_SUBJECT);
-  await owner.create(createRequest());
+  const configuredChoices = maximumContributionAreaChoices();
+  const owner = repository(observed, ALICE_SUBJECT, configuredChoices);
+  await owner.create({
+    ...createRequest(),
+    fields: maximumFields("\u0800", configuredChoices),
+  });
 
   for (let revision = 1; revision < MAX_FOUNDER_APPLICATION_REVISIONS - 1; revision += 1) {
-    await repository(observed, ALICE_SUBJECT).edit(editRequest({
+    await repository(observed, ALICE_SUBJECT, configuredChoices).edit(editRequest({
       operationId: `founder-operation:bounded-edit-${revision}`,
       expectedRevision: revision,
       occurredAt: new Date(
         Date.parse("2026-08-10T10:00:00.000Z") + revision * 60_000,
       ).toISOString(),
       historyEntryId: `founder-history:bounded-edit-${revision}`,
-      fields: fields({ note: `Bounded edit ${revision}.` }),
+      fields: maximumFields("\u0800", configuredChoices),
     }));
   }
 
   await rejectsStorage(
-    () => repository(observed, ALICE_SUBJECT).edit(editRequest({
+    () => repository(observed, ALICE_SUBJECT, configuredChoices).edit(editRequest({
       operationId: "founder-operation:over-budget-edit",
       expectedRevision: MAX_FOUNDER_APPLICATION_REVISIONS - 1,
       occurredAt: "2026-08-10T11:00:00.000Z",
       historyEntryId: "founder-history:over-budget-edit",
-      fields: fields(),
+      fields: maximumFields("\u0800", configuredChoices),
     })),
     "PRECONDITION_FAILED",
   );
 
   observed.resetReads();
-  const received = await repository(observed, ALICE_SUBJECT).get(APPLICATION_ID);
+  const received = await repository(
+    observed,
+    ALICE_SUBJECT,
+    configuredChoices,
+  ).get(APPLICATION_ID);
   assert.equal(received?.revision, MAX_FOUNDER_APPLICATION_REVISIONS - 1);
   assert.ok(observed.reads <= MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS);
 
-  const withdrawn = await repository(observed, ALICE_SUBJECT).withdraw(
-    withdrawRequest({
-      operationId: "founder-operation:bounded-withdraw",
-      expectedRevision: MAX_FOUNDER_APPLICATION_REVISIONS - 1,
-      occurredAt: "2026-08-10T12:00:00.000Z",
-      historyEntryId: "founder-history:bounded-withdraw",
-    }),
+  const fieldRecordsBeforeWithdrawal = recordsIn(
+    state,
+    "founder-application-fields",
+  ).length;
+  const barrier = new ConcurrentTransactionStorageAdapter(
+    new DeterministicMemoryStorageAdapter(state, true),
   );
+  const firstObserved = new ObservedStorageAdapter(barrier);
+  const secondObserved = new ObservedStorageAdapter(barrier);
+  const withdrawal = withdrawRequest({
+    operationId: "founder-operation:bounded-withdraw",
+    expectedRevision: MAX_FOUNDER_APPLICATION_REVISIONS - 1,
+    occurredAt: "2026-08-10T12:00:00.000Z",
+    historyEntryId: "founder-history:bounded-withdraw",
+  });
+  const withdrawals = await Promise.all([
+    repository(
+      firstObserved,
+      ALICE_SUBJECT,
+      configuredChoices,
+    ).withdraw(withdrawal),
+    repository(
+      secondObserved,
+      ALICE_SUBJECT,
+      configuredChoices,
+    ).withdraw({
+      ...withdrawal,
+      occurredAt: "2026-08-10T12:01:00.000Z",
+    }),
+  ]);
+  assert.deepEqual(withdrawals[0]?.snapshot, withdrawals[1]?.snapshot);
+  assert.deepEqual(
+    withdrawals.map((result) => result.replayed).sort(),
+    [false, true],
+  );
+  const withdrawn = withdrawals[0];
+  assert(withdrawn);
   assert.equal(withdrawn.revision, MAX_FOUNDER_APPLICATION_REVISIONS);
   assert.equal(
     recordsIn(state, "founder-application-history").length,
@@ -502,13 +772,21 @@ test("founder ancestry is finite and always reserves the final transition for wi
   );
   assert.equal(
     recordsIn(state, "founder-application-fields").length,
-    MAX_FOUNDER_APPLICATION_REVISIONS - 1,
+    fieldRecordsBeforeWithdrawal,
   );
-  assert.equal(state.records.size, MAX_FOUNDER_APPLICATION_REVISIONS * 2);
-  assert.ok(
-    MAX_FOUNDER_APPLICATION_STORAGE_READS >
-      MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS,
+  assert.equal(
+    state.records.size,
+    1 + MAX_FOUNDER_APPLICATION_REVISIONS + fieldRecordsBeforeWithdrawal,
   );
+  const observedContentionReads = Math.max(
+    firstObserved.reads,
+    secondObserved.reads,
+  );
+  assert.equal(
+    observedContentionReads,
+    33 + 2 * fieldRecordsBeforeWithdrawal,
+  );
+  assert.ok(observedContentionReads <= MAX_FOUNDER_APPLICATION_STORAGE_READS);
 });
 
 test("persisted founder history survives configured contribution choice evolution", async () => {
@@ -543,6 +821,26 @@ test("persisted founder history survives configured contribution choice evolutio
   assert.deepEqual(replay.snapshot, historical.snapshot);
 
   await rejectsStorage(
+    () => evolved.edit({
+      ...historicalEdit,
+      occurredAt: "2026-08-10T11:02:00.000Z",
+      fields: fields({
+        primaryContributionAreaId: "area:commercial",
+        secondaryContributionAreaIds: ["area:delivery"],
+      }),
+    }),
+    "CONFLICT",
+  );
+  await rejectsStorage(
+    () => evolved.edit({
+      ...historicalEdit,
+      occurredAt: "2026-08-10T11:03:00.000Z",
+      fields: fields({ expertiseSummary: 7 }),
+    }),
+    "INVALID_REQUEST",
+  );
+
+  await rejectsStorage(
     () => evolved.edit(editRequest({
       operationId: "founder-operation:removed-choice-edit",
       expectedRevision: 2,
@@ -572,6 +870,53 @@ test("persisted founder history survives configured contribution choice evolutio
     current.snapshot.history[2]?.fields.primaryContributionAreaId,
     "area:commercial",
   );
+});
+
+test("concurrent evolved-choice work with one operation id commits once and conflicts once", async () => {
+  const state = new MemoryStorageState();
+  const delegate = new DeterministicMemoryStorageAdapter(state, true);
+  await repository(delegate, ALICE_SUBJECT).create(createRequest());
+
+  const barrier = new ConcurrentTransactionStorageAdapter(delegate);
+  const oldChoices = repository(barrier, ALICE_SUBJECT);
+  const evolvedChoices = choices([
+    { id: "area:commercial", label: "Commercial" },
+    { id: "area:delivery", label: "Delivery" },
+  ]);
+  const evolved = repository(barrier, ALICE_SUBJECT, evolvedChoices);
+  const envelope = {
+    operationId: "founder-operation:choice-race",
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T11:00:00.000Z",
+    historyEntryId: "founder-history:choice-race",
+  } as const;
+
+  const results = await Promise.allSettled([
+    oldChoices.edit(editRequest({
+      ...envelope,
+      fields: fields({
+        primaryContributionAreaId: "area:product",
+        secondaryContributionAreaIds: ["area:engineering"],
+      }),
+    })),
+    evolved.edit(editRequest({
+      ...envelope,
+      fields: fields({
+        primaryContributionAreaId: "area:commercial",
+        secondaryContributionAreaIds: ["area:delivery"],
+      }),
+    })),
+  ]);
+
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  const rejected = results.find((result) => result.status === "rejected");
+  assert(rejected?.status === "rejected");
+  assert(rejected.reason instanceof StorageFailure);
+  assert.equal(rejected.reason.code, "CONFLICT");
+  const current = await repository(delegate, ALICE_SUBJECT).get(APPLICATION_ID);
+  assert.equal(current?.revision, 2);
+  assert.equal(current?.history.length, 2);
+  assert.equal(state.operations.size, 2);
 });
 
 test("configured owner can page and inspect opaque founder review records", async () => {
@@ -659,13 +1004,19 @@ function repository(
 }
 
 function maximumContributionAreaChoices(): readonly ContributionAreaChoice[] {
-  return choices(Array.from({ length: 17 }, (_, index) => ({
-    id: `area:${index}`,
-    label: `Area ${index}`,
-  })));
+  return choices(Array.from({ length: 64 }, (_, index) => {
+    const prefix = `area:${index}:`;
+    return {
+      id: `${prefix}${"x".repeat(128 - prefix.length)}`,
+      label: `Area ${index}`,
+    };
+  }));
 }
 
-function maximumFields(character: string) {
+function maximumFields(
+  character: string,
+  configuredChoices: readonly ContributionAreaChoice[],
+) {
   const profileLinks = Array.from({ length: 8 }, (_, index) => {
     const prefix = `https://profiles.invalid/${index}/`;
     return `${prefix}${character.repeat(2_048 - prefix.length)}`;
@@ -673,11 +1024,10 @@ function maximumFields(character: string) {
   return fields({
     expertiseSummary: character.repeat(4_000),
     intendedContribution: character.repeat(4_000),
-    primaryContributionAreaId: "area:0",
-    secondaryContributionAreaIds: Array.from(
-      { length: 16 },
-      (_, index) => `area:${index + 1}`,
-    ),
+    primaryContributionAreaId: configuredChoices[0]?.id,
+    secondaryContributionAreaIds: configuredChoices
+      .slice(1, 17)
+      .map((choice) => choice.id),
     approximateAvailability: character.repeat(500),
     possibleStartTiming: character.repeat(500),
     compensationExpectation: character.repeat(500),
@@ -693,6 +1043,74 @@ function recordsIn(
   return [...state.records.values()].filter(
     (record) => record.key.collection === collection,
   );
+}
+
+function requiredRecordIn(
+  state: MemoryStorageState,
+  collection: string,
+): StorageRecord {
+  const record = recordsIn(state, collection)[0];
+  assert(record);
+  return record;
+}
+
+function sortedFieldChunks(state: MemoryStorageState): readonly StorageRecord[] {
+  return [...recordsIn(state, "founder-application-fields")].sort(
+    (left, right) =>
+      Number(left.value.chunkIndex) - Number(right.value.chunkIndex),
+  );
+}
+
+function mutateStoredDocument(
+  state: MemoryStorageState,
+  record: StorageRecord,
+  mutate: (document: MutableRecord) => void,
+): void {
+  const value = cloneDocument(record.value) as MutableRecord;
+  mutate(value);
+  replaceStoredDocument(state, record, value as StorageDocument);
+}
+
+function replaceStoredDocument(
+  state: MemoryStorageState,
+  record: StorageRecord,
+  value: StorageDocument,
+): void {
+  state.records.set(storageKeyString(record.key), freezeRecord({
+    key: record.key,
+    revision: record.revision,
+    value,
+  }));
+}
+
+function cloneMemoryStorageState(source: MemoryStorageState): MemoryStorageState {
+  const clone = new MemoryStorageState();
+  for (const [key, record] of source.records) {
+    const copied = cloneRecord(record);
+    assert(copied);
+    clone.records.set(key, copied);
+  }
+  for (const [key, operation] of source.operations) {
+    clone.operations.set(key, {
+      fingerprint: operation.fingerprint,
+      result: cloneResult(operation.result, operation.result.replayed),
+    });
+  }
+  return clone;
+}
+
+function corruptTransactionRecord(
+  result: StorageTransactionResult,
+  index: number,
+  mutate: (record: MutableRecord) => void,
+): unknown {
+  const records = result.records.map((record) =>
+    record === null ? null : cloneDocument(record as unknown as StorageDocument)
+  );
+  const candidate = records[index];
+  assert(candidate && typeof candidate === "object" && !Array.isArray(candidate));
+  mutate(candidate as MutableRecord);
+  return { replayed: result.replayed, records };
 }
 
 function jsonBytes(value: unknown): number {
@@ -933,6 +1351,35 @@ class ObservedStorageAdapter implements StorageAdapter {
         MAX_FOUNDER_APPLICATION_STORAGE_TRANSACTION_BYTES,
     );
     return this.#delegate.transact(request);
+  }
+}
+
+class MalformedTransactionResultStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #corrupt: (result: StorageTransactionResult) => unknown;
+
+  constructor(
+    delegate: StorageAdapter,
+    corrupt: (result: StorageTransactionResult) => unknown,
+  ) {
+    this.#delegate = delegate;
+    this.#corrupt = corrupt;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    return this.#corrupt(
+      await this.#delegate.transact(request),
+    ) as StorageTransactionResult;
   }
 }
 
