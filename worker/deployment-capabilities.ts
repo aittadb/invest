@@ -14,6 +14,7 @@ import type {
 import type { OwnerCampaignEditorRepository } from "../services/owner-campaign-editor.ts";
 import type { OwnerPackageWorkspaceService } from "../services/owner-package-workspace.ts";
 import type { ActorSubject } from "../domain/foundation.ts";
+import type { ParticipantAccessStateReader } from "../domain/participant-home-resource.ts";
 
 export type CampaignWorkspaceOperationKind =
   | "setup"
@@ -38,6 +39,7 @@ export type ApplicationRepositoryFactory = Readonly<{
       "get" | "latest" | "record"
     >;
   }>;
+  participantAccessReader(): ParticipantAccessStateReader;
 }>;
 
 /** Backend-only deployment capability; it contains no serializable credential. */

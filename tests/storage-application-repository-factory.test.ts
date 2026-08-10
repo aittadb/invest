@@ -183,6 +183,7 @@ test("factory exposes only named application repository capabilities", () => {
     "ownerPackageWorkspace",
     "participantPackageReader",
     "participantPackageAcknowledgments",
+    "participantAccessReader",
   ]);
   assert.equal(
     factory.campaignRepository(),
@@ -221,6 +222,10 @@ test("factory exposes only named application repository capabilities", () => {
     Object.keys(acknowledgment.acknowledgments),
     ["get", "latest", "record"],
   );
+  const accessReader = factory.participantAccessReader();
+  assert.equal(factory.participantAccessReader(), accessReader);
+  assert.deepEqual(Object.keys(accessReader), ["read"]);
+  assert.equal(Object.isFrozen(accessReader), true);
   assert.doesNotMatch(
     Object.getOwnPropertyNames(Object.getPrototypeOf(factory)).join(" "),
     /adapter|storage|create/iu,

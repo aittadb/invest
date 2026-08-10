@@ -7,15 +7,15 @@ boundary for Investor App persistence. It composes one confidential service
 token provider, one bounded AittaDB `StorageAdapter`, one backend repository
 factory, and one browser-mutation session per immutable Sites environment.
 
-The runtime now composes named persistent campaign and package capabilities over
-that adapter. `createApplicationWorker` installs `/owner/setup`, campaign
-editing, draft preview, publish/unpublish, and owner package management only in
-the configured-owner route group. Registered-participant package reading and
-current-package acknowledgment are subject-bound and additionally require the
-trusted `participantAccess` projection. Until TASK-090 supplies that persistent
-projection, those participant routes remain non-disclosing and unavailable
-without opening the package repository. Founder, indication, aggregate,
-moderation, export, deletion, registration, and profile composition still
+The runtime now composes named persistent campaign, package, and participant
+access capabilities over that adapter. `createApplicationWorker` installs
+`/owner/setup`, campaign editing, draft preview, publish/unpublish, and owner
+package management only in the configured-owner route group. For a signed-in
+non-owner, it derives the trusted `participantAccess` projection from that
+subject's persistent profile, current package, and current acknowledgment gate.
+An unregistered subject stops after the profile read without opening package or
+acknowledgment storage. Founder, indication, aggregate, moderation, export,
+deletion coordination, registration-route, and profile-route composition still
 require their own named persistent capabilities.
 
 This source composition and its deterministic protocol services are not hosted
@@ -103,11 +103,14 @@ redirect and carry the bearer value only to the validated transport target.
 `StorageApplicationRepositoryFactory` closes over the single credential-bound
 adapter and exposes only named, narrow capability methods for browser-mutation
 replay, the atomic campaign/audit repository, the public campaign projection
-reader, the owner package workspace, a participant package reader, and
-subject-bound package acknowledgment. It intentionally has no generic builder
-or adapter accessor. The Worker calls these methods centrally and passes routes
-only their declared interfaces and mutation session; it never passes the
-adapter or factory into route context. The factory does not infer persistence
+reader, the owner package workspace, a participant package reader,
+subject-bound package acknowledgment, and one participant-access state reader.
+That reader creates fresh profile and acknowledgment repositories for each
+trusted account and combines them only through the bounded projection service.
+It intentionally has no generic builder or adapter accessor. The Worker calls
+these methods centrally and passes routes only their declared interfaces and
+mutation session; it never passes the adapter or factory into route context.
+The factory does not infer persistence
 from a hostname, owner, campaign, D1, R2, browser store, file, or process-memory
 map. `StoragePackageVersionRepository` and
 `StorageAcknowledgmentRepository` retain no local authority; their historical

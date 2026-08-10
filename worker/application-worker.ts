@@ -176,9 +176,11 @@ export function createApplicationWorker(
       const campaign = isOwner && isOwnerPath(url.pathname) && campaignWorkspace
         ? await resolveOwnerCampaign(campaignWorkspace, publicCampaign)
         : publicCampaign;
+      const participantAccessReader = dependencies.participantAccessReader ??
+        runtimeParticipantAccessReader(applicationRuntime, actor, isOwner);
       const participantAccess = await resolveParticipantAccess(
         actor,
-        dependencies.participantAccessReader,
+        participantAccessReader,
       );
       const renderEnvironment = applicationRenderEnvironment(env);
       const campaignEditorAvailable = campaignWorkspace !== null;
@@ -602,6 +604,19 @@ async function resolveParticipantAccess(
     );
   } catch {
     return null;
+  }
+}
+
+function runtimeParticipantAccessReader(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+): ParticipantAccessStateReader | undefined {
+  if (runtime === null || actor === null || isOwner) return undefined;
+  try {
+    return runtime.repositoryFactory.participantAccessReader();
+  } catch {
+    return undefined;
   }
 }
 

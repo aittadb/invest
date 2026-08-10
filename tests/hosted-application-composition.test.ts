@@ -16,14 +16,10 @@ import {
   MutationSecurityFailure,
 } from "../http/mutation-security.ts";
 import { OWNER_PACKAGE_WORKSPACE_HEADER } from "../http/runtime-capabilities.ts";
-import type { ParticipantAccessStateReader } from "../domain/participant-home-resource.ts";
 import type { OwnerPackageDocument } from "../domain/owner-package-resource.ts";
+import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   parseActorSubject,
-  parseStableId,
-  parseTimestamp,
-  type StableId,
-  type Timestamp,
 } from "../domain/foundation.ts";
 import {
   StorageFailure,
@@ -31,6 +27,7 @@ import {
 } from "../domain/storage-adapter.ts";
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
 import { StoragePackageVersionRepository } from "../repositories/in-memory-content-repository.ts";
+import { StorageParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
 import type {
   InvestorAppEnv,
@@ -332,6 +329,57 @@ test("complete runtime advertises package capability on owner rendering", async 
   );
 });
 
+test("hosted participant access is subject-bound and excludes the configured owner", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Private participant profile",
+    "participant-operation:subject-bound-participant",
+  );
+  await registerHostedParticipant(
+    service,
+    OWNER.subject,
+    OWNER_EMAIL,
+    "Private owner profile",
+    "participant-operation:subject-bound-owner",
+  );
+  const worker = hostedPackageWorker(service);
+
+  const owner = await worker.fetch(
+    new Request(`${APP_ORIGIN}/participant`, {
+      headers: {
+        accept: "application/json",
+        "oai-authenticated-user-id": OWNER.subject,
+        "oai-authenticated-user-email": OWNER_EMAIL,
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(owner.status, 404);
+  assert.doesNotMatch(await owner.text(), /Private owner profile/u);
+
+  const foreign = await worker.fetch(
+    new Request(`${APP_ORIGIN}/participant`, {
+      headers: {
+        accept: "application/json",
+        "oai-authenticated-user-id": "sites-foreign-participant",
+        "oai-authenticated-user-email": "foreign@example.test",
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(foreign.status, 404);
+  assert.doesNotMatch(
+    await foreign.text(),
+    /Private participant profile|Private owner profile/u,
+  );
+});
+
 test("hosted package routes persist atomic private versions and current acknowledgments", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
@@ -382,7 +430,7 @@ test("hosted package routes persist atomic private versions and current acknowle
     executionContext,
   );
   assert.equal(gated.status, 404);
-  assert.equal(service.readRequests, gatedReadsBefore + 1);
+  assert.equal(service.readRequests, gatedReadsBefore + 2);
   assert.doesNotMatch(await gated.text(), /package content|PRIVATE DRAFT/u);
 
   const concurrencyWorker = hostedPackageWorker(service);
@@ -425,29 +473,22 @@ test("hosted package routes persist atomic private versions and current acknowle
     /Visible package content|PRIVATE DRAFT SENTINEL|Concurrent package update/u,
   );
 
-  let acceptanceRequired = true;
-  let currentVersion = requiredCurrentVersion(currentOwner.document);
-  const accessReader: ParticipantAccessStateReader = {
-    async read(account) {
-      return {
-        profile: {
-          subject: account.subject,
-          displayName: "Synthetic participant",
-          declaredInterest: "investor",
-          participationContext: "individual",
-          accountDeletionRequested: false,
-        },
-        currentPackage: {
-          id: currentVersion.id,
-          createdAt: currentVersion.created_at,
-          changeSummary: currentVersion.change_summary,
-          materialChange: currentVersion.material_change,
-          requiresCurrentAcceptance: acceptanceRequired,
-        },
-      };
+  const participantRepository = hostedParticipantRepository(service);
+  const registration = await participantRepository.register({
+    operationId: "participant-operation:hosted-access-registration",
+    expectedRevision: null,
+    registeredAt: "2026-08-10T10:00:00.000Z",
+    registration: {
+      displayName: "Synthetic participant",
+      country: "FI",
+      declaredInterest: "investor",
+      participationContext: "individual",
+      processEmailNoticeAcknowledged: true,
+      marketingConsent: false,
     },
-  };
-  const participantWorker = hostedPackageWorker(service, accessReader);
+  });
+  assert.equal(registration.revision, 1);
+  const participantWorker = hostedPackageWorker(service);
   const reader = await participantWorker.fetch(
     participantRequest("/participant/package"),
     env,
@@ -521,8 +562,7 @@ test("hosted package routes persist atomic private versions and current acknowle
   assert.equal(recordsIn(service, "private-package-acceptances").length, 1);
   assert.equal(recordsIn(service, "private-package-acceptance-heads").length, 1);
 
-  acceptanceRequired = false;
-  const restartedParticipant = hostedPackageWorker(service, accessReader);
+  const restartedParticipant = hostedPackageWorker(service);
   const satisfied = await participantAcknowledgment(restartedParticipant, env);
   assert.equal(satisfied.document.data.status, "satisfied");
   assert.deepEqual(actionNames(satisfied.document), []);
@@ -542,11 +582,8 @@ test("hosted package routes persist atomic private versions and current acknowle
     },
   );
   assert.equal(editorialResponse.status, 200);
-  currentVersion = requiredCurrentVersion(
-    (await ownerWorkspace(hostedPackageWorker(service), env)).document,
-  );
   const editorialState = await participantAcknowledgment(
-    hostedPackageWorker(service, accessReader),
+    hostedPackageWorker(service),
     env,
   );
   assert.equal(editorialState.document.data.status, "satisfied");
@@ -566,12 +603,8 @@ test("hosted package routes persist atomic private versions and current acknowle
     },
   );
   assert.equal(materialResponse.status, 200);
-  currentVersion = requiredCurrentVersion(
-    (await ownerWorkspace(hostedPackageWorker(service), env)).document,
-  );
-  acceptanceRequired = true;
   const renewed = await participantAcknowledgment(
-    hostedPackageWorker(service, accessReader),
+    hostedPackageWorker(service),
     env,
   );
   assert.equal(renewed.document.data.status, "acceptance_required");
@@ -1209,10 +1242,7 @@ function mutationRequest(proof: Readonly<{ token: string; setCookie: string }>) 
   });
 }
 
-function hostedPackageWorker(
-  service: SyntheticAittaDBService,
-  participantAccessReader?: ParticipantAccessStateReader,
-) {
+function hostedPackageWorker(service: SyntheticAittaDBService) {
   return createApplicationWorker({
     fetchApplication: async () =>
       new Response("application fallback", { status: 404 }),
@@ -1221,22 +1251,78 @@ function hostedPackageWorker(
       fetch: service.fetch,
       now: () => NOW,
     }),
-    ...(participantAccessReader === undefined
-      ? {}
-      : { participantAccessReader }),
   });
 }
 
 function hostedPackageRepository(
   service: SyntheticAittaDBService,
 ): StoragePackageVersionRepository {
-  return new StoragePackageVersionRepository(new AittaDBStorageAdapter({
+  return new StoragePackageVersionRepository(hostedStorageAdapter(service));
+}
+
+function hostedParticipantRepository(
+  service: SyntheticAittaDBService,
+): StorageParticipantRepository {
+  return hostedParticipantRepositoryFor(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+  );
+}
+
+function hostedParticipantRepositoryFor(
+  service: SyntheticAittaDBService,
+  subject: string,
+  email: string,
+): StorageParticipantRepository {
+  const account = parseParticipantAccount({
+    subject,
+    accountEmailLabel: email,
+  });
+  assert(account.ok);
+  return new StorageParticipantRepository(
+    hostedStorageAdapter(service),
+    account.value,
+  );
+}
+
+async function registerHostedParticipant(
+  service: SyntheticAittaDBService,
+  subject: string,
+  email: string,
+  displayName: string,
+  operationId: string,
+): Promise<void> {
+  const result = await hostedParticipantRepositoryFor(
+    service,
+    subject,
+    email,
+  ).register({
+    operationId,
+    expectedRevision: null,
+    registeredAt: "2026-08-10T10:00:00.000Z",
+    registration: {
+      displayName,
+      country: "FI",
+      declaredInterest: "investor",
+      participationContext: "individual",
+      processEmailNoticeAcknowledged: true,
+      marketingConsent: false,
+    },
+  });
+  assert.equal(result.revision, 1);
+}
+
+function hostedStorageAdapter(
+  service: SyntheticAittaDBService,
+): AittaDBStorageAdapter {
+  return new AittaDBStorageAdapter({
     issuer: ISSUER,
     transportOrigin: TRANSPORT_ORIGIN,
     entryHref: ENTRY_HREF,
     accessToken: () => ACCESS_TOKEN,
     fetch: service.fetch,
-  }));
+  });
 }
 
 type TestWorker = ReturnType<typeof hostedPackageWorker>;
@@ -1472,30 +1558,6 @@ function recordsIn(
   return [...service.records.values()].filter(
     (record) => record.key.collection === collection,
   );
-}
-
-type TestCurrentVersion = Readonly<{
-  id: StableId<"package-version">;
-  created_at: Timestamp;
-  change_summary: string;
-  material_change: boolean;
-}>;
-
-function requiredCurrentVersion(
-  document: OwnerPackageDocument,
-): TestCurrentVersion {
-  const current = document.data.current_version;
-  assert(current);
-  const id = parseStableId<"package-version">(current.id);
-  const createdAt = parseTimestamp(current.created_at);
-  assert(id.ok);
-  assert(createdAt.ok);
-  return Object.freeze({
-    id: id.value,
-    created_at: createdAt.value,
-    change_summary: current.change_summary,
-    material_change: current.material_change,
-  });
 }
 
 function configuredEnvironment(

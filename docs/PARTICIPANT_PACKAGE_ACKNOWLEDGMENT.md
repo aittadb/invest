@@ -92,9 +92,9 @@ acknowledgment repositories plus mutation security, CSRF issuance, clock, and
 operation-ID capabilities. Hosted composition supplies those repositories from
 the credential-bound AittaDB adapter and projects them only into the participant
 route group. It does not treat package or acceptance records as participant
-authority. Until TASK-090 supplies the persistent `participantAccess` reader,
-the route remains non-disclosing and unavailable without opening package
-persistence.
+authority. Hosted composition supplies the persistent `participantAccess`
+reader separately; unresolved and unregistered accounts remain non-disclosing
+and unavailable without opening package persistence.
 
 The package-current gate is a private synchronization record separate from the
 owner-visible package head. Every package publish updates its exact version and

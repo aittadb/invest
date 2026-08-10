@@ -2,9 +2,10 @@
 
 Participant profile self-service is an injectable registered-reader resource at
 `/participant/profile`. `StorageParticipantRepository` now supplies the
-production-neutral persistence contract. Trusted participant-access projection
-and hosted registration/profile composition remain `TASK-090`, `TASK-091`, and
-`TASK-092`, so this resource is not yet installed in the hosted Worker.
+production-neutral persistence contract, and the trusted participant-access
+projection is available. Hosted registration and profile composition remain
+`TASK-091` and `TASK-092`, so this resource is not yet installed in the hosted
+Worker.
 
 ## Representations
 

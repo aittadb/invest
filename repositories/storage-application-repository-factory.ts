@@ -3,6 +3,7 @@ import {
   parseTimestamp,
   type ActorSubject,
 } from "../domain/foundation.ts";
+import type { ParticipantAccessStateReader } from "../domain/participant-home-resource.ts";
 import {
   StorageFailure,
   parseStorageCollection,
@@ -19,6 +20,7 @@ import type {
   BrowserMutationReplayClaimer,
 } from "../http/browser-mutation-session.ts";
 import { RepositoryOwnerPackageWorkspaceService } from "../services/owner-package-workspace.ts";
+import { createRepositoryParticipantAccessStateReader } from "../services/participant-access.ts";
 import {
   StorageCampaignRepository,
   StoragePublicCampaignPresentationReader,
@@ -31,6 +33,7 @@ import {
   type AcknowledgmentRepository,
   type PackageVersionRepository,
 } from "./in-memory-content-repository.ts";
+import { StorageParticipantRepository } from "./in-memory-participant-repository.ts";
 
 const REPLAY_SCHEMA_VERSION = 1;
 const REPLAY_COLLECTION = storageCollection("browser-mutation-replays");
@@ -60,6 +63,7 @@ export class StorageApplicationRepositoryFactory {
   readonly #participantPackageAcknowledgments: (
     participantSubject: ActorSubject,
   ) => ParticipantPackageAcknowledgmentRepositories;
+  readonly #participantAccessReader: ParticipantAccessStateReader;
 
   constructor(storage: StorageAdapter, now: () => Date) {
     const adapter = requiredStorageAdapter(storage);
@@ -91,6 +95,26 @@ export class StorageApplicationRepositoryFactory {
         }),
       });
     };
+    this.#participantAccessReader = createRepositoryParticipantAccessStateReader(
+      (account) => {
+        const participant = new StorageParticipantRepository(adapter, account);
+        const acknowledgments = new StorageAcknowledgmentRepository(
+          adapter,
+          packageVersions,
+          account.subject,
+        );
+        return Object.freeze({
+          participant: Object.freeze({
+            current: () => participant.current(),
+          }),
+          packages: this.#participantPackageReader,
+          acknowledgments: Object.freeze({
+            requiresCurrentAcceptance: () =>
+              acknowledgments.requiresCurrentAcceptance(),
+          }),
+        });
+      },
+    );
     this.#claimBrowserMutationReplay = Object.freeze(
       (claim: BrowserMutationReplayClaim) => claimReplay(adapter, clock, claim),
     );
@@ -128,6 +152,10 @@ export class StorageApplicationRepositoryFactory {
     participantSubject: ActorSubject,
   ): ParticipantPackageAcknowledgmentRepositories {
     return this.#participantPackageAcknowledgments(participantSubject);
+  }
+
+  participantAccessReader(): ParticipantAccessStateReader {
+    return this.#participantAccessReader;
   }
 }
 
