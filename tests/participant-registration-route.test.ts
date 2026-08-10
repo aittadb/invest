@@ -24,16 +24,29 @@ import {
 import {
   MUTATION_CSRF_FIELD,
   MUTATION_CSRF_HEADER,
+  MutationSecurityFailure,
   hashCsrfToken,
   type TrustedMutationSession,
 } from "../http/mutation-security.ts";
 import {
+  createBrowserMutationSession,
+  type BrowserMutationProof,
+  type BrowserMutationReplayClaim,
+  type TrustedSitesMutationIdentity,
+} from "../http/browser-mutation-session.ts";
+import {
   DevelopmentInMemoryParticipantRepository,
+  type ParticipantRepository,
   type ParticipantProfileSnapshot,
 } from "../repositories/in-memory-participant-repository.ts";
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
 import { createParticipantRouteHandler } from "../worker/routes/participant.ts";
-import { createParticipantRegistrationRouteHandler } from "../worker/routes/participant-registration.ts";
+import {
+  MAX_REGISTRATION_MUTATION_BYTES,
+  MAX_REGISTRATION_MUTATION_FIELDS,
+  createParticipantRegistrationRouteHandler,
+  type ParticipantRegistrationMutationVerifier,
+} from "../worker/routes/participant-registration.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
 import {
   MemoryStorageAdapter,
@@ -50,6 +63,10 @@ const PROCESS_NOTICE =
   "Required <process> messages concern registration and campaign participation.";
 const MARKETING_NOTICE =
   "Optional marketing messages are separate from required process messages.";
+const ISSUED_COOKIE =
+  "__Host-investor_mutation_test=encrypted; Path=/; Max-Age=300; Secure; HttpOnly; SameSite=Strict";
+const CLEAR_COOKIE =
+  "__Host-investor_mutation_test=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict";
 
 test("registration GET exposes equivalent HTML and versioned hypermedia without browser identity fields", async () => {
   const harness = await createHarness();
@@ -524,6 +541,225 @@ test("operation IDs and CSRF proofs are issued only for unregistered discovery",
   assert.equal(harness.csrfCalls(), 1);
 });
 
+test("hosted proof discovery emits only the server cookie transport", async () => {
+  const proof = Object.freeze({
+    token: CSRF_TOKEN,
+    expiresAt: timestamp("2026-08-09T12:05:00.000Z"),
+    setCookie: ISSUED_COOKIE,
+  }) satisfies BrowserMutationProof;
+  const harness = await createHarness({ csrfToken: proof });
+  const alice = participant(ALICE, "alice@provider.example");
+
+  const jsonResponse = await harness.dispatch(
+    getRequest(ALICE, "application/json"),
+    alice,
+  );
+  assert.equal(jsonResponse.status, 200);
+  assert.equal(jsonResponse.headers.get("set-cookie"), ISSUED_COOKIE);
+  assert.equal(jsonResponse.headers.get(MUTATION_CSRF_HEADER), CSRF_TOKEN);
+  const jsonBody = await jsonResponse.text();
+  assert.doesNotMatch(jsonBody, new RegExp(CSRF_TOKEN, "u"));
+  assert.doesNotMatch(jsonBody, /set-cookie|encrypted|HttpOnly/iu);
+
+  const htmlResponse = await harness.dispatch(
+    getRequest(ALICE, "text/html"),
+    alice,
+  );
+  assert.equal(htmlResponse.status, 200);
+  assert.equal(htmlResponse.headers.get("set-cookie"), ISSUED_COOKIE);
+  const html = await htmlResponse.text();
+  assert.equal(hiddenCsrfToken(html), CSRF_TOKEN);
+  assert.doesNotMatch(html, /set-cookie|encrypted|HttpOnly/iu);
+
+  const malformed = await createHarness({
+    csrfToken: Object.freeze({ ...proof, setCookie: "bad\r\ncookie" }),
+  });
+  const failure = await malformed.dispatch(
+    getRequest(ALICE, "application/json"),
+    alice,
+  );
+  assert.equal(failure.status, 503);
+  assert.equal(failure.headers.get("set-cookie"), null);
+  assert.doesNotMatch(await failure.text(), /bad|cookie|registration_csrf/iu);
+});
+
+test("verified hosted mutations clear their proof cookie exactly once on success and later failures", async () => {
+  const alice = participant(ALICE, "alice@provider.example");
+  const success = await createHarness({
+    verifyMutation: verifierFor(
+      registrationBody("participant-operation:hosted-success"),
+      CLEAR_COOKIE,
+    ),
+  });
+  const successResponse = await success.dispatch(
+    postRequest(ALICE),
+    alice,
+  );
+  assert.equal(successResponse.status, 201);
+  assertSingleCookie(successResponse, CLEAR_COOKIE);
+  assert.doesNotMatch(await successResponse.text(), /set-cookie|Max-Age=0/iu);
+
+  const parserFailure = await createHarness({
+    verifyMutation: verifierFor(
+      registrationBody("participant-operation:hosted-parser", {
+        unexpected: "private parser value",
+      }),
+      CLEAR_COOKIE,
+    ),
+  });
+  const parserResponse = await parserFailure.dispatch(postRequest(ALICE), alice);
+  assert.equal(parserResponse.status, 400);
+  assertSingleCookie(parserResponse, CLEAR_COOKIE);
+  assert.doesNotMatch(await parserResponse.text(), /private parser value|Max-Age=0/iu);
+
+  const repositoryFailure = await createHarness({
+    verifyMutation: verifierFor(
+      registrationBody("participant-operation:hosted-repository"),
+      CLEAR_COOKIE,
+    ),
+    repositoryFor() {
+      throw new Error("private repository failure");
+    },
+  });
+  const repositoryResponse = await repositoryFailure.dispatch(
+    postRequest(ALICE),
+    alice,
+  );
+  assert.equal(repositoryResponse.status, 503);
+  assertSingleCookie(repositoryResponse, CLEAR_COOKIE);
+  assert.doesNotMatch(
+    await repositoryResponse.text(),
+    /private repository failure|Max-Age=0/iu,
+  );
+
+  const renderingFailure = await createHarness({
+    verifyMutation: verifierFor(
+      registrationBody("participant-operation:hosted-render"),
+      CLEAR_COOKIE,
+    ),
+    repositoryFor: renderingFailureRepository,
+  });
+  const renderingResponse = await renderingFailure.dispatch(
+    postRequest(ALICE),
+    alice,
+  );
+  assert.equal(renderingResponse.status, 503);
+  assertSingleCookie(renderingResponse, CLEAR_COOKIE);
+  assert.doesNotMatch(
+    await renderingResponse.text(),
+    /private rendering failure|Max-Age=0/iu,
+  );
+});
+
+test("pre-verification failures do not clear a hosted proof cookie", async () => {
+  const harness = await createHarness({
+    async verifyMutation() {
+      throw new MutationSecurityFailure("REQUEST_REJECTED");
+    },
+  });
+  const alice = participant(ALICE, "alice@provider.example");
+  const response = await harness.dispatch(postRequest(ALICE), alice);
+  assert.equal(response.status, 403);
+  assert.equal(response.headers.get("set-cookie"), null);
+});
+
+test("hosted registration limits reject bodies, field counts, and repeats before replay or persistence", async () => {
+  assert.equal(MAX_REGISTRATION_MUTATION_BYTES, 2_048);
+  assert.equal(MAX_REGISTRATION_MUTATION_FIELDS, 8);
+  const maximumValidForm = new URLSearchParams({
+    [MUTATION_CSRF_FIELD]: "x".repeat(65),
+    "operation-id": `registration:${"x".repeat(114)}`,
+    "display-name": "\u{1F600}".repeat(120),
+    country: "FI",
+    "declared-interest": "investor",
+    "participation-context": "individual",
+    "process-email-notice-acknowledged": "on",
+    "marketing-consent": "on",
+  });
+  assert.equal([...maximumValidForm].length, MAX_REGISTRATION_MUTATION_FIELDS);
+  assert(
+    new TextEncoder().encode(maximumValidForm.toString()).byteLength <=
+      MAX_REGISTRATION_MUTATION_BYTES,
+  );
+  const alice = participant(ALICE, "alice@provider.example");
+  const identity = Object.freeze({
+    type: "participant",
+    subject: ALICE,
+  }) satisfies TrustedSitesMutationIdentity;
+  const claims: BrowserMutationReplayClaim[] = [];
+  const session = createBrowserMutationSession({
+    appOrigin: APP_ORIGIN,
+    encryptionKey: await aesKey(29),
+    async claimReplay(claim) {
+      claims.push(claim);
+      return true;
+    },
+    now: () => new Date("2026-08-09T09:00:00.000Z"),
+    randomBytes: (length) => Uint8Array.from(
+      { length },
+      (_, index) => (index + 17) % 256,
+    ),
+    ttlSeconds: 300,
+  });
+  const proof = await session.issue(
+    getRequest(ALICE, "text/html"),
+    identity,
+    APP_ORIGIN,
+  );
+  let repositoryCalls = 0;
+  const storage = new MemoryStorageAdapter(new MemoryStorageState());
+  const route = createParticipantRegistrationRouteHandler({
+    repositoryFor(account) {
+      repositoryCalls += 1;
+      return new DevelopmentInMemoryParticipantRepository(storage, account);
+    },
+    verifyMutation: (request) => session.verifyMutation(
+      request,
+      identity,
+      APP_ORIGIN,
+      {
+        maxBodyBytes: MAX_REGISTRATION_MUTATION_BYTES,
+        maxFields: MAX_REGISTRATION_MUTATION_FIELDS,
+        repeatedFormFields: [],
+      },
+    ),
+    csrfTokenFor: async () => proof,
+    notices: { processEmail: PROCESS_NOTICE, marketing: MARKETING_NOTICE },
+  });
+
+  const oversized = hostedJsonMutation(proof, registrationBody(
+    "participant-operation:hosted-oversized",
+    { "display-name": "x".repeat(MAX_REGISTRATION_MUTATION_BYTES) },
+  ));
+  const oversizedResponse = await route(routeContext(oversized, alice));
+  assert(oversizedResponse);
+  assert.equal(oversizedResponse.status, 413);
+
+  const excessFields = hostedJsonMutation(proof, registrationBody(
+    "participant-operation:hosted-fields",
+    { one: "1", two: "2", three: "3" },
+  ));
+  const fieldsResponse = await route(routeContext(excessFields, alice));
+  assert(fieldsResponse);
+  assert.equal(fieldsResponse.status, 400);
+
+  const repeated = hostedFormMutation(proof, [
+    ["operation-id", "participant-operation:hosted-repeat"],
+    ["display-name", "Alice"],
+    ["display-name", "Alice again"],
+    ["country", "FI"],
+    ["declared-interest", "investor"],
+    ["participation-context", "individual"],
+    ["process-email-notice-acknowledged", "on"],
+  ]);
+  const repeatedResponse = await route(routeContext(repeated, alice));
+  assert(repeatedResponse);
+  assert.equal(repeatedResponse.status, 400);
+
+  assert.equal(repositoryCalls, 0);
+  assert.deepEqual(claims, []);
+});
+
 type TestActor = Readonly<{
   subject: ActorSubject;
   email: string;
@@ -539,7 +775,11 @@ type TestHarness = Readonly<{
 }>;
 
 async function createHarness(
-  options: Readonly<{ csrfToken?: string | null }> = {},
+  options: Readonly<{
+    csrfToken?: string | BrowserMutationProof | null;
+    verifyMutation?: ParticipantRegistrationMutationVerifier;
+    repositoryFor?: (account: ParticipantAccount) => ParticipantRepository;
+  }> = {},
 ): Promise<TestHarness> {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
@@ -550,31 +790,33 @@ async function createHarness(
   let csrfCalls = 0;
   let timeCalls = 0;
   let operationSequence = 0;
-  const repositoryFor = (account: ParticipantAccount) =>
-    new DevelopmentInMemoryParticipantRepository(storage, account);
+  const repositoryFor = options.repositoryFor ?? ((account: ParticipantAccount) =>
+    new DevelopmentInMemoryParticipantRepository(storage, account));
   const registrationRoute = createParticipantRegistrationRouteHandler({
     repositoryFor,
     notices: {
       processEmail: PROCESS_NOTICE,
       marketing: MARKETING_NOTICE,
     },
-    mutationSecurity: {
-      allowedOrigins: [APP_ORIGIN, SECOND_ALLOWED_ORIGIN],
-      resolveSession: async (request) => {
-        const value = request.headers.get("x-test-auth-subject");
-        if (!value) return null;
-        return session(
-          subject(value),
-          csrfHash,
-          request.headers.get("x-test-session-type") === "owner"
-            ? "owner"
-            : "participant",
-        );
-      },
-      now: () => new Date("2026-08-09T09:00:00.000Z"),
-      maxBodyBytes: 1_024,
-      maxFields: 16,
-    },
+    ...(options.verifyMutation === undefined
+      ? {
+          mutationSecurity: {
+            allowedOrigins: [APP_ORIGIN, SECOND_ALLOWED_ORIGIN],
+            resolveSession: async (request: Request) => {
+              const value = request.headers.get("x-test-auth-subject");
+              if (!value) return null;
+              return session(
+                subject(value),
+                csrfHash,
+                request.headers.get("x-test-session-type") === "owner"
+                  ? "owner"
+                  : "participant",
+              );
+            },
+            now: () => new Date("2026-08-09T09:00:00.000Z"),
+          },
+        }
+      : { verifyMutation: options.verifyMutation }),
     csrfTokenFor: (request, account) => {
       csrfCalls += 1;
       return request.headers.get("x-test-auth-subject") === account.subject
@@ -688,6 +930,135 @@ function formMutation(
     },
     body,
   });
+}
+
+function postRequest(actorSubject: ActorSubject): Request {
+  return new Request(`${APP_ORIGIN}${PARTICIPANT_REGISTRATION_PATH}`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      origin: APP_ORIGIN,
+      "x-test-auth-subject": actorSubject,
+    },
+    body: "{}",
+  });
+}
+
+function hostedJsonMutation(
+  proof: BrowserMutationProof,
+  body: Readonly<Record<string, unknown>>,
+): Request {
+  return new Request(`${APP_ORIGIN}${PARTICIPANT_REGISTRATION_PATH}`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      cookie: proofCookieHeader(proof),
+      origin: APP_ORIGIN,
+      [MUTATION_CSRF_HEADER]: proof.token,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+function hostedFormMutation(
+  proof: BrowserMutationProof,
+  entries: readonly (readonly [string, string])[],
+): Request {
+  const body = new URLSearchParams();
+  body.append(MUTATION_CSRF_FIELD, proof.token);
+  for (const [name, value] of entries) body.append(name, value);
+  return new Request(`${APP_ORIGIN}${PARTICIPANT_REGISTRATION_PATH}`, {
+    method: "POST",
+    headers: {
+      accept: "text/html",
+      "content-type": "application/x-www-form-urlencoded",
+      cookie: proofCookieHeader(proof),
+      origin: APP_ORIGIN,
+    },
+    body,
+  });
+}
+
+function proofCookieHeader(proof: BrowserMutationProof): string {
+  const value = proof.setCookie.split(";", 1)[0];
+  assert(value);
+  return value;
+}
+
+function verifierFor(
+  body: Readonly<Record<string, unknown>>,
+  clearCookie: string,
+): ParticipantRegistrationMutationVerifier {
+  return async () => Object.freeze({
+    actor: Object.freeze({ type: "participant" as const, subject: ALICE }),
+    method: "POST" as const,
+    mediaType: "application/json" as const,
+    body: Object.freeze({ ...body }),
+    clearCookie,
+  });
+}
+
+function renderingFailureRepository(
+  account: ParticipantAccount,
+): ParticipantRepository {
+  const snapshot = Object.freeze({
+    subject: account.subject,
+    accountEmailLabel: account.accountEmailLabel,
+    get displayName(): never {
+      throw new Error("private rendering failure");
+    },
+    country: "FI",
+    declaredInterest: "investor",
+    participationContext: "individual",
+    processEmailNoticeAcknowledged: true,
+    marketingConsent: Object.freeze({ state: "not-granted" }),
+    accountDeletionRequest: Object.freeze({ state: "not-requested" }),
+    registeredAt: timestamp("2026-08-09T10:00:00.000Z"),
+    updatedAt: timestamp("2026-08-09T10:00:00.000Z"),
+  });
+  return {
+    async current() {
+      return null;
+    },
+    async register() {
+      return {
+        revision: 1,
+        snapshot,
+        replayed: false,
+        intents: [],
+      } as never;
+    },
+    async update() {
+      throw new Error("unused");
+    },
+    async withdrawMarketingConsent() {
+      throw new Error("unused");
+    },
+    async requestAccountDeletion() {
+      throw new Error("unused");
+    },
+    async pendingDeletionIntent() {
+      return null;
+    },
+  };
+}
+
+function assertSingleCookie(response: Response, expected: string): void {
+  const value = response.headers.get("set-cookie");
+  assert.equal(value, expected);
+  assert.equal(value?.split(expected).length, 2);
+}
+
+async function aesKey(seed: number): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    "raw",
+    Uint8Array.from({ length: 32 }, (_, index) => (seed + index) % 256),
+    "AES-GCM",
+    false,
+    ["encrypt", "decrypt"],
+  );
 }
 
 function registrationBody(

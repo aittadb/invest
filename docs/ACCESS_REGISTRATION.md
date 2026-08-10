@@ -31,16 +31,27 @@ participant links become available for later runtime composition.
 
 ## Mutation Boundary
 
-`POST` accepts JSON or URL-encoded form input through the shared browser
-mutation guard. The route enforces the exact resource origin, an actor-bound
-session and CSRF proof, bounded bodies and field counts, an exact field
-allowlist, and participant rather than owner authority.
+`POST` accepts JSON or URL-encoded form input through either the injectable
+hosted browser-mutation verifier or the compatibility mutation guard used by
+isolated fixtures. Both paths enforce the exact resource origin, an actor-bound
+session and CSRF proof, a 2 KiB body ceiling, at most eight transport fields,
+no repeated form fields, an exact application-field allowlist, and participant
+rather than owner authority. The exported route limits let hosted composition
+narrow `BrowserMutationSession.verifyMutation()` without duplicating values.
 
 When registration is available, HTML receives the validated CSRF proof in its
 hidden transport field. Hypermedia JSON receives the same kind of proof only in
 the `x-investor-app-csrf` response header; the token and header name are never
-serialized into the document. A missing, malformed, or actor-mismatched proof
-fails closed. A registered resource has no mutation action and emits no proof.
+serialized into the JSON document. A hosted proof's opaque `Set-Cookie` value
+is emitted only as a response header and never enters either response body. A
+missing, malformed, or actor-mismatched proof fails closed. A registered
+resource has no mutation action and emits no proof.
+
+Once hosted verification succeeds, its one-time proof cookie is expired exactly
+once on successful registration and on every later parser, repository, or
+rendering failure. Failures before verification do not emit that expiration
+cookie. Body and field limits run before the hosted replay capability is claimed
+and before the participant repository is opened.
 
 The request-scoped repository factory receives the trusted subject and provider
 email as a `ParticipantAccount`. Registration delegates persistence to the

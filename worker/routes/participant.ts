@@ -19,6 +19,9 @@ export {
 
 export {
   createParticipantRegistrationRouteHandler,
+  MAX_REGISTRATION_MUTATION_BYTES,
+  MAX_REGISTRATION_MUTATION_FIELDS,
+  type ParticipantRegistrationMutationVerifier,
   type ParticipantRegistrationRouteDependencies,
 } from "./participant-registration.ts";
 

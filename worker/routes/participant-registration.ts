@@ -40,6 +40,7 @@ import {
   type BrowserMutationGuardOptions,
   type VerifiedMutationRequest,
 } from "../../http/mutation-security.ts";
+import type { BrowserMutationProof } from "../../http/browser-mutation-session.ts";
 import type {
   ParticipantProfileSnapshot,
   ParticipantRepository,
@@ -57,6 +58,9 @@ const DECLARED_INTEREST_FIELD = "declared-interest";
 const PARTICIPATION_CONTEXT_FIELD = "participation-context";
 const PROCESS_NOTICE_FIELD = "process-email-notice-acknowledged";
 const MARKETING_CONSENT_FIELD = "marketing-consent";
+
+export const MAX_REGISTRATION_MUTATION_BYTES = 2_048;
+export const MAX_REGISTRATION_MUTATION_FIELDS = 8;
 
 const REQUIRED_REGISTRATION_FIELDS = Object.freeze([
   OPERATION_ID_FIELD,
@@ -78,11 +82,22 @@ export type ParticipantRegistrationRepositoryFactory = (
 export type ParticipantRegistrationCsrfTokenProvider = (
   request: Request,
   account: ParticipantAccount,
-) => string | null | Promise<string | null>;
+) =>
+  | string
+  | BrowserMutationProof
+  | null
+  | Promise<string | BrowserMutationProof | null>;
+
+export type ParticipantRegistrationMutationVerifier = (
+  request: Request,
+) => Promise<
+  VerifiedMutationRequest & Readonly<{ clearCookie?: string }>
+>;
 
 export type ParticipantRegistrationRouteDependencies = Readonly<{
   repositoryFor: ParticipantRegistrationRepositoryFactory;
-  mutationSecurity: BrowserMutationGuardOptions;
+  mutationSecurity?: BrowserMutationGuardOptions;
+  verifyMutation?: ParticipantRegistrationMutationVerifier;
   csrfTokenFor: ParticipantRegistrationCsrfTokenProvider;
   notices: ParticipantRegistrationNotices;
   now?: () => Date;
@@ -95,7 +110,9 @@ export function createParticipantRegistrationRouteHandler(
 ): ApplicationRouteHandler {
   if (
     typeof dependencies.repositoryFor !== "function" ||
-    typeof dependencies.csrfTokenFor !== "function"
+    typeof dependencies.csrfTokenFor !== "function" ||
+    (dependencies.verifyMutation === undefined) ===
+      (dependencies.mutationSecurity === undefined)
   ) {
     throw new Error("Invalid participant-registration route configuration.");
   }
@@ -105,9 +122,14 @@ export function createParticipantRegistrationRouteHandler(
   if (typeof now !== "function" || typeof createOperationId !== "function") {
     throw new Error("Invalid participant-registration route configuration.");
   }
-  const mutationGuard = createBrowserMutationGuard(
-    dependencies.mutationSecurity,
-  );
+  const mutationGuard: ParticipantRegistrationMutationVerifier =
+    dependencies.verifyMutation ??
+    createBrowserMutationGuard({
+      ...(dependencies.mutationSecurity as BrowserMutationGuardOptions),
+      maxBodyBytes: MAX_REGISTRATION_MUTATION_BYTES,
+      maxFields: MAX_REGISTRATION_MUTATION_FIELDS,
+      repeatedFormFields: [],
+    });
 
   return async (context) => {
     if (context.url.pathname !== PARTICIPANT_REGISTRATION_PATH) return null;
@@ -167,8 +189,12 @@ export function createParticipantRegistrationRouteHandler(
       });
     }
 
+    let clearCookie: string | null = null;
     try {
       const verified = await mutationGuard(context.request);
+      clearCookie = validSetCookie(verified.clearCookie)
+        ? verified.clearCookie
+        : null;
       assertExactResourceOrigin(context.request, context.resourceUrl);
       const account = requiredParticipantAccount(context);
       if (
@@ -189,7 +215,7 @@ export function createParticipantRegistrationRouteHandler(
       });
       requireOwnedProfile(result.snapshot, account);
 
-      return await resourceResponse({
+      return withSetCookie(await resourceResponse({
         context,
         representation: representation.kind,
         account,
@@ -198,12 +224,12 @@ export function createParticipantRegistrationRouteHandler(
         csrfTokenFor: dependencies.csrfTokenFor,
         createOperationId,
         status: result.replayed ? 200 : 201,
-      });
+      }), clearCookie);
     } catch (error) {
-      return errorResponse(
+      return withSetCookie(errorResponse(
         publicRouteError(error, context.resourceUrl),
         representation.kind,
-      );
+      ), clearCookie);
     }
   };
 }
@@ -223,6 +249,7 @@ type RegistrationMutation = Readonly<{
 function parseRegistrationMutation(
   request: VerifiedMutationRequest,
 ): RegistrationMutation {
+  if (request.method !== "POST") invalidRequest();
   assertExactFields(request.body);
   if (!requiredConfirmation(request.body[PROCESS_NOTICE_FIELD])) {
     invalidRequest();
@@ -289,40 +316,54 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
   const hasMutationAction = model.actionContracts.some(
     (action) => action.method !== "GET",
   );
-  const csrfToken = hasMutationAction
-    ? await requiredCsrfToken(
+  const csrf = hasMutationAction
+    ? await requiredCsrfProof(
         await input.csrfTokenFor(input.context.request, input.account),
       )
     : null;
 
   if (input.representation === "hypermedia-json") {
-    return hypermediaResponseWithCsrf(
+    return withSetCookie(hypermediaResponseWithCsrf(
       model.document,
       input.status,
-      csrfToken,
-    );
+      csrf?.token ?? null,
+    ), csrf?.setCookie ?? null);
   }
 
-  return htmlResponse(
+  return withSetCookie(htmlResponse(
     renderParticipantRegistrationHtml(
       model,
-      csrfToken,
+      csrf?.token ?? null,
       input.context.campaign?.name ?? "Campaign",
     ),
     input.status,
-  );
+  ), csrf?.setCookie ?? null);
 }
 
-async function requiredCsrfToken(value: unknown): Promise<string> {
-  if (typeof value !== "string") {
+async function requiredCsrfProof(
+  value: unknown,
+): Promise<Readonly<{ token: string; setCookie: string | null }>> {
+  const token = typeof value === "string"
+    ? value
+    : typeof value === "object" && value !== null && "token" in value
+    ? value.token
+    : null;
+  const setCookie = typeof value === "object" && value !== null &&
+      "setCookie" in value
+    ? value.setCookie
+    : null;
+  if (
+    typeof token !== "string" ||
+    (setCookie !== null && !validSetCookie(setCookie))
+  ) {
     throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
   }
   try {
-    await hashCsrfToken(value);
+    await hashCsrfToken(token);
   } catch (error) {
     throw new MutationSecurityFailure("SERVICE_UNAVAILABLE", { cause: error });
   }
-  return value;
+  return Object.freeze({ token, setCookie });
 }
 
 function hypermediaResponseWithCsrf(
@@ -786,6 +827,24 @@ function htmlResponse(html: string, status: number): Response {
       Vary: "Accept",
       "X-Content-Type-Options": "nosniff",
     },
+  });
+}
+
+function validSetCookie(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 4_096 &&
+    !/[\r\n]/u.test(value);
+}
+
+function withSetCookie(response: Response, cookie: string | null): Response {
+  if (!validSetCookie(cookie)) return response;
+  const headers = new Headers(response.headers);
+  headers.append("Set-Cookie", cookie);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
 }
 
