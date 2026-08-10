@@ -78,6 +78,19 @@ Split broad work into the smallest coherent increments. Do not combine independe
 
 If a proposed task names several independent repositories, routes, use cases, or security controls, split it. A good PLAN item can be reviewed by asking one yes/no question: did this one primitive or bounded proof meet its stated contract? Prefer ten small tasks with crisp DoDs over one umbrella that hides partial progress.
 
+Apply these task-size rules on every PLAN edit and again before implementation:
+
+- one item produces one independently observable state transition, artifact, route/resource contract, security control, migration, or bounded proof;
+- a route group is one item only when its methods share one authorization and domain contract and cannot be completed or validated usefully in isolation;
+- local implementation, hosted acceptance proof, production configuration, production deployment, and post-deployment verification are separate items whenever they can fail or require approval independently;
+- the DoD names the exact behavior and evidence that close the item, including bounded failure cases and the validation command, without relying on an undefined phrase such as "complete the workflow";
+- an item may be an incremental internal contract behind a narrow interface; it need not make the whole product user-ready, but its own DoD must be complete and independently testable;
+- dependencies name only contracts or proof consumed by the item, never every earlier task in the same feature area; remove redundant transitive dependencies;
+- when an item grows beyond one focused commit, crosses independent file ownership, or gains a second separately testable outcome, stop and split it before continuing;
+- after every split, identify all newly ready siblings and run them in parallel worktrees when write ownership is disjoint.
+
+Task count is not a reason to merge independent work. Small tasks expose progress, reduce review risk, and increase safe parallelism; avoid both artificial serial chains and meaningless fragments that have no standalone contract or proof.
+
 After a task's DoD passes, remove it from `PLAN.md` and append its unchanged description plus evidence to `CHANGELOG.md`. Do not keep completed PLAN checkboxes.
 
 `ROADMAP.md` is a flat stable `ROADMAP-NNN` future-direction list. `BACKLOG.md` is a flat stable `BACKLOG-NNN` unscheduled-idea list. Neither implies availability or authority to implement. Move work into `PLAN.md` before implementation.
