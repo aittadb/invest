@@ -1,9 +1,10 @@
 # Participant Profile Self-Service
 
 Participant profile self-service is an injectable registered-reader resource at
-`/participant/profile`. It is not installed in the production Worker until the
-production participant repository and browser-mutation session are composed by
-the later persistent-runtime work.
+`/participant/profile`. `StorageParticipantRepository` now supplies the
+production-neutral persistence contract. Trusted participant-access projection
+and hosted registration/profile composition remain `TASK-090`, `TASK-091`, and
+`TASK-092`, so this resource is not yet installed in the hosted Worker.
 
 ## Representations
 
@@ -70,9 +71,12 @@ IDs nor a CSRF proof.
 Mutations delegate compare-and-set, idempotency, and immutable revision history
 to the existing `ParticipantRepository`. Exact immediate retries reuse the
 persisted resulting timestamp and return the repository replay without adding a
-revision. Changed retries conflict, stale revisions fail their precondition, and
-new attempts to repeat a completed withdraw-only or request-only transition do
-not create no-op revisions.
+revision. Before any existing-profile write, the storage repository verifies the
+current record against the expected immutable revision. A response lost after
+commit can be reconstructed only from the exact stored operation revision;
+changed retries conflict, stale revisions fail their precondition, and new
+attempts to repeat a completed withdraw-only or request-only transition do not
+create no-op revisions.
 
 Anonymous requests receive only the fixed sign-in resource. Owners,
 unregistered accounts, foreign subjects, missing records, and inaccessible

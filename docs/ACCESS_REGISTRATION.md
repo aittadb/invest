@@ -1,8 +1,11 @@
 # Access Registration
 
 Access registration is an injectable participant resource at
-`/participant/registration`. It is not wired into the production Worker until a
-production participant repository and browser-mutation session are available.
+`/participant/registration`. `StorageParticipantRepository` now supplies the
+production-neutral persistence contract, but the resource is not wired into the
+hosted Worker. Trusted participant projection and registration composition
+remain `TASK-090` and `TASK-091`; profile self-service composition remains
+`TASK-092`.
 
 ## Representations
 

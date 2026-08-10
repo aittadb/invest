@@ -30,6 +30,8 @@ import {
 } from "../domain/storage-adapter.ts";
 
 const PARTICIPANT_PROFILE_SCHEMA_VERSION = 1;
+const MAX_PARTICIPANT_PROFILE_RECORD_BYTES = 8_192;
+const MAX_PARTICIPANT_PROFILE_RECORD_NODES = 64;
 const PARTICIPANT_PROFILES = storageCollection("private-participant-profiles");
 const PARTICIPANT_PROFILE_REVISIONS = storageCollection(
   "private-participant-profile-revisions",
@@ -60,6 +62,9 @@ const LAST_MUTATION_KEYS = new Set([
   "operationId",
   "requestHash",
 ]);
+const STORAGE_RECORD_KEYS = ["key", "revision", "value"] as const;
+const STORAGE_KEY_KEYS = ["collection", "id"] as const;
+const TRANSACTION_RESULT_KEYS = ["replayed", "records"] as const;
 const MUTATION_ACTIONS = new Set<ParticipantMutationAction>([
   "register",
   "update",
@@ -72,6 +77,17 @@ type ParticipantMutationAction =
   | "update"
   | "withdraw-marketing-consent"
   | "request-account-deletion";
+
+type ParticipantMutationEvidence = Readonly<{
+  action: ParticipantMutationAction;
+  operationId: StorageOperationId;
+  requestHash: string;
+}>;
+
+type VerifiedParticipantMutationBase = Readonly<{
+  expected: ParticipantProfileSnapshot;
+  currentRevision: number;
+}>;
 
 /** The current compare-and-set revision and its immutable profile snapshot. */
 export type ParticipantProfileSnapshot = Readonly<{
@@ -130,14 +146,9 @@ export interface ParticipantRepository {
   pendingDeletionIntent(): Promise<ParticipantProfileIntent | null>;
 }
 
-/**
- * Deterministic development repository composed entirely through StorageAdapter.
- * It owns no process-local state and is not a production persistence substitute.
- */
-export class DevelopmentInMemoryParticipantRepository
-  implements ParticipantRepository
-{
-  readonly storageKind = "development-in-memory" as const;
+/** Subject-bound participant persistence over a credential-bound StorageAdapter. */
+export class StorageParticipantRepository implements ParticipantRepository {
+  readonly storageKind = "storage-adapter" as const;
 
   readonly #storage: StorageAdapter;
   readonly #account: ParticipantAccount | null;
@@ -157,9 +168,29 @@ export class DevelopmentInMemoryParticipantRepository
     if (account === null) return null;
 
     const key = await participantProfileKey(account.subject);
-    const record = await this.#storage.read(key);
+    const record = await storageRead(this.#storage, key);
     if (record === null) return null;
-    return decodeCurrentParticipantRecord(record, key, account.subject);
+    const current = decodeCurrentParticipantRecord(
+      record,
+      key,
+      account.subject,
+    );
+    if (current === null) return null;
+
+    const historyKey = await participantProfileRevisionKey(
+      account.subject,
+      current.revision,
+    );
+    const historyRecord = await storageRead(this.#storage, historyKey);
+    if (historyRecord === null) unavailable();
+    const history = decodeHistoricalParticipantRecord(
+      historyRecord,
+      historyKey,
+      account.subject,
+      current.revision,
+    );
+    if (history === null || !equalData(current, history)) unavailable();
+    return current;
   }
 
   async register(
@@ -193,6 +224,7 @@ export class DevelopmentInMemoryParticipantRepository
       null,
       "register",
       requestHash,
+      null,
     );
   }
 
@@ -203,13 +235,13 @@ export class DevelopmentInMemoryParticipantRepository
     const operationId = requiredOperationId(request.operationId);
     const expectedRevision = requiredRevision(request.expectedRevision);
     const updatedAt = requiredTimestamp(request.updatedAt);
-    const base = await this.#requireRevision(expectedRevision);
-    requireNondecreasingTime(base.snapshot.updatedAt, updatedAt);
+    const base = await this.#requireMutationBase(expectedRevision);
+    requireNondecreasingTime(base.expected.snapshot.updatedAt, updatedAt);
 
     let parsed;
     try {
       parsed = updateParticipantProfile(
-        base.snapshot,
+        base.expected.snapshot,
         request.changes,
         updatedAt,
       );
@@ -229,6 +261,7 @@ export class DevelopmentInMemoryParticipantRepository
       expectedRevision,
       "update",
       requestHash,
+      base.currentRevision,
     );
   }
 
@@ -239,11 +272,11 @@ export class DevelopmentInMemoryParticipantRepository
     const operationId = requiredOperationId(request.operationId);
     const expectedRevision = requiredRevision(request.expectedRevision);
     const withdrawnAt = requiredTimestamp(request.withdrawnAt);
-    const base = await this.#requireRevision(expectedRevision);
-    requireNondecreasingTime(base.snapshot.updatedAt, withdrawnAt);
+    const base = await this.#requireMutationBase(expectedRevision);
+    requireNondecreasingTime(base.expected.snapshot.updatedAt, withdrawnAt);
 
     const profile = withdrawProfileMarketingConsent(
-      base.snapshot,
+      base.expected.snapshot,
       withdrawnAt,
     );
     const requestHash = await hashMutationRequest({
@@ -256,6 +289,7 @@ export class DevelopmentInMemoryParticipantRepository
       expectedRevision,
       "withdraw-marketing-consent",
       requestHash,
+      base.currentRevision,
     );
   }
 
@@ -266,11 +300,11 @@ export class DevelopmentInMemoryParticipantRepository
     const operationId = requiredOperationId(request.operationId);
     const expectedRevision = requiredRevision(request.expectedRevision);
     const requestedAt = requiredTimestamp(request.requestedAt);
-    const base = await this.#requireRevision(expectedRevision);
-    requireNondecreasingTime(base.snapshot.updatedAt, requestedAt);
+    const base = await this.#requireMutationBase(expectedRevision);
+    requireNondecreasingTime(base.expected.snapshot.updatedAt, requestedAt);
 
     const transition = requestParticipantAccountDeletion(
-      base.snapshot,
+      base.expected.snapshot,
       requestedAt,
     );
     const requestHash = await hashMutationRequest({
@@ -283,6 +317,7 @@ export class DevelopmentInMemoryParticipantRepository
       expectedRevision,
       "request-account-deletion",
       requestHash,
+      base.currentRevision,
     );
     const intent = deletionIntentFromProfile(persisted.snapshot);
     if (intent === null) unavailable();
@@ -299,10 +334,12 @@ export class DevelopmentInMemoryParticipantRepository
     return current === null ? null : deletionIntentFromProfile(current.snapshot);
   }
 
-  async #requireRevision(revision: number): Promise<ParticipantProfileSnapshot> {
+  async #requireMutationBase(
+    revision: number,
+  ): Promise<VerifiedParticipantMutationBase> {
     const account = this.#requireAccount();
     const key = await participantProfileRevisionKey(account.subject, revision);
-    const record = await this.#storage.read(key);
+    const record = await storageRead(this.#storage, key);
     if (record === null) notFound();
     const decoded = decodeHistoricalParticipantRecord(
       record,
@@ -311,7 +348,17 @@ export class DevelopmentInMemoryParticipantRepository
       revision,
     );
     if (decoded === null) notFound();
-    return decoded;
+
+    const current = await this.current();
+    if (current === null) notFound();
+    if (current.revision < revision) unavailable();
+    if (current.revision === revision && !equalData(current, decoded)) {
+      unavailable();
+    }
+    return deepFreeze({
+      expected: decoded,
+      currentRevision: current.revision,
+    });
   }
 
   #requireAccount(): ParticipantAccount {
@@ -325,6 +372,7 @@ export class DevelopmentInMemoryParticipantRepository
     expectedRevision: number | null,
     action: ParticipantMutationAction,
     requestHash: string,
+    verifiedCurrentRevision: number | null,
   ): Promise<ParticipantProfileMutationResult> {
     const account = this.#requireAccount();
     if (profile.subject !== account.subject) notFound();
@@ -341,7 +389,22 @@ export class DevelopmentInMemoryParticipantRepository
       operationId,
       requestHash,
     );
-    const result = await this.#storage.transact({
+    if (expectedRevision !== null) {
+      if (verifiedCurrentRevision === null) unavailable();
+      if (verifiedCurrentRevision < expectedRevision) unavailable();
+      if (verifiedCurrentRevision > expectedRevision) {
+        await this.#requireExactReplay(
+          historyKey,
+          account.subject,
+          nextRevision,
+          operationId,
+          action,
+          requestHash,
+          value,
+        );
+      }
+    }
+    const result = await storageTransact(this.#storage, {
       operationId,
       mutations: [
         {
@@ -358,17 +421,11 @@ export class DevelopmentInMemoryParticipantRepository
         },
       ],
     });
-
-    const currentRecord = result.records[0];
-    const historyRecord = result.records[1];
-    if (
-      currentRecord === null ||
-      currentRecord === undefined ||
-      historyRecord === null ||
-      historyRecord === undefined
-    ) {
-      unavailable();
-    }
+    const verified = verifyParticipantTransactionResult(result, [
+      { key, revision: nextRevision, value },
+      { key: historyKey, revision: 1, value },
+    ]);
+    const [currentRecord, historyRecord] = verified.records;
     const decoded = decodeCurrentParticipantRecord(
       currentRecord,
       key,
@@ -383,16 +440,120 @@ export class DevelopmentInMemoryParticipantRepository
     if (
       decoded === null ||
       history === null ||
-      JSON.stringify(decoded) !== JSON.stringify(history)
+      !equalData(decoded, history)
     ) {
       unavailable();
     }
     return mutationResult(
       decoded.revision,
       decoded.snapshot,
-      result.replayed,
+      verified.replayed,
       [],
     );
+  }
+
+  async #requireExactReplay(
+    historyKey: StorageKey,
+    subject: ActorSubject,
+    revision: number,
+    operationId: StorageOperationId,
+    action: ParticipantMutationAction,
+    requestHash: string,
+    expectedValue: StorageDocument,
+  ): Promise<void> {
+    const record = await storageRead(this.#storage, historyKey);
+    if (record === null) unavailable();
+    const replay = decodeHistoricalParticipantRecord(
+      record,
+      historyKey,
+      subject,
+      revision,
+    );
+    if (replay === null) unavailable();
+
+    const stored = snapshotStorageRecord(record);
+    const evidence = participantMutationEvidence(stored.value);
+    if (evidence.operationId !== operationId) preconditionFailed();
+    if (
+      evidence.action !== action ||
+      evidence.requestHash !== requestHash ||
+      !equalData(stored.value, expectedValue)
+    ) {
+      throw new StorageFailure("CONFLICT");
+    }
+  }
+}
+
+/** Compatibility name retained for existing local development composition. */
+export {
+  StorageParticipantRepository as DevelopmentInMemoryParticipantRepository,
+};
+
+type ExpectedParticipantStorageRecord = Readonly<{
+  key: StorageKey;
+  revision: number;
+  value: StorageDocument;
+}>;
+
+type VerifiedParticipantTransactionResult = Readonly<{
+  replayed: boolean;
+  records: readonly [StorageRecord, StorageRecord];
+}>;
+
+async function storageRead(
+  storage: StorageAdapter,
+  key: StorageKey,
+): Promise<unknown> {
+  try {
+    return await storage.read(key);
+  } catch (error) {
+    sanitizedAdapterFailure(error);
+  }
+}
+
+async function storageTransact(
+  storage: StorageAdapter,
+  request: Parameters<StorageAdapter["transact"]>[0],
+): Promise<unknown> {
+  try {
+    return await storage.transact(request);
+  } catch (error) {
+    sanitizedAdapterFailure(error);
+  }
+}
+
+function verifyParticipantTransactionResult(
+  value: unknown,
+  expected: readonly [
+    ExpectedParticipantStorageRecord,
+    ExpectedParticipantStorageRecord,
+  ],
+): VerifiedParticipantTransactionResult {
+  try {
+    const source = exactDataRecord(value, TRANSACTION_RESULT_KEYS);
+    if (typeof source.replayed !== "boolean") unavailable();
+    const candidates = exactDataArray(source.records, expected.length);
+    const records: StorageRecord[] = [];
+
+    for (const [index, expectation] of expected.entries()) {
+      const record = snapshotStorageRecord(candidates[index]);
+      if (
+        record.key.collection !== expectation.key.collection ||
+        record.key.id !== expectation.key.id ||
+        record.revision !== expectation.revision ||
+        !equalData(record.value, expectation.value)
+      ) {
+        unavailable();
+      }
+      records.push(record);
+    }
+
+    return deepFreeze({
+      replayed: source.replayed,
+      records: records as unknown as readonly [StorageRecord, StorageRecord],
+    });
+  } catch {
+    unavailable();
   }
 }
 
@@ -453,7 +614,7 @@ function deletionRequestDocument(
 }
 
 function decodeCurrentParticipantRecord(
-  record: StorageRecord,
+  record: unknown,
   expectedKey: StorageKey,
   trustedSubject: ActorSubject,
 ): ParticipantProfileSnapshot | null {
@@ -461,13 +622,13 @@ function decodeCurrentParticipantRecord(
     record,
     expectedKey,
     trustedSubject,
-    record.revision,
-    record.revision,
+    null,
+    null,
   );
 }
 
 function decodeHistoricalParticipantRecord(
-  record: StorageRecord,
+  record: unknown,
   expectedKey: StorageKey,
   trustedSubject: ActorSubject,
   expectedProfileRevision: number,
@@ -482,42 +643,48 @@ function decodeHistoricalParticipantRecord(
 }
 
 function decodeParticipantRecord(
-  record: StorageRecord,
+  record: unknown,
   expectedKey: StorageKey,
   trustedSubject: ActorSubject,
-  expectedProfileRevision: number,
-  expectedStorageRevision: number,
+  expectedProfileRevision: number | null,
+  expectedStorageRevision: number | null,
 ): ParticipantProfileSnapshot | null {
-  if (
-    record.key.collection !== expectedKey.collection ||
-    record.key.id !== expectedKey.id ||
-    !Number.isSafeInteger(record.revision) ||
-    record.revision !== expectedStorageRevision
-  ) {
+  try {
+    const stored = snapshotStorageRecord(record);
+    if (
+      stored.key.collection !== expectedKey.collection ||
+      stored.key.id !== expectedKey.id ||
+      (expectedStorageRevision !== null &&
+        stored.revision !== expectedStorageRevision)
+    ) {
+      unavailable();
+    }
+
+    const profileRevision = expectedProfileRevision ?? stored.revision;
+    const source = objectRecord(stored.value);
+    if (
+      source === null ||
+      !hasExactKeys(source, PROFILE_DOCUMENT_KEYS) ||
+      source.kind !== "participant-profile" ||
+      source.schemaVersion !== PARTICIPANT_PROFILE_SCHEMA_VERSION ||
+      !Number.isSafeInteger(source.profileRevision) ||
+      source.profileRevision !== profileRevision
+    ) {
+      unavailable();
+    }
+
+    const outerSubject = parseActorSubject(source.subject);
+    if (!outerSubject.ok) unavailable();
+    if (outerSubject.value !== trustedSubject) return null;
+    validateLastMutation(source.lastMutation);
+
+    const profile = decodeParticipantProfile(source.profile, trustedSubject);
+    return profile === null
+      ? null
+      : profileSnapshot(profileRevision, profile);
+  } catch {
     unavailable();
   }
-
-  const source = objectRecord(record.value);
-  if (
-    source === null ||
-    !hasExactKeys(source, PROFILE_DOCUMENT_KEYS) ||
-    source.kind !== "participant-profile" ||
-    source.schemaVersion !== PARTICIPANT_PROFILE_SCHEMA_VERSION ||
-    !Number.isSafeInteger(source.profileRevision) ||
-    source.profileRevision !== expectedProfileRevision
-  ) {
-    unavailable();
-  }
-
-  const outerSubject = parseActorSubject(source.subject);
-  if (!outerSubject.ok) unavailable();
-  if (outerSubject.value !== trustedSubject) return null;
-  validateLastMutation(source.lastMutation);
-
-  const profile = decodeParticipantProfile(source.profile, trustedSubject);
-  return profile === null
-    ? null
-    : profileSnapshot(expectedProfileRevision, profile);
 }
 
 function decodeParticipantProfile(
@@ -667,7 +834,22 @@ function decodeDeletionRequest(
   });
 }
 
-function validateLastMutation(value: unknown): void {
+function participantMutationEvidence(
+  value: StorageDocument,
+): ParticipantMutationEvidence {
+  const source = objectRecord(value);
+  if (
+    source === null ||
+    !hasExactKeys(source, PROFILE_DOCUMENT_KEYS) ||
+    source.kind !== "participant-profile" ||
+    source.schemaVersion !== PARTICIPANT_PROFILE_SCHEMA_VERSION
+  ) {
+    unavailable();
+  }
+  return validateLastMutation(source.lastMutation);
+}
+
+function validateLastMutation(value: unknown): ParticipantMutationEvidence {
   const source = objectRecord(value);
   if (
     source === null ||
@@ -681,6 +863,11 @@ function validateLastMutation(value: unknown): void {
   }
   const operationId = parseStorageOperationId(source.operationId);
   if (!operationId.ok) unavailable();
+  return deepFreeze({
+    action: source.action as ParticipantMutationAction,
+    operationId: operationId.value,
+    requestHash: source.requestHash,
+  });
 }
 
 function deletionIntentFromProfile(
@@ -830,6 +1017,232 @@ function storageCollection(value: string): StorageCollection {
   return parsed.value;
 }
 
+function snapshotStorageRecord(value: unknown): StorageRecord {
+  const source = exactDataRecord(value, STORAGE_RECORD_KEYS);
+  const keySource = exactDataRecord(source.key, STORAGE_KEY_KEYS);
+  const key = parseStorageKey(keySource.collection, keySource.id);
+  if (
+    !key.ok ||
+    !Number.isSafeInteger(source.revision) ||
+    (source.revision as number) < 1
+  ) {
+    unavailable();
+  }
+
+  return deepFreeze({
+    key: key.value,
+    revision: source.revision as number,
+    value: snapshotBoundedStorageDocument(source.value),
+  });
+}
+
+function snapshotBoundedStorageDocument(value: unknown): StorageDocument {
+  const state = { nodes: 0, stringCodeUnits: 0 };
+  const snapshot = snapshotBoundedData(value, state, 0);
+  if (
+    typeof snapshot !== "object" ||
+    snapshot === null ||
+    Array.isArray(snapshot)
+  ) {
+    unavailable();
+  }
+
+  const serialized = JSON.stringify(snapshot);
+  if (
+    typeof serialized !== "string" ||
+    serialized.length > MAX_PARTICIPANT_PROFILE_RECORD_BYTES ||
+    new TextEncoder().encode(serialized).byteLength >
+      MAX_PARTICIPANT_PROFILE_RECORD_BYTES
+  ) {
+    unavailable();
+  }
+  return deepFreeze(snapshot as StorageDocument);
+}
+
+function snapshotBoundedData(
+  value: unknown,
+  state: { nodes: number; stringCodeUnits: number },
+  depth: number,
+): unknown {
+  state.nodes += 1;
+  if (
+    state.nodes > MAX_PARTICIPANT_PROFILE_RECORD_NODES ||
+    depth > 8
+  ) {
+    unavailable();
+  }
+
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    accountStoredString(value, state);
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) unavailable();
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return Object.freeze(
+      exactDataArray(value).map((candidate) =>
+        snapshotBoundedData(candidate, state, depth + 1)
+      ),
+    );
+  }
+
+  const entries = dataRecordEntries(value);
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<
+    string,
+    unknown
+  >;
+  for (const [key, candidate] of entries) {
+    accountStoredString(key, state);
+    snapshot[key] = snapshotBoundedData(candidate, state, depth + 1);
+  }
+  return Object.freeze(snapshot);
+}
+
+function accountStoredString(
+  value: string,
+  state: { stringCodeUnits: number },
+): void {
+  if (value.length > MAX_PARTICIPANT_PROFILE_RECORD_BYTES) unavailable();
+  state.stringCodeUnits += value.length;
+  if (state.stringCodeUnits > MAX_PARTICIPANT_PROFILE_RECORD_BYTES) {
+    unavailable();
+  }
+}
+
+function exactDataRecord(
+  value: unknown,
+  expectedKeys: readonly string[],
+): Record<string, unknown> {
+  const entries = dataRecordEntries(value);
+  if (
+    entries.length !== expectedKeys.length ||
+    entries.some(([key]) => !expectedKeys.includes(key))
+  ) {
+    unavailable();
+  }
+
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<
+    string,
+    unknown
+  >;
+  for (const [key, candidate] of entries) snapshot[key] = candidate;
+  return snapshot;
+}
+
+function dataRecordEntries(
+  value: unknown,
+): readonly (readonly [string, unknown])[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    unavailable();
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) unavailable();
+
+  const source = value as Record<string, unknown>;
+  const keys = Reflect.ownKeys(source);
+  if (
+    keys.length > MAX_PARTICIPANT_PROFILE_RECORD_NODES ||
+    keys.some((key) => typeof key !== "string")
+  ) {
+    unavailable();
+  }
+
+  const entries: (readonly [string, unknown])[] = [];
+  for (const key of keys as string[]) {
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !("value" in descriptor)
+    ) {
+      unavailable();
+    }
+    entries.push([key, descriptor.value] as const);
+  }
+  return entries;
+}
+
+function exactDataArray(
+  value: unknown,
+  expectedLength?: number,
+): readonly unknown[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    unavailable();
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    lengthDescriptor === undefined ||
+    lengthDescriptor.enumerable ||
+    !("value" in lengthDescriptor) ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0 ||
+    lengthDescriptor.value > MAX_PARTICIPANT_PROFILE_RECORD_NODES ||
+    (expectedLength !== undefined &&
+      lengthDescriptor.value !== expectedLength)
+  ) {
+    unavailable();
+  }
+
+  const length = lengthDescriptor.value as number;
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== length + 1 ||
+    !keys.includes("length") ||
+    keys.some((key) =>
+      typeof key !== "string" ||
+      key !== "length" &&
+        (!/^(?:0|[1-9][0-9]*)$/u.test(key) || Number(key) >= length)
+    )
+  ) {
+    unavailable();
+  }
+
+  const snapshot: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !("value" in descriptor)
+    ) {
+      unavailable();
+    }
+    snapshot.push(descriptor.value);
+  }
+  return snapshot;
+}
+
+function equalData(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => equalData(value, right[index]));
+  }
+  if (
+    typeof left !== "object" ||
+    left === null ||
+    typeof right !== "object" ||
+    right === null
+  ) {
+    return false;
+  }
+
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  return leftKeys.length === rightKeys.length &&
+    leftKeys.every((key) =>
+      Object.prototype.hasOwnProperty.call(rightRecord, key) &&
+      equalData(leftRecord[key], rightRecord[key])
+    );
+}
+
 function hasExactKeys(
   source: Record<string, unknown>,
   expected: ReadonlySet<string>,
@@ -877,6 +1290,33 @@ function notFound(): never {
   throw new StorageFailure("NOT_FOUND");
 }
 
+function preconditionFailed(): never {
+  throw new StorageFailure("PRECONDITION_FAILED");
+}
+
 function unavailable(): never {
   throw new StorageFailure("UNAVAILABLE");
+}
+
+function sanitizedAdapterFailure(error: unknown): never {
+  let code: StorageFailure["code"] = "UNAVAILABLE";
+  try {
+    if (error instanceof StorageFailure) {
+      const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+      if (
+        descriptor !== undefined &&
+        "value" in descriptor &&
+        (descriptor.value === "INVALID_REQUEST" ||
+          descriptor.value === "NOT_FOUND" ||
+          descriptor.value === "CONFLICT" ||
+          descriptor.value === "PRECONDITION_FAILED" ||
+          descriptor.value === "UNAVAILABLE")
+      ) {
+        code = descriptor.value;
+      }
+    }
+  } catch {
+    code = "UNAVAILABLE";
+  }
+  throw new StorageFailure(code);
 }
