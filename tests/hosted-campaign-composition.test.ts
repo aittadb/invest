@@ -37,6 +37,8 @@ const STORAGE_SCOPES = "storage.read storage.write storage.delete";
 const MUTATION_KEY = keyMaterial(61);
 const OWNER_EMAIL = "owner@example.test";
 const OWNER_SUBJECT = "owner-subject";
+const FOREIGN_PROFILE_KEY =
+  "private-participant-profiles/subject:ee1bd506c8e5801aa4de32eca0b5ee8e6bc9e92049eeac71a21f9ad35b6beb9c";
 const NOW = new Date("2026-08-10T12:00:00.000Z");
 
 const executionContext: WorkerExecutionContext = {
@@ -75,6 +77,7 @@ test("hosted campaign setup, editing, publication, restart, and concurrency stay
   assert.equal(foreign.status, 404);
   assert.deepEqual(service.readKeys, [
     "campaign-public-presentation/configured-campaign",
+    FOREIGN_PROFILE_KEY,
   ]);
   assertPrivateMaterialAbsent(await foreign.text());
 
