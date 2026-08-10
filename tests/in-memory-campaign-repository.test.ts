@@ -17,6 +17,7 @@ import {
   type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
 import {
+  CAMPAIGN_OPERATION_INTENT_MAX_RECORD_BYTES,
   DevelopmentInMemoryCampaignRepository,
   DevelopmentInMemoryPublicCampaignPresentationReader,
   parseCampaignSetup,
@@ -170,7 +171,13 @@ test("setup revisions and their adapter records remain immutable", async () => {
   ]);
   assert.equal(Object.isFrozen(history), true);
   assert.equal(Object.isFrozen(history.items), true);
-  assert.equal(state.records.size, 6);
+  assert.equal(
+    [...state.records.values()].filter((record) =>
+      record.key.collection === "campaign-setup-chunks"
+    ).length,
+    2,
+  );
+  assert.equal(state.records.size, 10);
 
   const reopened = new DevelopmentInMemoryCampaignRepository(adapter);
   assert.deepEqual(await reopened.readSetup(), second);
@@ -273,7 +280,13 @@ test("audited campaign creation atomically records one unpublished draft", async
       .items,
     [first.auditEvent],
   );
-  assert.equal(state.records.size, 5);
+  assert.equal(
+    [...state.records.values()].filter((record) =>
+      record.key.collection === "campaign-setup-chunks"
+    ).length,
+    1,
+  );
+  assert.equal(state.records.size, 7);
 });
 
 test("audited campaign creation rejects invalid and changed transitions", async () => {
@@ -353,7 +366,7 @@ test("audited campaign creation rejects invalid and changed transitions", async 
   );
 });
 
-test("an initial audit failure leaves every campaign record absent", async () => {
+test("an initial audit failure leaves only an intent and unreachable immutable setup chunks", async () => {
   const state = new MemoryStorageState();
   const adapter = new DeterministicMemoryStorageAdapter(state, true, true);
   const repository = new DevelopmentInMemoryCampaignRepository(adapter);
@@ -384,7 +397,271 @@ test("an initial audit failure leaves every campaign record absent", async () =>
     await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }),
     { items: [], nextCursor: null },
   );
-  assert.equal(state.records.size, 0);
+  assert.equal(state.records.size, 2);
+  assert.equal(
+    [...state.records.values()].every((record) =>
+      record.key.collection === "campaign-setup-intents" ||
+      record.key.collection === "campaign-setup-chunks"
+    ),
+    true,
+  );
+});
+
+test("campaign transactions reject a compact malformed result matrix", async (context) => {
+  const commonCorruptions: readonly TransactionResultCorruption[] = [
+    {
+      name: "extra result member",
+      corrupt: (result) => ({ ...result, ignored: true }),
+    },
+    {
+      name: "non-boolean replayed",
+      corrupt: (result) => ({ ...result, replayed: "false" }),
+    },
+    {
+      name: "missing record",
+      corrupt: (result) => ({
+        ...result,
+        records: result.records.slice(0, -1),
+      }),
+    },
+    {
+      name: "extra record",
+      corrupt: (result) => ({
+        ...result,
+        records: [...result.records, result.records[0] ?? null],
+      }),
+    },
+    {
+      name: "null record",
+      corrupt: (result) => replaceTransactionRecord(result, 0, null),
+    },
+    {
+      name: "extra record member",
+      corrupt: (result) => replaceTransactionRecord(
+        result,
+        0,
+        { ...requiredTransactionRecord(result, 0), ignored: true },
+      ),
+    },
+    {
+      name: "wrong key",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 0);
+        return replaceTransactionRecord(result, 0, {
+          ...record,
+          key: { ...record.key, id: `${record.key.id}-wrong` },
+        });
+      },
+    },
+    {
+      name: "wrong revision",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 0);
+        return replaceTransactionRecord(result, 0, {
+          ...record,
+          revision: record.revision + 1,
+        });
+      },
+    },
+    {
+      name: "changed value",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 0);
+        return replaceTransactionRecord(result, 0, {
+          ...record,
+          value: { ...record.value, resultMismatch: true },
+        });
+      },
+    },
+  ];
+  const finalCorruptions: readonly TransactionResultCorruption[] = [
+    {
+      name: "campaign and audit out of order",
+      corrupt: (result) => {
+        const records = [...result.records];
+        [records[0], records[4]] = [records[4], records[0]];
+        return { ...result, records };
+      },
+    },
+    {
+      name: "null audit record",
+      corrupt: (result) => replaceTransactionRecord(result, 4, null),
+    },
+    {
+      name: "extra audit record member",
+      corrupt: (result) => replaceTransactionRecord(
+        result,
+        4,
+        { ...requiredTransactionRecord(result, 4), ignored: true },
+      ),
+    },
+    {
+      name: "changed audit value",
+      corrupt: (result) => {
+        const record = requiredTransactionRecord(result, 4);
+        return replaceTransactionRecord(result, 4, {
+          ...record,
+          value: { ...record.value, resultMismatch: true },
+        });
+      },
+    },
+  ];
+
+  for (const stage of ["intent", "chunk", "final"] as const) {
+    const corruptions = stage === "final"
+      ? [...commonCorruptions, ...finalCorruptions]
+      : commonCorruptions;
+    for (const corruption of corruptions) {
+      await context.test(`${stage}: ${corruption.name}`, async () => {
+        const state = new MemoryStorageState();
+        const adapter = new DeterministicMemoryStorageAdapter(state, true);
+        const storage = corruptFirstCampaignTransactionResult(
+          adapter,
+          stage,
+          corruption.corrupt,
+        );
+        const repository = new DevelopmentInMemoryCampaignRepository(storage);
+        const request = {
+          operationId: `campaign-operation:malformed-${stage}-${corruption.name.replaceAll(" ", "-")}`,
+          ownerSubject: "owner-subject",
+          recordedAt: FIRST_SAVE,
+          expectedRevision: null,
+          setup: {
+            ...explicitSetup(),
+            publicCampaign: { ...syntheticPublicCampaign, published: false },
+          },
+          transition: "created" as const,
+        };
+
+        const failure = await captureStorageFailure(() =>
+          repository.saveSetupWithAudit(request)
+        );
+        assert.equal(failure.code, "UNAVAILABLE");
+        const visibleRecords = [...state.records.values()].filter((record) =>
+          record.key.collection === "campaign-setup-current" ||
+          record.key.collection === "campaign-setup-history" ||
+          record.key.collection === "campaign-setup-operations" ||
+          record.key.collection === "campaign-public-presentation" ||
+          record.key.collection === "audit-events"
+        );
+        assert.equal(visibleRecords.length, stage === "final" ? 5 : 0);
+
+        const recovered = await new DevelopmentInMemoryCampaignRepository(adapter)
+          .saveSetupWithAudit(request);
+        assert.equal(recovered.replayed, stage === "final");
+        assert.equal(recovered.campaign.revision, 1);
+      });
+    }
+  }
+});
+
+test("stored operation intents reject malformed envelopes, identity, and bytes", async (context) => {
+  const corruptions: readonly Readonly<{
+    name: string;
+    corrupt(record: StorageRecord): StorageRecord;
+  }>[] = [
+    {
+      name: "extra record member",
+      corrupt: (record) => ({ ...record, ignored: true }) as StorageRecord,
+    },
+    {
+      name: "wrong key",
+      corrupt: (record) =>
+        ({
+          ...record,
+          key: { ...record.key, id: `${record.key.id}-wrong` },
+        }) as unknown as StorageRecord,
+    },
+    {
+      name: "wrong revision",
+      corrupt: (record) => ({ ...record, revision: 2 }),
+    },
+    {
+      name: "extra value member",
+      corrupt: (record) => ({
+        ...record,
+        value: { ...record.value, ignored: true },
+      }),
+    },
+    {
+      name: "mismatched operation identity",
+      corrupt: (record) => ({
+        ...record,
+        value: {
+          ...record.value,
+          operationId: "campaign-operation:different-intent",
+        },
+      }),
+    },
+    {
+      name: "record exceeds byte boundary",
+      corrupt: (record) => ({
+        ...record,
+        value: {
+          ...record.value,
+          actor: { type: "owner", subject: "x".repeat(2_048) },
+        },
+      }),
+    },
+  ];
+
+  for (const corruption of corruptions) {
+    await context.test(corruption.name, async () => {
+      const state = new MemoryStorageState();
+      const adapter = new DeterministicMemoryStorageAdapter(state, true, true);
+      const repository = new DevelopmentInMemoryCampaignRepository(adapter);
+      const request = {
+        operationId: `campaign-operation:stored-intent-${corruption.name.replaceAll(" ", "-")}`,
+        ownerSubject: "owner-subject",
+        recordedAt: FIRST_SAVE,
+        expectedRevision: null,
+        setup: {
+          ...explicitSetup(),
+          publicCampaign: { ...syntheticPublicCampaign, published: false },
+        },
+        transition: "created" as const,
+      };
+      const initialFailure = await captureStorageFailure(() =>
+        repository.saveSetupWithAudit(request)
+      );
+      assert.equal(initialFailure.code, "UNAVAILABLE");
+      const intentEntry = [...state.records.entries()].find(([, record]) =>
+        record.key.collection === "campaign-setup-intents"
+      );
+      assert.ok(intentEntry);
+      const [, intentRecord] = intentEntry;
+      assert.equal(
+        documentByteLength(intentRecord.value) <=
+          CAMPAIGN_OPERATION_INTENT_MAX_RECORD_BYTES,
+        true,
+      );
+      const malformed = corruption.corrupt(intentRecord);
+      if (corruption.name === "record exceeds byte boundary") {
+        assert.equal(
+          documentByteLength(malformed.value) >
+            CAMPAIGN_OPERATION_INTENT_MAX_RECORD_BYTES,
+          true,
+        );
+      }
+      const transactionCalls = state.transactionCalls;
+      const malformedReadAdapter: StorageAdapter = Object.freeze({
+        async read(key: StorageKey) {
+          return key.collection === "campaign-setup-intents"
+            ? malformed
+            : adapter.read(key);
+        },
+        list: adapter.list.bind(adapter),
+        transact: adapter.transact.bind(adapter),
+      });
+
+      const failure = await captureStorageFailure(() =>
+        new DevelopmentInMemoryCampaignRepository(malformedReadAdapter)
+          .saveSetupWithAudit(request)
+      );
+      assert.equal(failure.code, "UNAVAILABLE");
+      assert.equal(state.transactionCalls, transactionCalls);
+    });
+  }
 });
 
 test("audited campaign saves commit the revision, history, and audit atomically", async () => {
@@ -832,6 +1109,63 @@ function parseCursor(cursor: StorageCursor): number {
   return Number.parseInt(match[1], 10);
 }
 
+type CampaignTransactionStage = "intent" | "chunk" | "final";
+
+type TransactionResultCorruption = Readonly<{
+  name: string;
+  corrupt(result: StorageTransactionResult): unknown;
+}>;
+
+function corruptFirstCampaignTransactionResult(
+  storage: StorageAdapter,
+  target: CampaignTransactionStage,
+  corrupt: (result: StorageTransactionResult) => unknown,
+): StorageAdapter {
+  let pending = true;
+  return Object.freeze({
+    read: storage.read.bind(storage),
+    list: storage.list.bind(storage),
+    async transact(request: StorageTransactionRequest) {
+      const result = await storage.transact(request);
+      if (
+        !pending ||
+        campaignTransactionStage(request.operationId as string) !== target
+      ) {
+        return result;
+      }
+      pending = false;
+      return corrupt(result) as StorageTransactionResult;
+    },
+  });
+}
+
+function campaignTransactionStage(
+  operationId: string,
+): CampaignTransactionStage {
+  if (operationId.startsWith("campaign-intent-claim:")) return "intent";
+  if (operationId.startsWith("campaign-chunk-stage:")) return "chunk";
+  return "final";
+}
+
+function requiredTransactionRecord(
+  result: StorageTransactionResult,
+  index: number,
+): StorageRecord {
+  const record = result.records[index];
+  assert.ok(record);
+  return record;
+}
+
+function replaceTransactionRecord(
+  result: StorageTransactionResult,
+  index: number,
+  replacement: unknown,
+): unknown {
+  const records: unknown[] = [...result.records];
+  records[index] = replacement;
+  return { ...result, records };
+}
+
 function cloneResult(
   result: StorageTransactionResult,
   replayed: boolean,
@@ -865,6 +1199,10 @@ function freezeRecord(input: Readonly<{
 
 function cloneDocument(value: StorageDocument): StorageDocument {
   return JSON.parse(JSON.stringify(value)) as StorageDocument;
+}
+
+function documentByteLength(value: StorageDocument): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 function deepFreeze<Value>(value: Value): Value {

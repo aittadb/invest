@@ -25,6 +25,7 @@ export type OwnerHomeDocument = Readonly<{
 }>;
 
 export type OwnerHomeCapabilities = Readonly<{
+  campaignSetup?: boolean;
   campaignEditor?: boolean;
   founderApplicationReview?: boolean;
   aggregateReconciliation?: boolean;
@@ -74,7 +75,13 @@ export function createOwnerHomeDocument(
     links: [
       { rel: ["self"], href: absolute("/owner") },
       { rel: ["campaign"], href: absolute("/") },
-      ...(capabilities.campaignEditor
+      ...(capabilities.campaignSetup
+        ? [{
+          rel: ["campaign-setup"],
+          href: absolute("/owner/setup"),
+        }]
+        : []),
+      ...(capabilities.campaignEditor && campaign !== null
         ? [{
           rel: ["campaign-editor"],
           href: absolute("/owner/campaign"),
@@ -122,6 +129,16 @@ export function createOwnerHomeDocument(
       ...packageLinks,
     ],
     actions: [
+      ...(capabilities.campaignSetup
+        ? [{
+          name: "manage-campaign-setup",
+          title: campaign === null ? "Configure campaign" : "Review campaign setup",
+          href: absolute("/owner/setup"),
+          method: "GET" as const,
+          type: "text/html" as const,
+          fields: [],
+        }]
+        : []),
       ...packageActions,
       {
         name: "sign-out",

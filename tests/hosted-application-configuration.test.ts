@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  hasHostedAittaDBApplicationRuntimeValues,
   parseHostedAittaDBApplicationConfiguration,
   type HostedAittaDBApplicationEnvironment,
 } from "../worker/hosted-application-configuration.ts";
@@ -24,6 +25,26 @@ const configuredEnvironment = Object.freeze({
 } satisfies HostedAittaDBApplicationEnvironment);
 
 test("application runtime stays disabled without application storage values", async () => {
+  assert.equal(
+    hasHostedAittaDBApplicationRuntimeValues({ APP_BASE_URL: APP_ORIGIN }),
+    false,
+  );
+  for (const field of [
+    "AITTADB_STORAGE_ISSUER",
+    "AITTADB_STORAGE_TRANSPORT_ORIGIN",
+    "AITTADB_STORAGE_ENTRY_HREF",
+    "AITTADB_STORAGE_CLIENT_ID",
+    "AITTADB_STORAGE_CLIENT_SECRET",
+    "AITTADB_STORAGE_SCOPES",
+    "BROWSER_MUTATION_SESSION_KEY",
+    "DEPLOYMENT_PUBLICATION_READY",
+  ] as const) {
+    assert.equal(
+      hasHostedAittaDBApplicationRuntimeValues({ [field]: "present" }),
+      true,
+      `${field} must suppress scalar fallback`,
+    );
+  }
   assert.equal(
     await parseHostedAittaDBApplicationConfiguration({
       APP_BASE_URL: APP_ORIGIN,
@@ -53,6 +74,7 @@ test("complete application configuration is exact and imports a closed key", asy
   assert.equal(configuration.issuer, ISSUER);
   assert.equal(configuration.transportOrigin, ISSUER);
   assert.equal(configuration.storageEntryHref, ENTRY_HREF);
+  assert.equal(configuration.publicationReady, false);
   assert.deepEqual(configuration.storageScopes, [
     "storage.read",
     "storage.write",
@@ -69,6 +91,31 @@ test("complete application configuration is exact and imports a closed key", asy
   const serialized = JSON.stringify(configuration);
   assert.equal(serialized.includes("investor-app-service"), false);
   assert.equal(serialized.includes(SERVICE_SECRET), false);
+});
+
+test("deployment publication readiness accepts only exact boolean text", async () => {
+  const blocked = await parseHostedAittaDBApplicationConfiguration({
+    ...configuredEnvironment,
+    DEPLOYMENT_PUBLICATION_READY: "false",
+  });
+  const ready = await parseHostedAittaDBApplicationConfiguration({
+    ...configuredEnvironment,
+    DEPLOYMENT_PUBLICATION_READY: "true",
+  });
+  assert.ok(blocked);
+  assert.ok(ready);
+  assert.equal(blocked.publicationReady, false);
+  assert.equal(ready.publicationReady, true);
+
+  for (const malformed of [true, false, "TRUE", "yes", "", " true "]) {
+    assert.equal(
+      await parseHostedAittaDBApplicationConfiguration({
+        ...configuredEnvironment,
+        DEPLOYMENT_PUBLICATION_READY: malformed,
+      }),
+      null,
+    );
+  }
 });
 
 test("optional transport origin stays independent from logical storage URLs", async () => {

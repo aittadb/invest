@@ -20,6 +20,7 @@ const REQUIRED_CONFIGURATION_FIELDS = [
 ] as const;
 const OPTIONAL_CONFIGURATION_FIELDS = [
   "AITTADB_STORAGE_TRANSPORT_ORIGIN",
+  "DEPLOYMENT_PUBLICATION_READY",
 ] as const;
 
 export type HostedAittaDBApplicationEnvironment = Readonly<{
@@ -31,6 +32,7 @@ export type HostedAittaDBApplicationEnvironment = Readonly<{
   AITTADB_STORAGE_CLIENT_SECRET?: unknown;
   AITTADB_STORAGE_SCOPES?: unknown;
   BROWSER_MUTATION_SESSION_KEY?: unknown;
+  DEPLOYMENT_PUBLICATION_READY?: unknown;
   AITTADB_OAUTH_CLIENT_ID?: unknown;
   AITTADB_OAUTH_CLIENT_SECRET?: unknown;
   AITTADB_OAUTH_TRANSACTION_KEY?: unknown;
@@ -44,6 +46,7 @@ export type HostedAittaDBApplicationConfiguration = Readonly<{
   storageEntryHref: string;
   storageScopes: readonly AittaDBStorageScope[];
   mutationKey: CryptoKey;
+  publicationReady: boolean;
   createServiceTokenProvider(
     dependencies: Readonly<{
       expirySkewSeconds: number;
@@ -54,16 +57,26 @@ export type HostedAittaDBApplicationConfiguration = Readonly<{
   ): AittaDBServiceTokenProvider;
 }>;
 
+/** True when any hosted application-runtime value was supplied, even if invalid. */
+export function hasHostedAittaDBApplicationRuntimeValues(
+  environment: HostedAittaDBApplicationEnvironment,
+): boolean {
+  try {
+    return [
+      ...REQUIRED_CONFIGURATION_FIELDS,
+      ...OPTIONAL_CONFIGURATION_FIELDS,
+    ].some((field) => environment[field] !== undefined);
+  } catch {
+    return true;
+  }
+}
+
 /** Returns null for both disabled and invalid application persistence. */
 export async function parseHostedAittaDBApplicationConfiguration(
   environment: HostedAittaDBApplicationEnvironment,
 ): Promise<HostedAittaDBApplicationConfiguration | null> {
   try {
-    const configured = [
-      ...REQUIRED_CONFIGURATION_FIELDS,
-      ...OPTIONAL_CONFIGURATION_FIELDS,
-    ].some((field) => environment[field] !== undefined);
-    if (!configured) return null;
+    if (!hasHostedAittaDBApplicationRuntimeValues(environment)) return null;
 
     const appOrigin = exactHttpsOrigin(environment.APP_BASE_URL);
     const issuer = exactHttpsOrigin(environment.AITTADB_STORAGE_ISSUER);
@@ -92,6 +105,9 @@ export async function parseHostedAittaDBApplicationConfiguration(
     );
     const mutationKeyMaterial = exactKeyMaterial(
       environment.BROWSER_MUTATION_SESSION_KEY,
+    );
+    const publicationReady = exactPublicationReadiness(
+      environment.DEPLOYMENT_PUBLICATION_READY,
     );
     rejectReusedProofMaterial(
       environment,
@@ -126,11 +142,18 @@ export async function parseHostedAittaDBApplicationConfiguration(
       storageEntryHref,
       storageScopes: Object.freeze([...storageScopes]),
       mutationKey,
+      publicationReady,
       createServiceTokenProvider,
     });
   } catch {
     return null;
   }
+}
+
+function exactPublicationReadiness(value: unknown): boolean {
+  if (value === undefined || value === "false") return false;
+  if (value === "true") return true;
+  invalid();
 }
 
 function exactHttpsOrigin(value: unknown): string {

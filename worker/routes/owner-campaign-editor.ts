@@ -20,9 +20,12 @@ import {
   MUTATION_CSRF_HEADER,
   MutationSecurityFailure,
   toPublicMutationSecurityFailure,
-  type BrowserMutationGuard,
   type MutationMediaType,
 } from "../../http/mutation-security.ts";
+import type {
+  BrowserMutationProof,
+  BrowserMutationSession,
+} from "../../http/browser-mutation-session.ts";
 import type {
   CampaignSetupRevision,
 } from "../../repositories/in-memory-campaign-repository.ts";
@@ -46,12 +49,14 @@ type Representation = "html" | "hypermedia-json";
 type OperationKind = "save" | "publish" | "unpublish";
 
 const PUBLICATION_KEYS = new Set<string>(CAMPAIGN_PUBLICATION_FIELD_NAMES);
+export const OWNER_CAMPAIGN_MUTATION_MAX_BYTES = 262_144;
+export const OWNER_CAMPAIGN_MUTATION_MAX_FIELDS = 256;
 
 export type OwnerCampaignEditorRouteOptions = Readonly<{
   repository: OwnerCampaignEditorRepository;
   checkPublicationReadiness: DeploymentPublicationReadinessCheck;
-  guardMutation: BrowserMutationGuard;
-  csrfToken(request: Request): Promise<string>;
+  mutationSession: BrowserMutationSession;
+  appOrigin: string;
   issueOperationId?: (kind: OperationKind) => string;
   now?: () => Date;
 }>;
@@ -93,6 +98,7 @@ export function createOwnerCampaignEditorRouteHandler(
       );
     }
 
+    let clearCookie: string | null = null;
     try {
       if (context.url.pathname === OWNER_CAMPAIGN_PREVIEW_PATH) {
         if (context.request.method !== "GET") {
@@ -127,10 +133,12 @@ export function createOwnerCampaignEditorRouteHandler(
         if (context.request.method === "POST") {
           assertMutationAvailable(service.mutationConsistency);
           const verified = await verifiedOwnerMutation(
-            options.guardMutation,
+            options.mutationSession,
             context.request,
             context.actor.userId,
+            options.appOrigin,
           );
+          clearCookie = requiredClearMutationCookie(verified.clearCookie);
           const mutation = parseCampaignPresentationMutation(
             verified.body,
             verified.mediaType,
@@ -148,6 +156,8 @@ export function createOwnerCampaignEditorRouteHandler(
             service,
             options,
             issueOperationId,
+            context.actor.userId,
+            clearCookie,
           );
         }
       } else {
@@ -156,10 +166,12 @@ export function createOwnerCampaignEditorRouteHandler(
         }
         assertMutationAvailable(service.mutationConsistency);
         const verified = await verifiedOwnerMutation(
-          options.guardMutation,
+          options.mutationSession,
           context.request,
           context.actor.userId,
+          options.appOrigin,
         );
+        clearCookie = requiredClearMutationCookie(verified.clearCookie);
         const mutation = parsePublicationMutation(
           verified.body,
           verified.mediaType,
@@ -179,10 +191,12 @@ export function createOwnerCampaignEditorRouteHandler(
           service,
           options,
           issueOperationId,
+          context.actor.userId,
+          clearCookie,
         );
       }
 
-      return editorResponse(
+      return await editorResponse(
         representation,
         context.resourceUrl,
         context.request,
@@ -190,35 +204,36 @@ export function createOwnerCampaignEditorRouteHandler(
         service,
         options,
         issueOperationId,
+        context.actor.userId,
       );
     } catch (error) {
       if (error instanceof MutationSecurityFailure) {
         const failure = toPublicMutationSecurityFailure(error);
-        return errorResponse(
+        return withOptionalClearedMutationCookie(errorResponse(
           representation,
           context.resourceUrl,
           failure.status,
           failure.body.error.code.toLowerCase(),
           failure.body.error.message,
-        );
+        ), clearCookie);
       }
       if (error instanceof CampaignPublicationNotReady) {
-        return errorResponse(
+        return withOptionalClearedMutationCookie(errorResponse(
           representation,
           context.resourceUrl,
           412,
           "publication_not_ready",
           "Complete the campaign publication requirements before publishing.",
-        );
+        ), clearCookie);
       }
       const failure = storageError(error);
-      return errorResponse(
+      return withOptionalClearedMutationCookie(errorResponse(
         representation,
         context.resourceUrl,
         failure.status,
         failure.code,
         failure.message,
-      );
+      ), clearCookie);
     }
   };
 }
@@ -230,11 +245,20 @@ function isCampaignEditorPath(pathname: string): boolean {
 }
 
 async function verifiedOwnerMutation(
-  guard: BrowserMutationGuard,
+  session: BrowserMutationSession,
   request: Request,
   expectedSubject: string,
+  appOrigin: string,
 ) {
-  const verified = await guard(request);
+  const verified = await session.verifyMutation(
+    request,
+    { type: "owner", subject: expectedSubject },
+    appOrigin,
+    {
+      maxBodyBytes: OWNER_CAMPAIGN_MUTATION_MAX_BYTES,
+      maxFields: OWNER_CAMPAIGN_MUTATION_MAX_FIELDS,
+    },
+  );
   if (
     verified.method !== "POST" ||
     verified.actor.type !== "owner" ||
@@ -344,6 +368,7 @@ async function editorResponse(
   service: OwnerCampaignEditorService,
   options: OwnerCampaignEditorRouteOptions,
   issueOperationId: (kind: OperationKind) => string,
+  ownerSubject: string,
 ): Promise<Response> {
   const readiness = current === null
     ? null
@@ -359,13 +384,17 @@ async function editorResponse(
       current,
     ),
   );
-  const csrf = resource.presentationForm || resource.publicationForm
-    ? requiredCsrfToken(await options.csrfToken(request))
+  const proof = resource.presentationForm || resource.publicationForm
+    ? requiredMutationProof(await options.mutationSession.issue(
+        request,
+        { type: "owner", subject: ownerSubject },
+        options.appOrigin,
+      ))
     : null;
   const response = representation === "hypermedia-json"
     ? hypermediaResponse(resource.document)
-    : htmlResponse(renderEditor(resource, csrf));
-  return csrf === null ? response : withCsrfToken(response, csrf);
+    : htmlResponse(renderEditor(resource, proof?.token ?? null));
+  return proof === null ? response : withMutationProof(response, proof);
 }
 
 async function mutationSuccessResponse(
@@ -376,19 +405,21 @@ async function mutationSuccessResponse(
   service: OwnerCampaignEditorService,
   options: OwnerCampaignEditorRouteOptions,
   issueOperationId: (kind: OperationKind) => string,
+  ownerSubject: string,
+  clearCookie: string,
 ): Promise<Response> {
   const editorUrl = new URL(OWNER_CAMPAIGN_EDITOR_PATH, requestUrl).href;
   if (representation === "html") {
-    return new Response(null, {
+    return withClearedMutationCookie(new Response(null, {
       status: 303,
       headers: {
         "Cache-Control": "no-store",
         Location: editorUrl,
         Vary: "Accept",
       },
-    });
+    }), clearCookie);
   }
-  return editorResponse(
+  return withClearedMutationCookie(await editorResponse(
     representation,
     editorUrl,
     request,
@@ -396,7 +427,8 @@ async function mutationSuccessResponse(
     service,
     options,
     issueOperationId,
-  );
+    ownerSubject,
+  ), clearCookie);
 }
 
 function operationIds(
@@ -424,6 +456,31 @@ function requiredCsrfToken(value: unknown): string {
     value.length < 32 ||
     value.length > 256 ||
     !/^[A-Za-z0-9_-]+$/.test(value)
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return value;
+}
+
+function requiredMutationProof(value: BrowserMutationProof): BrowserMutationProof {
+  requiredCsrfToken(value.token);
+  if (
+    typeof value.setCookie !== "string" ||
+    value.setCookie.length < 1 ||
+    value.setCookie.length > 4_096 ||
+    /[\r\n]/u.test(value.setCookie)
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return value;
+}
+
+function requiredClearMutationCookie(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > 4_096 ||
+    /[\r\n]/u.test(value)
   ) {
     throw new StorageFailure("UNAVAILABLE");
   }
@@ -596,14 +653,35 @@ function previewResponse(response: Response): Response {
   });
 }
 
-function withCsrfToken(response: Response, token: string): Response {
+function withMutationProof(
+  response: Response,
+  proof: BrowserMutationProof,
+): Response {
   const headers = new Headers(response.headers);
-  headers.set(MUTATION_CSRF_HEADER, token);
+  headers.set(MUTATION_CSRF_HEADER, proof.token);
+  headers.append("Set-Cookie", proof.setCookie);
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
     headers,
   });
+}
+
+function withClearedMutationCookie(response: Response, value: string): Response {
+  const headers = new Headers(response.headers);
+  headers.append("Set-Cookie", requiredClearMutationCookie(value));
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function withOptionalClearedMutationCookie(
+  response: Response,
+  value: string | null,
+): Response {
+  return value === null ? response : withClearedMutationCookie(response, value);
 }
 
 function mergeVary(current: string | null, value: string): string {

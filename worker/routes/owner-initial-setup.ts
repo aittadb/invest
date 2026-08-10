@@ -27,11 +27,15 @@ import { negotiateRepresentation } from "../../http/content-negotiation.ts";
 import {
   MUTATION_CSRF_FIELD,
   MUTATION_CSRF_HEADER,
+  MAX_MUTATION_BODY_BYTES,
   MutationSecurityFailure,
   toPublicMutationSecurityFailure,
-  type BrowserMutationGuard,
   type MutationMediaType,
 } from "../../http/mutation-security.ts";
+import type {
+  BrowserMutationProof,
+  BrowserMutationSession,
+} from "../../http/browser-mutation-session.ts";
 import {
   parseCampaignSetup,
   type AtomicCampaignAuditRepository,
@@ -62,6 +66,7 @@ const MAX_PHASES = 32;
 const MAX_COUNTRIES_PER_PHASE = 26 * 26;
 const MAX_CONTRIBUTION_CHOICES = 64;
 export const OWNER_INITIAL_SETUP_MAX_FIELDS = 768;
+export const OWNER_INITIAL_SETUP_WIRE_MAX_BYTES = MAX_MUTATION_BODY_BYTES;
 
 const FORM_SCALAR_KEYS = Object.freeze([
   "operation-id",
@@ -124,8 +129,8 @@ const FORM_SCALAR_KEYS = Object.freeze([
 export type OwnerInitialSetupRouteOptions = Readonly<{
   repository: CampaignRepository;
   checkPublicationReadiness: DeploymentPublicationReadinessCheck;
-  guardMutation: BrowserMutationGuard;
-  csrfToken(request: Request): Promise<string>;
+  mutationSession: BrowserMutationSession;
+  appOrigin: string;
   issueOperationId?: () => string;
   now?: () => Date;
 }>;
@@ -167,6 +172,7 @@ export function createOwnerInitialSetupRouteHandler(
       );
     }
 
+    let clearCookie: string | null = null;
     try {
       if (context.url.pathname === OWNER_INITIAL_SETUP_PREVIEW_PATH) {
         if (context.request.method !== "GET") {
@@ -205,10 +211,12 @@ export function createOwnerInitialSetupRouteHandler(
       if (context.request.method === "POST") {
         if (atomic === null) throw new StorageFailure("UNAVAILABLE");
         const verified = await verifiedOwnerMutation(
-          options.guardMutation,
+          options.mutationSession,
           context.request,
           context.actor.userId,
+          options.appOrigin,
         );
+        clearCookie = requiredClearMutationCookie(verified.clearCookie);
         const mutation = parseInitialSetupMutation(
           verified.body,
           verified.mediaType,
@@ -220,44 +228,55 @@ export function createOwnerInitialSetupRouteHandler(
           currentTimestamp(now),
         );
         if (representation === "html") {
-          return new Response(null, {
+          return withClearedMutationCookie(new Response(null, {
             status: 303,
             headers: {
               "Cache-Control": "no-store",
               Location: new URL(OWNER_INITIAL_SETUP_PATH, context.resourceUrl).href,
               Vary: "Accept",
             },
-          });
+          }), clearCookie);
         }
+        const response = await setupResponse(
+          representation,
+          context.resourceUrl,
+          context.request,
+          options,
+          consistency,
+          issueOperationId,
+          context.actor.userId,
+        );
+        return withClearedMutationCookie(response, clearCookie);
       }
 
-      return setupResponse(
+      return await setupResponse(
         representation,
         context.resourceUrl,
         context.request,
         options,
         consistency,
         issueOperationId,
+        context.actor.userId,
       );
     } catch (error) {
       if (error instanceof MutationSecurityFailure) {
         const failure = toPublicMutationSecurityFailure(error);
-        return errorResponse(
+        return withOptionalClearedMutationCookie(errorResponse(
           representation,
           context.resourceUrl,
           failure.status,
           failure.body.error.code.toLowerCase(),
           failure.body.error.message,
-        );
+        ), clearCookie);
       }
       const failure = storageError(error);
-      return errorResponse(
+      return withOptionalClearedMutationCookie(errorResponse(
         representation,
         context.resourceUrl,
         failure.status,
         failure.code,
         failure.message,
-      );
+      ), clearCookie);
     }
   };
 }
@@ -274,6 +293,7 @@ async function setupResponse(
   options: OwnerInitialSetupRouteOptions,
   consistency: CampaignMutationConsistency,
   issueOperationId: () => string,
+  ownerSubject: string,
 ): Promise<Response> {
   const current = await options.repository.readSetup();
   const readiness = current === null
@@ -292,13 +312,17 @@ async function setupResponse(
     consistency,
     operationId,
   );
-  const csrf = resource.form === null
+  const proof = resource.form === null
     ? null
-    : requiredCsrfToken(await options.csrfToken(request));
+    : requiredMutationProof(await options.mutationSession.issue(
+        request,
+        { type: "owner", subject: ownerSubject },
+        options.appOrigin,
+      ));
   const response = representation === "hypermedia-json"
     ? hypermediaResponse(resource.document)
-    : htmlResponse(renderWorkspace(resource, csrf));
-  return csrf === null ? response : withCsrfToken(response, csrf);
+    : htmlResponse(renderWorkspace(resource, proof?.token ?? null));
+  return proof === null ? response : withMutationProof(response, proof);
 }
 
 type ParsedInitialSetupMutation = Readonly<{
@@ -1015,11 +1039,20 @@ function optionalInteger(
 }
 
 async function verifiedOwnerMutation(
-  guard: BrowserMutationGuard,
+  session: BrowserMutationSession,
   request: Request,
   expectedSubject: string,
+  appOrigin: string,
 ) {
-  const verified = await guard(request);
+  const verified = await session.verifyMutation(
+    request,
+    { type: "owner", subject: expectedSubject },
+    appOrigin,
+    {
+      maxBodyBytes: OWNER_INITIAL_SETUP_WIRE_MAX_BYTES,
+      maxFields: OWNER_INITIAL_SETUP_MAX_FIELDS,
+    },
+  );
   if (
     verified.method !== "POST" ||
     verified.actor.type !== "owner" ||
@@ -1081,6 +1114,31 @@ function requiredCsrfToken(value: unknown): string {
     value.length < 32 ||
     value.length > 256 ||
     !/^[A-Za-z0-9_-]+$/u.test(value)
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return value;
+}
+
+function requiredMutationProof(value: BrowserMutationProof): BrowserMutationProof {
+  requiredCsrfToken(value.token);
+  if (
+    typeof value.setCookie !== "string" ||
+    value.setCookie.length < 1 ||
+    value.setCookie.length > 4_096 ||
+    /[\r\n]/u.test(value.setCookie)
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return value;
+}
+
+function requiredClearMutationCookie(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > 4_096 ||
+    /[\r\n]/u.test(value)
   ) {
     throw new StorageFailure("UNAVAILABLE");
   }
@@ -1450,14 +1508,35 @@ function previewResponse(response: Response): Response {
   });
 }
 
-function withCsrfToken(response: Response, token: string): Response {
+function withMutationProof(
+  response: Response,
+  proof: BrowserMutationProof,
+): Response {
   const headers = new Headers(response.headers);
-  headers.set(MUTATION_CSRF_HEADER, token);
+  headers.set(MUTATION_CSRF_HEADER, proof.token);
+  headers.append("Set-Cookie", proof.setCookie);
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
     headers,
   });
+}
+
+function withClearedMutationCookie(response: Response, value: string): Response {
+  const headers = new Headers(response.headers);
+  headers.append("Set-Cookie", requiredClearMutationCookie(value));
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function withOptionalClearedMutationCookie(
+  response: Response,
+  value: string | null,
+): Response {
+  return value === null ? response : withClearedMutationCookie(response, value);
 }
 
 function mergeVary(current: string | null, value: string): string {

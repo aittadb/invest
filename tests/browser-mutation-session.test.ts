@@ -502,6 +502,63 @@ test("malformed and oversized requests fail closed without consuming proof", asy
   assert.equal(harness.claims.calls.length, 0);
 });
 
+test("route verification limits stay narrower than the shared session ceiling", async () => {
+  const harness = await configuredHarness({
+    maxBodyBytes: 1_024,
+    maxFields: 16,
+  });
+  const oversizedProof = await issue(harness.session);
+  const oversizedWithMalformedToken = rawRequest(
+    oversizedProof,
+    `${MUTATION_CSRF_FIELD}=bad&note=${"x".repeat(256)}`,
+    "application/x-www-form-urlencoded",
+  );
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.verifyMutation(
+        oversizedWithMalformedToken,
+        PARTICIPANT,
+        APP_ORIGIN,
+        { maxBodyBytes: 192, maxFields: 16 },
+      )
+    )).code,
+    "PAYLOAD_TOO_LARGE",
+  );
+
+  const fieldProof = await issue(harness.session);
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.verifyMutation(
+        formRequest(fieldProof, {
+          body: { first: "1", second: "2", third: "3" },
+        }),
+        PARTICIPANT,
+        APP_ORIGIN,
+        { maxBodyBytes: 1_024, maxFields: 3 },
+      )
+    )).code,
+    "INVALID_REQUEST",
+  );
+
+  const invalidLimitsProof = await issue(harness.session);
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.verifyMutation(
+        rawRequest(
+          invalidLimitsProof,
+          `${MUTATION_CSRF_FIELD}=bad`,
+          "application/x-www-form-urlencoded",
+        ),
+        PARTICIPANT,
+        APP_ORIGIN,
+        { maxBodyBytes: 1_025, maxFields: 16 },
+      )
+    )).code,
+    "SERVICE_UNAVAILABLE",
+  );
+  assert.equal(harness.claims.calls.length, 0);
+});
+
 test("missing, shared, or unsuitable hosted key material creates no capability", async () => {
   const claims = new AtomicClaims();
   assert.throws(
@@ -625,6 +682,7 @@ type HarnessOptions = Readonly<{
   appOrigin?: string;
   now?: () => Date;
   maxBodyBytes?: number;
+  maxFields?: number;
   claims?: AtomicClaims;
   claimReplay?: (claim: BrowserMutationReplayClaim) => Promise<boolean>;
 }>;
@@ -651,6 +709,9 @@ async function configuredHarness(
     ...(options.maxBodyBytes === undefined
       ? {}
       : { maxBodyBytes: options.maxBodyBytes }),
+    ...(options.maxFields === undefined
+      ? {}
+      : { maxFields: options.maxFields }),
   });
   return Object.freeze({ session, claims });
 }

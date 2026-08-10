@@ -18,7 +18,7 @@ Keep campaign names, owner identity, hostnames, targets, countries, branding, co
 
 ## Status
 
-The reusable Investor App software is experimental. Its public AittaDB development instance is available at [invest.aittadb.com](https://invest.aittadb.com); that hostname and its campaign content are deployment configuration, not application defaults. The secure hosted AittaDB runtime can now be composed from runtime-only values, but it advertises no private feature by itself. The instance is not production-ready while persistent workflow wiring and hosted storage proof remain unfinished.
+The reusable Investor App software is experimental. Its public AittaDB development instance is available at [invest.aittadb.com](https://invest.aittadb.com); that hostname and its campaign content are deployment configuration, not application defaults. A completely configured hosted AittaDB runtime now supplies persistent owner setup and campaign-editor routes, while public requests receive only the separately stored published projection. This source implementation is not production-ready until the configured deployment passes the remaining hosted storage, authorization, and launch-readiness proofs.
 
 The public source must not hard-code any reference campaign, person, country, currency, funding target, legal entity, country rule, private package content, or private campaign decision.
 
@@ -34,7 +34,7 @@ Version one collects non-binding interest only. It does not accept money, reserv
 
 The reusable source keeps D1 and R2 null in `.openai/hosting.example.json`. A deployment may opt into a D1 binding only for the OAuth connection proof's short-lived replay claims and closed verification evidence; campaign and participant data still belongs behind the configured AittaDB adapter. Production publication remains blocked until that backend passes this app's authorization, consistency, listing, pagination, quota, and non-disclosure contract tests.
 
-The production entry point also includes an all-or-nothing AittaDB application-runtime resolver. It keeps the dedicated service client and bearer tokens behind backend closures, uses AittaDB for durable browser-mutation replay claims, and exposes no feature routes until their persistent wiring is installed. See [docs/HOSTED_AITTADB_RUNTIME.md](docs/HOSTED_AITTADB_RUNTIME.md) for the exact ordinary and secret hosted settings.
+The production entry point also includes an all-or-nothing AittaDB application-runtime resolver. It keeps the dedicated service client and bearer tokens behind backend closures; uses AittaDB for durable browser-mutation replay claims, campaign revisions, audit evidence, and public projection; and installs setup/editor capabilities only in the owner route group. Publication remains unavailable unless the deployment supplies the exact non-secret readiness value `DEPLOYMENT_PUBLICATION_READY=true`. A development scalar campaign fixture is considered only when every hosted application-runtime field is absent. See [docs/HOSTED_AITTADB_RUNTIME.md](docs/HOSTED_AITTADB_RUNTIME.md) for the exact ordinary and secret hosted settings.
 
 Each application URI supports equivalent human HTML and versioned hypermedia JSON selected through `Accept`. See [docs/HYPERMEDIA_API.md](docs/HYPERMEDIA_API.md) for the media type, document structure, authorization rules, and route definition of done.
 

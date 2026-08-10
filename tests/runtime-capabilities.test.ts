@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   OWNER_AITTADB_CONNECTION_HEADER,
   OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER,
+  OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER,
   OWNER_INDICATION_MODERATION_HEADER,
   OWNER_PACKAGE_WORKSPACE_HEADER,
   OWNER_REVIEW_EXPORTS_HEADER,
@@ -11,6 +12,7 @@ import {
   PARTICIPANT_INVESTMENT_INTERESTS_HEADER,
   hasOwnerAittaDBConnection,
   hasOwnerCampaignEditorCapability,
+  hasOwnerCampaignSetupCapability,
   hasOwnerIndicationModeration,
   hasOwnerPackageWorkspace,
   hasOwnerReviewExports,
@@ -24,6 +26,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
     headers: {
       [OWNER_PACKAGE_WORKSPACE_HEADER]: "available",
       [OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER]: "available",
+      [OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER]: "available",
       [OWNER_INDICATION_MODERATION_HEADER]: "available",
       [OWNER_REVIEW_EXPORTS_HEADER]: "available",
       [PARTICIPANT_FOUNDER_INTEREST_HEADER]: "available",
@@ -34,6 +37,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   const unavailable = withRuntimeCapabilities(spoofed, {
     ownerPackageWorkspace: false,
     ownerCampaignEditor: false,
+    ownerCampaignSetup: false,
     ownerIndicationModeration: false,
     ownerReviewExports: false,
     participantFounderInterest: false,
@@ -43,6 +47,10 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   assert.equal(unavailable.headers.get(OWNER_PACKAGE_WORKSPACE_HEADER), null);
   assert.equal(
     unavailable.headers.get(OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER),
+    null,
+  );
+  assert.equal(
+    unavailable.headers.get(OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER),
     null,
   );
   assert.equal(unavailable.headers.get(OWNER_INDICATION_MODERATION_HEADER), null);
@@ -55,6 +63,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   assert.equal(unavailable.headers.get(OWNER_AITTADB_CONNECTION_HEADER), null);
   assert.equal(hasOwnerPackageWorkspace("AVAILABLE"), false);
   assert.equal(hasOwnerCampaignEditorCapability("AVAILABLE"), false);
+  assert.equal(hasOwnerCampaignSetupCapability("AVAILABLE"), false);
   assert.equal(hasOwnerIndicationModeration("AVAILABLE"), false);
   assert.equal(hasOwnerReviewExports("AVAILABLE"), false);
   assert.equal(hasParticipantFounderInterest("AVAILABLE"), false);
@@ -64,6 +73,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   const available = withRuntimeCapabilities(spoofed, {
     ownerPackageWorkspace: true,
     ownerCampaignEditor: true,
+    ownerCampaignSetup: true,
     ownerIndicationModeration: true,
     ownerReviewExports: true,
     participantFounderInterest: true,
@@ -77,6 +87,12 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   assert.equal(
     hasOwnerCampaignEditorCapability(
       available.headers.get(OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER),
+    ),
+    true,
+  );
+  assert.equal(
+    hasOwnerCampaignSetupCapability(
+      available.headers.get(OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER),
     ),
     true,
   );

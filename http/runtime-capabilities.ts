@@ -12,12 +12,15 @@ export const OWNER_AITTADB_CONNECTION_HEADER =
   "x-investor-app-owner-aittadb-connection";
 export const OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER =
   "x-investor-app-owner-campaign-editor";
+export const OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER =
+  "x-investor-app-owner-campaign-setup";
 
 export function withRuntimeCapabilities(
   request: Request,
   capabilities: Readonly<{
     ownerPackageWorkspace: boolean;
     ownerCampaignEditor?: boolean;
+    ownerCampaignSetup?: boolean;
     ownerIndicationModeration?: boolean;
     ownerReviewExports?: boolean;
     participantFounderInterest?: boolean;
@@ -33,6 +36,7 @@ export function withRuntimeCapabilities(
   headers.delete(PARTICIPANT_INVESTMENT_INTERESTS_HEADER);
   headers.delete(OWNER_AITTADB_CONNECTION_HEADER);
   headers.delete(OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER);
+  headers.delete(OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER);
   if (capabilities.ownerPackageWorkspace) {
     headers.set(OWNER_PACKAGE_WORKSPACE_HEADER, "available");
   }
@@ -54,6 +58,9 @@ export function withRuntimeCapabilities(
   if (capabilities.ownerCampaignEditor) {
     headers.set(OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER, "available");
   }
+  if (capabilities.ownerCampaignSetup) {
+    headers.set(OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER, "available");
+  }
   return new Request(request, { headers });
 }
 
@@ -66,6 +73,12 @@ export function hasOwnerIndicationModeration(value: string | null): boolean {
 }
 
 export function hasOwnerCampaignEditorCapability(
+  value: string | null | undefined,
+): boolean {
+  return value === "available";
+}
+
+export function hasOwnerCampaignSetupCapability(
   value: string | null | undefined,
 ): boolean {
   return value === "available";

@@ -5,6 +5,7 @@ import {
 } from "../domain/foundation.ts";
 import {
   DEFAULT_MUTATION_BODY_BYTES,
+  DEFAULT_MUTATION_FIELDS,
   MAX_MUTATION_BODY_BYTES,
   MUTATION_CSRF_FIELD,
   MUTATION_CSRF_HEADER,
@@ -75,6 +76,12 @@ export type BrowserMutationSessionDependencies = Readonly<{
   repeatedFormFields?: readonly string[];
 }>;
 
+export type BrowserMutationVerificationLimits = Readonly<{
+  maxBodyBytes: number;
+  maxFields: number;
+  repeatedFormFields?: readonly string[];
+}>;
+
 export interface BrowserMutationSession {
   issue(
     request: Request,
@@ -85,6 +92,7 @@ export interface BrowserMutationSession {
     request: Request,
     identity: TrustedSitesMutationIdentity | null,
     appOrigin: string,
+    limits?: BrowserMutationVerificationLimits,
   ): Promise<VerifiedBrowserMutationRequest>;
 }
 
@@ -97,8 +105,8 @@ type ValidatedConfiguration = Readonly<{
   ttlSeconds: number;
   cookiePrefix: string;
   maxBodyBytes: number;
-  maxFields?: number;
-  repeatedFormFields?: readonly string[];
+  maxFields: number;
+  repeatedFormFields: readonly string[];
 }>;
 
 type EncryptedSession = Readonly<{
@@ -175,6 +183,7 @@ export function createBrowserMutationSession(
       request: Request,
       identity: TrustedSitesMutationIdentity | null,
       appOriginValue: string,
+      requestedLimits?: BrowserMutationVerificationLimits,
     ) {
       const actor = requiredContext(
         config,
@@ -182,8 +191,9 @@ export function createBrowserMutationSession(
         identity,
         appOriginValue,
       );
+      const limits = verificationLimits(config, requestedLimits);
       const submitted = parseCapabilityToken(
-        await submittedProofToken(request, config.maxBodyBytes),
+        await submittedProofToken(request, limits.maxBodyBytes),
       );
       const cookieName = sessionCookieName(config, submitted.capabilityId);
       const cookie = findSessionCookie(
@@ -216,13 +226,11 @@ export function createBrowserMutationSession(
         allowedOrigins: [config.appOrigin],
         resolveSession: async () => session,
         now: () => now,
-        maxBodyBytes: config.maxBodyBytes,
-        ...(config.maxFields === undefined
+        maxBodyBytes: limits.maxBodyBytes,
+        maxFields: limits.maxFields,
+        ...(limits.repeatedFormFields.length === 0
           ? {}
-          : { maxFields: config.maxFields }),
-        ...(config.repeatedFormFields === undefined
-          ? {}
-          : { repeatedFormFields: config.repeatedFormFields }),
+          : { repeatedFormFields: limits.repeatedFormFields }),
       });
       const verified = await guard(request);
       if (
@@ -266,6 +274,8 @@ function validateConfiguration(
   const cookiePrefix = input.cookiePrefix ??
     DEFAULT_BROWSER_MUTATION_COOKIE_PREFIX;
   const maxBodyBytes = input.maxBodyBytes ?? DEFAULT_MUTATION_BODY_BYTES;
+  const maxFields = input.maxFields ?? DEFAULT_MUTATION_FIELDS;
+  const repeatedFormFields = Object.freeze([...(input.repeatedFormFields ?? [])]);
   if (
     typeof CryptoKey === "undefined" ||
     !(input.encryptionKey instanceof CryptoKey) ||
@@ -298,10 +308,10 @@ function validateConfiguration(
     allowedOrigins: [appOrigin],
     resolveSession: async () => null,
     maxBodyBytes,
-    ...(input.maxFields === undefined ? {} : { maxFields: input.maxFields }),
-    ...(input.repeatedFormFields === undefined
+    maxFields,
+    ...(repeatedFormFields.length === 0
       ? {}
-      : { repeatedFormFields: input.repeatedFormFields }),
+      : { repeatedFormFields }),
   });
 
   return Object.freeze({
@@ -313,10 +323,54 @@ function validateConfiguration(
     ttlSeconds: input.ttlSeconds,
     cookiePrefix,
     maxBodyBytes,
-    ...(input.maxFields === undefined ? {} : { maxFields: input.maxFields }),
-    ...(input.repeatedFormFields === undefined
-      ? {}
-      : { repeatedFormFields: Object.freeze([...input.repeatedFormFields]) }),
+    maxFields,
+    repeatedFormFields,
+  });
+}
+
+function verificationLimits(
+  config: ValidatedConfiguration,
+  requested: BrowserMutationVerificationLimits | undefined,
+): Readonly<{
+  maxBodyBytes: number;
+  maxFields: number;
+  repeatedFormFields: readonly string[];
+}> {
+  if (requested === undefined) {
+    return Object.freeze({
+      maxBodyBytes: config.maxBodyBytes,
+      maxFields: config.maxFields,
+      repeatedFormFields: config.repeatedFormFields,
+    });
+  }
+  if (
+    !Number.isSafeInteger(requested.maxBodyBytes) ||
+    requested.maxBodyBytes < 1 ||
+    requested.maxBodyBytes > config.maxBodyBytes ||
+    !Number.isSafeInteger(requested.maxFields) ||
+    requested.maxFields < 1 ||
+    requested.maxFields > config.maxFields
+  ) {
+    unavailable();
+  }
+  const repeatedFormFields = Object.freeze([
+    ...(requested.repeatedFormFields ?? []),
+  ]);
+  try {
+    createBrowserMutationGuard({
+      allowedOrigins: [config.appOrigin],
+      resolveSession: async () => null,
+      maxBodyBytes: requested.maxBodyBytes,
+      maxFields: requested.maxFields,
+      ...(repeatedFormFields.length === 0 ? {} : { repeatedFormFields }),
+    });
+  } catch {
+    unavailable();
+  }
+  return Object.freeze({
+    maxBodyBytes: requested.maxBodyBytes,
+    maxFields: requested.maxFields,
+    repeatedFormFields,
   });
 }
 

@@ -19,7 +19,9 @@ import {
   MUTATION_CSRF_HEADER,
   createBrowserMutationGuard,
   hashCsrfToken,
+  type BrowserMutationGuardOptions,
 } from "../http/mutation-security.ts";
+import type { BrowserMutationVerificationLimits } from "../http/browser-mutation-session.ts";
 import {
   parseCampaignSetup,
   type AtomicCampaignAuditRepository,
@@ -30,7 +32,11 @@ import {
   type SaveCampaignSetupWithAuditRequest,
 } from "../repositories/in-memory-campaign-repository.ts";
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
-import { createOwnerCampaignEditorRouteHandler } from "../worker/routes/owner-campaign-editor.ts";
+import { OWNER_CAMPAIGN_PRESENTATION_MAX_BYTES } from "../worker/routes/owner-campaign-editor-form.ts";
+import {
+  OWNER_CAMPAIGN_MUTATION_MAX_BYTES,
+  createOwnerCampaignEditorRouteHandler,
+} from "../worker/routes/owner-campaign-editor.ts";
 import { createOwnerRouteHandler } from "../worker/routes/owner.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
 import { explicitCampaignSetup } from "./support/campaign-repository-contract.ts";
@@ -39,6 +45,8 @@ const CANONICAL_ORIGIN = "https://canonical.example";
 const REQUEST_ORIGIN = "https://worker.internal";
 const OWNER_SUBJECT = "owner-subject";
 const CSRF_TOKEN = "campaign_editor_csrf_token_1234567890";
+const CLEAR_CAMPAIGN_COOKIE =
+  "__Host-test_campaign=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax";
 const NOW = new Date("2026-08-09T12:00:00.000Z");
 
 test("one capability model exposes JSON mutation and readiness-gated publication", () => {
@@ -227,6 +235,35 @@ test("structured HTML form saves through the same normalized campaign command", 
   assert.deepEqual(repository.current?.setup.publicCampaign.product, campaign.product);
 });
 
+test("near-maximum UTF-8 campaign form uses the distinct editor wire ceiling", async () => {
+  const repository = new TestCampaignRepository(revision(1, false));
+  const handler = await routeHandler(repository);
+  const editor = await editorDocument(handler);
+  const action = requiredAction(editor, "save-campaign-presentation");
+  const campaign = nearMaximumUtf8Campaign();
+  const parameters = structuredFormCommand(action, campaign);
+  const decodedBytes = byteLength(JSON.stringify(campaign));
+  const wireBytes = byteLength(parameters.toString());
+  assert.equal(decodedBytes <= OWNER_CAMPAIGN_PRESENTATION_MAX_BYTES, true);
+  assert.equal(wireBytes > 65_536, true);
+  assert.equal(wireBytes <= OWNER_CAMPAIGN_MUTATION_MAX_BYTES, true);
+
+  const response = requiredResponse(await handler(routeContext(
+    "/owner/campaign",
+    { accept: "text/html" },
+    { request: formMutationRequest("/owner/campaign", parameters, "text/html") },
+  )));
+  assert.equal(response.status, 303);
+  assert.deepEqual(
+    repository.current?.setup.publicCampaign.risks.items,
+    campaign.risks.items,
+  );
+  assert.deepEqual(
+    repository.current?.setup.publicCampaign.faq?.items,
+    campaign.faq?.items,
+  );
+});
+
 test("route security and revision failures leave campaign and audit state unchanged", async (context) => {
   const cases = [
     {
@@ -303,6 +340,61 @@ test("route security and revision failures leave campaign and audit state unchan
       assert.equal(repository.auditEvents.length, 0);
       assert.equal(repository.operations.size, 0);
     });
+  }
+});
+
+test("post-verification campaign failures clear exactly one consumed proof cookie", async () => {
+  const parserRepository = new TestCampaignRepository(revision(1, false));
+  const parserHandler = await routeHandler(parserRepository);
+  const parserAction = requiredAction(
+    await editorDocument(parserHandler),
+    "save-campaign-presentation",
+  );
+  const malformed = {
+    ...jsonCommand(parserAction, editedCampaign()),
+    unexpected: "rejected",
+  };
+
+  const blockedRepository = new TestCampaignRepository(revision(1, false));
+  const blockedHandler = await routeHandler(blockedRepository, {
+    deploymentReady: false,
+  });
+  const blocked = publicationCommand(
+    "publish",
+    1,
+    "campaign-publication:blocked-cookie-test",
+  );
+
+  const staleRepository = new TestCampaignRepository(revision(1, false));
+  const staleHandler = await routeHandler(staleRepository);
+  const staleAction = requiredAction(
+    await editorDocument(staleHandler),
+    "save-campaign-presentation",
+  );
+  const stale = {
+    ...jsonCommand(staleAction, editedCampaign()),
+    "expected-revision": 7,
+  };
+
+  for (const candidate of [
+    { handler: parserHandler, path: "/owner/campaign", body: malformed, status: 400 },
+    {
+      handler: blockedHandler,
+      path: "/owner/campaign/publication",
+      body: blocked,
+      status: 412,
+    },
+    { handler: staleHandler, path: "/owner/campaign", body: stale, status: 412 },
+  ]) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = requiredResponse(await candidate.handler(routeContext(
+        candidate.path,
+        { accept: "application/json" },
+        { request: jsonMutationRequest(candidate.path, candidate.body) },
+      )));
+      assert.equal(response.status, candidate.status);
+      assert.equal(response.headers.get("set-cookie"), CLEAR_CAMPAIGN_COOKIE);
+    }
   }
 });
 
@@ -471,7 +563,7 @@ async function routeHandler(
   return createOwnerCampaignEditorRouteHandler({
     repository,
     checkPublicationReadiness: async () => options.deploymentReady ?? true,
-    guardMutation: createBrowserMutationGuard({
+    mutationSession: mutationSession({
       allowedOrigins: [CANONICAL_ORIGIN],
       maxBodyBytes: 1_048_576,
       maxFields: 256,
@@ -489,10 +581,49 @@ async function routeHandler(
         };
       },
     }),
-    csrfToken: async () => CSRF_TOKEN,
+    appOrigin: CANONICAL_ORIGIN,
     issueOperationId: (kind) =>
       `campaign-${kind}:route-${String(++operationSequence).padStart(3, "0")}`,
     now: () => new Date(NOW.valueOf() + clockSequence++ * 1_000),
+  });
+}
+
+function mutationSession(
+  options: BrowserMutationGuardOptions,
+) {
+  const expiresAt = parseTimestamp("2026-08-09T13:00:00.000Z");
+  assert(expiresAt.ok);
+  return Object.freeze({
+    async issue() {
+      return Object.freeze({
+        token: CSRF_TOKEN,
+        expiresAt: expiresAt.value,
+        setCookie: "__Host-test_campaign=proof; Path=/; Secure; HttpOnly; SameSite=Lax",
+      });
+    },
+    async verifyMutation(
+      request: Request,
+      _identity: unknown,
+      _appOrigin: string,
+      limits?: BrowserMutationVerificationLimits,
+    ) {
+      const guard = createBrowserMutationGuard({
+        ...options,
+        ...(limits === undefined
+          ? {}
+          : {
+              maxBodyBytes: limits.maxBodyBytes,
+              maxFields: limits.maxFields,
+              ...(limits.repeatedFormFields === undefined
+                ? {}
+                : { repeatedFormFields: limits.repeatedFormFields }),
+            }),
+      });
+      return Object.freeze({
+        ...await guard(request),
+        clearCookie: CLEAR_CAMPAIGN_COOKIE,
+      });
+    },
   });
 }
 
@@ -738,6 +869,42 @@ function editedCampaign(name = "Northstar Systems"): PublicCampaignConfiguration
       summary: "Updated industrial inspection systems.",
     },
   };
+}
+
+function nearMaximumUtf8Campaign(): PublicCampaignConfiguration {
+  const repeated = "\u754c";
+  const campaign = {
+    ...syntheticPublicCampaign,
+    published: false,
+    hero: {
+      ...syntheticPublicCampaign.hero,
+      summary: repeated.repeat(500),
+      invitation: repeated.repeat(800),
+      note: repeated.repeat(500),
+    },
+    risks: {
+      ...syntheticPublicCampaign.risks,
+      items: Array.from({ length: 12 }, () => repeated.repeat(500)),
+    },
+    faq: {
+      ...syntheticPublicCampaign.faq,
+      items: Array.from({ length: 4 }, () => ({
+        question: repeated.repeat(240),
+        answer: repeated.repeat(800),
+      })),
+    },
+  };
+  const parsed = parseCampaignSetup({
+    ...explicitCampaignSetup(),
+    publicCampaign: campaign,
+  });
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) throw new Error("Invalid UTF-8 campaign fixture.");
+  return parsed.value.publicCampaign;
+}
+
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function revision(

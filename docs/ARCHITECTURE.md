@@ -50,23 +50,27 @@ the parsed object has no readable credential field.
 Sites environment, creates one service-token provider and bounded AittaDB
 adapter, and closes that adapter inside `StorageApplicationRepositoryFactory`.
 The factory has no generic builder or adapter accessor. It exposes only named,
-narrow capabilities; its first atomically stores expiry-only browser-mutation
-replay claims through the adapter. The returned runtime contains only the
-repository factory and mutation session, never a provider, adapter,
-configuration, credential, key, or token. Token acquisition has an independent
-deadline and clears failed renewal so a stalled request cannot poison the
-isolate.
+narrow replay, atomic campaign/audit, and public campaign reader capabilities.
+Both campaign capabilities keep their adapter authority in ECMAScript-private
+state or a closed read function; reflection and serialization cannot recover a
+generic `read`, `list`, `transact`, adapter, or storage surface. The returned
+runtime contains only the repository factory, mutation session, and immutable
+publication-readiness result, never a provider, adapter, configuration,
+credential, key, or token. Token acquisition has an independent deadline and
+clears failed renewal so a stalled request cannot poison the isolate.
 
 `worker/index.ts` installs the resolver, and `worker/application-worker.ts`
 resolves it without placing it in route context. Runtime availability has no
-browser header or navigation control. TASK-068 and later tasks must compose
-concrete repositories centrally and inject only narrow capabilities into the
-authorized route group. The framework renderer receives only `ASSETS` and
+browser header or navigation control. It obtains the named campaign repository
+and public reader centrally, injects setup and editor capabilities only into the
+owner route group, and gives public composition only the separately persisted
+published projection reader. The framework renderer receives only `ASSETS` and
 `IMAGES`, never the secret-bearing Worker environment. Participant-state
-readers are explicit composition dependencies rather than runtime environment
-fallbacks. Partial or malformed configuration resolves to no runtime and
-performs no provider request. Local composition is independent from hosted
-proof, while TASK-059 remains a direct activation prerequisite of TASK-080.
+readers remain explicit composition dependencies rather than runtime
+environment fallbacks. Partial or malformed hosted configuration resolves to no
+runtime and suppresses scalar campaign fallback when any hosted application
+field was supplied. Publication stays closed unless exact deployment readiness
+was configured. Local composition remains independent from live hosted proof.
 See `docs/HOSTED_AITTADB_RUNTIME.md`.
 
 ## Resource representations
@@ -359,13 +363,60 @@ snapshot.
 
 Public totals render only when configured for non-zero visibility and the sanitized total is positive. The public projection is closed to amount, currency, bounded display label, and qualifier, so participant identities, counts, notes, moderation state, and private totals cannot enter it.
 
-### Development campaign repository
+### Storage campaign repository
 
-`DevelopmentInMemoryCampaignRepository` persists one explicitly configured campaign setup through a supplied development/test `StorageAdapter`. It does not retain separate process-local state, so recreating the repository over the same adapter proves the persistence boundary. A setup contains the validated public presentation, one or more explicit phases, amount and aggregate-display policy, deployment-supplied founder contribution choices, legal and non-binding notices, required-process-email and optional-marketing-consent notices, a privacy contact, retention text, and explicit owner review gates; the parser supplies no campaign, country, path, currency, notice, contact, contribution, or publication default.
+`StorageCampaignRepository` persists one explicitly configured campaign setup
+through a supplied `StorageAdapter` and retains no process-local durable state.
+Hosted composition supplies only the credential-bound `AittaDBStorageAdapter`.
+`DevelopmentInMemoryCampaignRepository` is a compatibility subclass for
+development tests and is never instantiated by hosted composition. A setup
+contains the validated public presentation, one or more explicit phases, amount
+and aggregate-display policy, deployment-supplied founder contribution choices,
+legal and non-binding notices, required-process-email and
+optional-marketing-consent notices, a privacy contact, retention text, and
+explicit owner review gates; the parser supplies no campaign, country, path,
+currency, notice, contact, contribution, or publication default.
 
 `domain/campaign-setup-policy.ts` keeps that private policy separate from the public presentation projection. Founder choices are required for publication only when a founder path is enabled. Public presentation, legal-notice, and privacy/retention review gates must all be affirmatively set before publication. `participantRegistrationNoticesFromCampaignPolicy` is the single mapping from owner-managed communication text into the registration resource. Setup comparison classifies a public-copy-only change as editorial and any phase, amount, founder-choice, notice, privacy, retention, or review-gate change as material. Immutable setup history retains every classification input, while public reads remain bound to the separately stored public presentation record.
 
-Each save atomically compare-and-sets the current setup and creates an immutable revision record, a direct operation-index record, and a public-only presentation projection under one retry-stable operation ID. History is bounded and cursor-paged, while retries use direct operation lookup rather than scanning a history prefix. The stronger `atomic-campaign-audit` capability adds an allowlisted owner audit event to that same adapter transaction. It accepts `created` only for an absent campaign becoming an unpublished revision-one draft, then derives and verifies `updated`, `published`, or `unpublished` against the prior and next publication states. Replay returns the original campaign and audit evidence, while a transition mismatch or any transaction failure leaves all records unchanged. The public reader is bound only to the public projection key. The adapter remains credential-bound, so unauthorized reads and lists have the same shape as missing state. This repository and deterministic adapter fixtures are development proof only.
+Schema version 4 deterministically serializes the normalized private setup,
+hashes its UTF-8 bytes, and prepares immutable content-addressed chunks with
+derived retry-stable operation IDs. Each 45,000-byte raw chunk encodes to a
+record no larger than 61,440 bytes. Current, history, and operation records
+contain only the hash, byte count, and chunk count. Reads validate every chunk
+key, index, size, hash, canonical serialization, and parsed domain value before
+returning private setup.
+
+Before the first chunk transaction, the repository immutably claims
+`campaign-setup-intents/<business-operation-id>` under a distinct deterministic
+`campaign-intent-claim:<sha256>` transaction operation ID. The closed intent
+record is bounded to 2,048 bytes and binds the audited or unaudited mode,
+business operation ID, expected and resulting revisions, original timestamp,
+normalized setup hash/byte/chunk reference, and, for audited writes, the trusted
+owner actor and derived transition. An exact existing intent resumes staging or
+final replay after a restart. Any changed setup, actor, timestamp, transition,
+expected revision, resulting revision, or mode conflicts before another chunk
+or final transaction. A failed staging attempt can therefore leave only the
+immutable intent and unreachable immutable chunks, never a current revision,
+history entry, completed operation result, public projection, or audit event.
+
+After chunk staging, one adapter transaction compare-and-sets current metadata
+and creates immutable history, direct operation-index metadata, the public-only
+presentation projection, and an allowlisted owner audit event under the
+business operation ID. It accepts `created` only for an absent campaign becoming
+an unpublished revision-one draft, then derives and verifies `updated`,
+`published`, or `unpublished` against prior and next publication state. Exact
+replay returns the original campaign and audit evidence; changed operation reuse
+conflicts, and competing revisions preserve one winner. A final transaction is
+all-or-none even when its response is lost: no partial visible records can
+exist, and an exact retry validates and returns the stored transaction receipt.
+Intent-claim, chunk-stage, and final transaction responses must be closed
+objects with a real boolean replay flag and exactly the requested records in
+mutation order. Every record envelope, key, revision, and JSON value must match;
+null, missing, extra, reordered, or mismatched records fail closed. History is
+bounded and cursor-paged. The public reader is closed over only the public
+projection read and cannot expose adapter, list, transaction, or private setup
+capabilities.
 
 ### Owner campaign editor
 
@@ -403,26 +454,38 @@ access to privileged setup data.
 
 `createApplicationWorker` accepts a trusted campaign-workspace object or resolver
 only as explicit server-side dependency injection. The object supplies the
-privileged repository, public projection reader, mutation guard, operation and
-CSRF capabilities, and readiness checker. It is deliberately absent from
-`InvestorAppEnv`: Sites runtime values are scalar and cannot configure this
-function-bearing composition. The production Worker entry injects no workspace,
-so editor routes and owner controls remain fail-closed until a real deployment
-assembly supplies one in code. This contract is useful for tests and future
-assembly, but is not evidence that production persistence is installed.
-Repositories that cannot atomically persist campaign revision, history,
-operation index, public projection, and audit evidence expose no mutation
-capability.
+privileged repository, public projection reader, browser mutation session,
+operation issuer, clock, and readiness checker. It is deliberately absent from
+`InvestorAppEnv`: Sites runtime values are parsed only by the hosted composition
+boundary and cannot directly construct this function-bearing capability. The
+production Worker now builds the workspace from the hosted runtime's named
+factory methods and installs it only in the owner route group. A missing,
+partial, or malformed runtime installs no workspace, and repositories that
+cannot atomically persist campaign metadata, public projection, and audit
+evidence expose no mutation capability. This source composition is not live
+hosted acceptance evidence.
 
 ### AittaDB campaign repository
 
-`AittaDBCampaignConfigurationRepository` implements the same campaign contract against one explicitly configured AittaDB JSON-record URL. The record contains the current setup and its immutable retry-addressed history, so operation lookup examines the complete bounded record rather than an arbitrary history prefix. Both request and response bodies have finite byte limits. The issuer origin, logical key, access-token provider, and HTTP implementation are deployment inputs; reusable source contains no production hostname, owner identity, credential, or campaign content.
+`AittaDBCampaignConfigurationRepository` is an older direct HTTP implementation
+against one explicitly configured AittaDB JSON-record URL. The record contains
+the current setup and its immutable retry-addressed history, so operation lookup
+examines the complete bounded record rather than an arbitrary history prefix.
+Both request and response bodies have finite byte limits. The issuer origin,
+logical key, access-token provider, and HTTP implementation are deployment
+inputs; reusable source contains no production hostname, owner identity,
+credential, or campaign content.
 
 Before any write, the repository reads the configured issuer's OpenAPI document and requires an advertised strong `ETag` on reads and writes, `If-Match` and `If-None-Match` request fields, and `412` conflict semantics. It then creates with `If-None-Match: *` or replaces with the exact previously read strong `ETag`. Missing capability, validators, malformed or oversized representations, and unexpected write results fail closed with fixed non-disclosing errors. This adapter does not yet provide the atomic campaign, projection, and audit transaction required by the editor, so it cannot be injected as the editor mutation capability. An AittaDB deployment that only advertises unconditional record replacement remains readable through this repository, but the repository performs no write against it.
 
 ## Storage plan
 
-Development can use a deterministic in-memory/test adapter. The AittaDB campaign-configuration repository runs the same campaign contract tests over a deterministic HTTP service. Other production repositories must likewise use AittaDB-compatible adapters and pass their shared contracts.
+Development can use a deterministic in-memory/test adapter. Production campaign
+composition uses `StorageCampaignRepository` over the bounded AittaDB adapter
+and must pass the same contract plus hosted quota, retry, concurrency, restart,
+authorization, and non-disclosure proofs. Other production repositories must
+likewise remain behind narrow AittaDB-compatible capabilities and pass their
+shared contracts.
 
 Production remains blocked until the configured backend provides the consistency, listing, pagination, quota, authorization, and non-disclosure behavior described in the use cases.
 

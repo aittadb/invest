@@ -5,6 +5,7 @@ import {
 import {
   parseActorSubject,
   parseTimestamp,
+  type ActorSubject,
   type Timestamp,
   type ValidationIssue,
   type ValidationResult,
@@ -37,10 +38,19 @@ import {
 import {
   prepareAuditAppend,
   verifyPreparedAuditAppend,
+  type PreparedAuditAppend,
 } from "./in-memory-audit-notification-repositories.ts";
 
-const CAMPAIGN_SETUP_SCHEMA_VERSION = 3;
+const CAMPAIGN_SETUP_SCHEMA_VERSION = 4;
 const MAX_CAMPAIGN_PHASES = 32;
+const MAX_SERIALIZED_CAMPAIGN_SETUP_BYTES = 262_144;
+const SETUP_CHUNK_RAW_BYTES = 45_000;
+const MAX_SETUP_CHUNKS = Math.ceil(
+  MAX_SERIALIZED_CAMPAIGN_SETUP_BYTES / SETUP_CHUNK_RAW_BYTES,
+);
+const MAX_SETUP_CHUNK_RECORD_BYTES = 61_440;
+export const CAMPAIGN_OPERATION_INTENT_MAX_RECORD_BYTES = 2_048;
+const SETUP_HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const CURRENT_SETUP_KEY = storageKey("campaign-setup-current", "configured-campaign");
 const HISTORY_COLLECTION = storageKey(
   "campaign-setup-history",
@@ -49,6 +59,14 @@ const HISTORY_COLLECTION = storageKey(
 const OPERATION_COLLECTION = storageKey(
   "campaign-setup-operations",
   "campaign-operation:example",
+).collection;
+const OPERATION_INTENT_COLLECTION = storageKey(
+  "campaign-setup-intents",
+  "campaign-operation:example",
+).collection;
+const SETUP_CHUNK_COLLECTION = storageKey(
+  "campaign-setup-chunks",
+  `campaign-setup-chunk:${"0".repeat(64)}:0000`,
 ).collection;
 const PUBLIC_PRESENTATION_KEY = storageKey(
   "campaign-public-presentation",
@@ -67,7 +85,38 @@ const STORED_REVISION_KEYS = new Set([
   "revision",
   "recordedAt",
   "operationId",
-  "setup",
+  "setupHash",
+  "setupBytes",
+  "setupChunks",
+]);
+const STORED_SETUP_CHUNK_KEYS = new Set([
+  "kind",
+  "schemaVersion",
+  "setupHash",
+  "setupBytes",
+  "chunkIndex",
+  "chunkCount",
+  "data",
+]);
+const STORED_OPERATION_INTENT_BASE_KEYS = [
+  "kind",
+  "schemaVersion",
+  "mode",
+  "operationId",
+  "expectedRevision",
+  "resultingRevision",
+  "recordedAt",
+  "setupHash",
+  "setupBytes",
+  "setupChunks",
+] as const;
+const STORED_UNAUDITED_OPERATION_INTENT_KEYS = new Set(
+  STORED_OPERATION_INTENT_BASE_KEYS,
+);
+const STORED_AUDITED_OPERATION_INTENT_KEYS = new Set([
+  ...STORED_OPERATION_INTENT_BASE_KEYS,
+  "actor",
+  "transition",
 ]);
 const PUBLIC_PRESENTATION_KEYS = new Set([
   "kind",
@@ -156,26 +205,26 @@ export interface AtomicCampaignAuditRepository extends CampaignRepository {
 }
 
 /**
- * Development/test campaign repository composed over an in-memory StorageAdapter.
+ * Atomic campaign repository composed over a caller-supplied StorageAdapter.
  *
- * The repository has no durable state of its own: a fresh instance reads all
- * state through the supplied adapter. It is not production storage. Production
- * deployments must use the separately validated AittaDB campaign repository.
+ * The repository has no durable state of its own. Production composition must
+ * supply the credential-bound AittaDB adapter; development wrappers may supply
+ * an explicit deterministic test adapter.
  */
-export class DevelopmentInMemoryCampaignRepository
-  implements AtomicCampaignAuditRepository {
-  readonly storageKind = "development-in-memory" as const;
+export class StorageCampaignRepository implements AtomicCampaignAuditRepository {
   readonly mutationConsistency = "atomic-campaign-audit" as const;
 
-  private readonly storage: StorageAdapter;
+  readonly #storage: StorageAdapter;
 
   constructor(storage: StorageAdapter) {
-    this.storage = storage;
+    this.#storage = storage;
   }
 
   async readSetup(): Promise<CampaignSetupRevision | null> {
-    const record = await this.storage.read(CURRENT_SETUP_KEY);
-    return record === null ? null : decodeCurrentRevision(record);
+    const record = await this.#storage.read(CURRENT_SETUP_KEY);
+    return record === null
+      ? null
+      : materializeRevision(this.#storage, decodeCurrentRevision(record));
   }
 
   async findSetupByOperationId(
@@ -183,21 +232,30 @@ export class DevelopmentInMemoryCampaignRepository
   ): Promise<CampaignSetupRevision | null> {
     const parsed = parseStorageOperationId(operationId);
     if (!parsed.ok) throw new StorageFailure("INVALID_REQUEST");
-    const record = await this.storage.read(setupOperationKey(parsed.value));
-    return record === null ? null : decodeOperationRevision(record);
+    const record = await this.#storage.read(setupOperationKey(parsed.value));
+    return record === null
+      ? null
+      : materializeRevision(this.#storage, decodeOperationRevision(record));
   }
 
   async saveSetup(
     request: SaveCampaignSetupRequest,
   ): Promise<CampaignSetupRevision> {
-    const prepared = prepareCampaignSave(request);
-    const result = await this.storage.transact({
+    const prepared = await prepareCampaignSave(request);
+    const intent = await prepareCampaignOperationIntent(prepared, {
+      mode: "unaudited",
+    });
+    if (!await hasMatchingCampaignOperationIntent(this.#storage, intent)) {
+      await persistCampaignOperationIntent(this.#storage, intent);
+    }
+    await stageSetupChunks(this.#storage, prepared.chunks);
+    const result = await this.#storage.transact({
       operationId: prepared.revision.operationId,
       mutations: [
         {
           type: "put",
           key: CURRENT_SETUP_KEY,
-          expectedRevision: request.expectedRevision,
+          expectedRevision: prepared.expectedRevision,
           value: prepared.value,
         },
         {
@@ -212,50 +270,21 @@ export class DevelopmentInMemoryCampaignRepository
           expectedRevision: null,
           value: prepared.value,
         },
-        publicPresentationMutation(prepared, request.expectedRevision),
+        publicPresentationMutation(prepared, prepared.expectedRevision),
       ],
     });
 
-    return verifyCampaignSave(
-      prepared,
-      result.records[0],
-      result.records[1],
-      result.records[2],
-      result.records[3],
-    );
+    return verifyCampaignSaveTransactionResult(result, prepared);
   }
 
   async saveSetupWithAudit(
     request: SaveCampaignSetupWithAuditRequest,
   ): Promise<AuditedCampaignSetupSaveResult> {
-    const prepared = prepareCampaignSave(request);
+    const prepared = await prepareCampaignSave(request);
     const ownerSubject = parseActorSubject(request.ownerSubject);
-    if (!ownerSubject.ok || !isCampaignAuditTransition(request.transition)) {
+    const transition = request.transition;
+    if (!ownerSubject.ok || !isCampaignAuditTransition(transition)) {
       throw new StorageFailure("INVALID_REQUEST");
-    }
-    const existing = await this.findSetupByOperationId(
-      prepared.revision.operationId,
-    );
-    if (existing === null) {
-      const current = await this.readSetup();
-      try {
-        assertCampaignAuditTransition(
-          current,
-          request.expectedRevision,
-          prepared.revision,
-          request.transition,
-        );
-      } catch (error) {
-        const raced = await this.findSetupByOperationId(
-          prepared.revision.operationId,
-        );
-        if (
-          raced === null ||
-          JSON.stringify(raced) !== JSON.stringify(prepared.revision)
-        ) {
-          throw error;
-        }
-      }
     }
 
     const audit = prepareAuditAppend({
@@ -271,21 +300,64 @@ export class DevelopmentInMemoryCampaignRepository
             type: "campaign",
             id: `campaign:${prepared.revision.setup.publicCampaign.id}`,
           },
-          transition: request.transition,
+          transition,
         },
       },
     });
     if (audit.operationId !== prepared.revision.operationId) {
       throw new StorageFailure("INVALID_REQUEST");
     }
+    const intent = await prepareCampaignOperationIntent(prepared, {
+      mode: "audited",
+      actor: { type: "owner", subject: ownerSubject.value },
+      transition,
+    });
+    const intentExists = await hasMatchingCampaignOperationIntent(
+      this.#storage,
+      intent,
+    );
+    if (!intentExists) {
+      const existing = await this.findSetupByOperationId(
+        prepared.revision.operationId,
+      );
+      if (
+        existing !== null &&
+        JSON.stringify(existing) !== JSON.stringify(prepared.revision)
+      ) {
+        throw new StorageFailure("CONFLICT");
+      }
+      if (existing === null) {
+        const current = await this.readSetup();
+        try {
+          assertCampaignAuditTransition(
+            current,
+            prepared.expectedRevision,
+            prepared.revision,
+            transition,
+          );
+        } catch (error) {
+          const raced = await this.findSetupByOperationId(
+            prepared.revision.operationId,
+          );
+          if (
+            raced === null ||
+            JSON.stringify(raced) !== JSON.stringify(prepared.revision)
+          ) {
+            throw error;
+          }
+        }
+      }
+      await persistCampaignOperationIntent(this.#storage, intent);
+    }
 
-    const result = await this.storage.transact({
+    await stageSetupChunks(this.#storage, prepared.chunks);
+    const result = await this.#storage.transact({
       operationId: prepared.revision.operationId,
       mutations: [
         {
           type: "put",
           key: CURRENT_SETUP_KEY,
-          expectedRevision: request.expectedRevision,
+          expectedRevision: prepared.expectedRevision,
           value: prepared.value,
         },
         {
@@ -300,22 +372,16 @@ export class DevelopmentInMemoryCampaignRepository
           expectedRevision: null,
           value: prepared.value,
         },
-        publicPresentationMutation(prepared, request.expectedRevision),
+        publicPresentationMutation(prepared, prepared.expectedRevision),
         audit.mutation,
       ],
     });
 
-    return deepFreeze({
-      campaign: verifyCampaignSave(
-        prepared,
-        result.records[0],
-        result.records[1],
-        result.records[2],
-        result.records[3],
-      ),
-      auditEvent: verifyPreparedAuditAppend(audit, result.records[4]),
-      replayed: result.replayed,
-    });
+    return verifyAuditedCampaignSaveTransactionResult(
+      result,
+      prepared,
+      audit,
+    );
   }
 
   async listSetupHistory(
@@ -326,46 +392,106 @@ export class DevelopmentInMemoryCampaignRepository
       limit: request.limit,
       ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
     });
-    const page = await this.storage.list({
+    const page = await this.#storage.list({
       collection: HISTORY_COLLECTION,
       limit: request.limit,
       ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
     });
 
     return deepFreeze({
-      items: page.items.map(decodeHistoryRevision),
+      items: await Promise.all(page.items.map(async (record) =>
+        materializeRevision(this.#storage, decodeHistoryRevision(record))
+      )),
       nextCursor: page.nextCursor,
     });
   }
 }
 
-/** Development/test reader bound only to the public projection key. */
-export class DevelopmentInMemoryPublicCampaignPresentationReader
-implements PublicCampaignPresentationReader {
-  private readonly storage: Pick<StorageAdapter, "read">;
+/** Reader bound only to the separately stored public campaign projection. */
+export class StoragePublicCampaignPresentationReader
+  implements PublicCampaignPresentationReader {
+  readonly #read: Pick<StorageAdapter, "read">["read"];
 
   constructor(storage: Pick<StorageAdapter, "read">) {
-    this.storage = storage;
+    this.#read = storage.read.bind(storage);
   }
 
   async readPublishedCampaign(): Promise<PublicCampaignConfiguration | null> {
-    const record = await this.storage.read(PUBLIC_PRESENTATION_KEY);
+    const record = await this.#read(PUBLIC_PRESENTATION_KEY);
     if (record === null) return null;
     const campaign = decodePublicPresentation(record);
     return campaign.published ? campaign : null;
   }
 }
 
+/** Development compatibility wrapper; never use this name in hosted wiring. */
+export class DevelopmentInMemoryCampaignRepository
+  extends StorageCampaignRepository {
+  readonly storageKind = "development-in-memory" as const;
+}
+
+/** Development compatibility wrapper; never use this name in hosted wiring. */
+export class DevelopmentInMemoryPublicCampaignPresentationReader
+  extends StoragePublicCampaignPresentationReader {}
+
+type StoredSetupReference = Readonly<{
+  setupHash: string;
+  setupBytes: number;
+  setupChunks: number;
+}>;
+
+type StoredCampaignSetupRevision = Readonly<{
+  revision: number;
+  recordedAt: Timestamp;
+  operationId: StorageOperationId;
+  reference: StoredSetupReference;
+}>;
+
+type PreparedSetupChunk = Readonly<{
+  key: StorageKey;
+  operationId: StorageOperationId;
+  value: StorageDocument;
+}>;
+
 type PreparedCampaignSave = Readonly<{
   revision: CampaignSetupRevision;
+  expectedRevision: number | null;
+  reference: StoredSetupReference;
+  chunks: readonly PreparedSetupChunk[];
   value: StorageDocument;
   historyKey: StorageKey;
   operationKey: StorageKey;
 }>;
 
-function prepareCampaignSave(
+type CampaignOperationIntent = Readonly<{
+  mode: "unaudited" | "audited";
+  operationId: StorageOperationId;
+  expectedRevision: number | null;
+  resultingRevision: number;
+  recordedAt: Timestamp;
+  reference: StoredSetupReference;
+  actor?: Readonly<{ type: "owner"; subject: ActorSubject }>;
+  transition?: CampaignAuditTransition;
+}>;
+
+type CampaignOperationIntentInput =
+  | Readonly<{ mode: "unaudited" }>
+  | Readonly<{
+      mode: "audited";
+      actor: Readonly<{ type: "owner"; subject: ActorSubject }>;
+      transition: CampaignAuditTransition;
+    }>;
+
+type PreparedCampaignOperationIntent = Readonly<{
+  intent: CampaignOperationIntent;
+  key: StorageKey;
+  transactionOperationId: StorageOperationId;
+  value: StorageDocument;
+}>;
+
+async function prepareCampaignSave(
   request: SaveCampaignSetupRequest,
-): PreparedCampaignSave {
+): Promise<PreparedCampaignSave> {
   const operationId = parseStorageOperationId(request.operationId);
   const recordedAt = parseTimestamp(request.recordedAt);
   const setup = parseCampaignSetup(request.setup);
@@ -381,38 +507,332 @@ function prepareCampaignSave(
     operationId: operationId.value,
     setup: setup.value,
   });
+  const preparedSetup = await prepareStoredSetup(revision.setup);
   return Object.freeze({
     revision,
-    value: encodeRevision(revision),
+    expectedRevision: nextRevision === 1 ? null : nextRevision - 1,
+    reference: preparedSetup.reference,
+    chunks: preparedSetup.chunks,
+    value: encodeRevision(revision, preparedSetup.reference),
     historyKey: setupHistoryKey(nextRevision),
     operationKey: setupOperationKey(revision.operationId),
   });
 }
 
-function verifyCampaignSave(
+async function prepareCampaignOperationIntent(
   prepared: PreparedCampaignSave,
-  currentRecord: StorageRecord | null | undefined,
-  historyRecord: StorageRecord | null | undefined,
-  operationRecord: StorageRecord | null | undefined,
-  publicRecord: StorageRecord | null | undefined,
-): CampaignSetupRevision {
-  if (!currentRecord || !historyRecord || !operationRecord || !publicRecord) {
+  input: CampaignOperationIntentInput,
+): Promise<PreparedCampaignOperationIntent> {
+  const intent = deepFreeze({
+    mode: input.mode,
+    operationId: prepared.revision.operationId,
+    expectedRevision: prepared.expectedRevision,
+    resultingRevision: prepared.revision.revision,
+    recordedAt: prepared.revision.recordedAt,
+    reference: prepared.reference,
+    ...(input.mode === "audited"
+      ? { actor: input.actor, transition: input.transition }
+      : {}),
+  }) satisfies CampaignOperationIntent;
+  const value = encodeCampaignOperationIntent(intent);
+  if (jsonByteLength(value) > CAMPAIGN_OPERATION_INTENT_MAX_RECORD_BYTES) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return Object.freeze({
+    intent,
+    key: setupOperationIntentKey(intent.operationId),
+    transactionOperationId: await setupOperationIntentTransactionId(
+      intent.operationId,
+    ),
+    value,
+  });
+}
+
+async function hasMatchingCampaignOperationIntent(
+  storage: Pick<StorageAdapter, "read">,
+  prepared: PreparedCampaignOperationIntent,
+): Promise<boolean> {
+  const record = await storage.read(prepared.key);
+  if (record === null) return false;
+  assertMatchingCampaignOperationIntent(record, prepared);
+  return true;
+}
+
+async function persistCampaignOperationIntent(
+  storage: StorageAdapter,
+  prepared: PreparedCampaignOperationIntent,
+): Promise<void> {
+  let result: unknown;
+  try {
+    result = await storage.transact({
+      operationId: prepared.transactionOperationId,
+      mutations: [{
+        type: "put",
+        key: prepared.key,
+        expectedRevision: null,
+        value: prepared.value,
+      }],
+    });
+  } catch (error) {
+    if (
+      error instanceof StorageFailure &&
+      (error.code === "CONFLICT" ||
+        error.code === "PRECONDITION_FAILED" ||
+        error.code === "UNAVAILABLE")
+    ) {
+      let record: StorageRecord | null;
+      try {
+        record = await storage.read(prepared.key);
+      } catch {
+        throw new StorageFailure("UNAVAILABLE");
+      }
+      if (record !== null) {
+        assertMatchingCampaignOperationIntent(record, prepared);
+        return;
+      }
+    }
+    throw error instanceof StorageFailure
+      ? new StorageFailure(error.code)
+      : new StorageFailure("UNAVAILABLE");
+  }
+  verifyCampaignOperationIntentTransactionResult(result, prepared);
+}
+
+function verifyCampaignOperationIntentTransactionResult(
+  result: unknown,
+  prepared: PreparedCampaignOperationIntent,
+): void {
+  const transaction = exactStorageTransactionResult(result, 1);
+  assertMatchingCampaignOperationIntent(transaction.records[0], prepared);
+}
+
+function assertMatchingCampaignOperationIntent(
+  record: unknown,
+  prepared: PreparedCampaignOperationIntent,
+): void {
+  const stored = decodeCampaignOperationIntentRecord(record);
+  if (JSON.stringify(stored) !== JSON.stringify(prepared.intent)) {
+    throw new StorageFailure("CONFLICT");
+  }
+}
+
+function decodeCampaignOperationIntentRecord(
+  value: unknown,
+): CampaignOperationIntent {
+  const envelope = exactDataObject(value, ["key", "revision", "value"]);
+  if (
+    envelope === null ||
+    envelope.revision !== 1 ||
+    jsonByteLength(envelope.value) > CAMPAIGN_OPERATION_INTENT_MAX_RECORD_BYTES
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  const key = exactDataObject(envelope.key, ["collection", "id"]);
+  const intent = decodeCampaignOperationIntent(envelope.value);
+  const expectedKey = setupOperationIntentKey(intent.operationId);
+  if (
+    key === null ||
+    key.collection !== expectedKey.collection ||
+    key.id !== expectedKey.id
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return intent;
+}
+
+function decodeCampaignOperationIntent(value: unknown): CampaignOperationIntent {
+  const candidate = exactObject(value);
+  const modeDescriptor = candidate === null
+    ? undefined
+    : Object.getOwnPropertyDescriptor(candidate, "mode");
+  const mode = modeDescriptor !== undefined &&
+      modeDescriptor.enumerable &&
+      "value" in modeDescriptor
+    ? modeDescriptor.value
+    : null;
+  const expectedKeys = mode === "audited"
+    ? STORED_AUDITED_OPERATION_INTENT_KEYS
+    : mode === "unaudited"
+      ? STORED_UNAUDITED_OPERATION_INTENT_KEYS
+      : null;
+  const source = expectedKeys === null
+    ? null
+    : exactDataObject(value, [...expectedKeys]);
+  if (
+    source === null ||
+    source.kind !== "campaign-setup-operation-intent" ||
+    source.schemaVersion !== CAMPAIGN_SETUP_SCHEMA_VERSION
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  const operationId = parseStorageOperationId(source.operationId);
+  const recordedAt = parseTimestamp(source.recordedAt);
+  const reference = parseStoredSetupReference(source);
+  const expectedRevision = source.expectedRevision;
+  const resultingRevision = source.resultingRevision;
+  if (
+    !operationId.ok ||
+    !recordedAt.ok ||
+    reference === null ||
+    (expectedRevision !== null &&
+      (!Number.isSafeInteger(expectedRevision) ||
+        (expectedRevision as number) < 1)) ||
+    !Number.isSafeInteger(resultingRevision) ||
+    parseNextRevision(expectedRevision as number | null) !== resultingRevision
+  ) {
     throw new StorageFailure("UNAVAILABLE");
   }
 
+  if (mode === "unaudited") {
+    return deepFreeze({
+      mode,
+      operationId: operationId.value,
+      expectedRevision: expectedRevision as number | null,
+      resultingRevision: resultingRevision as number,
+      recordedAt: recordedAt.value,
+      reference,
+    });
+  }
+
+  const actor = exactDataObject(source.actor, ["type", "subject"]);
+  const subject = parseActorSubject(actor?.subject);
+  if (
+    actor === null ||
+    actor.type !== "owner" ||
+    !subject.ok ||
+    !isCampaignAuditTransition(source.transition)
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return deepFreeze({
+    mode,
+    operationId: operationId.value,
+    expectedRevision: expectedRevision as number | null,
+    resultingRevision: resultingRevision as number,
+    recordedAt: recordedAt.value,
+    reference,
+    actor: { type: "owner", subject: subject.value },
+    transition: source.transition,
+  });
+}
+
+function encodeCampaignOperationIntent(
+  intent: CampaignOperationIntent,
+): StorageDocument {
+  return deepFreeze({
+    kind: "campaign-setup-operation-intent",
+    schemaVersion: CAMPAIGN_SETUP_SCHEMA_VERSION,
+    mode: intent.mode,
+    operationId: intent.operationId,
+    expectedRevision: intent.expectedRevision,
+    resultingRevision: intent.resultingRevision,
+    recordedAt: intent.recordedAt,
+    setupHash: intent.reference.setupHash,
+    setupBytes: intent.reference.setupBytes,
+    setupChunks: intent.reference.setupChunks,
+    ...(intent.mode === "audited"
+      ? { actor: intent.actor, transition: intent.transition }
+      : {}),
+  });
+}
+
+function verifyCampaignSaveTransactionResult(
+  result: unknown,
+  prepared: PreparedCampaignSave,
+): CampaignSetupRevision {
+  const transaction = exactStorageTransactionResult(result, 4);
+  const [currentRecord, historyRecord, operationRecord, publicRecord] =
+    campaignSaveRecords(transaction.records, prepared);
+  return verifyCampaignSaveRecords(
+    prepared,
+    currentRecord,
+    historyRecord,
+    operationRecord,
+    publicRecord,
+  );
+}
+
+function verifyAuditedCampaignSaveTransactionResult(
+  result: unknown,
+  prepared: PreparedCampaignSave,
+  audit: PreparedAuditAppend,
+): AuditedCampaignSetupSaveResult {
+  const transaction = exactStorageTransactionResult(result, 5);
+  const [currentRecord, historyRecord, operationRecord, publicRecord] =
+    campaignSaveRecords(transaction.records, prepared);
+  const auditRecord = verifyExactStorageRecord(
+    transaction.records[4],
+    audit.mutation.key,
+    1,
+    audit.mutation.value,
+  );
+  return deepFreeze({
+    campaign: verifyCampaignSaveRecords(
+      prepared,
+      currentRecord,
+      historyRecord,
+      operationRecord,
+      publicRecord,
+    ),
+    auditEvent: verifyPreparedAuditAppend(audit, auditRecord),
+    replayed: transaction.replayed,
+  });
+}
+
+function campaignSaveRecords(
+  records: readonly unknown[],
+  prepared: PreparedCampaignSave,
+): readonly [StorageRecord, StorageRecord, StorageRecord, StorageRecord] {
+  return Object.freeze([
+    verifyExactStorageRecord(
+      records[0],
+      CURRENT_SETUP_KEY,
+      prepared.revision.revision,
+      prepared.value,
+    ),
+    verifyExactStorageRecord(
+      records[1],
+      prepared.historyKey,
+      1,
+      prepared.value,
+    ),
+    verifyExactStorageRecord(
+      records[2],
+      prepared.operationKey,
+      1,
+      prepared.value,
+    ),
+    verifyExactStorageRecord(
+      records[3],
+      PUBLIC_PRESENTATION_KEY,
+      prepared.revision.revision,
+      encodePublicPresentation(prepared.revision),
+    ),
+  ]);
+}
+
+function verifyCampaignSaveRecords(
+  prepared: PreparedCampaignSave,
+  currentRecord: StorageRecord,
+  historyRecord: StorageRecord,
+  operationRecord: StorageRecord,
+  publicRecord: StorageRecord,
+): CampaignSetupRevision {
   const current = decodeCurrentRevision(currentRecord);
   const history = decodeHistoryRevision(historyRecord);
   const operation = decodeOperationRevision(operationRecord);
+  const expected = decodeRevision(prepared.value);
   const publicCampaign = decodePublicPresentation(publicRecord);
   if (
     JSON.stringify(current) !== JSON.stringify(history) ||
     JSON.stringify(current) !== JSON.stringify(operation) ||
-    JSON.stringify(current.setup.publicCampaign) !== JSON.stringify(publicCampaign) ||
-    JSON.stringify(current) !== JSON.stringify(prepared.revision)
+    JSON.stringify(current) !== JSON.stringify(expected) ||
+    JSON.stringify(prepared.revision.setup.publicCampaign) !==
+      JSON.stringify(publicCampaign)
   ) {
     throw new StorageFailure("UNAVAILABLE");
   }
-  return current;
+  return prepared.revision;
 }
 
 function assertCampaignAuditTransition(
@@ -632,18 +1052,151 @@ function parseNextRevision(expectedRevision: number | null): number | null {
   return expectedRevision + 1;
 }
 
-function encodeRevision(revision: CampaignSetupRevision): StorageDocument {
+async function prepareStoredSetup(
+  setup: CampaignSetup,
+): Promise<Readonly<{
+  reference: StoredSetupReference;
+  chunks: readonly PreparedSetupChunk[];
+}>> {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(setup);
+  } catch (error) {
+    throw new StorageFailure("INVALID_REQUEST", { cause: error });
+  }
+  const bytes = new TextEncoder().encode(serialized);
+  if (
+    bytes.byteLength < 1 ||
+    bytes.byteLength > MAX_SERIALIZED_CAMPAIGN_SETUP_BYTES
+  ) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+  const setupHash = await hashSetupBytes(bytes);
+  const setupChunks = Math.ceil(bytes.byteLength / SETUP_CHUNK_RAW_BYTES);
+  if (setupChunks < 1 || setupChunks > MAX_SETUP_CHUNKS) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+  const reference = deepFreeze({
+    setupHash,
+    setupBytes: bytes.byteLength,
+    setupChunks,
+  });
+  const chunks: PreparedSetupChunk[] = [];
+  for (let chunkIndex = 0; chunkIndex < setupChunks; chunkIndex += 1) {
+    const start = chunkIndex * SETUP_CHUNK_RAW_BYTES;
+    const chunk = bytes.slice(
+      start,
+      Math.min(start + SETUP_CHUNK_RAW_BYTES, bytes.byteLength),
+    );
+    const value = deepFreeze({
+      kind: "campaign-setup-chunk",
+      schemaVersion: CAMPAIGN_SETUP_SCHEMA_VERSION,
+      setupHash,
+      setupBytes: bytes.byteLength,
+      chunkIndex,
+      chunkCount: setupChunks,
+      data: base64UrlEncode(chunk),
+    });
+    if (jsonByteLength(value) > MAX_SETUP_CHUNK_RECORD_BYTES) {
+      throw new StorageFailure("UNAVAILABLE");
+    }
+    chunks.push(Object.freeze({
+      key: setupChunkKey(setupHash, chunkIndex),
+      operationId: setupChunkOperationId(setupHash, chunkIndex),
+      value,
+    }));
+  }
+  return Object.freeze({ reference, chunks: Object.freeze(chunks) });
+}
+
+async function stageSetupChunks(
+  storage: StorageAdapter,
+  chunks: readonly PreparedSetupChunk[],
+): Promise<void> {
+  for (const chunk of chunks) {
+    let result: unknown;
+    try {
+      result = await storage.transact({
+        operationId: chunk.operationId,
+        mutations: [{
+          type: "put",
+          key: chunk.key,
+          expectedRevision: null,
+          value: chunk.value,
+        }],
+      });
+    } catch (error) {
+      if (
+        error instanceof StorageFailure &&
+        (error.code === "CONFLICT" ||
+          error.code === "PRECONDITION_FAILED" ||
+          error.code === "UNAVAILABLE")
+      ) {
+        let record: StorageRecord | null;
+        try {
+          record = await storage.read(chunk.key);
+        } catch {
+          throw new StorageFailure("UNAVAILABLE");
+        }
+        if (record !== null) {
+          verifyPreparedSetupChunk(record, chunk);
+          continue;
+        }
+      }
+      throw error instanceof StorageFailure
+        ? new StorageFailure(error.code)
+        : new StorageFailure("UNAVAILABLE");
+    }
+    verifyPreparedSetupChunkTransactionResult(result, chunk);
+  }
+}
+
+function verifyPreparedSetupChunkTransactionResult(
+  result: unknown,
+  chunk: PreparedSetupChunk,
+): void {
+  const transaction = exactStorageTransactionResult(result, 1);
+  verifyPreparedSetupChunk(transaction.records[0], chunk);
+}
+
+function verifyPreparedSetupChunk(
+  record: unknown,
+  chunk: PreparedSetupChunk,
+): void {
+  const envelope = exactDataObject(record, ["key", "revision", "value"]);
+  const key = envelope === null
+    ? null
+    : exactDataObject(envelope.key, ["collection", "id"]);
+  if (
+    envelope === null ||
+    key === null ||
+    key.collection !== chunk.key.collection ||
+    key.id !== chunk.key.id ||
+    envelope.revision !== 1 ||
+    jsonByteLength(envelope.value) > MAX_SETUP_CHUNK_RECORD_BYTES ||
+    !exactJsonDataEqual(envelope.value, chunk.value)
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+}
+
+function encodeRevision(
+  revision: CampaignSetupRevision,
+  reference: StoredSetupReference,
+): StorageDocument {
   return deepFreeze({
     kind: "campaign-setup-revision",
     schemaVersion: CAMPAIGN_SETUP_SCHEMA_VERSION,
     revision: revision.revision,
     recordedAt: revision.recordedAt,
     operationId: revision.operationId,
-    setup: revision.setup,
+    setupHash: reference.setupHash,
+    setupBytes: reference.setupBytes,
+    setupChunks: reference.setupChunks,
   });
 }
 
-function decodeCurrentRevision(record: StorageRecord): CampaignSetupRevision {
+function decodeCurrentRevision(record: StorageRecord): StoredCampaignSetupRevision {
   const revision = decodeRevision(record.value);
   if (
     record.key.collection !== CURRENT_SETUP_KEY.collection ||
@@ -655,7 +1208,7 @@ function decodeCurrentRevision(record: StorageRecord): CampaignSetupRevision {
   return revision;
 }
 
-function decodeHistoryRevision(record: StorageRecord): CampaignSetupRevision {
+function decodeHistoryRevision(record: StorageRecord): StoredCampaignSetupRevision {
   const revision = decodeRevision(record.value);
   const expectedKey = setupHistoryKey(revision.revision);
   if (
@@ -668,7 +1221,7 @@ function decodeHistoryRevision(record: StorageRecord): CampaignSetupRevision {
   return revision;
 }
 
-function decodeOperationRevision(record: StorageRecord): CampaignSetupRevision {
+function decodeOperationRevision(record: StorageRecord): StoredCampaignSetupRevision {
   const revision = decodeRevision(record.value);
   const expectedKey = setupOperationKey(revision.operationId);
   if (
@@ -732,7 +1285,7 @@ function decodePublicPresentation(
   return campaign;
 }
 
-function decodeRevision(value: StorageDocument): CampaignSetupRevision {
+function decodeRevision(value: StorageDocument): StoredCampaignSetupRevision {
   const source = record(value);
   if (source === null || !hasExactKeys(source, STORED_REVISION_KEYS)) {
     throw new StorageFailure("UNAVAILABLE");
@@ -748,8 +1301,8 @@ function decodeRevision(value: StorageDocument): CampaignSetupRevision {
 
   const recordedAt = parseTimestamp(source.recordedAt);
   const operationId = parseStorageOperationId(source.operationId);
-  const setup = parseCampaignSetup(source.setup);
-  if (!recordedAt.ok || !operationId.ok || !setup.ok) {
+  const reference = parseStoredSetupReference(source);
+  if (!recordedAt.ok || !operationId.ok || reference === null) {
     throw new StorageFailure("UNAVAILABLE");
   }
 
@@ -757,8 +1310,193 @@ function decodeRevision(value: StorageDocument): CampaignSetupRevision {
     revision: source.revision as number,
     recordedAt: recordedAt.value,
     operationId: operationId.value,
-    setup: setup.value,
+    reference,
   });
+}
+
+function parseStoredSetupReference(
+  source: Readonly<Record<string, unknown>>,
+): StoredSetupReference | null {
+  if (
+    typeof source.setupHash !== "string" ||
+    !SETUP_HASH_PATTERN.test(source.setupHash) ||
+    !Number.isSafeInteger(source.setupBytes) ||
+    (source.setupBytes as number) < 1 ||
+    (source.setupBytes as number) > MAX_SERIALIZED_CAMPAIGN_SETUP_BYTES ||
+    !Number.isSafeInteger(source.setupChunks) ||
+    (source.setupChunks as number) !== Math.ceil(
+      (source.setupBytes as number) / SETUP_CHUNK_RAW_BYTES,
+    ) ||
+    (source.setupChunks as number) < 1 ||
+    (source.setupChunks as number) > MAX_SETUP_CHUNKS
+  ) {
+    return null;
+  }
+  return deepFreeze({
+    setupHash: source.setupHash,
+    setupBytes: source.setupBytes as number,
+    setupChunks: source.setupChunks as number,
+  });
+}
+
+async function materializeRevision(
+  storage: Pick<StorageAdapter, "read">,
+  stored: StoredCampaignSetupRevision,
+): Promise<CampaignSetupRevision> {
+  const setup = await readStoredSetup(storage, stored.reference);
+  return deepFreeze({
+    revision: stored.revision,
+    recordedAt: stored.recordedAt,
+    operationId: stored.operationId,
+    setup,
+  });
+}
+
+async function readStoredSetup(
+  storage: Pick<StorageAdapter, "read">,
+  reference: StoredSetupReference,
+): Promise<CampaignSetup> {
+  const parts = await Promise.all(
+    Array.from({ length: reference.setupChunks }, async (_, chunkIndex) => {
+      const record = await storage.read(setupChunkKey(reference.setupHash, chunkIndex));
+      if (record === null) throw new StorageFailure("UNAVAILABLE");
+      return decodeSetupChunk(record, reference, chunkIndex);
+    }),
+  );
+  const bytes = new Uint8Array(reference.setupBytes);
+  let offset = 0;
+  for (const part of parts) {
+    if (offset + part.byteLength > bytes.byteLength) {
+      throw new StorageFailure("UNAVAILABLE");
+    }
+    bytes.set(part, offset);
+    offset += part.byteLength;
+  }
+  if (offset !== bytes.byteLength || await hashSetupBytes(bytes) !== reference.setupHash) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+
+  let serialized: string;
+  let candidate: unknown;
+  try {
+    serialized = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    candidate = JSON.parse(serialized);
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+  const setup = parseCampaignSetup(candidate);
+  if (!setup.ok || JSON.stringify(setup.value) !== serialized) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return setup.value;
+}
+
+function decodeSetupChunk(
+  record: StorageRecord,
+  reference: StoredSetupReference,
+  chunkIndex: number,
+): Uint8Array {
+  const source = recordValue(record.value);
+  const expectedKey = setupChunkKey(reference.setupHash, chunkIndex);
+  if (
+    source === null ||
+    !hasExactKeys(source, STORED_SETUP_CHUNK_KEYS) ||
+    source.kind !== "campaign-setup-chunk" ||
+    source.schemaVersion !== CAMPAIGN_SETUP_SCHEMA_VERSION ||
+    source.setupHash !== reference.setupHash ||
+    source.setupBytes !== reference.setupBytes ||
+    source.chunkIndex !== chunkIndex ||
+    source.chunkCount !== reference.setupChunks ||
+    typeof source.data !== "string" ||
+    record.key.collection !== expectedKey.collection ||
+    record.key.id !== expectedKey.id ||
+    record.revision !== 1 ||
+    jsonByteLength(record.value) > MAX_SETUP_CHUNK_RECORD_BYTES
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  const bytes = base64UrlDecode(source.data);
+  const expectedBytes = chunkIndex === reference.setupChunks - 1
+    ? reference.setupBytes - chunkIndex * SETUP_CHUNK_RAW_BYTES
+    : SETUP_CHUNK_RAW_BYTES;
+  if (bytes.byteLength !== expectedBytes) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return bytes;
+}
+
+async function hashSetupBytes(bytes: Uint8Array): Promise<string> {
+  let digest: ArrayBuffer;
+  try {
+    const input = new Uint8Array(bytes.byteLength);
+    input.set(bytes);
+    digest = await crypto.subtle.digest("SHA-256", input);
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+  return `sha256:${[...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")}`;
+}
+
+function setupChunkKey(setupHash: string, chunkIndex: number): StorageKey {
+  return storageKey(
+    SETUP_CHUNK_COLLECTION,
+    `campaign-setup-chunk:${setupHash.slice("sha256:".length)}:${chunkSuffix(chunkIndex)}`,
+  );
+}
+
+function setupChunkOperationId(
+  setupHash: string,
+  chunkIndex: number,
+): StorageOperationId {
+  const parsed = parseStorageOperationId(
+    `campaign-chunk-stage:${setupHash.slice("sha256:".length)}:${chunkSuffix(chunkIndex)}`,
+  );
+  if (!parsed.ok) throw new StorageFailure("UNAVAILABLE");
+  return parsed.value;
+}
+
+function chunkSuffix(chunkIndex: number): string {
+  if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= MAX_SETUP_CHUNKS) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return String(chunkIndex).padStart(4, "0");
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 8_192) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 8_192));
+  }
+  return btoa(binary).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/gu, "");
+}
+
+function base64UrlDecode(value: string): Uint8Array {
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  const padded = value.replace(/-/gu, "+").replace(/_/gu, "/") +
+    "=".repeat((4 - value.length % 4) % 4);
+  let binary: string;
+  try {
+    binary = atob(padded);
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  if (base64UrlEncode(bytes) !== value) throw new StorageFailure("UNAVAILABLE");
+  return bytes;
+}
+
+function jsonByteLength(value: unknown): number {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+  return new TextEncoder().encode(serialized).byteLength;
 }
 
 function setupHistoryKey(revision: number): StorageKey {
@@ -770,6 +1508,23 @@ function setupHistoryKey(revision: number): StorageKey {
 
 function setupOperationKey(operationId: StorageOperationId): StorageKey {
   return storageKey(OPERATION_COLLECTION, operationId);
+}
+
+function setupOperationIntentKey(operationId: StorageOperationId): StorageKey {
+  return storageKey(OPERATION_INTENT_COLLECTION, operationId);
+}
+
+async function setupOperationIntentTransactionId(
+  operationId: StorageOperationId,
+): Promise<StorageOperationId> {
+  const digest = await hashSetupBytes(
+    new TextEncoder().encode(`campaign-operation-intent:${operationId}`),
+  );
+  const parsed = parseStorageOperationId(
+    `campaign-intent-claim:${digest.slice("sha256:".length)}`,
+  );
+  if (!parsed.ok) throw new StorageFailure("UNAVAILABLE");
+  return parsed.value;
 }
 
 function storageKey(collection: unknown, id: unknown): StorageKey {
@@ -797,6 +1552,162 @@ function hasExactKeys(
 ): boolean {
   const keys = Object.keys(source);
   return keys.length === expected.size && keys.every((key) => expected.has(key));
+}
+
+function exactObject(value: unknown): Record<PropertyKey, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<PropertyKey, unknown>
+    : null;
+}
+
+function exactDataObject(
+  value: unknown,
+  expectedKeys: readonly string[],
+): Readonly<Record<string, unknown>> | null {
+  try {
+    const source = exactObject(value);
+    if (source === null) return null;
+    const keys = Reflect.ownKeys(source);
+    if (
+      keys.length !== expectedKeys.length ||
+      keys.some((key) =>
+        typeof key !== "string" || !expectedKeys.includes(key)
+      )
+    ) {
+      return null;
+    }
+    const result: Record<string, unknown> = {};
+    for (const key of expectedKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(source, key);
+      if (
+        descriptor === undefined ||
+        !descriptor.enumerable ||
+        !("value" in descriptor)
+      ) {
+        return null;
+      }
+      result[key] = descriptor.value;
+    }
+    return Object.freeze(result);
+  } catch {
+    return null;
+  }
+}
+
+function exactStorageTransactionResult(
+  value: unknown,
+  expectedRecords: number,
+): Readonly<{ replayed: boolean; records: readonly unknown[] }> {
+  const source = exactDataObject(value, ["replayed", "records"]);
+  const records = source === null
+    ? null
+    : exactArrayValues(source.records, expectedRecords);
+  if (
+    source === null ||
+    typeof source.replayed !== "boolean" ||
+    records === null
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return Object.freeze({ replayed: source.replayed, records });
+}
+
+function exactArrayValues(
+  value: unknown,
+  expectedLength: number,
+): readonly unknown[] | null {
+  try {
+    if (!Array.isArray(value) || value.length !== expectedLength) return null;
+    const keys = Reflect.ownKeys(value);
+    const expectedKeys = [
+      ...Array.from({ length: expectedLength }, (_, index) => String(index)),
+      "length",
+    ];
+    if (
+      keys.length !== expectedKeys.length ||
+      keys.some((key) =>
+        typeof key !== "string" || !expectedKeys.includes(key)
+      )
+    ) return null;
+    const values: unknown[] = [];
+    for (let index = 0; index < expectedLength; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (
+        descriptor === undefined ||
+        !descriptor.enumerable ||
+        !("value" in descriptor)
+      ) return null;
+      values.push(descriptor.value);
+    }
+    const length = Object.getOwnPropertyDescriptor(value, "length");
+    if (
+      length === undefined ||
+      length.enumerable ||
+      !("value" in length) ||
+      length.value !== expectedLength
+    ) return null;
+    return Object.freeze(values);
+  } catch {
+    return null;
+  }
+}
+
+function verifyExactStorageRecord(
+  value: unknown,
+  expectedKey: StorageKey,
+  expectedRevision: number,
+  expectedValue: StorageDocument,
+): StorageRecord {
+  const envelope = exactDataObject(value, ["key", "revision", "value"]);
+  const key = envelope === null
+    ? null
+    : exactDataObject(envelope.key, ["collection", "id"]);
+  if (
+    envelope === null ||
+    key === null ||
+    key.collection !== expectedKey.collection ||
+    key.id !== expectedKey.id ||
+    envelope.revision !== expectedRevision ||
+    !exactJsonDataEqual(envelope.value, expectedValue)
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return Object.freeze({
+    key: Object.freeze({ ...expectedKey }),
+    revision: expectedRevision,
+    value: envelope.value as StorageDocument,
+  });
+}
+
+function exactJsonDataEqual(actual: unknown, expected: unknown): boolean {
+  if (
+    actual === null ||
+    expected === null ||
+    typeof actual !== "object" ||
+    typeof expected !== "object"
+  ) {
+    return Object.is(actual, expected);
+  }
+  if (Array.isArray(actual) || Array.isArray(expected)) {
+    if (!Array.isArray(actual) || !Array.isArray(expected)) return false;
+    const actualValues = exactArrayValues(actual, expected.length);
+    return actualValues !== null && actualValues.every((item, index) =>
+      exactJsonDataEqual(item, expected[index])
+    );
+  }
+  try {
+    const actualPrototype = Object.getPrototypeOf(actual);
+    if (actualPrototype !== Object.prototype && actualPrototype !== null) {
+      return false;
+    }
+    const expectedKeys = Object.keys(expected);
+    const source = exactDataObject(actual, expectedKeys);
+    return source !== null && expectedKeys.every((key) =>
+      exactJsonDataEqual(source[key], (expected as Record<string, unknown>)[key])
+    );
+  } catch {
+    return false;
+  }
 }
 
 function record(value: unknown): Record<string, unknown> | null {

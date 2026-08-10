@@ -58,6 +58,13 @@ decrypts and validates its bindings, and delegates request verification to
 the same actor, exact-origin check, body limits, method normalization, and
 constant-time SHA-256 proof comparison.
 
+The session configuration is an absolute ceiling shared by composed routes.
+Each route passes its own body, field, and repeated-field limits to
+`verifyMutation()`. Requested limits must be no greater than that ceiling and
+are validated before proof extraction; form proof extraction itself uses the
+route's byte limit. A larger setup form therefore cannot widen campaign,
+package, profile, or participant mutation boundaries.
+
 Only after identity, origin, ciphertext, expiry, request body, and CSRF proof
 validation succeed does the module call `claimReplay()`. The claim contains an
 opaque hash-derived capability ID and expiry only. It contains no identity,
@@ -67,6 +74,13 @@ under concurrent requests. A false, malformed, or failed result rejects the
 mutation. Successful verification also returns a matching expired cookie value
 for the route to attach to its response; replay remains blocked even if the
 client ignores that deletion.
+
+Once `verifyMutation()` returns, replay authority has already been consumed.
+The owning route therefore attaches that expired cookie to every subsequent
+success or error response, including feature parsing, readiness, revision, and
+storage failures. It appends only that one clearing value and does not mint a
+replacement proof on an error. A replay rejected inside verification has no
+returned clear-cookie capability and receives no additional cookie header.
 
 Production composition implements the claim as a durable, expiry-bounded
 AittaDB atomic create through `StorageApplicationRepositoryFactory`. It stores

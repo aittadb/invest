@@ -64,8 +64,10 @@ test("hosted runtime composes once and closes credentials behind repositories", 
   assert.equal(Object.isFrozen(runtime), true);
   assert.deepEqual(Object.keys(runtime).sort(), [
     "mutationSession",
+    "publicationReady",
     "repositoryFactory",
   ]);
+  assert.equal(runtime.publicationReady, false);
   const serialized = JSON.stringify(runtime);
   for (const secret of [
     SERVICE_CLIENT_SECRET,
@@ -236,7 +238,7 @@ test("complete runtime stays outside route and rendering capabilities", async ()
   }
 });
 
-test("complete runtime alone installs no persistent feature route", async () => {
+test("complete runtime centrally installs an owner route that fails closed", async () => {
   const resolver = createHostedApplicationRuntimeResolver({
     fetch: new SyntheticAittaDBService().fetch,
   });
@@ -260,13 +262,9 @@ test("complete runtime alone installs no persistent feature route", async () => 
     configuredEnvironment({ OWNER_EMAIL: "owner@example.test" }),
     executionContext,
   );
-  assert.equal(response.status, 418);
-  assert.equal(await response.text(), "application fallback");
-  assert.equal(rendered.length, 1);
-  assert.equal(
-    [...rendered[0]!.headers].some(([, value]) => value === "available"),
-    false,
-  );
+  assert.equal(response.status, 503);
+  assert.match(await response.text(), /temporarily unavailable/u);
+  assert.equal(rendered.length, 0);
 });
 
 test("the production entry point installs the fail-closed application resolver", () => {

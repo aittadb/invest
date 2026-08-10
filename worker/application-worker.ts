@@ -33,6 +33,7 @@ import type {
   ApplicationRuntimeDeploymentCapability,
   CampaignWorkspaceDeploymentCapability,
 } from "./deployment-capabilities.ts";
+import { hasHostedAittaDBApplicationRuntimeValues } from "./hosted-application-configuration.ts";
 import {
   createApplicationRouteDispatcher,
   dispatchApplicationRoute,
@@ -42,6 +43,7 @@ import {
   type OwnerIndicationModerationRouteDependencies,
 } from "./routes/owner-indication-moderation.ts";
 import { createOwnerCampaignEditorRouteHandler } from "./routes/owner-campaign-editor.ts";
+import { createOwnerInitialSetupRouteHandler } from "./routes/owner-initial-setup.ts";
 import { createOwnerRouteHandler } from "./routes/owner.ts";
 import {
   createOwnerPackageRouteHandler,
@@ -113,23 +115,26 @@ export function createApplicationWorker(
   return {
     async fetch(request, env, executionContext) {
       const url = new URL(request.url);
-      const resourceUrl = canonicalResourceUrl(
-        url,
-        resolveAppOrigin(request.url, env.APP_BASE_URL),
-      );
+      const appOrigin = resolveAppOrigin(request.url, env.APP_BASE_URL);
+      const resourceUrl = canonicalResourceUrl(url, appOrigin);
       const actor = authenticatedActor(request);
       const isOwner = isConfiguredOwner(actor?.email, env.OWNER_EMAIL);
-      await resolveApplicationRuntime(dependencies, env);
+      const applicationRuntime = await resolveApplicationRuntime(
+        dependencies,
+        env,
+      );
       const ownerOAuthProof = dependencies.dispatchRoute === undefined
         ? await resolveOwnerOAuthProof(dependencies, env)
         : null;
       const ownerOAuthProofAvailable = ownerOAuthProof !== null;
       const campaignWorkspace = dependencies.dispatchRoute === undefined
-        ? resolveCampaignWorkspace(dependencies)
+        ? resolveCampaignWorkspace(dependencies, applicationRuntime, appOrigin)
         : null;
       const publicCampaign = await resolvePublicCampaign(
         campaignWorkspace?.publicReader ?? dependencies.publicCampaignReader,
-        env.CAMPAIGN_CONFIG_JSON,
+        hasHostedAittaDBApplicationRuntimeValues(env)
+          ? undefined
+          : env.CAMPAIGN_CONFIG_JSON,
       );
       const campaign = isOwner && isOwnerPath(url.pathname) && campaignWorkspace
         ? await resolveOwnerCampaign(campaignWorkspace, publicCampaign)
@@ -165,6 +170,8 @@ export function createApplicationWorker(
                 normalApplication && participantInvestmentInterestsAvailable,
               ownerCampaignEditor:
                 normalApplication && campaignEditorAvailable,
+              ownerCampaignSetup:
+                normalApplication && campaignEditorAvailable,
               ownerAittadbConnection:
                 normalApplication && ownerOAuthProofAvailable,
             },
@@ -195,6 +202,7 @@ export function createApplicationWorker(
                 participantFounderInterestAvailable,
                 participantInvestmentInterestsAvailable,
                 campaignEditorAvailable,
+                campaignSetupAvailable: campaignEditorAvailable,
                 ownerOAuthProofAvailable,
               },
             )
@@ -237,6 +245,7 @@ type InjectedRouteAvailability = Readonly<{
   participantFounderInterestAvailable: boolean;
   participantInvestmentInterestsAvailable: boolean;
   campaignEditorAvailable: boolean;
+  campaignSetupAvailable: boolean;
   ownerOAuthProofAvailable: boolean;
 }>;
 
@@ -246,6 +255,7 @@ function createInjectedRouteDispatcher(
   ownerOAuthProof: OwnerOAuthProofRouteDependencies | null,
   available: InjectedRouteAvailability,
 ): ApplicationRouteHandler {
+  const issueCampaignOperationId = campaignWorkspace?.issueOperationId;
   return createApplicationRouteDispatcher({
     public: handlePublicRoutes,
     participant: createParticipantRouteHandler(
@@ -282,7 +292,23 @@ function createInjectedRouteDispatcher(
             )]
           : []),
         ...(campaignWorkspace
-          ? [createOwnerCampaignEditorRouteHandler(campaignWorkspace)]
+          ? [
+              createOwnerInitialSetupRouteHandler({
+                repository: campaignWorkspace.repository,
+                checkPublicationReadiness:
+                  campaignWorkspace.checkPublicationReadiness,
+                mutationSession: campaignWorkspace.mutationSession,
+                appOrigin: campaignWorkspace.appOrigin,
+                ...(issueCampaignOperationId
+                  ? {
+                      issueOperationId: () =>
+                        issueCampaignOperationId("setup"),
+                    }
+                  : {}),
+                ...(campaignWorkspace.now ? { now: campaignWorkspace.now } : {}),
+              }),
+              createOwnerCampaignEditorRouteHandler(campaignWorkspace),
+            ]
           : []),
         ...(ownerOAuthProof
           ? [createOwnerOAuthProofRouteHandler(ownerOAuthProof)]
@@ -293,6 +319,7 @@ function createInjectedRouteDispatcher(
         indicationModeration: available.ownerIndicationModerationAvailable,
         reviewExports: available.ownerReviewExportsAvailable,
         campaignEditor: available.campaignEditorAvailable,
+        campaignSetup: available.campaignSetupAvailable,
         aittadbConnection: available.ownerOAuthProofAvailable,
       },
     ),
@@ -343,6 +370,7 @@ function withRuntimeConfiguration(
     participantFounderInterest: boolean;
     participantInvestmentInterests: boolean;
     ownerCampaignEditor: boolean;
+    ownerCampaignSetup: boolean;
     ownerAittadbConnection: boolean;
   }>,
   preview: RuntimeCampaignPreview | null,
@@ -392,10 +420,21 @@ async function resolveOwnerCampaign(
 
 function resolveCampaignWorkspace(
   dependencies: ApplicationWorkerDependencies,
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  appOrigin: string,
 ): CampaignWorkspaceDeploymentCapability | null {
   if (dependencies.campaignWorkspace) return dependencies.campaignWorkspace;
   try {
-    return dependencies.resolveCampaignWorkspace?.() ?? null;
+    const injected = dependencies.resolveCampaignWorkspace?.() ?? null;
+    if (injected !== null) return injected;
+    if (runtime === null) return null;
+    return Object.freeze({
+      repository: runtime.repositoryFactory.campaignRepository(),
+      publicReader: runtime.repositoryFactory.publicCampaignReader(),
+      checkPublicationReadiness: async () => runtime.publicationReady === true,
+      mutationSession: runtime.mutationSession,
+      appOrigin,
+    });
   } catch {
     return null;
   }

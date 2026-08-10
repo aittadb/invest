@@ -2,6 +2,10 @@ import {
   createBrowserMutationSession,
   type BrowserMutationRandomBytes,
 } from "../http/browser-mutation-session.ts";
+import {
+  MAX_MUTATION_BODY_BYTES,
+  MAX_MUTATION_FIELDS,
+} from "../http/mutation-security.ts";
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
 import { StorageApplicationRepositoryFactory } from "../repositories/storage-application-repository-factory.ts";
 import type { AittaDBServiceTokenFetch } from "../services/aittadb-service-token.ts";
@@ -86,8 +90,14 @@ async function composeHostedApplicationRuntime(
       now,
       randomBytes,
       ttlSeconds: BROWSER_MUTATION_TTL_SECONDS,
+      maxBodyBytes: MAX_MUTATION_BODY_BYTES,
+      maxFields: MAX_MUTATION_FIELDS,
     });
-    return Object.freeze({ repositoryFactory, mutationSession });
+    return Object.freeze({
+      repositoryFactory,
+      mutationSession,
+      publicationReady: configuration.publicationReady,
+    });
   } catch {
     return null;
   }

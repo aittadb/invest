@@ -23,6 +23,7 @@ const MAX_PROCESS_STEPS = 8;
 const MAX_RISKS = 12;
 const MAX_FAQ_ITEMS = 12;
 const MAX_FOOTER_LINKS = 6;
+export const OWNER_CAMPAIGN_PRESENTATION_MAX_BYTES = 65_536;
 
 const SCALAR_FORM_KEYS = Object.freeze([
   "operation-id",
@@ -387,6 +388,12 @@ function parseCampaign(value: unknown): PublicCampaignConfiguration {
     serialized = JSON.stringify(value);
   } catch (error) {
     throw new StorageFailure("INVALID_REQUEST", { cause: error });
+  }
+  if (
+    new TextEncoder().encode(serialized).byteLength >
+      OWNER_CAMPAIGN_PRESENTATION_MAX_BYTES
+  ) {
+    throw new StorageFailure("INVALID_REQUEST");
   }
   const campaign = parsePublicCampaignConfiguration(serialized);
   if (campaign === null) throw new StorageFailure("INVALID_REQUEST");

@@ -14,6 +14,12 @@ import type {
   BrowserMutationReplayClaim,
   BrowserMutationReplayClaimer,
 } from "../http/browser-mutation-session.ts";
+import {
+  StorageCampaignRepository,
+  StoragePublicCampaignPresentationReader,
+  type AtomicCampaignAuditRepository,
+  type PublicCampaignPresentationReader,
+} from "./in-memory-campaign-repository.ts";
 
 const REPLAY_SCHEMA_VERSION = 1;
 const REPLAY_COLLECTION = storageCollection("browser-mutation-replays");
@@ -28,6 +34,8 @@ const MAX_REPLAY_TTL_SECONDS = 600;
  */
 export class StorageApplicationRepositoryFactory {
   readonly #claimBrowserMutationReplay: BrowserMutationReplayClaimer;
+  readonly #campaignRepository: AtomicCampaignAuditRepository;
+  readonly #publicCampaignReader: PublicCampaignPresentationReader;
 
   constructor(storage: StorageAdapter, now: () => Date) {
     const adapter = requiredStorageAdapter(storage);
@@ -35,11 +43,23 @@ export class StorageApplicationRepositoryFactory {
     this.#claimBrowserMutationReplay = Object.freeze(
       (claim: BrowserMutationReplayClaim) => claimReplay(adapter, clock, claim),
     );
+    this.#campaignRepository = new StorageCampaignRepository(adapter);
+    this.#publicCampaignReader = new StoragePublicCampaignPresentationReader(
+      adapter,
+    );
     Object.freeze(this);
   }
 
   browserMutationReplayClaimer(): BrowserMutationReplayClaimer {
     return this.#claimBrowserMutationReplay;
+  }
+
+  campaignRepository(): AtomicCampaignAuditRepository {
+    return this.#campaignRepository;
+  }
+
+  publicCampaignReader(): PublicCampaignPresentationReader {
+    return this.#publicCampaignReader;
   }
 }
 

@@ -16,8 +16,10 @@ import {
   MUTATION_CSRF_HEADER,
   createBrowserMutationGuard,
   hashCsrfToken,
+  type BrowserMutationGuardOptions,
   type TrustedMutationSession,
 } from "../http/mutation-security.ts";
+import type { BrowserMutationVerificationLimits } from "../http/browser-mutation-session.ts";
 import {
   DevelopmentInMemoryCampaignRepository,
   DevelopmentInMemoryPublicCampaignPresentationReader,
@@ -31,6 +33,7 @@ import { DevelopmentInMemoryAuditRepository } from "../repositories/in-memory-au
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
 import {
   OWNER_INITIAL_SETUP_MAX_FIELDS,
+  OWNER_INITIAL_SETUP_WIRE_MAX_BYTES,
   createOwnerInitialSetupRouteHandler,
 } from "../worker/routes/owner-initial-setup.ts";
 import { explicitCampaignSetup } from "./support/campaign-repository-contract.ts";
@@ -43,6 +46,8 @@ const CANONICAL_ORIGIN = "https://canonical.example";
 const REQUEST_ORIGIN = "https://worker.internal";
 const OWNER_SUBJECT = "owner-subject";
 const CSRF_TOKEN = "owner_setup_csrf_token_0123456789ABCDEFGHIJKLMN";
+const CLEAR_SETUP_COOKIE =
+  "__Host-test_setup=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax";
 const NOW = new Date("2026-08-09T12:00:00.000Z");
 
 test("unconfigured owners receive no campaign defaults and one complete setup action", async () => {
@@ -140,10 +145,10 @@ test("JSON creation commits unpublished setup and one owner audit atomically", a
     subject: OWNER_SUBJECT,
   });
   assert.equal(resourceTransition(audit.items[0]), "created");
-  assert.equal(harness.state.records.size, 5);
+  assert.equal(harness.state.records.size, 7);
 });
 
-test("structured HTML creates the same schema-v3 setup without a JSON editor", async () => {
+test("structured HTML creates the same complete setup without a JSON editor", async () => {
   const harness = await createHarness();
   const discovery = await setupDocument(harness.handler);
   const action = requiredAction(discovery, "create-campaign-setup");
@@ -264,6 +269,44 @@ test("structured HTML accepts the maximum rows, root-relative media, and 128-cha
     current?.setup.campaignPolicy.founderContributionChoices[0]?.id.length,
     128,
   );
+});
+
+test("near-maximum UTF-8 setup form uses the distinct setup wire ceiling", async () => {
+  const harness = await createHarness();
+  const discovery = await setupDocument(harness.handler);
+  const action = requiredAction(discovery, "create-campaign-setup");
+  const setup = nearMaximumUtf8Setup();
+  const parameters = structuredFormCommand(
+    String(fieldValue(action, "operation-id")),
+    null,
+    setup,
+  );
+  const decodedBytes = byteLength(JSON.stringify(setup));
+  const wireBytes = byteLength(parameters.toString());
+  assert.equal(decodedBytes <= OWNER_INITIAL_SETUP_MAX_BYTES, true);
+  assert.equal(wireBytes > OWNER_INITIAL_SETUP_MAX_BYTES, true);
+  assert.equal(wireBytes <= OWNER_INITIAL_SETUP_WIRE_MAX_BYTES, true);
+  assert.equal([...parameters].length <= OWNER_INITIAL_SETUP_MAX_FIELDS, true);
+
+  const response = requiredResponse(await harness.handler(routeContext(
+    OWNER_INITIAL_SETUP_PATH,
+    {},
+    {
+      request: formMutationRequest(
+        OWNER_INITIAL_SETUP_PATH,
+        parameters,
+        "text/html",
+      ),
+    },
+  )));
+  assert.equal(response.status, 303);
+  const current = await harness.repository.readSetup();
+  assert.equal(current?.setup.phases.length, 32);
+  assert.equal(
+    current?.setup.campaignPolicy.founderContributionChoices.length,
+    64,
+  );
+  assert.deepEqual(current?.setup.publicCampaign, setup.publicCampaign);
 });
 
 test("UTF-8 campaign values remain renderable within the aggregate setup bound", async () => {
@@ -520,7 +563,7 @@ test("stale, published-create, unknown-field, and bounded-body requests fail clo
   assert.equal(unknownResponse.status, 400);
   assert.equal((await harness.repository.readSetup())?.revision, 1);
 
-  const boundedHarness = await createHarness({ maxBodyBytes: 512 });
+  const boundedHarness = await createHarness();
   const tooLarge = requiredResponse(await boundedHarness.handler(routeContext(
     OWNER_INITIAL_SETUP_PATH,
     {},
@@ -528,7 +571,9 @@ test("stale, published-create, unknown-field, and bounded-body requests fail clo
       request: jsonMutationRequest(OWNER_INITIAL_SETUP_PATH, {
         "operation-id": "owner-setup:oversized",
         "expected-revision": null,
-        "public-campaign": { filler: "x".repeat(1_000) },
+        "public-campaign": {
+          filler: "x".repeat(OWNER_INITIAL_SETUP_WIRE_MAX_BYTES),
+        },
         phases: [],
         "amount-aggregate": {},
         "campaign-policy": {},
@@ -537,6 +582,48 @@ test("stale, published-create, unknown-field, and bounded-body requests fail clo
   )));
   assert.equal(tooLarge.status, 413);
   assert.equal(await boundedHarness.repository.readSetup(), null);
+});
+
+test("post-verification setup failures clear exactly one consumed proof cookie", async () => {
+  const malformedHarness = await createHarness();
+  const malformedAction = requiredAction(
+    await setupDocument(malformedHarness.handler),
+    "create-campaign-setup",
+  );
+  const malformed = {
+    ...jsonCommand(
+      String(fieldValue(malformedAction, "operation-id")),
+      null,
+      draftSetup(),
+    ),
+    unexpected: "rejected",
+  };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = requiredResponse(await malformedHarness.handler(routeContext(
+      OWNER_INITIAL_SETUP_PATH,
+      { accept: "application/json" },
+      { request: jsonMutationRequest(OWNER_INITIAL_SETUP_PATH, malformed) },
+    )));
+    assert.equal(response.status, 400);
+    assert.equal(response.headers.get("set-cookie"), CLEAR_SETUP_COOKIE);
+  }
+
+  const staleHarness = await createHarness();
+  const current = await createThroughJson(staleHarness);
+  const stale = jsonCommand(
+    "owner-setup:stale-cookie-test",
+    7,
+    current.setup,
+  );
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = requiredResponse(await staleHarness.handler(routeContext(
+      OWNER_INITIAL_SETUP_PATH,
+      { accept: "application/json" },
+      { request: jsonMutationRequest(OWNER_INITIAL_SETUP_PATH, stale) },
+    )));
+    assert.equal(response.status, 412);
+    assert.equal(response.headers.get("set-cookie"), CLEAR_SETUP_COOKIE);
+  }
 });
 
 test("readiness exposes objective details and preview never publishes", async () => {
@@ -725,7 +812,6 @@ type HarnessOptions = Readonly<{
   repository?: CampaignRepository;
   deploymentReady?: boolean;
   sessionSubject?: string;
-  maxBodyBytes?: number;
   onGuard?: () => void;
 }>;
 
@@ -757,9 +843,9 @@ async function createHarness(options: HarnessOptions = {}) {
   const handler = createOwnerInitialSetupRouteHandler({
     repository,
     checkPublicationReadiness: async () => options.deploymentReady ?? true,
-    guardMutation: createBrowserMutationGuard({
+    mutationSession: mutationSession({
       allowedOrigins: [CANONICAL_ORIGIN],
-      maxBodyBytes: options.maxBodyBytes ?? 1_048_576,
+      maxBodyBytes: 1_048_576,
       maxFields: OWNER_INITIAL_SETUP_MAX_FIELDS,
       now: () => NOW,
       resolveSession: async () => {
@@ -767,7 +853,7 @@ async function createHarness(options: HarnessOptions = {}) {
         return trustedSession(options.sessionSubject ?? OWNER_SUBJECT, tokenHash);
       },
     }),
-    csrfToken: async () => CSRF_TOKEN,
+    appOrigin: CANONICAL_ORIGIN,
     issueOperationId: () =>
       `owner-setup:route-${String(++operationSequence).padStart(3, "0")}`,
     now: () => NOW,
@@ -780,6 +866,45 @@ async function createHarness(options: HarnessOptions = {}) {
     auditRepository: new DevelopmentInMemoryAuditRepository(adapter),
     state,
   };
+}
+
+function mutationSession(
+  options: BrowserMutationGuardOptions,
+) {
+  const expiresAt = parseTimestamp("2026-08-09T13:00:00.000Z");
+  assert(expiresAt.ok);
+  return Object.freeze({
+    async issue() {
+      return Object.freeze({
+        token: CSRF_TOKEN,
+        expiresAt: expiresAt.value,
+        setCookie: "__Host-test_setup=proof; Path=/; Secure; HttpOnly; SameSite=Lax",
+      });
+    },
+    async verifyMutation(
+      request: Request,
+      _identity: unknown,
+      _appOrigin: string,
+      limits?: BrowserMutationVerificationLimits,
+    ) {
+      const guard = createBrowserMutationGuard({
+        ...options,
+        ...(limits === undefined
+          ? {}
+          : {
+              maxBodyBytes: limits.maxBodyBytes,
+              maxFields: limits.maxFields,
+              ...(limits.repeatedFormFields === undefined
+                ? {}
+                : { repeatedFormFields: limits.repeatedFormFields }),
+            }),
+      });
+      return Object.freeze({
+        ...await guard(request),
+        clearCookie: CLEAR_SETUP_COOKIE,
+      });
+    },
+  });
 }
 
 function trustedSession(
@@ -951,6 +1076,69 @@ function draftSetup() {
       },
     },
   };
+}
+
+function nearMaximumUtf8Setup() {
+  const base = draftSetup();
+  const repeated = "\u754c";
+  const countries = Array.from(
+    { length: 26 * 26 },
+    (_, index) =>
+      String.fromCharCode(65 + Math.floor(index / 26)) +
+      String.fromCharCode(65 + index % 26),
+  );
+  const candidate = {
+    ...base,
+    publicCampaign: {
+      ...base.publicCampaign,
+      hero: {
+        ...base.publicCampaign.hero,
+        summary: repeated.repeat(500),
+        invitation: repeated.repeat(800),
+        note: repeated.repeat(500),
+      },
+      risks: {
+        ...base.publicCampaign.risks,
+        items: Array.from({ length: 12 }, () => repeated.repeat(500)),
+      },
+      faq: {
+        ...base.publicCampaign.faq,
+        items: Array.from({ length: 4 }, () => ({
+          question: repeated.repeat(240),
+          answer: repeated.repeat(800),
+        })),
+      },
+    },
+    phases: Array.from({ length: 32 }, (_, index) => ({
+      id: `phase:max-${String(index).padStart(2, "0")}`,
+      state: "open",
+      enabledParticipationPaths: ["investor", "founder"],
+      countryEligibility: { mode: "allow", countries },
+    })),
+    campaignPolicy: {
+      ...base.campaignPolicy,
+      founderContributionChoices: Array.from({ length: 64 }, (_, index) => ({
+        id: `area:max-${String(index).padStart(2, "0")}`,
+        label: repeated.repeat(120),
+      })),
+      notices: {
+        ...base.campaignPolicy.notices,
+        legalBoundary: repeated.repeat(4_000),
+        nonBindingInterest: repeated.repeat(4_000),
+        processEmail: repeated.repeat(4_000),
+        marketingConsent: repeated.repeat(4_000),
+        retention: repeated.repeat(4_000),
+      },
+    },
+  };
+  const parsed = parseCampaignSetup(candidate);
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) throw new Error("Invalid near-maximum setup fixture.");
+  return parsed.value;
+}
+
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 async function createThroughJson(

@@ -7,7 +7,9 @@ import {
   MUTATION_CSRF_HEADER,
   createBrowserMutationGuard,
   hashCsrfToken,
+  type BrowserMutationGuardOptions,
 } from "../http/mutation-security.ts";
+import type { BrowserMutationVerificationLimits } from "../http/browser-mutation-session.ts";
 import { OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER } from "../http/runtime-capabilities.ts";
 import {
   DevelopmentInMemoryCampaignRepository,
@@ -180,7 +182,7 @@ async function campaignWorkspace(
     repository,
     publicReader,
     checkPublicationReadiness: async () => true,
-    guardMutation: createBrowserMutationGuard({
+    mutationSession: mutationSession({
       allowedOrigins: [ORIGIN],
       maxBodyBytes: 1_048_576,
       maxFields: 256,
@@ -191,10 +193,49 @@ async function campaignWorkspace(
         csrf: { tokenHash, expiresAt: expiresAt.value },
       }),
     }),
-    csrfToken: async () => CSRF_TOKEN,
+    appOrigin: ORIGIN,
     issueOperationId: (kind) => `campaign-${kind}:worker-${++sequence}`,
     now: () => new Date(`2026-08-09T12:00:${String(sequence).padStart(2, "0")}.000Z`),
   };
+}
+
+function mutationSession(
+  options: BrowserMutationGuardOptions,
+) {
+  const expiresAt = parseTimestamp("2026-08-09T14:00:00.000Z");
+  assert(expiresAt.ok);
+  return Object.freeze({
+    async issue() {
+      return Object.freeze({
+        token: CSRF_TOKEN,
+        expiresAt: expiresAt.value,
+        setCookie: "__Host-test_worker=proof; Path=/; Secure; HttpOnly; SameSite=Lax",
+      });
+    },
+    async verifyMutation(
+      request: Request,
+      _identity: unknown,
+      _appOrigin: string,
+      limits?: BrowserMutationVerificationLimits,
+    ) {
+      const guard = createBrowserMutationGuard({
+        ...options,
+        ...(limits === undefined
+          ? {}
+          : {
+              maxBodyBytes: limits.maxBodyBytes,
+              maxFields: limits.maxFields,
+              ...(limits.repeatedFormFields === undefined
+                ? {}
+                : { repeatedFormFields: limits.repeatedFormFields }),
+            }),
+      });
+      return Object.freeze({
+        ...await guard(request),
+        clearCookie: "__Host-test_worker=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax",
+      });
+    },
+  });
 }
 
 function request(

@@ -22,6 +22,7 @@ export interface InvestorAppEnv {
   AITTADB_STORAGE_CLIENT_SECRET?: string;
   AITTADB_STORAGE_SCOPES?: string;
   BROWSER_MUTATION_SESSION_KEY?: string;
+  DEPLOYMENT_PUBLICATION_READY?: string;
   CAMPAIGN_CONFIG_JSON?: string;
   OWNER_EMAIL?: string;
   OAUTH_PROOF_DB?: D1OAuthProofDatabase;

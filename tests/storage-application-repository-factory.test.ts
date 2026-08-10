@@ -165,16 +165,59 @@ test("factory rejects anything other than a complete adapter", () => {
   );
 });
 
-test("factory exposes only its narrow replay capability", () => {
+test("factory exposes only named replay and campaign capabilities", () => {
   const storage = new MemoryStorageAdapter();
   const factory = new StorageApplicationRepositoryFactory(storage, () => NOW);
+  const campaignRepository = factory.campaignRepository();
+  const publicCampaignReader = factory.publicCampaignReader();
 
   assert.deepEqual(Object.getOwnPropertyNames(
     Object.getPrototypeOf(factory) as object,
-  ), ["constructor", "browserMutationReplayClaimer"]);
+  ), [
+    "constructor",
+    "browserMutationReplayClaimer",
+    "campaignRepository",
+    "publicCampaignReader",
+  ]);
+  assert.equal(
+    factory.campaignRepository(),
+    factory.campaignRepository(),
+  );
+  assert.equal(
+    factory.publicCampaignReader(),
+    factory.publicCampaignReader(),
+  );
+  assert.equal(
+    campaignRepository.mutationConsistency,
+    "atomic-campaign-audit",
+  );
+  assert.deepEqual(Reflect.ownKeys(campaignRepository), [
+    "mutationConsistency",
+  ]);
+  assert.deepEqual(Reflect.ownKeys(publicCampaignReader), []);
+  assert.deepEqual(Object.values(campaignRepository), [
+    "atomic-campaign-audit",
+  ]);
+  assert.deepEqual(Object.values(publicCampaignReader), []);
+  assertNoGenericStorageSurface(campaignRepository, storage);
+  assertNoGenericStorageSurface(publicCampaignReader, storage);
+  assert.equal("storage" in factory, false);
+  assert.equal("create" in factory, false);
   assert.equal(Object.isFrozen(factory), true);
   assert.deepEqual(JSON.parse(JSON.stringify(factory)), {});
 });
+
+function assertNoGenericStorageSurface(
+  capability: object,
+  storage: StorageAdapter,
+): void {
+  for (const property of ["adapter", "storage", "read", "list", "transact"]) {
+    assert.equal(property in capability, false, property);
+    assert.equal(Reflect.ownKeys(capability).includes(property), false, property);
+  }
+  assert.equal(Object.values(capability).includes(storage), false);
+  assert.doesNotMatch(JSON.stringify(capability), /adapter|storage|transact/iu);
+}
 
 function replayClaim() {
   const expiresAt = parseTimestamp("2026-08-10T12:05:00.000Z");

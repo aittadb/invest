@@ -11,11 +11,13 @@ import {
 import {
   hasOwnerAittaDBConnection,
   hasOwnerCampaignEditorCapability,
+  hasOwnerCampaignSetupCapability,
   hasOwnerIndicationModeration,
   hasOwnerPackageWorkspace,
   hasOwnerReviewExports,
   OWNER_AITTADB_CONNECTION_HEADER,
   OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER,
+  OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER,
   OWNER_INDICATION_MODERATION_HEADER,
   OWNER_PACKAGE_WORKSPACE_HEADER,
   OWNER_REVIEW_EXPORTS_HEADER,
@@ -46,6 +48,9 @@ export default async function OwnerHome() {
   const canEditCampaign = hasOwnerCampaignEditorCapability(
     requestHeaders.get(OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER),
   );
+  const canConfigureCampaign = hasOwnerCampaignSetupCapability(
+    requestHeaders.get(OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER),
+  );
   const reviewExportsAvailable = hasOwnerReviewExports(
     requestHeaders.get(OWNER_REVIEW_EXPORTS_HEADER),
   );
@@ -64,7 +69,10 @@ export default async function OwnerHome() {
         </Link>
         <nav aria-label="Owner navigation">
           <Link href="/">View campaign</Link>
-          {canEditCampaign ? <Link href="/owner/campaign">Edit presentation</Link> : null}
+          {canConfigureCampaign ? <Link href="/owner/setup">Campaign setup</Link> : null}
+          {canEditCampaign && campaign ? (
+            <Link href="/owner/campaign">Edit presentation</Link>
+          ) : null}
           {packageWorkspaceAvailable ? (
             <Link href="/owner/package">Information package</Link>
           ) : null}
@@ -111,10 +119,13 @@ export default async function OwnerHome() {
             </div>
           </dl>
         </section>
-        {canEditCampaign ? (
+        {canConfigureCampaign ? (
           <p className="owner-workspace-action">
-            <Link className="button button--primary" href="/owner/campaign">
-              Edit campaign presentation
+            <Link
+              className="button button--primary"
+              href={campaign ? "/owner/campaign" : "/owner/setup"}
+            >
+              {campaign ? "Edit campaign presentation" : "Configure campaign"}
             </Link>
           </p>
         ) : null}
