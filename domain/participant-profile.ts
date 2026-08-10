@@ -348,8 +348,11 @@ export function requestParticipantAccountDeletion(
 export function isParticipantProfileDescendantProjection(
   ancestor: ParticipantProfile,
   descendant: ParticipantProfile,
+  revisionDelta: number,
 ): boolean {
   if (
+    !Number.isSafeInteger(revisionDelta) ||
+    revisionDelta < 1 ||
     descendant.subject !== ancestor.subject ||
     descendant.accountEmailLabel !== ancestor.accountEmailLabel ||
     descendant.processEmailNoticeAcknowledgedAt !==
@@ -365,6 +368,15 @@ export function isParticipantProfileDescendantProjection(
       ancestor.accountDeletionRequest,
       descendant.accountDeletionRequest,
       ancestor.updatedAt,
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    revisionDelta < minimumParticipantProfileRevisionDelta(
+      ancestor,
+      descendant,
     )
   ) {
     return false;
@@ -389,6 +401,27 @@ export function isParticipantProfileDescendantProjection(
   }
 
   return true;
+}
+
+function minimumParticipantProfileRevisionDelta(
+  ancestor: ParticipantProfile,
+  descendant: ParticipantProfile,
+): number {
+  let minimum = 0;
+  if (!sameEditableProfileFields(ancestor, descendant)) minimum += 1;
+  if (
+    ancestor.marketingConsent.state !== "withdrawn" &&
+    descendant.marketingConsent.state === "withdrawn"
+  ) {
+    minimum += 1;
+  }
+  if (
+    ancestor.accountDeletionRequest.state === "not-requested" &&
+    descendant.accountDeletionRequest.state === "requested"
+  ) {
+    minimum += 1;
+  }
+  return minimum;
 }
 
 function isMarketingConsentDescendant(

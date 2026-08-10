@@ -14,6 +14,7 @@ import {
   PARTICIPANT_PROFILE_PATH,
   ParticipantProfileResourceError,
   createParticipantProfileCapabilityModel,
+  participantProfileOperations,
 } from "../domain/participant-profile-resource.ts";
 import {
   parseParticipantAccount,
@@ -437,6 +438,121 @@ test("profile mutations preserve exact retries and reject changed or stale opera
   assert.equal(harness.nowCalls(), 3);
 });
 
+test("delayed replays reject mutations unavailable from their immutable historical base", async () => {
+  const alice = participant(ALICE, "alice@provider.example");
+  const account = participantAccount(alice);
+  const persisted = new DevelopmentInMemoryParticipantRepository(
+    new MemoryStorageAdapter(new MemoryStorageState()),
+    account,
+  );
+  await persisted.register({
+    operationId: "participant-profile-operation:historical-register",
+    expectedRevision: null,
+    registeredAt: REGISTERED_AT,
+    registration: {
+      displayName: "Alice Participant",
+      country: "FI",
+      declaredInterest: "both",
+      participationContext: "company",
+      processEmailNoticeAcknowledged: true,
+      marketingConsent: true,
+    },
+  });
+  await persisted.requestAccountDeletion({
+    operationId: "participant-profile-operation:historical-deletion",
+    expectedRevision: 1,
+    requestedAt: timestamp("2026-08-09T10:00:00.000Z"),
+  });
+  const deletionBase = await persisted.revision(2);
+  assert(deletionBase);
+  assert.deepEqual(participantProfileOperations(deletionBase.snapshot), [
+    "withdraw-marketing-consent",
+  ]);
+  const updateBody = {
+    "operation-id": "participant-profile-operation:invalid-historical-update",
+    "expected-revision": 2,
+    "display-name": "Invalid Historical Edit",
+    country: "se",
+    "declared-interest": "founder",
+    "participation-context": "individual",
+  } as const;
+  await persisted.update({
+    operationId: updateBody["operation-id"],
+    expectedRevision: 2,
+    updatedAt: timestamp("2026-08-09T10:01:00.000Z"),
+    changes: {
+      displayName: updateBody["display-name"],
+      country: updateBody.country,
+      declaredInterest: updateBody["declared-interest"],
+      participationContext: updateBody["participation-context"],
+    },
+  });
+  await persisted.withdrawMarketingConsent({
+    operationId: "participant-profile-operation:historical-withdrawal",
+    expectedRevision: 3,
+    withdrawnAt: timestamp("2026-08-09T10:02:00.000Z"),
+  });
+  const current = await persisted.current();
+  assert(current);
+  assert.equal(current.revision, 4);
+
+  for (const representation of ["json", "html"] as const) {
+    let currentCalls = 0;
+    let revisionCalls = 0;
+    let updateCalls = 0;
+    const repository: ParticipantRepository = {
+      current: () => {
+        currentCalls += 1;
+        return persisted.current();
+      },
+      revision: (revision) => {
+        revisionCalls += 1;
+        return persisted.revision(revision);
+      },
+      update: (request) => {
+        updateCalls += 1;
+        return persisted.update(request);
+      },
+      register: (request) => persisted.register(request),
+      withdrawMarketingConsent: (request) =>
+        persisted.withdrawMarketingConsent(request),
+      requestAccountDeletion: (request) =>
+        persisted.requestAccountDeletion(request),
+      pendingDeletionIntent: () => persisted.pendingDeletionIntent(),
+    };
+    const harness = await createHarness({
+      marketingConsent: true,
+      verifyMutation: profileVerifierFor("PATCH", updateBody, CLEAR_COOKIE),
+      repositoryFor: () => repository,
+    });
+    const request = representation === "json"
+      ? jsonMutation("PATCH", ALICE, updateBody)
+      : formMutation(ALICE, profileFormEntries("PATCH", updateBody));
+    const response = await harness.dispatch(request, {
+      actor: alice,
+      access: accessFromProfile(alice, current, "required"),
+    });
+    assert.equal(response.status, 409, representation);
+    assertSingleCookie(response, CLEAR_COOKIE);
+    assert.equal(response.headers.get(MUTATION_CSRF_HEADER), null);
+    assert.match(
+      response.headers.get("content-type") ?? "",
+      representation === "json" ? /json/iu : /^text\/html/iu,
+    );
+    assert.equal(currentCalls, 1, representation);
+    assert.equal(revisionCalls, 1, representation);
+    assert.equal(updateCalls, 0, representation);
+    assert.equal(harness.csrfCalls(), 0, representation);
+    assert.equal(harness.operationIdCalls(), 0, representation);
+    assert.doesNotMatch(
+      await response.text(),
+      /Invalid Historical Edit|alice@provider|issuer\.invalid/u,
+      representation,
+    );
+  }
+  assert.equal((await persisted.current())?.revision, 4);
+});
+
 test("post-replay projection rejects a regressed latest snapshot without issuing proof", async () => {
   const alice = participant(ALICE, "alice@provider.example");
   const account = participantAccount(alice);
@@ -594,13 +710,88 @@ test("post-replay projection rejects well-formed higher revisions with illegal a
   const deleted = await persisted.current();
   assert(deleted);
   assert.equal(deleted.revision, 5);
+  const result = await persisted.revision(2);
+  assert(result);
 
   const changedRegistrationAt = timestamp("2026-08-09T07:30:00.000Z");
   const cases: readonly Readonly<{
     name: string;
     current: ParticipantProfileSnapshot;
     latest: ParticipantProfileSnapshot;
+    revisionReads?: number;
+    representation?: "json" | "html";
   }>[] = [
+    {
+      name: "compressed edit and marketing withdrawal",
+      current: result,
+      latest: profileSnapshot(3, {
+        ...result.snapshot,
+        displayName: "Compressed edit and withdrawal",
+        marketingConsent: {
+          state: "withdrawn",
+          grantedAt: REGISTERED_AT,
+          withdrawnAt: timestamp("2026-08-09T10:01:00.000Z"),
+        },
+        updatedAt: timestamp("2026-08-09T10:01:00.000Z"),
+      }),
+      revisionReads: 1,
+      representation: "html",
+    },
+    {
+      name: "compressed edit and deletion request",
+      current: result,
+      latest: profileSnapshot(3, {
+        ...result.snapshot,
+        displayName: "Compressed edit and deletion",
+        accountDeletionRequest: {
+          state: "requested",
+          requestedAt: timestamp("2026-08-09T10:01:00.000Z"),
+          activeInterestDisposition: "withdraw",
+        },
+        updatedAt: timestamp("2026-08-09T10:01:00.000Z"),
+      }),
+      revisionReads: 1,
+      representation: "html",
+    },
+    {
+      name: "compressed withdrawal and deletion request",
+      current: result,
+      latest: profileSnapshot(3, {
+        ...result.snapshot,
+        marketingConsent: {
+          state: "withdrawn",
+          grantedAt: REGISTERED_AT,
+          withdrawnAt: timestamp("2026-08-09T10:01:00.000Z"),
+        },
+        accountDeletionRequest: {
+          state: "requested",
+          requestedAt: timestamp("2026-08-09T10:01:00.000Z"),
+          activeInterestDisposition: "withdraw",
+        },
+        updatedAt: timestamp("2026-08-09T10:01:00.000Z"),
+      }),
+      revisionReads: 1,
+    },
+    {
+      name: "compressed edit withdrawal and deletion request",
+      current: result,
+      latest: profileSnapshot(4, {
+        ...result.snapshot,
+        displayName: "Compressed three-transition profile",
+        marketingConsent: {
+          state: "withdrawn",
+          grantedAt: REGISTERED_AT,
+          withdrawnAt: timestamp("2026-08-09T10:01:00.000Z"),
+        },
+        accountDeletionRequest: {
+          state: "requested",
+          requestedAt: timestamp("2026-08-09T10:02:00.000Z"),
+          activeInterestDisposition: "withdraw",
+        },
+        updatedAt: timestamp("2026-08-09T10:02:00.000Z"),
+      }),
+      revisionReads: 1,
+    },
     {
       name: "restored marketing consent",
       current: active,
@@ -708,8 +899,11 @@ test("post-replay projection rejects well-formed higher revisions with illegal a
       verifyMutation: profileVerifierFor("PATCH", updateBody, CLEAR_COOKIE),
       repositoryFor: () => repository,
     });
+    const request = testCase.representation === "html"
+      ? formMutation(ALICE, profileFormEntries("PATCH", updateBody))
+      : jsonMutation("PATCH", ALICE, updateBody);
     const response = await harness.dispatch(
-      jsonMutation("PATCH", ALICE, updateBody),
+      request,
       {
         actor: alice,
         access: accessFromProfile(alice, testCase.current, "required"),
@@ -718,14 +912,19 @@ test("post-replay projection rejects well-formed higher revisions with illegal a
     assert.equal(response.status, 503, testCase.name);
     assertSingleCookie(response, CLEAR_COOKIE);
     assert.equal(response.headers.get(MUTATION_CSRF_HEADER), null);
+    assert.match(
+      response.headers.get("content-type") ?? "",
+      testCase.representation === "html" ? /^text\/html/iu : /json/iu,
+      testCase.name,
+    );
     assert.equal(currentCalls, 2, testCase.name);
-    assert.equal(revisionCalls, 2, testCase.name);
+    assert.equal(revisionCalls, testCase.revisionReads ?? 2, testCase.name);
     assert.equal(updateCalls, 1, testCase.name);
     assert.equal(harness.csrfCalls(), 0, testCase.name);
     assert.equal(harness.operationIdCalls(), 0, testCase.name);
     assert.doesNotMatch(
       await response.text(),
-      /Ancestry Result|Forbidden post-deletion|alice@provider/u,
+      /Ancestry Result|Compressed|Forbidden post-deletion|alice@provider/u,
       testCase.name,
     );
   }

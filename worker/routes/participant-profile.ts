@@ -478,7 +478,15 @@ function requireMutationAvailable(
   mutation: ProfileMutation,
 ): void {
   if (mutation.expectedRevision !== current.revision) return;
-  const available = new Set(participantProfileOperations(current.snapshot));
+  requireMutationAvailableFromBase(current, mutation);
+}
+
+function requireMutationAvailableFromBase(
+  base: ParticipantProfileSnapshot,
+  mutation: ProfileMutation,
+): void {
+  if (base.revision !== mutation.expectedRevision) unavailable();
+  const available = new Set(participantProfileOperations(base.snapshot));
   if (!available.has(mutation.kind)) conflict();
 }
 
@@ -633,6 +641,7 @@ function isParticipantProfileSnapshotDescendant(
   return isParticipantProfileDescendantProjection(
     ancestor.snapshot,
     descendant.snapshot,
+    descendant.revision - ancestor.revision,
   );
 }
 
@@ -971,6 +980,7 @@ async function profileMutationReplayContext(
         account,
         expectedRevision,
       );
+  requireMutationAvailableFromBase(base, mutation);
   const committed = current.revision <= expectedRevision
     ? null
     : current.revision === expectedRevision + 1

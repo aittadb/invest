@@ -231,15 +231,15 @@ test("descendant projections preserve irreversible profile history", () => {
     DELETION_AT,
   ).profile;
   assert.equal(
-    isParticipantProfileDescendantProjection(registered, updated),
+    isParticipantProfileDescendantProjection(registered, updated, 1),
     true,
   );
   assert.equal(
-    isParticipantProfileDescendantProjection(registered, deleted),
+    isParticipantProfileDescendantProjection(registered, deleted, 3),
     true,
   );
   assert.equal(
-    isParticipantProfileDescendantProjection(withdrawn, deleted),
+    isParticipantProfileDescendantProjection(withdrawn, deleted, 1),
     true,
   );
 
@@ -255,6 +255,7 @@ test("descendant projections preserve irreversible profile history", () => {
     isParticipantProfileDescendantProjection(
       deletionBeforeWithdrawal,
       withdrawalAfterDeletion,
+      1,
     ),
     true,
   );
@@ -328,8 +329,64 @@ test("descendant projections preserve irreversible profile history", () => {
   ];
   for (const { ancestor, descendant } of invalidDescendants) {
     assert.equal(
-      isParticipantProfileDescendantProjection(ancestor, descendant),
+      isParticipantProfileDescendantProjection(ancestor, descendant, 4),
       false,
+    );
+  }
+});
+
+test("descendant projections require separate revisions for distinct transitions", () => {
+  const registered = registeredProfile(true);
+  const updatedResult = updateParticipantProfile(
+    registered,
+    { displayName: "Updated participant" },
+    UPDATED_AT,
+  );
+  assert(updatedResult.ok);
+  const updated = updatedResult.value;
+  const editedAndWithdrawn = withdrawMarketingConsent(updated, WITHDRAWN_AT);
+  const editedAndDeleted = requestParticipantAccountDeletion(
+    updated,
+    WITHDRAWN_AT,
+  ).profile;
+  const withdrawnAndDeleted = requestParticipantAccountDeletion(
+    withdrawMarketingConsent(registered, UPDATED_AT),
+    WITHDRAWN_AT,
+  ).profile;
+  const editedWithdrawnAndDeleted = requestParticipantAccountDeletion(
+    editedAndWithdrawn,
+    DELETION_AT,
+  ).profile;
+
+  for (const { descendant, minimumDelta } of [
+    { descendant: editedAndWithdrawn, minimumDelta: 2 },
+    { descendant: editedAndDeleted, minimumDelta: 2 },
+    { descendant: withdrawnAndDeleted, minimumDelta: 2 },
+    { descendant: editedWithdrawnAndDeleted, minimumDelta: 3 },
+  ] as const) {
+    assert.equal(
+      isParticipantProfileDescendantProjection(
+        registered,
+        descendant,
+        minimumDelta - 1,
+      ),
+      false,
+    );
+    assert.equal(
+      isParticipantProfileDescendantProjection(
+        registered,
+        descendant,
+        minimumDelta,
+      ),
+      true,
+    );
+    assert.equal(
+      isParticipantProfileDescendantProjection(
+        registered,
+        descendant,
+        minimumDelta + 2,
+      ),
+      true,
     );
   }
 });
