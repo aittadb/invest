@@ -2255,10 +2255,11 @@ test("hosted participant profile self-service persists bounded actions across re
     ),
   ]);
   assert.deepEqual(updateResponses.map(({ status }) => status), [200, 200]);
-  for (const response of updateResponses) {
-    assert.equal(
-      (response.headers.get("set-cookie")?.match(/Max-Age=0/gu) ?? []).length,
-      1,
+  for (const [index, response] of updateResponses.entries()) {
+    assertProfileMutationCookieLifecycle(
+      response,
+      true,
+      [first, retry][index]?.cookie ?? null,
     );
     const document = await response.json() as ParticipantProfileDocument;
     assert.equal(document.data.revision, 2);
@@ -2293,11 +2294,7 @@ test("hosted participant profile self-service persists bounded actions across re
     }),
   );
   assert.equal(changedResponse.status, 409);
-  assert.equal(
-    (changedResponse.headers.get("set-cookie")?.match(/Max-Age=0/gu) ?? [])
-      .length,
-    1,
-  );
+  assertProfileMutationCookieLifecycle(changedResponse, false, changed.cookie);
   assert.doesNotMatch(
     await changedResponse.text(),
     /PRIVATE CHANGED RETRY VALUE|Hosted profile participant/u,
@@ -2315,10 +2312,7 @@ test("hosted participant profile self-service persists bounded actions across re
     }),
   );
   assert.equal(staleResponse.status, 412);
-  assert.equal(
-    (staleResponse.headers.get("set-cookie")?.match(/Max-Age=0/gu) ?? []).length,
-    1,
-  );
+  assertProfileMutationCookieLifecycle(staleResponse, false, stale.cookie);
   assert.doesNotMatch(await staleResponse.text(), /Updated hosted participant/u);
 
   const restartEpoch = Date.parse("2026-08-11T12:00:00.000Z");
@@ -2377,10 +2371,11 @@ test("hosted participant profile self-service persists bounded actions across re
     await withdrawalResponses[0]!.clone().text(),
     /<h1>Your profile<\/h1>/u,
   );
-  for (const response of withdrawalResponses) {
-    assert.equal(
-      (response.headers.get("set-cookie")?.match(/Max-Age=0/gu) ?? []).length,
-      1,
+  for (const [index, response] of withdrawalResponses.entries()) {
+    assertProfileMutationCookieLifecycle(
+      response,
+      true,
+      [afterUpdate, withdrawalRetry][index]?.cookie ?? null,
     );
   }
   const afterWithdrawal = await participantProfile(
@@ -2394,6 +2389,14 @@ test("hosted participant profile self-service persists bounded actions across re
     "request-account-deletion",
   ]);
 
+  const delayedHtmlProofReads = service.readRequests;
+  const delayedAfterWithdrawalHtmlProof = await participantProfile(
+    hostedPackageWorker(service, () => new Date(restartEpoch + 60_000)),
+    env,
+  );
+  assert.equal(service.readRequests, delayedHtmlProofReads + 9);
+
+  const delayedJsonReads = service.readRequests;
   const delayedAfterWithdrawalResponse = await submitProfile(
     hostedPackageWorker(service, () => new Date(restartEpoch + 60_000)),
     env,
@@ -2402,10 +2405,11 @@ test("hosted participant profile self-service persists bounded actions across re
     updateBody,
   );
   assert.equal(delayedAfterWithdrawalResponse.status, 200);
-  assert.equal(
-    (delayedAfterWithdrawalResponse.headers.get("set-cookie")
-      ?.match(/Max-Age=0/gu) ?? []).length,
-    1,
+  assert.equal(service.readRequests, delayedJsonReads + 17);
+  assertProfileMutationCookieLifecycle(
+    delayedAfterWithdrawalResponse,
+    true,
+    afterWithdrawal.cookie,
   );
   assert.notEqual(
     delayedAfterWithdrawalResponse.headers.get(MUTATION_CSRF_HEADER),
@@ -2419,6 +2423,45 @@ test("hosted participant profile self-service persists bounded actions across re
     "update-participant-profile",
     "request-account-deletion",
   ]);
+
+  const delayedHtmlReads = service.readRequests;
+  const delayedAfterWithdrawalHtmlResponse = await submitProfileForm(
+    hostedPackageWorker(service, () => new Date(restartEpoch + 60_000)),
+    env,
+    delayedAfterWithdrawalHtmlProof,
+    requiredAction(
+      delayedAfterWithdrawalHtmlProof.document,
+      "update-participant-profile",
+    ),
+    updateBody,
+  );
+  assert.equal(delayedAfterWithdrawalHtmlResponse.status, 200);
+  assert.equal(service.readRequests, delayedHtmlReads + 17);
+  assertProfileMutationCookieLifecycle(
+    delayedAfterWithdrawalHtmlResponse,
+    true,
+    delayedAfterWithdrawalHtmlProof.cookie,
+  );
+  assert.equal(
+    delayedAfterWithdrawalHtmlResponse.headers.get(MUTATION_CSRF_HEADER),
+    null,
+  );
+  const delayedAfterWithdrawalHtml =
+    await delayedAfterWithdrawalHtmlResponse.text();
+  assert.match(
+    delayedAfterWithdrawalHtml,
+    /<dt>Profile revision<\/dt>\s*<dd>3<\/dd>/u,
+  );
+  assert.deepEqual(
+    profileHtmlActionNames(delayedAfterWithdrawalHtml),
+    actionNames(delayedAfterWithdrawal),
+  );
+  const delayedAfterWithdrawalHtmlTokens = profileHtmlCsrfTokens(
+    delayedAfterWithdrawalHtml,
+  );
+  assert.equal(delayedAfterWithdrawalHtmlTokens.length, 2);
+  assert.equal(new Set(delayedAfterWithdrawalHtmlTokens).size, 1);
+  assert.ok(delayedAfterWithdrawalHtmlTokens[0]?.length);
   const historicalUpdate = await hostedParticipantRepository(service).revision(2);
   assert(historicalUpdate);
   assert.equal(historicalUpdate.snapshot.updatedAt, committedUpdateTimestamp);
@@ -2427,8 +2470,14 @@ test("hosted participant profile self-service persists bounded actions across re
     service,
     () => new Date(restartEpoch + 60_000),
   );
-  const [deletionFirst, deletionRetry, delayedAfterDeletionProof] =
+  const [
+    deletionFirst,
+    deletionRetry,
+    delayedAfterDeletionProof,
+    delayedAfterDeletionHtmlProof,
+  ] =
     await Promise.all([
+      participantProfile(deletionDiscoveryWorker, env),
       participantProfile(deletionDiscoveryWorker, env),
       participantProfile(deletionDiscoveryWorker, env),
       participantProfile(deletionDiscoveryWorker, env),
@@ -2468,10 +2517,11 @@ test("hosted participant profile self-service persists bounded actions across re
     ),
   ]);
   assert.deepEqual(deletionResponses.map(({ status }) => status), [200, 200]);
-  for (const response of deletionResponses) {
-    assert.equal(
-      (response.headers.get("set-cookie")?.match(/Max-Age=0/gu) ?? []).length,
-      1,
+  for (const [index, response] of deletionResponses.entries()) {
+    assertProfileMutationCookieLifecycle(
+      response,
+      false,
+      [deletionFirst, deletionRetry][index]?.cookie ?? null,
     );
   }
 
@@ -2479,6 +2529,7 @@ test("hosted participant profile self-service persists bounded actions across re
     ...recordsIn(service, "participant-profiles"),
     ...recordsIn(service, "participant-profile-revisions"),
   ]);
+  const delayedTerminalJsonReads = service.readRequests;
   const delayedAfterDeletionResponse = await submitProfile(
     deletionWorker,
     env,
@@ -2490,21 +2541,15 @@ test("hosted participant profile self-service persists bounded actions across re
     updateBody,
   );
   assert.equal(delayedAfterDeletionResponse.status, 200);
+  assert.equal(service.readRequests, delayedTerminalJsonReads + 17);
   assert.equal(
     delayedAfterDeletionResponse.headers.get(MUTATION_CSRF_HEADER),
     null,
   );
-  const delayedAfterDeletionSetCookie =
-    delayedAfterDeletionResponse.headers.get("set-cookie") ?? "";
-  assert.equal(
-    (delayedAfterDeletionSetCookie.match(/Max-Age=0/gu) ?? []).length,
-    1,
-  );
-  assert.equal(
-    (delayedAfterDeletionSetCookie.match(
-      /__Host-investor_app_mutation_/gu,
-    ) ?? []).length,
-    1,
+  assertProfileMutationCookieLifecycle(
+    delayedAfterDeletionResponse,
+    false,
+    delayedAfterDeletionProof.cookie,
   );
   const delayedAfterDeletion = await delayedAfterDeletionResponse.json() as
     ParticipantProfileDocument;
@@ -2512,6 +2557,36 @@ test("hosted participant profile self-service persists bounded actions across re
   assert.equal(delayedAfterDeletion.data.account_deletion_state, "requested");
   assert.equal(delayedAfterDeletion.data.marketing_consent_state, "withdrawn");
   assert.deepEqual(actionNames(delayedAfterDeletion), []);
+
+  const delayedTerminalHtmlReads = service.readRequests;
+  const delayedAfterDeletionHtmlResponse = await submitProfileForm(
+    deletionWorker,
+    env,
+    delayedAfterDeletionHtmlProof,
+    requiredAction(
+      delayedAfterDeletionHtmlProof.document,
+      "update-participant-profile",
+    ),
+    updateBody,
+  );
+  assert.equal(delayedAfterDeletionHtmlResponse.status, 200);
+  assert.equal(service.readRequests, delayedTerminalHtmlReads + 17);
+  assert.equal(
+    delayedAfterDeletionHtmlResponse.headers.get(MUTATION_CSRF_HEADER),
+    null,
+  );
+  assertProfileMutationCookieLifecycle(
+    delayedAfterDeletionHtmlResponse,
+    false,
+    delayedAfterDeletionHtmlProof.cookie,
+  );
+  const delayedAfterDeletionHtml = await delayedAfterDeletionHtmlResponse.text();
+  assert.match(
+    delayedAfterDeletionHtml,
+    /<dt>Profile revision<\/dt>\s*<dd>4<\/dd>/u,
+  );
+  assert.deepEqual(profileHtmlActionNames(delayedAfterDeletionHtml), []);
+  assert.deepEqual(profileHtmlCsrfTokens(delayedAfterDeletionHtml), []);
   assert.equal(
     JSON.stringify([
       ...recordsIn(service, "participant-profiles"),
@@ -4452,6 +4527,49 @@ function cookieHeader(setCookie: string): string {
   const value = setCookie.split(";", 1)[0];
   assert(value);
   return value;
+}
+
+function assertProfileMutationCookieLifecycle(
+  response: Response,
+  replacementExpected: boolean,
+  consumedCookie: string | null,
+): void {
+  assert(consumedCookie);
+  const separator = consumedCookie.indexOf("=");
+  assert.ok(separator > 0);
+  const consumedName = consumedCookie.slice(0, separator);
+  const setCookie = response.headers.get("set-cookie") ?? "";
+  assert.equal((setCookie.match(/Max-Age=0/gu) ?? []).length, 1);
+  assert.equal(
+    setCookie.split(`${consumedName}=`).length - 1,
+    1,
+  );
+  assert.match(
+    setCookie,
+    new RegExp(`${consumedName}=; Path=/; Max-Age=0;`, "u"),
+  );
+  assert.equal(
+    (setCookie.match(/__Host-investor_app_mutation_/gu) ?? []).length,
+    replacementExpected ? 2 : 1,
+  );
+  assert.equal(
+    (setCookie.match(/Max-Age=300/gu) ?? []).length,
+    replacementExpected ? 1 : 0,
+  );
+}
+
+function profileHtmlActionNames(html: string): string[] {
+  return [...html.matchAll(/\bdata-action-name="([^"]+)"/gu)]
+    .map((match) => match[1] ?? "");
+}
+
+function profileHtmlCsrfTokens(html: string): string[] {
+  return [...html.matchAll(
+    new RegExp(
+      `<input name="${MUTATION_CSRF_FIELD}" type="hidden" value="([^"]+)">`,
+      "gu",
+    ),
+  )].map((match) => match[1] ?? "");
 }
 
 function recordsIn(

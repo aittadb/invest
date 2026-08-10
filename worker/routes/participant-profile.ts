@@ -24,6 +24,7 @@ import {
   type ParticipantProfileOperationIds,
 } from "../../domain/participant-profile-resource.ts";
 import {
+  isParticipantProfileDescendantProjection,
   parseParticipantAccount,
   requestParticipantAccountDeletion,
   updateParticipantProfile,
@@ -607,16 +608,32 @@ function requireLatestProfileAfterMutation(
 ): ParticipantProfileSnapshot {
   const latest = requireOwnedCurrentProfile(value, account);
   if (
-    latest.revision < current.revision ||
-    latest.revision < result.revision ||
-    (latest.revision === current.revision &&
-      !sameParticipantProfile(latest.snapshot, current.snapshot)) ||
-    (latest.revision === result.revision &&
-      !sameParticipantProfile(latest.snapshot, result.snapshot))
+    !isParticipantProfileSnapshotDescendant(current, latest) ||
+    !isParticipantProfileSnapshotDescendant(result, latest)
   ) {
     unavailable();
   }
   return latest;
+}
+
+function isParticipantProfileSnapshotDescendant(
+  ancestor: Readonly<{ revision: number; snapshot: ParticipantProfile }>,
+  descendant: ParticipantProfileSnapshot,
+): boolean {
+  if (descendant.revision < ancestor.revision) return false;
+  if (descendant.revision === ancestor.revision) {
+    return sameParticipantProfile(descendant.snapshot, ancestor.snapshot);
+  }
+  if (
+    ancestor.snapshot.accountDeletionRequest.state === "requested" &&
+    descendant.revision !== ancestor.revision + 1
+  ) {
+    return false;
+  }
+  return isParticipantProfileDescendantProjection(
+    ancestor.snapshot,
+    descendant.snapshot,
+  );
 }
 
 function expectedProfileTransition(

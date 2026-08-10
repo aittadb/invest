@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   PARTICIPANT_PROFILE_FIELD_RULES,
+  isParticipantProfileDescendantProjection,
   parseParticipantAccount,
   registerParticipantProfile,
   requestParticipantAccountDeletion,
@@ -213,6 +214,124 @@ test("deletion requests produce a retry-stable active-interest withdrawal intent
   const retry = requestParticipantAccountDeletion(transition.profile, WITHDRAWN_AT);
   assert.equal(retry.profile, transition.profile);
   assert.deepEqual(retry.intents, transition.intents);
+});
+
+test("descendant projections preserve irreversible profile history", () => {
+  const registered = registeredProfile(true);
+  const updatedResult = updateParticipantProfile(
+    registered,
+    { displayName: "Updated participant" },
+    UPDATED_AT,
+  );
+  assert(updatedResult.ok);
+  const updated = updatedResult.value;
+  const withdrawn = withdrawMarketingConsent(updated, WITHDRAWN_AT);
+  const deleted = requestParticipantAccountDeletion(
+    withdrawn,
+    DELETION_AT,
+  ).profile;
+  assert.equal(
+    isParticipantProfileDescendantProjection(registered, updated),
+    true,
+  );
+  assert.equal(
+    isParticipantProfileDescendantProjection(registered, deleted),
+    true,
+  );
+  assert.equal(
+    isParticipantProfileDescendantProjection(withdrawn, deleted),
+    true,
+  );
+
+  const deletionBeforeWithdrawal = requestParticipantAccountDeletion(
+    updated,
+    WITHDRAWN_AT,
+  ).profile;
+  const withdrawalAfterDeletion = withdrawMarketingConsent(
+    deletionBeforeWithdrawal,
+    DELETION_AT,
+  );
+  assert.equal(
+    isParticipantProfileDescendantProjection(
+      deletionBeforeWithdrawal,
+      withdrawalAfterDeletion,
+    ),
+    true,
+  );
+
+  const laterUpdateResult = updateParticipantProfile(
+    withdrawn,
+    { displayName: "Later participant" },
+    DELETION_AT,
+  );
+  assert(laterUpdateResult.ok);
+  const invalidDescendants: readonly Readonly<{
+    ancestor: ParticipantProfile;
+    descendant: ParticipantProfile;
+  }>[] = [
+    {
+      ancestor: withdrawn,
+      descendant: {
+        ...withdrawn,
+        marketingConsent: registered.marketingConsent,
+        updatedAt: DELETION_AT,
+      },
+    },
+    {
+      ancestor: deleted,
+      descendant: {
+        ...deleted,
+        accountDeletionRequest: { state: "not-requested" },
+      },
+    },
+    {
+      ancestor: withdrawn,
+      descendant: {
+        ...withdrawn,
+        registeredAt: UPDATED_AT,
+        processEmailNoticeAcknowledgedAt: UPDATED_AT,
+        marketingConsent: {
+          state: "withdrawn",
+          grantedAt: UPDATED_AT,
+          withdrawnAt: WITHDRAWN_AT,
+        },
+        updatedAt: DELETION_AT,
+      },
+    },
+    {
+      ancestor: laterUpdateResult.value,
+      descendant: {
+        ...laterUpdateResult.value,
+        updatedAt: WITHDRAWN_AT,
+      },
+    },
+    {
+      ancestor: withdrawn,
+      descendant: {
+        ...withdrawn,
+        marketingConsent: {
+          state: "withdrawn",
+          grantedAt: REGISTERED_AT,
+          withdrawnAt: DELETION_AT,
+        },
+        updatedAt: DELETION_AT,
+      },
+    },
+    {
+      ancestor: deleted,
+      descendant: {
+        ...deleted,
+        displayName: "Edit after deletion",
+        updatedAt: timestamp("2026-01-05T00:00:00.000Z"),
+      },
+    },
+  ];
+  for (const { ancestor, descendant } of invalidDescendants) {
+    assert.equal(
+      isParticipantProfileDescendantProjection(ancestor, descendant),
+      false,
+    );
+  }
 });
 
 function registeredProfile(marketingConsent: boolean): ParticipantProfile {

@@ -341,6 +341,104 @@ export function requestParticipantAccountDeletion(
   };
 }
 
+/**
+ * Proves that a later profile can result from the participant operations that
+ * remain available after an already-validated ancestor snapshot.
+ */
+export function isParticipantProfileDescendantProjection(
+  ancestor: ParticipantProfile,
+  descendant: ParticipantProfile,
+): boolean {
+  if (
+    descendant.subject !== ancestor.subject ||
+    descendant.accountEmailLabel !== ancestor.accountEmailLabel ||
+    descendant.processEmailNoticeAcknowledgedAt !==
+      ancestor.processEmailNoticeAcknowledgedAt ||
+    descendant.registeredAt !== ancestor.registeredAt ||
+    descendant.updatedAt < ancestor.updatedAt ||
+    !isMarketingConsentDescendant(
+      ancestor.marketingConsent,
+      descendant.marketingConsent,
+      ancestor.updatedAt,
+    ) ||
+    !isDeletionRequestDescendant(
+      ancestor.accountDeletionRequest,
+      descendant.accountDeletionRequest,
+      ancestor.updatedAt,
+    )
+  ) {
+    return false;
+  }
+
+  if (ancestor.accountDeletionRequest.state === "requested") {
+    return sameEditableProfileFields(ancestor, descendant) &&
+      ancestor.marketingConsent.state === "granted" &&
+      descendant.marketingConsent.state === "withdrawn" &&
+      descendant.updatedAt === descendant.marketingConsent.withdrawnAt;
+  }
+
+  if (descendant.accountDeletionRequest.state === "requested") {
+    const marketingAt = descendant.marketingConsent.state === "withdrawn"
+      ? descendant.marketingConsent.withdrawnAt
+      : descendant.registeredAt;
+    const latestIrreversibleAt =
+      descendant.accountDeletionRequest.requestedAt > marketingAt
+        ? descendant.accountDeletionRequest.requestedAt
+        : marketingAt;
+    if (descendant.updatedAt !== latestIrreversibleAt) return false;
+  }
+
+  return true;
+}
+
+function isMarketingConsentDescendant(
+  ancestor: MarketingConsent,
+  descendant: MarketingConsent,
+  ancestorUpdatedAt: Timestamp,
+): boolean {
+  if (ancestor.state === "not-granted") {
+    return descendant.state === "not-granted" ||
+      (descendant.state === "withdrawn" &&
+        descendant.grantedAt === undefined &&
+        descendant.withdrawnAt >= ancestorUpdatedAt);
+  }
+  if (ancestor.state === "granted") {
+    return descendant.state === "granted"
+      ? descendant.grantedAt === ancestor.grantedAt
+      : descendant.state === "withdrawn" &&
+        descendant.grantedAt === ancestor.grantedAt &&
+        descendant.withdrawnAt >= ancestorUpdatedAt;
+  }
+  return descendant.state === "withdrawn" &&
+    descendant.grantedAt === ancestor.grantedAt &&
+    descendant.withdrawnAt === ancestor.withdrawnAt;
+}
+
+function isDeletionRequestDescendant(
+  ancestor: AccountDeletionRequestState,
+  descendant: AccountDeletionRequestState,
+  ancestorUpdatedAt: Timestamp,
+): boolean {
+  if (ancestor.state === "not-requested") {
+    return descendant.state === "not-requested" ||
+      (descendant.state === "requested" &&
+        descendant.requestedAt >= ancestorUpdatedAt);
+  }
+  return descendant.state === "requested" &&
+    descendant.requestedAt === ancestor.requestedAt &&
+    descendant.activeInterestDisposition === ancestor.activeInterestDisposition;
+}
+
+function sameEditableProfileFields(
+  left: ParticipantProfile,
+  right: ParticipantProfile,
+): boolean {
+  return left.displayName === right.displayName &&
+    left.country === right.country &&
+    left.declaredInterest === right.declaredInterest &&
+    left.participationContext === right.participationContext;
+}
+
 function parseAccountEmailLabel(
   value: unknown,
 ): ValidationResult<AccountEmailLabel> {
