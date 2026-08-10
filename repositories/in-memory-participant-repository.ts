@@ -152,6 +152,7 @@ export type RequestParticipantDeletionRequest = Readonly<{
 /** Narrow subject-owned profile, consent, and deletion-intent persistence API. */
 export interface ParticipantRepository {
   current(): Promise<ParticipantProfileSnapshot | null>;
+  revision(revision: number): Promise<ParticipantProfileSnapshot | null>;
   register(
     request: RegisterParticipantRequest,
   ): Promise<ParticipantProfileMutationResult>;
@@ -248,6 +249,24 @@ export class StorageParticipantRepository
       }
     }
     return current;
+  }
+
+  async revision(revision: number): Promise<ParticipantProfileSnapshot | null> {
+    const account = this.#account;
+    if (account === null) return null;
+    const expectedRevision = requiredRevision(revision);
+    const key = await participantProfileRevisionKey(
+      account.subject,
+      expectedRevision,
+    );
+    const record = await storageRead(this.#storage, key);
+    if (record === null) return null;
+    return decodeHistoricalParticipantRecord(
+      record,
+      key,
+      account.subject,
+      expectedRevision,
+    );
   }
 
   async register(
@@ -459,16 +478,8 @@ export class StorageParticipantRepository
   async #requireMutationBase(
     revision: number,
   ): Promise<VerifiedParticipantMutationBase> {
-    const account = this.#requireAccount();
-    const key = await participantProfileRevisionKey(account.subject, revision);
-    const record = await storageRead(this.#storage, key);
-    if (record === null) notFound();
-    const decoded = decodeHistoricalParticipantRecord(
-      record,
-      key,
-      account.subject,
-      revision,
-    );
+    this.#requireAccount();
+    const decoded = await this.revision(revision);
     if (decoded === null) notFound();
 
     const current = await this.current();

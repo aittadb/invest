@@ -354,6 +354,23 @@ test("profile mutations preserve exact retries and reject changed or stale opera
   );
   assert.equal(harness.nowCalls(), 2);
 
+  const delayedReplay = await harness.dispatch(
+    jsonMutation("PATCH", ALICE, updateBody),
+    { actor: alice },
+  );
+  assert.equal(delayedReplay.status, 200);
+  assert.equal(resourceData(await jsonDocument(delayedReplay)).revision, 2);
+  assert.equal(harness.nowCalls(), 2);
+  const delayedChangedRetry = await harness.dispatch(
+    jsonMutation("PATCH", ALICE, {
+      ...updateBody,
+      "display-name": "Changed delayed private retry value",
+    }),
+    { actor: alice },
+  );
+  assert.equal(delayedChangedRetry.status, 409);
+  assert.equal(harness.nowCalls(), 2);
+
   const deletionBody = {
     "operation-id": "participant-profile-operation:retry-deletion",
     "expected-revision": 3,
@@ -536,6 +553,10 @@ test("malformed persisted profile state fails before every mutation method", asy
   };
   const repository: ParticipantRepository = {
     current: async () => ({
+      revision: current.revision,
+      snapshot: malformedProfile,
+    }),
+    revision: async () => ({
       revision: current.revision,
       snapshot: malformedProfile,
     }),

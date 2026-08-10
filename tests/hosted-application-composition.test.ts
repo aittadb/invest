@@ -2339,7 +2339,7 @@ test("hosted participant profile self-service persists bounded actions across re
     "withdraw-marketing-consent",
   );
   const withdrawalResponses = await Promise.all([
-    submitProfile(
+    submitProfileForm(
       restarted,
       env,
       afterUpdate,
@@ -2367,6 +2367,14 @@ test("hosted participant profile self-service persists bounded actions across re
         withdrawalResponses.map((response) => response.clone().text()),
       ),
     }),
+  );
+  assert.match(
+    withdrawalResponses[0]?.headers.get("content-type") ?? "",
+    /^text\/html/iu,
+  );
+  assert.match(
+    await withdrawalResponses[0]!.clone().text(),
+    /<h1>Your profile<\/h1>/u,
   );
   for (const response of withdrawalResponses) {
     assert.equal(
@@ -4118,6 +4126,46 @@ async function submitProfile(
         "oai-authenticated-user-email": PARTICIPANT_EMAIL,
       },
       body: JSON.stringify(body),
+    }),
+    env,
+    executionContext,
+  );
+}
+
+async function submitProfileForm(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  resource: ParticipantProfileResponse,
+  action: TestAction,
+  body: Readonly<Record<string, unknown>>,
+): Promise<Response> {
+  assert(resource.csrfToken);
+  assert(resource.cookie);
+  const fields = new URLSearchParams();
+  fields.append(MUTATION_CSRF_FIELD, resource.csrfToken);
+  if (action.method !== "POST") {
+    fields.append(MUTATION_METHOD_FIELD, action.method);
+  }
+  for (const [name, value] of Object.entries(body)) {
+    assert(
+      typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean",
+    );
+    fields.append(name, String(value));
+  }
+  return worker.fetch(
+    new Request(action.href, {
+      method: "POST",
+      headers: {
+        accept: "text/html",
+        "content-type": "application/x-www-form-urlencoded",
+        cookie: resource.cookie,
+        origin: APP_ORIGIN,
+        "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+        "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+      },
+      body: fields,
     }),
     env,
     executionContext,

@@ -18,7 +18,9 @@ import {
   type VerifiedMutationRequest,
 } from "./mutation-security.ts";
 
-const COOKIE_HEADER_MAX_LENGTH = 65_536;
+const COOKIE_HEADER_UNKNOWN_MAX_LENGTH = 8_192;
+const COOKIE_HEADER_ABSOLUTE_MAX_LENGTH = 524_288;
+const COOKIE_HEADER_PROOF_MAX_COUNT = 256;
 const COOKIE_PAIR_MAX_COUNT = 128;
 const COOKIE_PAIR_MAX_LENGTH = 4_096;
 const COOKIE_VALUE_MAX_LENGTH = 2_048;
@@ -206,6 +208,7 @@ export function createBrowserMutationSession(
       const cookie = findSessionCookie(
         request.headers.get("cookie"),
         cookieName,
+        config.cookiePrefix,
       );
       if (cookie.kind !== "value") rejectRequest();
 
@@ -639,45 +642,75 @@ function isCapabilityId(value: string): boolean {
 function findSessionCookie(
   header: string | null,
   cookieName: string,
+  cookiePrefix: string,
 ): CookieLookup {
   if (header === null) return Object.freeze({ kind: "missing" });
-  if (header.length > COOKIE_HEADER_MAX_LENGTH) {
+  if (header.length > COOKIE_HEADER_ABSOLUTE_MAX_LENGTH) {
     return Object.freeze({ kind: "invalid" });
   }
 
-  const values: string[] = [];
   let pairCount = 0;
-  let offset = 0;
-  while (offset <= header.length) {
+  let targetCount = 0;
+  let targetValue: string | undefined;
+  let proofCount = 0;
+  let unknownLength = 0;
+  let start = 0;
+
+  while (start <= header.length) {
     pairCount += 1;
-    const delimiter = header.indexOf(";", offset);
-    const end = delimiter < 0 ? header.length : delimiter;
+    const foundSeparator = header.indexOf(";", start);
+    const end = foundSeparator < 0 ? header.length : foundSeparator;
     if (
       pairCount > COOKIE_PAIR_MAX_COUNT ||
-      end - offset > COOKIE_PAIR_MAX_LENGTH
+      end - start > COOKIE_PAIR_MAX_LENGTH
     ) {
       return Object.freeze({ kind: "invalid" });
     }
-    const raw = header.slice(offset, end);
+    const raw = header.slice(start, end);
     const part = raw.trim();
     const separator = part.indexOf("=");
-    if (separator >= 1 && part.slice(0, separator) === cookieName) {
-      values.push(part.slice(separator + 1));
+    const name = separator < 1 ? "" : part.slice(0, separator);
+    const value = separator < 1 ? "" : part.slice(separator + 1);
+
+    if (name === cookieName) {
+      targetCount += 1;
+      targetValue = value;
     }
-    if (delimiter < 0) break;
-    offset = delimiter + 1;
+
+    const capabilityId = name.startsWith(cookiePrefix)
+      ? name.slice(cookiePrefix.length)
+      : "";
+    const isProofCookie =
+      separator > 0 &&
+      isCapabilityId(capabilityId) &&
+      isEncryptedCookieValue(value);
+    if (isProofCookie) {
+      proofCount += 1;
+      if (proofCount > COOKIE_HEADER_PROOF_MAX_COUNT) {
+        return Object.freeze({ kind: "invalid" });
+      }
+    } else {
+      unknownLength += raw.length + (foundSeparator < 0 ? 0 : 1);
+      if (unknownLength > COOKIE_HEADER_UNKNOWN_MAX_LENGTH) {
+        return Object.freeze({ kind: "invalid" });
+      }
+    }
+
+    if (foundSeparator < 0) break;
+    start = end + 1;
   }
-  if (values.length === 0) return Object.freeze({ kind: "missing" });
-  const value = values[0];
-  if (
-    values.length !== 1 ||
-    !value ||
-    value.length > COOKIE_VALUE_MAX_LENGTH ||
-    !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value)
-  ) {
+
+  if (targetCount === 0) return Object.freeze({ kind: "missing" });
+  if (targetCount !== 1 || !isEncryptedCookieValue(targetValue ?? "")) {
     return Object.freeze({ kind: "invalid" });
   }
-  return Object.freeze({ kind: "value", value });
+  return Object.freeze({ kind: "value", value: targetValue as string });
+}
+
+function isEncryptedCookieValue(value: string): boolean {
+  return value.length > 0 &&
+    value.length <= COOKIE_VALUE_MAX_LENGTH &&
+    /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
 }
 
 function sessionCookieName(

@@ -431,6 +431,43 @@ test("a valid target proof survives many accumulated valid proof cookies", async
   assert.equal(harness.claims.claimed.size, 1);
 });
 
+test("many outstanding app proofs do not deny an independently valid form", async () => {
+  const harness = await configuredHarness();
+  const proofs: BrowserMutationProof[] = [];
+  for (let index = 0; index < 64; index += 1) {
+    proofs.push(await issue(harness.session));
+  }
+  const browserCookies = proofs.map(cookieHeader).join("; ");
+  assert(browserCookies.length > 8_192);
+
+  const first = proofs[0];
+  const last = proofs.at(-1);
+  assert(first);
+  assert(last);
+  const results = await Promise.all([
+    harness.session.verifyMutation(
+      jsonRequest(first, { action: "first" }, "POST", {
+        cookie: browserCookies,
+      }),
+      PARTICIPANT,
+      APP_ORIGIN,
+    ),
+    harness.session.verifyMutation(
+      formRequest(last, {
+        cookie: browserCookies,
+        body: { action: "last" },
+      }),
+      PARTICIPANT,
+      APP_ORIGIN,
+    ),
+  ]);
+  assert.deepEqual(results.map((result) => result.body.action).sort(), [
+    "first",
+    "last",
+  ]);
+  assert.equal(harness.claims.claimed.size, 2);
+});
+
 test("malformed and oversized requests fail closed without consuming proof", async () => {
   const harness = await configuredHarness({ maxBodyBytes: 192 });
   const jsonProof = await issue(harness.session);

@@ -522,6 +522,7 @@ test("concurrent exact registration retries preserve the first server timestamp"
           }
           return current;
         },
+        revision: (revision) => repository.revision(revision),
         register: (request) => repository.register(request),
         recoverRegistration: (request) => repository.recoverRegistration(request),
         update: (request) => repository.update(request),
@@ -1387,6 +1388,9 @@ function renderingFailureRepository(
   });
   return {
     async current() {
+      return null;
+    },
+    async revision() {
       return null;
     },
     async register() {

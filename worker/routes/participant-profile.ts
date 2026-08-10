@@ -281,6 +281,7 @@ export function createParticipantProfileRouteHandler(
       requireMutationResult(
         applied.result,
         current,
+        applied.base,
         mutation,
         applied.occurredAt,
         authorized.account,
@@ -507,6 +508,7 @@ async function applyMutation(
 type AppliedProfileMutation = Readonly<{
   result: ParticipantProfileMutationResult;
   occurredAt: Timestamp;
+  base: ParticipantProfileSnapshot;
 }>;
 
 async function applyMutationWithReplayRecovery(
@@ -516,15 +518,21 @@ async function applyMutationWithReplayRecovery(
   current: ParticipantProfileSnapshot,
   now: () => Date,
 ): Promise<AppliedProfileMutation> {
-  const occurredAt = mutationTimestamp(
+  const replayContext = await profileMutationReplayContext(
+    repository,
+    account,
+    mutation,
     current,
-    mutation.expectedRevision,
     now,
   );
   try {
     return Object.freeze({
-      result: await applyMutation(repository, mutation, occurredAt),
-      occurredAt,
+      result: await applyMutation(
+        repository,
+        mutation,
+        replayContext.occurredAt,
+      ),
+      ...replayContext,
     });
   } catch (error) {
     if (
@@ -538,15 +546,21 @@ async function applyMutationWithReplayRecovery(
       await repository.current(),
       account,
     );
-    if (replay.revision !== mutation.expectedRevision + 1) throw error;
-    const replayedAt = mutationTimestamp(
+    if (replay.revision <= mutation.expectedRevision) throw error;
+    const recovered = await profileMutationReplayContext(
+      repository,
+      account,
+      mutation,
       replay,
-      mutation.expectedRevision,
       now,
     );
     return Object.freeze({
-      result: await applyMutation(repository, mutation, replayedAt),
-      occurredAt: replayedAt,
+      result: await applyMutation(
+        repository,
+        mutation,
+        recovered.occurredAt,
+      ),
+      ...recovered,
     });
   }
 }
@@ -554,6 +568,7 @@ async function applyMutationWithReplayRecovery(
 function requireMutationResult(
   result: ParticipantProfileMutationResult,
   current: ParticipantProfileSnapshot,
+  base: ParticipantProfileSnapshot,
   mutation: ProfileMutation,
   occurredAt: Timestamp,
   account: ParticipantAccount,
@@ -562,6 +577,7 @@ function requireMutationResult(
     typeof result.replayed !== "boolean" ||
     !Number.isSafeInteger(result.revision) ||
     result.revision !== mutation.expectedRevision + 1 ||
+    base.revision !== mutation.expectedRevision ||
     !Array.isArray(result.intents) ||
     result.snapshot.updatedAt !== occurredAt ||
     !result.replayed && current.revision !== mutation.expectedRevision
@@ -570,7 +586,7 @@ function requireMutationResult(
   }
   requireOwnedProfile(result.snapshot, account);
   const expected = expectedProfileTransition(
-    current.snapshot,
+    base.snapshot,
     mutation,
     occurredAt,
   );
@@ -832,6 +848,7 @@ function requiredRepository(
     typeof repository !== "object" ||
     repository === null ||
     typeof repository.current !== "function" ||
+    typeof repository.revision !== "function" ||
     typeof repository.update !== "function" ||
     typeof repository.withdrawMarketingConsent !== "function" ||
     typeof repository.requestAccountDeletion !== "function"
@@ -896,17 +913,55 @@ function acknowledgmentState(
       });
 }
 
-function mutationTimestamp(
+async function profileMutationReplayContext(
+  repository: ParticipantRepository,
+  account: ParticipantAccount,
+  mutation: ProfileMutation,
   current: ParticipantProfileSnapshot,
-  expectedRevision: number,
   now: () => Date,
-): Timestamp {
-  if (current.revision === expectedRevision + 1) {
-    const parsed = parseTimestamp(current.snapshot.updatedAt);
-    if (!parsed.ok) unavailable();
-    return parsed.value;
-  }
-  return currentTimestamp(now);
+): Promise<Readonly<{
+  base: ParticipantProfileSnapshot;
+  occurredAt: Timestamp;
+}>> {
+  const expectedRevision = mutation.expectedRevision;
+  const base = current.revision === expectedRevision
+    ? current
+    : requireOwnedProfileRevision(
+        await repository.revision(expectedRevision),
+        account,
+        expectedRevision,
+      );
+  const committed = current.revision <= expectedRevision
+    ? null
+    : current.revision === expectedRevision + 1
+    ? current
+    : requireOwnedProfileRevision(
+        await repository.revision(expectedRevision + 1),
+        account,
+        expectedRevision + 1,
+      );
+  return Object.freeze({
+    base,
+    occurredAt: committed === null
+      ? currentTimestamp(now)
+      : profileUpdatedAt(committed),
+  });
+}
+
+function requireOwnedProfileRevision(
+  value: ParticipantProfileSnapshot | null,
+  account: ParticipantAccount,
+  revision: number,
+): ParticipantProfileSnapshot {
+  const snapshot = requireOwnedCurrentProfile(value, account);
+  if (snapshot.revision !== revision) unavailable();
+  return snapshot;
+}
+
+function profileUpdatedAt(profile: ParticipantProfileSnapshot): Timestamp {
+  const parsed = parseTimestamp(profile.snapshot.updatedAt);
+  if (!parsed.ok) unavailable();
+  return parsed.value;
 }
 
 function currentTimestamp(now: () => Date): Timestamp {
