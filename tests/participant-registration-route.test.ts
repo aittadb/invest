@@ -321,6 +321,66 @@ test("registration preserves exact repository replay and duplicate behavior", as
   assert.equal(harness.nowCalls(), 1);
 });
 
+test("concurrent exact registration retries preserve the first server timestamp", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  let waiting = 0;
+  let release!: () => void;
+  const bothReadMissing = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const harness = await createHarness({
+    repositoryFor(account) {
+      const repository = new DevelopmentInMemoryParticipantRepository(
+        storage,
+        account,
+      );
+      return {
+        async current() {
+          const current = await repository.current();
+          if (current === null) {
+            waiting += 1;
+            if (waiting === 2) release();
+            await bothReadMissing;
+          }
+          return current;
+        },
+        register: (request) => repository.register(request),
+        update: (request) => repository.update(request),
+        withdrawMarketingConsent: (request) =>
+          repository.withdrawMarketingConsent(request),
+        requestAccountDeletion: (request) =>
+          repository.requestAccountDeletion(request),
+        pendingDeletionIntent: () => repository.pendingDeletionIntent(),
+      };
+    },
+  });
+  const alice = participant(ALICE, "alice@provider.example");
+  const body = registrationBody(
+    "participant-operation:concurrent-exact-registration",
+  );
+
+  const responses = await Promise.all([
+    harness.dispatch(jsonMutation(ALICE, body), alice),
+    harness.dispatch(jsonMutation(ALICE, body), alice),
+  ]);
+  assert.deepEqual(
+    responses.map(({ status }) => status).sort((left, right) => left - right),
+    [200, 201],
+  );
+  assert.equal(harness.nowCalls(), 2);
+  const current = await harness.profile(alice);
+  assert(current);
+  assert.equal(current.revision, 1);
+  assert.equal(
+    [
+      "2026-08-09T10:00:00.000Z",
+      "2026-08-09T10:01:00.000Z",
+    ].includes(current.snapshot.registeredAt),
+    true,
+  );
+});
+
 test("registration enforces non-owner identity, exact origin, CSRF, bounds, fields, and negotiation", async () => {
   const harness = await createHarness();
   const alice = participant(ALICE, "alice@provider.example");
@@ -661,6 +721,45 @@ test("pre-verification failures do not clear a hosted proof cookie", async () =>
   const response = await harness.dispatch(postRequest(ALICE), alice);
   assert.equal(response.status, 403);
   assert.equal(response.headers.get("set-cookie"), null);
+});
+
+test("hosted verification requires one valid cookie-clearing instruction", async () => {
+  const alice = participant(ALICE, "alice@provider.example");
+  for (const [name, clearCookie] of [
+    ["missing", undefined],
+    ["malformed", "bad\r\nclear-cookie"],
+  ] as const) {
+    let repositoryCalls = 0;
+    const verified = await verifierFor(
+      registrationBody(`participant-operation:hosted-clear-${name}`),
+      CLEAR_COOKIE,
+    )(postRequest(ALICE));
+    const harness = await createHarness({
+      verifyMutation: (async () => {
+        if (clearCookie === undefined) {
+          return {
+            actor: verified.actor,
+            method: verified.method,
+            mediaType: verified.mediaType,
+            body: verified.body,
+          } as never;
+        }
+        return { ...verified, clearCookie } as never;
+      }) as ParticipantRegistrationMutationVerifier,
+      repositoryFor(account) {
+        repositoryCalls += 1;
+        return new DevelopmentInMemoryParticipantRepository(
+          new MemoryStorageAdapter(),
+          account,
+        );
+      },
+    });
+
+    const response = await harness.dispatch(postRequest(ALICE), alice);
+    assert.equal(response.status, 503, name);
+    assert.equal(response.headers.get("set-cookie"), null, name);
+    assert.equal(repositoryCalls, 0, name);
+  }
 });
 
 test("hosted registration limits reject bodies, field counts, and repeats before replay or persistence", async () => {

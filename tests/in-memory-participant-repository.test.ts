@@ -238,6 +238,12 @@ test("operation IDs replay exactly and reject changed retries or stale writes", 
   assert.equal(firstReplay.replayed, true);
   assert.equal(firstReplay.revision, 1);
   assert.deepEqual(firstReplay.snapshot, first.snapshot);
+  const timestampReplay = await repository.register({
+    ...registration,
+    registeredAt: UPDATED_AT,
+  });
+  assert.equal(timestampReplay.replayed, true);
+  assert.equal(timestampReplay.snapshot.registeredAt, REGISTERED_AT);
 
   await rejectsStorage(
     () => repository.register({

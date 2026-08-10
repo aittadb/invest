@@ -215,7 +215,6 @@ export class StorageParticipantRepository implements ParticipantRepository {
 
     const requestHash = await hashMutationRequest({
       action: "register",
-      registeredAt,
       registration: request.registration,
     });
     return this.#persist(
@@ -404,23 +403,41 @@ export class StorageParticipantRepository implements ParticipantRepository {
         );
       }
     }
-    const result = await storageTransact(this.#storage, {
-      operationId,
-      mutations: [
-        {
-          type: "put",
-          key,
-          expectedRevision,
-          value,
-        },
-        {
-          type: "put",
-          key: historyKey,
-          expectedRevision: null,
-          value,
-        },
-      ],
-    });
+    let result: unknown;
+    try {
+      result = await storageTransact(this.#storage, {
+        operationId,
+        mutations: [
+          {
+            type: "put",
+            key,
+            expectedRevision,
+            value,
+          },
+          {
+            type: "put",
+            key: historyKey,
+            expectedRevision: null,
+            value,
+          },
+        ],
+      });
+    } catch (error) {
+      if (
+        expectedRevision === null &&
+        action === "register" &&
+        isReplayConflict(error)
+      ) {
+        return this.#recoverRegistrationReplay(
+          historyKey,
+          account.subject,
+          operationId,
+          requestHash,
+          error.code,
+        );
+      }
+      throw error;
+    }
     const verified = verifyParticipantTransactionResult(result, [
       { key, revision: nextRevision, value },
       { key: historyKey, revision: 1, value },
@@ -481,6 +498,35 @@ export class StorageParticipantRepository implements ParticipantRepository {
     ) {
       throw new StorageFailure("CONFLICT");
     }
+  }
+
+  async #recoverRegistrationReplay(
+    historyKey: StorageKey,
+    subject: ActorSubject,
+    operationId: StorageOperationId,
+    requestHash: string,
+    fallbackCode: "CONFLICT" | "PRECONDITION_FAILED",
+  ): Promise<ParticipantProfileMutationResult> {
+    const record = await storageRead(this.#storage, historyKey);
+    if (record === null) throw new StorageFailure(fallbackCode);
+    const replay = decodeHistoricalParticipantRecord(
+      record,
+      historyKey,
+      subject,
+      1,
+    );
+    if (replay === null) unavailable();
+
+    const evidence = participantMutationEvidence(
+      snapshotStorageRecord(record).value,
+    );
+    if (evidence.operationId !== operationId) {
+      throw new StorageFailure("CONFLICT");
+    }
+    if (evidence.action !== "register" || evidence.requestHash !== requestHash) {
+      throw new StorageFailure("CONFLICT");
+    }
+    return mutationResult(replay.revision, replay.snapshot, true, []);
   }
 }
 
@@ -1319,4 +1365,11 @@ function sanitizedAdapterFailure(error: unknown): never {
     code = "UNAVAILABLE";
   }
   throw new StorageFailure(code);
+}
+
+function isReplayConflict(error: unknown): error is StorageFailure & Readonly<{
+  code: "CONFLICT" | "PRECONDITION_FAILED";
+}> {
+  return error instanceof StorageFailure &&
+    (error.code === "CONFLICT" || error.code === "PRECONDITION_FAILED");
 }

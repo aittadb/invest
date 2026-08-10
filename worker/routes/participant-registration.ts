@@ -91,7 +91,7 @@ export type ParticipantRegistrationCsrfTokenProvider = (
 export type ParticipantRegistrationMutationVerifier = (
   request: Request,
 ) => Promise<
-  VerifiedMutationRequest & Readonly<{ clearCookie?: string }>
+  VerifiedMutationRequest & Readonly<{ clearCookie: string }>
 >;
 
 export type ParticipantRegistrationRouteDependencies = Readonly<{
@@ -122,8 +122,11 @@ export function createParticipantRegistrationRouteHandler(
   if (typeof now !== "function" || typeof createOperationId !== "function") {
     throw new Error("Invalid participant-registration route configuration.");
   }
-  const mutationGuard: ParticipantRegistrationMutationVerifier =
-    dependencies.verifyMutation ??
+  const hostedMutationVerifier = dependencies.verifyMutation;
+  const mutationGuard: (
+    request: Request,
+  ) => Promise<VerifiedMutationRequest & Readonly<{ clearCookie?: string }>> =
+    hostedMutationVerifier ??
     createBrowserMutationGuard({
       ...(dependencies.mutationSecurity as BrowserMutationGuardOptions),
       maxBodyBytes: MAX_REGISTRATION_MUTATION_BYTES,
@@ -192,9 +195,12 @@ export function createParticipantRegistrationRouteHandler(
     let clearCookie: string | null = null;
     try {
       const verified = await mutationGuard(context.request);
-      clearCookie = validSetCookie(verified.clearCookie)
-        ? verified.clearCookie
-        : null;
+      if (hostedMutationVerifier !== undefined) {
+        if (!validSetCookie(verified.clearCookie)) {
+          throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+        }
+        clearCookie = verified.clearCookie;
+      }
       assertExactResourceOrigin(context.request, context.resourceUrl);
       const account = requiredParticipantAccount(context);
       if (
