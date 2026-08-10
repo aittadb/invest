@@ -177,7 +177,12 @@ export function createApplicationWorker(
         ? await resolveOwnerCampaign(campaignWorkspace, publicCampaign)
         : publicCampaign;
       const participantAccessReader = dependencies.participantAccessReader ??
-        runtimeParticipantAccessReader(applicationRuntime, actor, isOwner);
+        runtimeParticipantAccessReader(
+          applicationRuntime,
+          actor,
+          isOwner,
+          url.pathname,
+        );
       const participantAccess = await resolveParticipantAccess(
         actor,
         participantAccessReader,
@@ -611,13 +616,27 @@ function runtimeParticipantAccessReader(
   runtime: ApplicationRuntimeDeploymentCapability | null,
   actor: AuthenticatedActor | null,
   isOwner: boolean,
+  pathname: string,
 ): ParticipantAccessStateReader | undefined {
-  if (runtime === null || actor === null || isOwner) return undefined;
+  if (
+    runtime === null ||
+    actor === null ||
+    isOwner ||
+    !isParticipantAccessPath(pathname)
+  ) {
+    return undefined;
+  }
   try {
     return runtime.repositoryFactory.participantAccessReader();
   } catch {
     return undefined;
   }
+}
+
+function isParticipantAccessPath(pathname: string): boolean {
+  return pathname === "/" ||
+    pathname === "/participant" ||
+    pathname.startsWith("/participant/");
 }
 
 function authenticatedActor(request: Request): AuthenticatedActor | null {
