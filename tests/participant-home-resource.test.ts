@@ -21,9 +21,23 @@ import {
   type ParticipantProfile,
 } from "../domain/participant-profile.ts";
 import { createPublicCampaignDocument } from "../domain/public-campaign-resource.ts";
-import { StorageFailure } from "../domain/storage-adapter.ts";
-import { readParticipantAuthorizationState } from "../services/participant-access.ts";
+import {
+  parseStorageOperationId,
+  StorageFailure,
+} from "../domain/storage-adapter.ts";
+import {
+  StorageAcknowledgmentRepository,
+  StoragePackageVersionRepository,
+} from "../repositories/in-memory-content-repository.ts";
+import {
+  createRepositoryParticipantAccessStateReader,
+  readParticipantAuthorizationState,
+} from "../services/participant-access.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
+import {
+  MemoryStorageAdapter,
+  MemoryStorageState,
+} from "./support/memory-storage-adapter.ts";
 
 test("participant authorization binds private state to the trusted account subject", () => {
   const alice = account("oidc:alice", "alice@example.test");
@@ -236,6 +250,58 @@ test("repository projection returns one stable participant, package, and accepta
   assert.equal(acknowledgmentReads, 1);
 });
 
+test("repository access reader reconstructs state through fresh storage-backed readers", async () => {
+  const alice = account("oidc:alice", "alice@example.test");
+  const profile = registeredProfile(alice);
+  const storageState = new MemoryStorageState();
+  const operation = parseStorageOperationId("operation:participant-access-package");
+  assert(operation.ok);
+  const ownerPackages = new StoragePackageVersionRepository(
+    new MemoryStorageAdapter(storageState),
+  );
+  await ownerPackages.append({
+    operationId: operation.value,
+    expectedRevision: null,
+    draft: packageDraft(
+      "package-version:stored-reader",
+      "Storage-backed package",
+    ),
+  });
+
+  const createReader = () => createRepositoryParticipantAccessStateReader(() => {
+    const storage = new MemoryStorageAdapter(storageState);
+    const packages = new StoragePackageVersionRepository(storage);
+    return {
+      participant: {
+        current: async () => ({ revision: 1, snapshot: profile }),
+      },
+      packages,
+      acknowledgments: new StorageAcknowledgmentRepository(
+        storage,
+        packages,
+        alice.subject,
+      ),
+    };
+  });
+
+  const first = await createReader().read(alice);
+  const reconstructed = await createReader().read(alice);
+  assert.deepEqual(reconstructed, first);
+  assert.notEqual(reconstructed, first);
+  assert.equal(first?.currentPackage?.id, "package-version:stored-reader");
+  assert.equal(first?.currentPackage?.requiresCurrentAcceptance, true);
+});
+
+test("repository access reader sanitizes resolver failures without retaining a cause", async () => {
+  const alice = account("oidc:alice", "alice@example.test");
+  const privateDetail = "private-resolver-token-value";
+  const reader = createRepositoryParticipantAccessStateReader(async () => {
+    throw new Error(privateDetail);
+  });
+
+  await assertUnavailableMasks(reader.read(alice), privateDetail);
+});
+
 test("repository projection retries a participant change and returns deletion-requested state", async () => {
   const alice = account("oidc:alice", "alice@example.test");
   const initial = registeredProfile(alice);
@@ -243,21 +309,31 @@ test("repository projection retries a participant change and returns deletion-re
   assert(requestedAt.ok);
   const deleted = requestParticipantAccountDeletion(initial, requestedAt.value);
   const version = await packageVersion("profile-race", "Stable package");
-  const profiles = [
-    { revision: 1, snapshot: initial },
-    { revision: 1, snapshot: deleted.profile },
-    { revision: 2, snapshot: deleted.profile },
-    { revision: 2, snapshot: deleted.profile },
-  ];
+  const sharedSnapshot = mutableParticipantProfile(initial);
+  const sharedSample = { revision: 1, snapshot: sharedSnapshot };
   let profileRead = 0;
+  let packageRead = 0;
   let acknowledgmentReads = 0;
 
   const state = await readParticipantAuthorizationState({
     participant: {
-      current: async () => profiles[profileRead++] ?? assert.fail("Unexpected profile read"),
+      current: async () => {
+        profileRead += 1;
+        return sharedSample;
+      },
     },
     packages: {
-      current: async () => ({ revision: 1, snapshot: version }),
+      current: async () => {
+        packageRead += 1;
+        if (packageRead === 1) {
+          sharedSample.revision = 2;
+          Object.assign(
+            sharedSnapshot,
+            mutableParticipantProfile(deleted.profile),
+          );
+        }
+        return { revision: 1, snapshot: version };
+      },
     },
     acknowledgments: {
       requiresCurrentAcceptance: async () => {
@@ -269,6 +345,7 @@ test("repository projection retries a participant change and returns deletion-re
 
   assert.equal(state?.profile.accountDeletionRequested, true);
   assert.equal(profileRead, 4);
+  assert.equal(packageRead, 4);
   assert.equal(acknowledgmentReads, 2);
 });
 
@@ -305,6 +382,41 @@ test("repository projection retries package publication around the acceptance re
   assert.equal(state?.currentPackage?.requiresCurrentAcceptance, true);
   assert.equal(packageRead, 4);
   assert.equal(acknowledgmentRead, 2);
+});
+
+test("repository projection detaches a mutable package alias before acceptance changes it", async () => {
+  const alice = account("oidc:alice", "alice@example.test");
+  const profile = registeredProfile(alice);
+  const first = await packageVersion("aliased-v1", "Aliased first package");
+  const second = await packageVersion("aliased-v2", "Aliased second package");
+  const sharedSnapshot = mutablePackageVersion(first);
+  const sharedSample = { revision: 1, snapshot: sharedSnapshot };
+  let acknowledgmentRead = 0;
+
+  const state = await readParticipantAuthorizationState({
+    participant: {
+      current: async () => ({ revision: 1, snapshot: profile }),
+    },
+    packages: {
+      current: async () => sharedSample,
+    },
+    acknowledgments: {
+      requiresCurrentAcceptance: async () => {
+        acknowledgmentRead += 1;
+        if (acknowledgmentRead === 1) {
+          sharedSample.revision = 2;
+          Object.assign(sharedSnapshot, mutablePackageVersion(second));
+          return false;
+        }
+        return true;
+      },
+    },
+  });
+
+  assert.equal(acknowledgmentRead, 2);
+  assert.equal(state?.currentPackage?.id, second.id);
+  assert.equal(state?.currentPackage?.changeSummary, "Aliased second package");
+  assert.equal(state?.currentPackage?.requiresCurrentAcceptance, true);
 });
 
 test("repository projection fails closed when participant or package state keeps changing", async () => {
@@ -351,6 +463,184 @@ test("missing participant short-circuits package and acknowledgment reads", asyn
     },
   });
   assert.equal(missing, null);
+});
+
+test("repository projection rejects malformed participant snapshots before package access", async () => {
+  const alice = account("oidc:alice", "alice@example.test");
+  const profile = registeredProfile(alice);
+  let accessorCalls = 0;
+  const accessorProfile = mutableParticipantProfile(profile);
+  Object.defineProperty(accessorProfile, "displayName", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      accessorCalls += 1;
+      return "Accessor participant";
+    },
+  });
+  const customPrototypeProfile = Object.assign(
+    Object.create({ inherited: true }) as Record<string, unknown>,
+    mutableParticipantProfile(profile),
+  );
+  const malformed = [
+    { revision: 0, snapshot: profile },
+    { revision: Number.MAX_SAFE_INTEGER + 1, snapshot: profile },
+    {
+      revision: 1,
+      snapshot: {
+        ...mutableParticipantProfile(profile),
+        subject: " oidc:alice",
+      },
+    },
+    {
+      revision: 1,
+      snapshot: {
+        ...mutableParticipantProfile(profile),
+        accountEmailLabel: "alice@example.test ",
+      },
+    },
+    {
+      revision: 1,
+      snapshot: { ...mutableParticipantProfile(profile), country: "fin" },
+    },
+    {
+      revision: 1,
+      snapshot: {
+        ...mutableParticipantProfile(profile),
+        processEmailNoticeAcknowledgedAt: "2026-08-09T08:00:01.000Z",
+      },
+    },
+    {
+      revision: 1,
+      snapshot: {
+        ...mutableParticipantProfile(profile),
+        updatedAt: "2026-08-09T07:59:59.000Z",
+      },
+    },
+    {
+      revision: 1,
+      snapshot: {
+        ...mutableParticipantProfile(profile),
+        marketingConsent: {
+          state: "granted",
+          grantedAt: "2026-08-09T09:00:00.000Z",
+        },
+      },
+    },
+    {
+      revision: 1,
+      snapshot: {
+        ...mutableParticipantProfile(profile),
+        accountDeletionRequest: {
+          state: "requested",
+          requestedAt: "2026-08-09T10:00:00.000Z",
+          activeInterestDisposition: "retain",
+        },
+      },
+    },
+    { revision: 1, snapshot: accessorProfile },
+    { revision: 1, snapshot: customPrototypeProfile },
+    {
+      revision: 1,
+      snapshot: { ...mutableParticipantProfile(profile), extra: "private" },
+    },
+  ];
+
+  for (const candidate of malformed) {
+    await assert.rejects(
+      readParticipantAuthorizationState({
+        participant: { current: async () => candidate as never },
+        packages: {
+          current: async () => assert.fail("Package state must stay unread."),
+        },
+        acknowledgments: {
+          requiresCurrentAcceptance: async () =>
+            assert.fail("Acknowledgment state must stay unread."),
+        },
+      }),
+      unavailableFailure,
+    );
+  }
+  assert.equal(accessorCalls, 0);
+});
+
+test("repository projection rejects unbounded or non-data package snapshots", async () => {
+  const alice = account("oidc:alice", "alice@example.test");
+  const profile = registeredProfile(alice);
+  const version = await packageVersion("malformed-package", "Valid package");
+  const base = mutablePackageVersion(version);
+  let accessorCalls = 0;
+  let arrayAccessorCalls = 0;
+  const accessorPackage = mutablePackageVersion(version);
+  Object.defineProperty(accessorPackage, "changeSummary", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      accessorCalls += 1;
+      return "Accessor package";
+    },
+  });
+  const sparsePackage = mutablePackageVersion(version);
+  sparsePackage.sections = new Array(1);
+  const accessorArrayPackage = mutablePackageVersion(version);
+  Object.defineProperty(accessorArrayPackage.sections, "0", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      arrayAccessorCalls += 1;
+      return base.sections[0];
+    },
+  });
+  const oversizedPackage = mutablePackageVersion(version);
+  oversizedPackage.sections = Array.from({ length: 65 }, (_, index) => ({
+    ...base.sections[0]!,
+    id: `package-section:oversized-${index}`,
+    order: index,
+  })) as never;
+  const customPrototypePackage = Object.assign(
+    Object.create({ inherited: true }) as Record<string, unknown>,
+    mutablePackageVersion(version),
+  );
+  const customArrayPackage = mutablePackageVersion(version);
+  customArrayPackage.sections = Object.setPrototypeOf(
+    [...base.sections],
+    Object.create(Array.prototype),
+  ) as typeof customArrayPackage.sections;
+  const malformed = [
+    { revision: 0, snapshot: base },
+    {
+      revision: 1,
+      snapshot: { ...mutablePackageVersion(version), contentHash: "private" },
+    },
+    { revision: 1, snapshot: sparsePackage },
+    { revision: 1, snapshot: accessorArrayPackage },
+    { revision: 1, snapshot: oversizedPackage },
+    { revision: 1, snapshot: accessorPackage },
+    { revision: 1, snapshot: customPrototypePackage },
+    { revision: 1, snapshot: customArrayPackage },
+    {
+      revision: 1,
+      snapshot: { ...mutablePackageVersion(version), method: () => true },
+    },
+  ];
+
+  for (const candidate of malformed) {
+    await assert.rejects(
+      readParticipantAuthorizationState({
+        participant: {
+          current: async () => ({ revision: 1, snapshot: profile }),
+        },
+        packages: { current: async () => candidate as never },
+        acknowledgments: {
+          requiresCurrentAcceptance: async () =>
+            assert.fail("Acknowledgment state must stay unread."),
+        },
+      }),
+      unavailableFailure,
+    );
+  }
+  assert.equal(accessorCalls, 0);
+  assert.equal(arrayAccessorCalls, 0);
 });
 
 test("repository projection masks repository exceptions and private details", async () => {
@@ -439,7 +729,9 @@ async function assertUnavailableMasks(
       assert.ok(error instanceof StorageFailure);
       assert.equal(error.code, "UNAVAILABLE");
       assert.equal(error.message, "Storage is temporarily unavailable.");
+      assert.equal(error.cause, undefined);
       assert.doesNotMatch(error.message, new RegExp(privateDetail, "u"));
+      assert.doesNotMatch(error.stack ?? "", new RegExp(privateDetail, "u"));
       return true;
     },
   );
@@ -467,16 +759,45 @@ function registeredProfile(
 }
 
 async function packageVersion(suffix: string, changeSummary: string) {
-  const version = await createPackageVersion({
-    id: `package-version:${suffix}`,
+  const version = await createPackageVersion(
+    packageDraft(`package-version:${suffix}`, changeSummary),
+  );
+  assert(version.ok);
+  return version.value;
+}
+
+function packageDraft(id: string, changeSummary: string) {
+  return {
+    id,
     createdAt: "2026-08-09T09:00:00.000Z",
     changeSummary,
     materialChange: true,
     acknowledgmentText: "I acknowledge the current information package.",
-    sections: [],
-  });
-  assert(version.ok);
-  return version.value;
+    sections: [
+      {
+        id: `package-section:${id}`,
+        order: 0,
+        title: "Company and product",
+        markdown: "# Company and product\n\nPrivate package content.",
+        enabled: true,
+      },
+    ],
+  };
+}
+
+function mutableParticipantProfile(profile: ParticipantProfile) {
+  return {
+    ...profile,
+    marketingConsent: { ...profile.marketingConsent },
+    accountDeletionRequest: { ...profile.accountDeletionRequest },
+  };
+}
+
+function mutablePackageVersion(version: Awaited<ReturnType<typeof packageVersion>>) {
+  return {
+    ...version,
+    sections: version.sections.map((section) => ({ ...section })),
+  };
 }
 
 function unavailableFailure(error: unknown): boolean {
