@@ -27,6 +27,11 @@ request actor. Process and marketing notice text is deployment-supplied; the
 resource defines no campaign-specific notice defaults. The version and both
 displayed texts form one closed server-derived evidence value.
 
+The hidden registration operation ID is also server-issued. Its only accepted
+form is `participant-operation:<lowercase UUIDv4>` (58 ASCII bytes); arbitrary
+stable IDs, labels, email addresses, or other private text are never advertised
+or accepted as registration operation IDs.
+
 After successful registration, both representations show the same current
 profile projection, immutable notice-evidence version, exact acknowledged
 process and marketing texts, process acknowledgment state, and current
@@ -58,7 +63,10 @@ rendering failure. Failures before verification do not emit that expiration
 cookie. A hosted verifier that omits or malforms the expiration instruction
 fails before origin parsing or repository access. Body and field limits run
 before the hosted replay capability is claimed and before the participant
-repository is opened.
+repository is opened. Hosted verification also checks the closed operation-ID
+shape at that point. A malformed or private-text ID therefore consumes neither
+replay authority nor participant storage, and route parsing repeats the check
+before repository access for every composition.
 
 The request-scoped repository factory receives the trusted subject and provider
 email as a `ParticipantAccount`. Registration delegates persistence to the
@@ -69,7 +77,10 @@ registration conflicts. Serial retries reuse the persisted registration
 timestamp. If two exact requests both observe the missing profile, persistence
 treats the timestamp as server-generated metadata, recovers the first immutable
 revision after the losing transaction, and returns it as a replay. No
-process-memory authority is retained.
+process-memory authority is retained. The operation ID is intentionally not
+bound to one browser proof: after a lost response, a fresh one-time proof may
+carry the originally advertised opaque ID and recover only that exact persisted
+result.
 
 ## Notice Evidence And Retries
 
@@ -92,7 +103,11 @@ Changed retries conflict and cannot associate old acknowledgment with new text.
 Each profile and immutable profile revision stores the evidence version,
 campaign revision, and exact process and marketing notice snapshots. The
 evidence has no separate storage key, so subject identity cannot enter a notice
-key. Profile self-service preserves it as a registration-only field.
+key. Profile self-service preserves it as a registration-only field. Reading a
+later profile validates the current record against its matching latest history
+record and then compares its notice evidence with immutable profile revision 1
+through one exact bounded read. Coordinated valid-looking changes to current and
+latest history therefore cannot replace the registration acknowledgment.
 
 Each notice is bounded to 4,000 UTF-16 code units and 12,000 UTF-8 bytes. A
 complete profile storage document is bounded to 30,000 UTF-8 bytes, 64 JSON

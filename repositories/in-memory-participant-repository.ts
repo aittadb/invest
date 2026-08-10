@@ -220,6 +220,33 @@ export class StorageParticipantRepository
       current.revision,
     );
     if (history === null || !equalData(current, history)) unavailable();
+
+    if (current.revision > 1) {
+      const registrationKey = await participantProfileRevisionKey(
+        account.subject,
+        1,
+      );
+      const registrationRecord = await storageRead(
+        this.#storage,
+        registrationKey,
+      );
+      if (registrationRecord === null) unavailable();
+      const registration = decodeHistoricalParticipantRecord(
+        registrationRecord,
+        registrationKey,
+        account.subject,
+        1,
+      );
+      if (
+        registration === null ||
+        !equalData(
+          current.snapshot.registrationNoticeEvidence,
+          registration.snapshot.registrationNoticeEvidence,
+        )
+      ) {
+        unavailable();
+      }
+    }
     return current;
   }
 

@@ -7,6 +7,7 @@ import {
   PARTICIPANT_REGISTRATION_PATH,
   createParticipantRegistrationCapabilityModel,
   defineParticipantRegistrationNoticeEvidence,
+  parseParticipantRegistrationOperationId,
   type ParticipantRegistrationCapabilityModel,
   type ParticipantRegistrationNoticeEvidence,
 } from "../../domain/participant-registration-resource.ts";
@@ -40,7 +41,10 @@ import {
   type BrowserMutationGuardOptions,
   type VerifiedMutationRequest,
 } from "../../http/mutation-security.ts";
-import type { BrowserMutationProof } from "../../http/browser-mutation-session.ts";
+import type {
+  BrowserMutationPreReplayValidator,
+  BrowserMutationProof,
+} from "../../http/browser-mutation-session.ts";
 import type {
   ParticipantProfileSnapshot,
   ParticipantRegistrationRepository,
@@ -92,6 +96,7 @@ export type ParticipantRegistrationCsrfTokenProvider = (
 
 export type ParticipantRegistrationMutationVerifier = (
   request: Request,
+  validateBeforeReplayClaim: BrowserMutationPreReplayValidator,
 ) => Promise<
   VerifiedMutationRequest & Readonly<{ clearCookie: string }>
 >;
@@ -130,13 +135,18 @@ export function createParticipantRegistrationRouteHandler(
   const mutationGuard: (
     request: Request,
   ) => Promise<VerifiedMutationRequest & Readonly<{ clearCookie?: string }>> =
-    hostedMutationVerifier ??
-    createBrowserMutationGuard({
-      ...(dependencies.mutationSecurity as BrowserMutationGuardOptions),
-      maxBodyBytes: MAX_REGISTRATION_MUTATION_BYTES,
-      maxFields: MAX_REGISTRATION_MUTATION_FIELDS,
-      repeatedFormFields: [],
-    });
+    hostedMutationVerifier === undefined
+      ? createBrowserMutationGuard({
+        ...(dependencies.mutationSecurity as BrowserMutationGuardOptions),
+        maxBodyBytes: MAX_REGISTRATION_MUTATION_BYTES,
+        maxFields: MAX_REGISTRATION_MUTATION_FIELDS,
+        repeatedFormFields: [],
+      })
+      : (request) =>
+        hostedMutationVerifier(
+          request,
+          validateRegistrationOperationIdBeforeReplay,
+        );
 
   return async (context) => {
     if (context.url.pathname !== PARTICIPANT_REGISTRATION_PATH) return null;
@@ -272,7 +282,9 @@ function parseRegistrationMutation(
     invalidRequest();
   }
   return Object.freeze({
-    operationId: requiredString(request.body[OPERATION_ID_FIELD]),
+    operationId: requiredRegistrationOperationId(
+      request.body[OPERATION_ID_FIELD],
+    ),
     noticeEvidenceVersion: requiredString(
       request.body[NOTICE_EVIDENCE_VERSION_FIELD],
     ),
@@ -320,6 +332,19 @@ function requiredString(value: unknown): string {
   if (typeof value !== "string") invalidRequest();
   return value;
 }
+
+function requiredRegistrationOperationId(value: unknown): string {
+  const parsed = parseParticipantRegistrationOperationId(value);
+  if (parsed === null) invalidRequest();
+  return parsed;
+}
+
+export const validateRegistrationOperationIdBeforeReplay:
+  BrowserMutationPreReplayValidator = (request) =>
+    request.method === "POST" &&
+    parseParticipantRegistrationOperationId(
+      request.body[OPERATION_ID_FIELD],
+    ) !== null;
 
 function requiredConfirmation(value: unknown): boolean {
   return value === true || value === "true" || value === "on";
@@ -849,7 +874,7 @@ function escapeHtml(value: string): string {
 const escapeAttribute = escapeHtml;
 
 function randomOperationId(): string {
-  return `participant-registration:${crypto.randomUUID()}`;
+  return `participant-operation:${crypto.randomUUID()}`;
 }
 
 function invalidRequest(): never {

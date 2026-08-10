@@ -28,6 +28,7 @@ import {
 } from "../domain/participant-founder-interest-resource.ts";
 import {
   PARTICIPANT_REGISTRATION_PATH,
+  parseParticipantRegistrationOperationId,
   type ParticipantRegistrationDocument,
 } from "../domain/participant-registration-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
@@ -567,6 +568,13 @@ test("participant access reconstructs maximum package history once per request",
     accountEmailLabel: PARTICIPANT_EMAIL,
   });
   assert(account.ok);
+  await hostedParticipantRepository(service).update({
+    operationId: "participant-operation:package-history-profile-update",
+    expectedRevision: 1,
+    updatedAt: "2026-08-10T10:30:00.000Z",
+    changes: { displayName: "Later package history participant" },
+  });
+  assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 551);
 
   const unacceptedFactory = new StorageApplicationRepositoryFactory(
     hostedStorageAdapter(service),
@@ -580,7 +588,7 @@ test("participant access reconstructs maximum package history once per request",
   const unacceptedReads = service.readRequests - beforeUnaccepted;
   assert.equal(unaccepted?.currentPackage?.id, current.snapshot.id);
   assert.equal(unaccepted?.currentPackage?.requiresCurrentAcceptance, true);
-  assert.equal(unacceptedReads, 137);
+  assert.equal(unacceptedReads, 139);
   assert.ok(unacceptedReads <= PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT);
 
   const subject = parseActorSubject(PARTICIPANT_SUBJECT);
@@ -620,7 +628,7 @@ test("participant access reconstructs maximum package history once per request",
   );
   const acceptedReads = service.readRequests - beforeAccepted;
   assert.equal(accepted?.currentPackage?.requiresCurrentAcceptance, false);
-  assert.equal(acceptedReads, 138);
+  assert.equal(acceptedReads, 140);
   assert.ok(acceptedReads <= PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT);
 });
 
@@ -676,9 +684,9 @@ test("participant access keeps nested package retry reads inside one budget", as
 });
 
 test("participant request scope enforces exact maximum route and retry read budgets", async () => {
-  assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 547);
+  assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 551);
   assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 8);
-  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 555);
+  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 559);
 
   const service = new SyntheticAittaDBService();
   await registerHostedParticipant(
@@ -805,7 +813,7 @@ test("participant request scope enforces exact maximum route and retry read budg
     profileState?.profile.displayName,
     "Maximum request participant updated",
   );
-  assert.equal(profileReads.count(), 531);
+  assert.equal(profileReads.count(), 534);
 
   const combinedGateOffsets = [
     0,
@@ -857,14 +865,14 @@ test("participant request scope enforces exact maximum route and retry read budg
   assert.equal(combinedProfileUpdated, true);
   assert.equal(combinedGateReadIndex, 12);
   assert.equal(combinedState?.currentPackage?.id, current.snapshot.id);
-  assert.equal(combinedReads.count(), 547);
+  assert.equal(combinedReads.count(), 551);
 
   const combinedAcknowledgments =
     combinedRequest.participantPackageAcknowledgments(subject.value);
   await combinedAcknowledgments.packages.current();
   await combinedAcknowledgments.acknowledgments.latest();
   await combinedAcknowledgments.packages.current();
-  assert.equal(combinedReads.count(), 551);
+  assert.equal(combinedReads.count(), 555);
   for (let index = 0; index < 4; index += 1) {
     await combinedRequest.participantPackageReader(subject.value).current();
   }
@@ -1887,13 +1895,14 @@ test("hosted participant registration persists policy-bound submissions across r
   assert.equal(service.readRequests, ownerReads + 1);
   assert.doesNotMatch(await owner.text(), /Persisted process|PRIVATE CAMPAIGN/u);
 
-  const [first, retry, exactJson, changed] = await Promise.all([
+  const [first, retry, exactJson, changed, malformed] = await Promise.all([
+    participantRegistration(worker, env),
     participantRegistration(worker, env),
     participantRegistration(worker, env),
     participantRegistration(worker, env),
     participantRegistration(worker, env),
   ]);
-  for (const resource of [first, retry, exactJson, changed]) {
+  for (const resource of [first, retry, exactJson, changed, malformed]) {
     assert.equal(resource.document.data.status, "registration_required");
     assert.equal(
       resource.document.data.process_email_notice,
@@ -1920,6 +1929,10 @@ test("hosted participant registration persists policy-bound submissions across r
     "process-email-notice-acknowledged": true,
     "marketing-consent": false,
   });
+  assert.notEqual(
+    parseParticipantRegistrationOperationId(body["operation-id"]),
+    null,
+  );
   const retryAction = requiredAction(
     retry.document,
     "register-participant-access",
@@ -1928,6 +1941,33 @@ test("hosted participant registration persists policy-bound submissions across r
     ...body,
     "operation-id": body["operation-id"],
   });
+
+  const replayClaimsBeforeMalformed = recordsIn(
+    service,
+    "browser-mutation-replays",
+  ).length;
+  const malformedResponse = await submitRegistration(
+    worker,
+    env,
+    malformed,
+    actionBody(
+      requiredAction(malformed.document, "register-participant-access"),
+      {
+        ...body,
+        "operation-id": "alice@example.test private retry label",
+      },
+    ),
+  );
+  assert.equal(malformedResponse.status, 400);
+  assert.doesNotMatch(
+    await malformedResponse.text(),
+    /alice@example|private|retry label/iu,
+  );
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    replayClaimsBeforeMalformed,
+  );
+  assert.equal(await hostedParticipantRepository(service).current(), null);
 
   const missingProof = await submitRegistration(
     worker,

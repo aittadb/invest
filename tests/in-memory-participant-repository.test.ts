@@ -1106,6 +1106,111 @@ test("current profiles require the matching immutable history snapshot", async (
   }
 });
 
+test("later profiles use one bounded revision-one notice-evidence anchor read", async () => {
+  const seeded = await seededParticipantStorage();
+  await new StorageParticipantRepository(
+    seeded.storage,
+    aliceAccount(),
+  ).update(updateRequest(
+    "participant-operation:seed-notice-anchor-read",
+    1,
+    { displayName: "Later participant profile" },
+  ));
+  const storage = new ReadTransformStorageAdapter(
+    seeded.storage,
+    (_key, record) => record,
+  );
+  const current = await new StorageParticipantRepository(
+    storage,
+    aliceAccount(),
+  ).current();
+
+  assert.equal(current?.revision, 2);
+  assert.equal(storage.readCalls, 3);
+  assert.equal(storage.transactCalls, 0);
+});
+
+test("later profiles reject corrupted immutable registration notice anchors", async (t) => {
+  const changedEvidence = testParticipantRegistrationNoticeEvidence(2, {
+    processEmail: "Changed but structurally valid process notice.",
+    marketing: "Changed but structurally valid marketing notice.",
+  });
+  const cases: readonly Readonly<{
+    name: string;
+    transform: (record: StorageRecord) => unknown;
+  }>[] = [
+    {
+      name: "current and latest history share changed valid evidence",
+      transform: (record) =>
+        storedParticipantProfileRevision(record) === 2
+          ? mutateStoredProfile(record, (profile) => {
+              profile.registrationNoticeEvidence = changedEvidence;
+            })
+          : record,
+    },
+    {
+      name: "revision one is missing",
+      transform: (record) =>
+        storedParticipantProfileRevision(record) === 1 ? null : record,
+    },
+    {
+      name: "revision one belongs to a foreign subject",
+      transform: (record) =>
+        storedParticipantProfileRevision(record) === 1
+          ? participantRecordWithSubjects(
+              record,
+              bobAccount().subject,
+              bobAccount().subject,
+            )
+          : record,
+    },
+    {
+      name: "revision one has malformed notice evidence",
+      transform: (record) =>
+        storedParticipantProfileRevision(record) === 1
+          ? mutateStoredProfile(record, (profile) => {
+              const evidence = mutableRecord(
+                profile.registrationNoticeEvidence,
+              );
+              evidence.campaignRevision = 2;
+              profile.registrationNoticeEvidence = evidence;
+            })
+          : record,
+    },
+  ];
+
+  for (const candidate of cases) {
+    await t.test(candidate.name, async () => {
+      const seeded = await seededParticipantStorage();
+      await new StorageParticipantRepository(
+        seeded.storage,
+        aliceAccount(),
+      ).update(updateRequest(
+        "participant-operation:seed-corrupted-notice-anchor",
+        1,
+        { displayName: "Later participant profile" },
+      ));
+      const storage = new ReadTransformStorageAdapter(
+        seeded.storage,
+        (key, record) =>
+          record !== null &&
+            (key.collection === "private-participant-profiles" ||
+              key.collection === "private-participant-profile-revisions")
+            ? candidate.transform(record)
+            : record,
+      );
+      const failure = await captureStorageFailure(() =>
+        new StorageParticipantRepository(storage, aliceAccount()).current()
+      );
+
+      assert.equal(failure.code, "UNAVAILABLE");
+      assert.equal(Object.hasOwn(failure, "cause"), false);
+      assert.equal(storage.readCalls, 3);
+      assert.equal(storage.transactCalls, 0);
+    });
+  }
+});
+
 test("immutable history rejects crossed revisions without exposing subjects", async () => {
   const cases: readonly Readonly<{
     name: string;
@@ -1489,6 +1594,7 @@ class ReadTransformStorageAdapter implements StorageAdapter {
     record: StorageRecord | null,
   ) => unknown;
   #transactCalls = 0;
+  #readCalls = 0;
 
   constructor(
     delegate: StorageAdapter,
@@ -1499,6 +1605,7 @@ class ReadTransformStorageAdapter implements StorageAdapter {
   }
 
   async read(key: StorageKey): Promise<StorageRecord | null> {
+    this.#readCalls += 1;
     return this.#transform(key, await this.#delegate.read(key)) as
       | StorageRecord
       | null;
@@ -1519,6 +1626,10 @@ class ReadTransformStorageAdapter implements StorageAdapter {
 
   get transactCalls(): number {
     return this.#transactCalls;
+  }
+
+  get readCalls(): number {
+    return this.#readCalls;
   }
 }
 
@@ -1731,6 +1842,13 @@ function mutateStoredProfile(
     mutate(profile);
     value.profile = profile;
   });
+}
+
+function storedParticipantProfileRevision(record: StorageRecord): number | null {
+  const value = mutableRecord(record.value);
+  return Number.isSafeInteger(value.profileRevision)
+    ? value.profileRevision as number
+    : null;
 }
 
 function hostileAccessor(probe?: AccessorProbe): PropertyDescriptor {

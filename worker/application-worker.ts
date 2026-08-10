@@ -501,7 +501,7 @@ async function runtimeParticipantRegistrationRoute(
         }
         return repositories.participantRepository(account.value);
       },
-      verifyMutation: (request: Request) =>
+      verifyMutation: (request, validateBeforeReplayClaim) =>
         runtime.mutationSession.verifyMutation(
           request,
           identity,
@@ -510,6 +510,7 @@ async function runtimeParticipantRegistrationRoute(
             maxBodyBytes: MAX_REGISTRATION_MUTATION_BYTES,
             maxFields: MAX_REGISTRATION_MUTATION_FIELDS,
             repeatedFormFields: [],
+            validateBeforeReplayClaim,
           },
         ),
       csrfTokenFor: (request, candidate) =>

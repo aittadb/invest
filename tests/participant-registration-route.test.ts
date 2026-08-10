@@ -9,9 +9,11 @@ import {
   type Timestamp,
 } from "../domain/foundation.ts";
 import {
+  PARTICIPANT_REGISTRATION_OPERATION_ID_LENGTH,
   PARTICIPANT_REGISTRATION_PATH,
   ParticipantRegistrationResourceError,
   createParticipantRegistrationCapabilityModel,
+  parseParticipantRegistrationOperationId,
 } from "../domain/participant-registration-resource.ts";
 import {
   parseParticipantAccount,
@@ -110,6 +112,14 @@ test("registration GET exposes equivalent HTML and versioned hypermedia without 
   const actions = actionsOf(document);
   assert.equal(actions.length, 1);
   const actionFields = fieldsOf(actions[0]);
+  const jsonOperationId = String(actionFields[0]?.value);
+  assert.notEqual(
+    parseParticipantRegistrationOperationId(jsonOperationId),
+    null,
+  );
+  assert.equal(jsonOperationId.length, PARTICIPANT_REGISTRATION_OPERATION_ID_LENGTH);
+  assert.equal(actionFields[0]?.min_length, PARTICIPANT_REGISTRATION_OPERATION_ID_LENGTH);
+  assert.equal(actionFields[0]?.max_length, PARTICIPANT_REGISTRATION_OPERATION_ID_LENGTH);
   assert.deepEqual(
     actionFields.map((field) => field.name),
     [
@@ -153,6 +163,15 @@ test("registration GET exposes equivalent HTML and versioned hypermedia without 
   const html = await htmlResponse.text();
   assertActionFormParity(document, html);
   assert.equal(hiddenCsrfToken(html), CSRF_TOKEN);
+  const htmlOperationId = hiddenInputValue(html, "operation-id");
+  assert.notEqual(
+    parseParticipantRegistrationOperationId(htmlOperationId),
+    null,
+  );
+  assert.equal(
+    htmlOperationId.length,
+    PARTICIPANT_REGISTRATION_OPERATION_ID_LENGTH,
+  );
   assert.match(
     html,
     /<link rel="stylesheet" href="\/participant-registration\.css">/u,
@@ -186,7 +205,12 @@ test("registration capability requires an operation ID only while advertising re
     profile: null,
     noticeEvidence: NOTICE_EVIDENCE,
   } as const;
-  for (const operationId of [null, "not a stable operation id"] as const) {
+  for (const operationId of [
+    null,
+    "not a stable operation id",
+    "participant-operation:private-retry-label",
+    "participant-operation:00000000-0000-1000-8000-000000000001",
+  ] as const) {
     assert.throws(
       () => createParticipantRegistrationCapabilityModel({
         ...input,
@@ -258,7 +282,7 @@ test("trusted account registration accepts JSON and HTML while keeping marketing
   const bobResponse = await harness.dispatch(
     formMutation(BOB, [
       [MUTATION_CSRF_FIELD, CSRF_TOKEN],
-      ["operation-id", "participant-operation:bob-register"],
+      ["operation-id", registrationOperationId("bob-register")],
       ["notice-evidence-version", NOTICE_EVIDENCE.version],
       ["display-name", "Bob Example"],
       ["country", "se"],
@@ -725,7 +749,7 @@ test("operation IDs and CSRF proofs are issued only for unregistered discovery",
   assert.equal(discoveryResponse.headers.get(MUTATION_CSRF_HEADER), CSRF_TOKEN);
   const discovery = await jsonDocument(discoveryResponse);
   const operationId = String(fieldsOf(actionsOf(discovery)[0])[0]?.value);
-  assert.equal(operationId, "participant-form-operation:1");
+  assert.equal(operationId, registrationOperationId("form-1"));
   assert.equal(harness.operationIdCalls(), 1);
   assert.equal(harness.csrfCalls(), 1);
 
@@ -887,7 +911,7 @@ test("hosted verification requires one valid cookie-clearing instruction", async
     const verified = await verifierFor(
       registrationBody(`participant-operation:hosted-clear-${name}`),
       CLEAR_COOKIE,
-    )(postRequest(ALICE));
+    )(postRequest(ALICE), () => true);
     const harness = await createHarness({
       verifyMutation: (async () => {
         if (clearCookie === undefined) {
@@ -916,12 +940,96 @@ test("hosted verification requires one valid cookie-clearing instruction", async
   }
 });
 
+test("malformed registration operation IDs are rejected before hosted replay claims", async () => {
+  const alice = participant(ALICE, "alice@provider.example");
+  const identity = Object.freeze({
+    type: "participant",
+    subject: ALICE,
+  }) satisfies TrustedSitesMutationIdentity;
+  const claims: BrowserMutationReplayClaim[] = [];
+  const session = createBrowserMutationSession({
+    appOrigin: APP_ORIGIN,
+    encryptionKey: await aesKey(37),
+    async claimReplay(claim) {
+      claims.push(claim);
+      return true;
+    },
+    now: () => new Date("2026-08-09T09:00:00.000Z"),
+    randomBytes: (length) => Uint8Array.from(
+      { length },
+      (_, index) => (index + 31) % 256,
+    ),
+    ttlSeconds: 300,
+  });
+  const proof = await session.issue(
+    getRequest(ALICE, "text/html"),
+    identity,
+    APP_ORIGIN,
+  );
+  let repositoryCalls = 0;
+  const storage = new MemoryStorageAdapter(new MemoryStorageState());
+  const route = createParticipantRegistrationRouteHandler({
+    repositoryFor(account) {
+      repositoryCalls += 1;
+      return new DevelopmentInMemoryParticipantRepository(storage, account);
+    },
+    verifyMutation: (request, validateBeforeReplayClaim) =>
+      session.verifyMutation(request, identity, APP_ORIGIN, {
+        maxBodyBytes: MAX_REGISTRATION_MUTATION_BYTES,
+        maxFields: MAX_REGISTRATION_MUTATION_FIELDS,
+        repeatedFormFields: [],
+        validateBeforeReplayClaim,
+      }),
+    csrfTokenFor: async () => proof,
+    noticeEvidence: NOTICE_EVIDENCE,
+  });
+
+  const privateText = "alice@example.test private registration retry";
+  const jsonFailure = await route(routeContext(
+    hostedJsonMutation(
+      proof,
+      registrationBody("ignored", { "operation-id": privateText }),
+    ),
+    alice,
+  ));
+  assert(jsonFailure);
+  assert.equal(jsonFailure.status, 400);
+  assert.doesNotMatch(await jsonFailure.text(), /alice@example|private|retry/iu);
+
+  const formFailure = await route(routeContext(hostedFormMutation(proof, [
+    ["operation-id", "participant-operation:not-a-uuid"],
+    ["notice-evidence-version", NOTICE_EVIDENCE.version],
+    ["display-name", "Alice Example"],
+    ["country", "FI"],
+    ["declared-interest", "investor"],
+    ["participation-context", "individual"],
+    ["process-email-notice-acknowledged", "on"],
+  ]), alice));
+  assert(formFailure);
+  assert.equal(formFailure.status, 400);
+  assert.doesNotMatch(await formFailure.text(), /not-a-uuid|alice@example/iu);
+  assert.deepEqual(claims, []);
+  assert.equal(repositoryCalls, 0);
+
+  const valid = await route(routeContext(
+    hostedJsonMutation(
+      proof,
+      registrationBody("valid-after-malformed-operation-ids"),
+    ),
+    alice,
+  ));
+  assert(valid);
+  assert.equal(valid.status, 201);
+  assert.equal(claims.length, 1);
+  assert.equal(repositoryCalls, 1);
+});
+
 test("hosted registration limits reject bodies, field counts, and repeats before replay or persistence", async () => {
   assert.equal(MAX_REGISTRATION_MUTATION_BYTES, 2_048);
   assert.equal(MAX_REGISTRATION_MUTATION_FIELDS, 9);
   const maximumValidForm = new URLSearchParams({
     [MUTATION_CSRF_FIELD]: "x".repeat(65),
-    "operation-id": `registration:${"x".repeat(114)}`,
+    "operation-id": registrationOperationId("maximum-valid-form"),
     "notice-evidence-version": NOTICE_EVIDENCE.version,
     "display-name": "\u{1F600}".repeat(120),
     country: "FI",
@@ -967,7 +1075,7 @@ test("hosted registration limits reject bodies, field counts, and repeats before
       repositoryCalls += 1;
       return new DevelopmentInMemoryParticipantRepository(storage, account);
     },
-    verifyMutation: (request) => session.verifyMutation(
+    verifyMutation: (request, validateBeforeReplayClaim) => session.verifyMutation(
       request,
       identity,
       APP_ORIGIN,
@@ -975,6 +1083,7 @@ test("hosted registration limits reject bodies, field counts, and repeats before
         maxBodyBytes: MAX_REGISTRATION_MUTATION_BYTES,
         maxFields: MAX_REGISTRATION_MUTATION_FIELDS,
         repeatedFormFields: [],
+        validateBeforeReplayClaim,
       },
     ),
     csrfTokenFor: async () => proof,
@@ -998,7 +1107,7 @@ test("hosted registration limits reject bodies, field counts, and repeats before
   assert.equal(fieldsResponse.status, 400);
 
   const repeated = hostedFormMutation(proof, [
-    ["operation-id", "participant-operation:hosted-repeat"],
+    ["operation-id", registrationOperationId("hosted-repeat")],
     ["notice-evidence-version", NOTICE_EVIDENCE.version],
     ["display-name", "Alice"],
     ["display-name", "Alice again"],
@@ -1088,7 +1197,7 @@ async function createHarness(
     },
     createOperationId: () => {
       operationSequence += 1;
-      return `participant-form-operation:${operationSequence}`;
+      return registrationOperationId(`form-${operationSequence}`);
     },
   });
   const route = createParticipantRouteHandler([registrationRoute]);
@@ -1327,7 +1436,7 @@ function registrationBody(
   overrides: Readonly<Record<string, unknown>> = {},
 ): Readonly<Record<string, unknown>> {
   return {
-    "operation-id": operationId,
+    "operation-id": registrationOperationId(operationId),
     "notice-evidence-version": NOTICE_EVIDENCE.version,
     "display-name": "  Alice Example  ",
     country: "fi",
@@ -1336,6 +1445,32 @@ function registrationBody(
     "process-email-notice-acknowledged": true,
     ...overrides,
   };
+}
+
+function registrationOperationId(label: string): string {
+  const existing = parseParticipantRegistrationOperationId(label);
+  if (existing !== null) return existing;
+
+  const digest = [0x811c9dc5, 0x9e3779b9, 0x85ebca6b, 0xc2b2ae35]
+    .map((seed) => registrationLabelHash(label, seed))
+    .join("")
+    .split("");
+  digest[12] = "4";
+  digest[16] = "8";
+  const hexadecimal = digest.join("");
+  return `participant-operation:${hexadecimal.slice(0, 8)}-${
+    hexadecimal.slice(8, 12)
+  }-${hexadecimal.slice(12, 16)}-${hexadecimal.slice(16, 20)}-${
+    hexadecimal.slice(20, 32)
+  }`;
+}
+
+function registrationLabelHash(label: string, seed: number): string {
+  let hash = seed >>> 0;
+  for (let index = 0; index < label.length; index += 1) {
+    hash = Math.imul(hash ^ label.charCodeAt(index), 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
 }
 
 function withoutField(
@@ -1441,8 +1576,12 @@ function assertActionFormParity(
 }
 
 function hiddenCsrfToken(html: string): string {
+  return hiddenInputValue(html, MUTATION_CSRF_FIELD);
+}
+
+function hiddenInputValue(html: string, name: string): string {
   const match = new RegExp(
-    `<input name="${MUTATION_CSRF_FIELD}" type="hidden" value="([^"]+)">`,
+    `<input name="${name}" type="hidden" value="([^"]+)">`,
     "u",
   ).exec(html);
   assert(match?.[1]);

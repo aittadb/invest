@@ -615,6 +615,37 @@ test("per-route verification limits can only narrow shared fields and repeats", 
   assert.equal(harness.claims.claimed.size, 1);
 });
 
+test("route validation runs after proof verification and before replay claim", async () => {
+  const harness = await configuredHarness();
+  const proof = await issue(harness.session);
+  const validateBeforeReplayClaim = (
+    request: Readonly<{ body: Readonly<Record<string, unknown>> }>,
+  ) => request.body.operationId === "opaque-server-value";
+
+  const rejected = await captureFailure(() =>
+    harness.session.verifyMutation(
+      jsonRequest(proof, { operationId: "private stable text" }),
+      PARTICIPANT,
+      APP_ORIGIN,
+      { validateBeforeReplayClaim },
+    )
+  );
+  assert.equal(rejected.code, "INVALID_REQUEST");
+  assert.doesNotMatch(rejected.message, /private|stable|text/u);
+  assert.equal(harness.claims.calls.length, 0);
+  assert.equal(harness.claims.claimed.size, 0);
+
+  const accepted = await harness.session.verifyMutation(
+    jsonRequest(proof, { operationId: "opaque-server-value" }),
+    PARTICIPANT,
+    APP_ORIGIN,
+    { validateBeforeReplayClaim },
+  );
+  assert.equal(accepted.body.operationId, "opaque-server-value");
+  assert.equal(harness.claims.calls.length, 1);
+  assert.equal(harness.claims.claimed.size, 1);
+});
+
 test("missing, shared, or unsuitable hosted key material creates no capability", async () => {
   const claims = new AtomicClaims();
   assert.throws(

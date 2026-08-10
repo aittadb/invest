@@ -63,10 +63,15 @@ export type VerifiedBrowserMutationRequest = VerifiedMutationRequest &
     clearCookie: string;
   }>;
 
+export type BrowserMutationPreReplayValidator = (
+  request: VerifiedMutationRequest,
+) => boolean;
+
 export type BrowserMutationVerificationLimits = Readonly<{
   maxBodyBytes?: number;
   maxFields?: number;
   repeatedFormFields?: readonly string[];
+  validateBeforeReplayClaim?: BrowserMutationPreReplayValidator;
 }>;
 
 export type BrowserMutationSessionDependencies = Readonly<{
@@ -239,6 +244,15 @@ export function createBrowserMutationSession(
       ) {
         rejectRequest();
       }
+      if (verification.validateBeforeReplayClaim !== undefined) {
+        let accepted = false;
+        try {
+          accepted = verification.validateBeforeReplayClaim(verified) === true;
+        } catch {
+          throw new MutationSecurityFailure("INVALID_REQUEST");
+        }
+        if (!accepted) throw new MutationSecurityFailure("INVALID_REQUEST");
+      }
 
       const capabilityId = await replayCapabilityId(
         config,
@@ -274,11 +288,13 @@ function verificationLimits(
   maxBodyBytes: number;
   maxFields: number;
   repeatedFormFields: readonly string[];
+  validateBeforeReplayClaim: BrowserMutationPreReplayValidator | undefined;
 }> {
   const maxBodyBytes = input.maxBodyBytes ?? config.maxBodyBytes;
   const maxFields = input.maxFields ?? config.maxFields;
   const repeatedFormFields = input.repeatedFormFields ??
     config.repeatedFormFields;
+  const validateBeforeReplayClaim = input.validateBeforeReplayClaim;
   if (
     !Number.isSafeInteger(maxBodyBytes) ||
     maxBodyBytes < 1 ||
@@ -289,7 +305,9 @@ function verificationLimits(
     !Array.isArray(repeatedFormFields) ||
     repeatedFormFields.some((field) =>
       !config.repeatedFormFields.includes(field)
-    )
+    ) ||
+    (validateBeforeReplayClaim !== undefined &&
+      typeof validateBeforeReplayClaim !== "function")
   ) {
     unavailable();
   }
@@ -309,6 +327,7 @@ function verificationLimits(
     maxBodyBytes,
     maxFields,
     repeatedFormFields: Object.freeze([...repeatedFormFields]),
+    validateBeforeReplayClaim,
   });
 }
 

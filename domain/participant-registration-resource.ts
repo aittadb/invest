@@ -25,9 +25,16 @@ import {
   type HypermediaAction,
   type HypermediaLink,
 } from "./public-campaign-resource.ts";
-import { parseStorageOperationId } from "./storage-adapter.ts";
+import {
+  parseStorageOperationId,
+  type StorageOperationId,
+} from "./storage-adapter.ts";
 
 export const PARTICIPANT_REGISTRATION_PATH = "/participant/registration";
+export const PARTICIPANT_REGISTRATION_OPERATION_ID_LENGTH = 58;
+
+const PARTICIPANT_REGISTRATION_OPERATION_ID_PATTERN =
+  /^participant-operation:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export {
   createParticipantRegistrationNoticeEvidence,
@@ -169,6 +176,21 @@ export class ParticipantRegistrationResourceError extends Error {
   }
 }
 
+/** Accept only the opaque lowercase UUIDv4 shape issued for registration. */
+export function parseParticipantRegistrationOperationId(
+  value: unknown,
+): StorageOperationId | null {
+  if (
+    typeof value !== "string" ||
+    value.length !== PARTICIPANT_REGISTRATION_OPERATION_ID_LENGTH ||
+    !PARTICIPANT_REGISTRATION_OPERATION_ID_PATTERN.test(value)
+  ) {
+    return null;
+  }
+  const parsed = parseStorageOperationId(value);
+  return parsed.ok ? parsed.value : null;
+}
+
 function registrationFields(
   operationId: string,
   noticeEvidenceVersion: string,
@@ -182,9 +204,9 @@ function registrationFields(
       location: "body",
       required: true,
       presentation: "hidden",
-      minLength: 1,
-      maxLength: 127,
-      maxBytes: 127,
+      minLength: PARTICIPANT_REGISTRATION_OPERATION_ID_LENGTH,
+      maxLength: PARTICIPANT_REGISTRATION_OPERATION_ID_LENGTH,
+      maxBytes: PARTICIPANT_REGISTRATION_OPERATION_ID_LENGTH,
       value: operationId,
     },
     {
@@ -264,7 +286,7 @@ function registrationFields(
 }
 
 function requiredOperationId(value: unknown): string {
-  const parsed = parseStorageOperationId(value);
-  if (!parsed.ok) throw new ParticipantRegistrationResourceError();
-  return parsed.value;
+  const parsed = parseParticipantRegistrationOperationId(value);
+  if (parsed === null) throw new ParticipantRegistrationResourceError();
+  return parsed;
 }

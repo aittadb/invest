@@ -251,10 +251,12 @@ or acknowledgment route receive the same subject-bound scope; route repository
 factories cannot reopen the underlying uncapped adapter. A second HTTP request
 receives a new scope.
 
-That scope admits at most 555 participant-private storage-record reads. The
-maximum valid authorization envelope is 547: 511 unique immutable package
-records plus two outer attempts, each containing four profile reads, two package
-head reads, and three four-read accepted gate attempts. The selected route owns
+That scope admits at most 559 participant-private storage-record reads. The
+maximum valid authorization envelope is 551: 511 unique immutable package
+records plus two outer attempts, each containing six profile reads, two package
+head reads, and three four-read accepted gate attempts. The profile reads cover
+current, matching latest history, and immutable registration revision 1 for
+each sample. The selected route owns
 the remaining eight reads. Package GET uses one cached-head read;
 acknowledgment GET uses at most four; the eight-read maximum also covers
 acknowledgment operation lookup, record preconditions, and conflict recovery.
@@ -382,7 +384,7 @@ records, failed-stage and failed-final-publication recovery, hostile record and
 transaction-result matrices, package/acceptance concurrency, stable gate
 sampling, accepted and unaccepted maximum-history aggregate read counts, nested
 publication retry counts, exact maximum-package GET and acknowledgment GET
-totals, the complete nested-plus-outer 547-read envelope, the read-556 cutoff,
+totals, the complete nested-plus-outer 551-read envelope, the read-560 cutoff,
 cached ancestry and reconstruction recharge, exact material gating, and
 narrowing-only route mutation limits.
 Founder coverage adds configured-choice projection, create/retry/edit/stale/

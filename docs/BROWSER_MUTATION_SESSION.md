@@ -65,8 +65,16 @@ are validated before proof extraction; form proof extraction itself uses the
 route's byte limit. A larger setup form therefore cannot widen campaign,
 package, profile, or participant mutation boundaries.
 
-Only after identity, origin, ciphertext, expiry, request body, and CSRF proof
-validation succeed does the module call `claimReplay()`. The claim contains an
+A route may also provide a synchronous `validateBeforeReplayClaim` predicate
+for a closed value that the generic body parser has already bounded and frozen.
+The predicate runs after identity, origin, ciphertext, body, and CSRF checks but
+before replay authority is consumed. A throw or any result other than `true`
+becomes the same fixed `INVALID_REQUEST` failure and does not call the durable
+claimer. Feature parsing still repeats the check before persistence.
+
+Only after identity, origin, ciphertext, expiry, request body, CSRF proof, and
+any route predicate validation succeed does the module call `claimReplay()`.
+The claim contains an
 opaque hash-derived capability ID and expiry only. It contains no identity,
 origin, CSRF token, body, credential, or campaign data. The claimer must
 atomically return `true` for the first claim and `false` thereafter, including

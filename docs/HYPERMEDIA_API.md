@@ -87,13 +87,16 @@ also retains `manage-campaign`.
 `participant-access-registration`. Before registration, HTML and JSON expose
 the same `register-participant-access` action, including a hidden server-derived
 notice-evidence version bound to the exact persisted process-email and optional
-marketing notices shown by both representations. `POST` rejects a stale version
-without creating participant state; only an exact already-committed operation
-may recover its immutable original result. After registration, `data` reports
-the stored evidence version, exact acknowledged process and marketing texts,
-process acknowledgment, and current marketing-consent state. Registered HTML
-shows that same state, and neither representation exposes another registration
-action or CSRF proof.
+marketing notices shown by both representations and a hidden server-issued
+`participant-operation:<lowercase UUIDv4>` operation ID. `POST` rejects any
+other operation-ID shape before a hosted replay claim or participant write. It
+rejects a stale notice version without creating participant state; only an exact
+already-committed operation may recover its immutable original result. After
+registration, `data` reports the stored evidence version, exact acknowledged
+process and marketing texts, process acknowledgment, and current
+marketing-consent state. Later profile revisions must retain the notice evidence
+from immutable profile revision 1. Registered HTML shows that same state, and
+neither representation exposes another registration action or CSRF proof.
 
 `GET /participant` has resource type `participant-home`. Its `data` contains the
 authorized account label, declared interest and participation context, account
