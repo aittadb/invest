@@ -16,7 +16,7 @@ Hosted composition injects a subject-bound AittaDB package reader only into the
 participant route group. The standalone route contains no global repository,
 process-memory fallback, hostname, campaign content, owner identity,
 credential, or token. Package persistence does not establish registration or
-profile authority: until TASK-070 injects the persistent `participantAccess`
+profile authority: until TASK-090 injects the persistent `participantAccess`
 reader, the hosted route returns the same non-disclosing unavailable response
 without opening the package repository.
 
