@@ -43,6 +43,10 @@ import {
   type VerifiedMutationRequest,
 } from "../../http/mutation-security.ts";
 import type {
+  BrowserMutationProof,
+  BrowserMutationVerificationLimits,
+} from "../../http/browser-mutation-session.ts";
+import type {
   ApplicationRouteContext,
   ApplicationRouteHandler,
 } from "../contracts.ts";
@@ -82,14 +86,64 @@ const COMPANY_FIELD_NAMES = Object.freeze([
   "note",
 ]);
 
+export const MAX_INVESTMENT_POST_MUTATION_BYTES = 65_536;
+export const MAX_INVESTMENT_POST_MUTATION_FIELDS = 13;
+export const MAX_INVESTMENT_PATCH_MUTATION_BYTES = 65_536;
+export const MAX_INVESTMENT_PATCH_MUTATION_FIELDS = 11;
+export const MAX_INVESTMENT_DELETE_MUTATION_BYTES = 512;
+export const MAX_INVESTMENT_DELETE_MUTATION_FIELDS = 3;
+
+const INVESTMENT_MUTATION_LIMITS = Object.freeze({
+  POST: Object.freeze({
+    maxBodyBytes: MAX_INVESTMENT_POST_MUTATION_BYTES,
+    maxFields: MAX_INVESTMENT_POST_MUTATION_FIELDS,
+    repeatedFormFields: Object.freeze([]),
+  }),
+  PATCH: Object.freeze({
+    maxBodyBytes: MAX_INVESTMENT_PATCH_MUTATION_BYTES,
+    maxFields: MAX_INVESTMENT_PATCH_MUTATION_FIELDS,
+    repeatedFormFields: Object.freeze([]),
+  }),
+  DELETE: Object.freeze({
+    maxBodyBytes: MAX_INVESTMENT_DELETE_MUTATION_BYTES,
+    maxFields: MAX_INVESTMENT_DELETE_MUTATION_FIELDS,
+    repeatedFormFields: Object.freeze([]),
+  }),
+} satisfies Readonly<
+  Record<"POST" | "PATCH" | "DELETE", BrowserMutationVerificationLimits>
+>);
+
+/** Route-owned limits selected before hosted or compatibility verification. */
+export function investmentInterestMutationLimits(
+  requestMethod: string,
+): BrowserMutationVerificationLimits {
+  if (
+    requestMethod !== "POST" &&
+    requestMethod !== "PATCH" &&
+    requestMethod !== "DELETE"
+  ) {
+    throw new MutationSecurityFailure("INVALID_REQUEST");
+  }
+  return INVESTMENT_MUTATION_LIMITS[requestMethod];
+}
+
 export type InvestmentInterestCsrfTokenProvider = (
   request: Request,
   actorSubject: ActorSubject,
-) => string | null | Promise<string | null>;
+) =>
+  | string
+  | BrowserMutationProof
+  | null
+  | Promise<string | BrowserMutationProof | null>;
+
+export type InvestmentInterestMutationVerifier = (
+  request: Request,
+) => Promise<VerifiedMutationRequest & Readonly<{ clearCookie: string }>>;
 
 export type InvestmentInterestRouteDependencies = Readonly<{
   serviceFor: ParticipantInvestmentInterestServiceFactory;
-  mutationSecurity: BrowserMutationGuardOptions;
+  mutationSecurity?: BrowserMutationGuardOptions;
+  verifyMutation?: InvestmentInterestMutationVerifier;
   csrfTokenFor: InvestmentInterestCsrfTokenProvider;
   createOperationId?: () => string;
 }>;
@@ -108,15 +162,21 @@ export function createInvestmentInterestRouteHandler(
 ): ApplicationRouteHandler {
   if (
     typeof dependencies.serviceFor !== "function" ||
-    typeof dependencies.csrfTokenFor !== "function"
+    typeof dependencies.csrfTokenFor !== "function" ||
+    (dependencies.verifyMutation === undefined) ===
+      (dependencies.mutationSecurity === undefined)
   ) {
     throw new Error("Invalid investment-interest route configuration.");
   }
 
   const createOperationId = dependencies.createOperationId ?? randomOperationId;
-  const mutationGuard = createBrowserMutationGuard(
-    dependencies.mutationSecurity,
-  );
+  const hostedMutationVerifier = dependencies.verifyMutation;
+  const mutationGuard: (
+    request: Request,
+  ) => Promise<VerifiedMutationRequest & Readonly<{ clearCookie?: string }>> =
+    hostedMutationVerifier ?? createLegacyMutationVerifier(
+      dependencies.mutationSecurity as BrowserMutationGuardOptions,
+    );
 
   return async (context) => {
     const matched = matchRoute(context.url.pathname);
@@ -185,8 +245,16 @@ export function createInvestmentInterestRouteHandler(
       );
     }
 
+    let clearCookie: string | null = null;
     try {
       const verified = await mutationGuard(context.request);
+      if (hostedMutationVerifier !== undefined) {
+        if (!validSetCookie(verified.clearCookie)) {
+          throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+        }
+        clearCookie = verified.clearCookie;
+      }
+      assertExactResourceOrigin(context.request, context.resourceUrl);
       if (
         verified.actor.type !== "participant" ||
         !authorizedParticipant(context, verified.actor.subject)
@@ -198,7 +266,7 @@ export function createInvestmentInterestRouteHandler(
       if (matched.kind === "collection") {
         const input = parseCreateMutation(verified);
         const result = await service.create(input);
-        return await resourceResponse({
+        return withSetCookie(await resourceResponse({
           context,
           representation: representation.kind,
           actorSubject: verified.actor.subject,
@@ -210,7 +278,7 @@ export function createInvestmentInterestRouteHandler(
             indicationId: result.snapshot.id,
           }),
           status: result.replayed ? 200 : 201,
-        });
+        }), clearCookie);
       }
 
       const mutation = parseItemMutation(verified, matched.indicationId);
@@ -222,7 +290,7 @@ export function createInvestmentInterestRouteHandler(
         await service.reactivate(mutation.input);
       }
 
-      return await resourceResponse({
+      return withSetCookie(await resourceResponse({
         context,
         representation: representation.kind,
         actorSubject: verified.actor.subject,
@@ -231,14 +299,55 @@ export function createInvestmentInterestRouteHandler(
         createOperationId,
         resource: matched,
         status: 200,
-      });
+      }), clearCookie);
     } catch (error) {
-      return errorResponse(
+      return withSetCookie(errorResponse(
         publicRouteError(error, context.resourceUrl),
         representation.kind,
-      );
+      ), clearCookie);
     }
   };
+}
+
+function createLegacyMutationVerifier(
+  options: BrowserMutationGuardOptions,
+): (request: Request) => Promise<VerifiedMutationRequest> {
+  const guards = Object.freeze({
+    POST: createBrowserMutationGuard(
+      legacyGuardOptions(options, INVESTMENT_MUTATION_LIMITS.POST),
+    ),
+    PATCH: createBrowserMutationGuard(
+      legacyGuardOptions(options, INVESTMENT_MUTATION_LIMITS.PATCH),
+    ),
+    DELETE: createBrowserMutationGuard(
+      legacyGuardOptions(options, INVESTMENT_MUTATION_LIMITS.DELETE),
+    ),
+  });
+  return (request) => {
+    const method = request.method;
+    if (method !== "POST" && method !== "PATCH" && method !== "DELETE") {
+      throw new MutationSecurityFailure("INVALID_REQUEST");
+    }
+    return guards[method](request);
+  };
+}
+
+function legacyGuardOptions(
+  options: BrowserMutationGuardOptions,
+  limits: BrowserMutationVerificationLimits,
+): BrowserMutationGuardOptions {
+  return Object.freeze({
+    ...options,
+    maxBodyBytes: Math.min(
+      options.maxBodyBytes ?? limits.maxBodyBytes ?? 1,
+      limits.maxBodyBytes ?? 1,
+    ),
+    maxFields: Math.min(
+      options.maxFields ?? limits.maxFields ?? 1,
+      limits.maxFields ?? 1,
+    ),
+    repeatedFormFields: [],
+  });
 }
 
 function parseCreateMutation(
@@ -487,28 +596,28 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
           : null,
       },
     });
-    const csrfToken = await csrfTokenForActions(
+    const csrf = await csrfProofForActions(
       model.actionContracts,
       input.context,
       input.actorSubject,
       input.csrfTokenFor,
     );
     if (input.representation === "hypermedia-json") {
-      return hypermediaResponseWithCsrf(
+      return withSetCookie(hypermediaResponseWithCsrf(
         model.document,
         input.status,
-        csrfToken,
-      );
+        csrf?.token ?? null,
+      ), csrf?.setCookie ?? null);
     }
-    return htmlResponse(
+    return withSetCookie(htmlResponse(
       renderCollectionHtml(
         model,
         state,
-        csrfToken,
+        csrf?.token ?? null,
         input.context.campaign?.name ?? "Campaign",
       ),
       input.status,
-    );
+    ), csrf?.setCookie ?? null);
   }
 
   const state = await input.service.getItemState(input.resource.indicationId);
@@ -526,43 +635,59 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
         : null,
     },
   });
-  const csrfToken = await csrfTokenForActions(
+  const csrf = await csrfProofForActions(
     model.actionContracts,
     input.context,
     input.actorSubject,
     input.csrfTokenFor,
   );
   if (input.representation === "hypermedia-json") {
-    return hypermediaResponseWithCsrf(model.document, input.status, csrfToken);
+    return withSetCookie(hypermediaResponseWithCsrf(
+      model.document,
+      input.status,
+      csrf?.token ?? null,
+    ), csrf?.setCookie ?? null);
   }
-  return htmlResponse(
+  return withSetCookie(htmlResponse(
     renderItemHtml(
       model,
       state,
-      csrfToken,
+      csrf?.token ?? null,
       input.context.campaign?.name ?? "Campaign",
     ),
     input.status,
-  );
+  ), csrf?.setCookie ?? null);
 }
 
-async function csrfTokenForActions(
+async function csrfProofForActions(
   actions: readonly Readonly<{ method: string }>[],
   context: ApplicationRouteContext,
   actorSubject: ActorSubject,
   provider: InvestmentInterestCsrfTokenProvider,
-): Promise<string | null> {
+): Promise<Readonly<{ token: string; setCookie: string | null }> | null> {
   if (!actions.some((action) => action.method !== "GET")) return null;
   const value = await provider(context.request, actorSubject);
-  if (typeof value !== "string") {
+  const token = typeof value === "string"
+    ? value
+    : typeof value === "object" && value !== null && "token" in value
+    ? value.token
+    : null;
+  const setCookie = typeof value === "object" && value !== null &&
+      "setCookie" in value
+    ? value.setCookie
+    : null;
+  if (
+    typeof token !== "string" ||
+    (setCookie !== null && !validSetCookie(setCookie))
+  ) {
     throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
   }
   try {
-    await hashCsrfToken(value);
+    await hashCsrfToken(token);
   } catch (error) {
     throw new MutationSecurityFailure("SERVICE_UNAVAILABLE", { cause: error });
   }
-  return value;
+  return Object.freeze({ token, setCookie });
 }
 
 function hypermediaResponseWithCsrf(
@@ -574,6 +699,24 @@ function hypermediaResponseWithCsrf(
   if (csrfToken === null) return response;
   const headers = new Headers(response.headers);
   headers.set(MUTATION_CSRF_HEADER, csrfToken);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function validSetCookie(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 4_096 &&
+    !/[\r\n]/u.test(value);
+}
+
+function withSetCookie(response: Response, cookie: string | null): Response {
+  if (!validSetCookie(cookie)) return response;
+  const headers = new Headers(response.headers);
+  headers.append("Set-Cookie", cookie);
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -1008,6 +1151,18 @@ function authorizedParticipant(
     access.accountStatus === "active" &&
     (access.declaredInterest === "investor" ||
       access.declaredInterest === "both");
+}
+
+function assertExactResourceOrigin(request: Request, resourceUrl: string): void {
+  let expected: string;
+  try {
+    expected = new URL(resourceUrl).origin;
+  } catch (error) {
+    throw new MutationSecurityFailure("SERVICE_UNAVAILABLE", { cause: error });
+  }
+  if (request.headers.get("origin") !== expected) {
+    throw new MutationSecurityFailure("REQUEST_REJECTED");
+  }
 }
 
 function participantSubject(value: unknown): ActorSubject | null {

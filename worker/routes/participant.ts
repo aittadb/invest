@@ -14,6 +14,14 @@ export {
 
 export {
   createInvestmentInterestRouteHandler,
+  investmentInterestMutationLimits,
+  MAX_INVESTMENT_DELETE_MUTATION_BYTES,
+  MAX_INVESTMENT_DELETE_MUTATION_FIELDS,
+  MAX_INVESTMENT_PATCH_MUTATION_BYTES,
+  MAX_INVESTMENT_PATCH_MUTATION_FIELDS,
+  MAX_INVESTMENT_POST_MUTATION_BYTES,
+  MAX_INVESTMENT_POST_MUTATION_FIELDS,
+  type InvestmentInterestMutationVerifier,
   type InvestmentInterestRouteDependencies,
 } from "./investment-interest.ts";
 
