@@ -295,3 +295,59 @@ These entries were removed because their scopes could not finish independently. 
 - **TASK-003:** Implement the deterministic in-memory/test storage adapter. DoD: adapter supports the domain repositories needed for setup, package, participant, indication, founder, aggregate, acknowledgment, audit, and notification flows; contract tests prove idempotency, uniqueness, immutable history, non-disclosure failures, and aggregate consistency.
 
   Retirement mapping: Replaced by `TASK-013` through `TASK-019`.
+
+- **TASK-055:** Diagnose and harden hosted OAuth provider availability. Depends on: `TASK-051`. DoD: the owner connection distinguishes only fixed non-secret discovery failure phases in private operator evidence, the deployed Worker can reach and validate the exact configured acceptance issuer without weakening endpoint, redirect, content-type, size, or grant checks, no URL query, credential, token, response body, identity, or exception enters logs or public output, and focused tests plus full validation pass.
+
+  Retirement mapping: Replaced by `TASK-098` and `TASK-099`.
+
+- **TASK-030:** Prove the configured AittaDB OAuth client path. Depends on: `TASK-055`. DoD: the selected AittaDB deployment advertises Authorization Code with PKCE, a confidential Investor App client has only the required storage scopes and exact redirect URIs, secrets remain hosted-only, and a development callback obtains and validates a scoped token without logging credentials.
+
+  Retirement mapping: Replaced by `TASK-100` and `TASK-101`.
+
+- **TASK-059:** Prove the production AittaDB `StorageAdapter` against hosted acceptance. Depends on: `TASK-088`. Blocked by: the AittaDB project must publish the accepted atomic storage transaction action on its disposable acceptance deployment. DoD: the disposable deployment advertises the accepted transaction contract, a least-privilege service-client-bound adapter passes the unchanged hosted authorization, consistency, uniqueness, history, pagination, idempotency, quota, rollback, restart, and non-disclosure matrix, all fixtures and credentials are removed or intentionally retained outside Git, and documentation plus full validation pass.
+
+  Retirement mapping: Replaced by `TASK-131` and `TASK-132`.
+
+- **TASK-072:** Wire owner founder review. Depends on: `TASK-071`. DoD: the configured owner can page and inspect opaque founder-review resources backed by the same persistent applications while subjects stay out of URLs and public output; anonymous, non-owner, malformed cursor, oversized page, missing, and restart paths remain bounded and non-disclosing; HTML/hypermedia parity tests and full validation pass.
+
+  Retirement mapping: Replaced by `TASK-133` and `TASK-134`.
+
+- **TASK-075:** Wire owner indication moderation. Depends on: `TASK-067`, `TASK-073`, `TASK-097`. DoD: the configured owner can page, inspect, and reject an active indication with a bounded participant-visible reason through AittaDB-backed atomic indication/aggregate/audit/notification persistence; rejection removes the public contribution exactly once, foreign and stale requests disclose nothing and change nothing, and HTML/hypermedia, retry, rollback, restart, and full validation tests pass.
+
+  Retirement mapping: Replaced by `TASK-102`, `TASK-103`, `TASK-104`, and `TASK-135`.
+
+- **TASK-077:** Wire owner audit and manual-notification history. Depends on: `TASK-067`, `TASK-068`, `TASK-069`, `TASK-073`, `TASK-075`. DoD: bounded persistent audit and manual-notification collections expose only owner-authorized HTML/hypermedia resources, copy evidence remains distinct from the owner-entered sent marker, expected campaign/package/indication/moderation transitions appear once across retries and restarts, private templates never enter public errors or logs, and focused tests plus full validation pass.
+
+  Retirement mapping: Replaced by `TASK-105`, `TASK-106`, and `TASK-136`.
+
+- **TASK-078:** Wire owner review exports. Depends on: `TASK-068`, `TASK-069`, `TASK-089`, `TASK-072`, `TASK-073`, `TASK-076`, `TASK-077`. DoD: owner-only CSV review and versioned JSON backup stream bounded current AittaDB-backed campaign, package, participant, founder, indication, aggregate, and audit projections with formula neutralization and guaranteed immutable audit evidence; anonymous, non-owner, stale, oversized, looping-page, cancellation, retry, and restart paths expose no partial download or credential; and full validation passes.
+
+  Retirement mapping: Replaced by `TASK-107` and `TASK-108`.
+
+- **TASK-079:** Coordinate participant account-deletion requests. Depends on: `TASK-064`, `TASK-089`, `TASK-071`, `TASK-073`, `TASK-077`. DoD: one retry-stable AittaDB-backed application operation marks deletion requested, withdraws every active founder and investment interest, updates aggregates, and appends closed audit evidence atomically or leaves all state unchanged; access is immediately blocked according to policy, marketing state remains independent, and partial failure, retry, concurrency, restart, and non-disclosure tests plus full validation pass.
+
+  Retirement mapping: Replaced by `TASK-109` and `TASK-110`.
+
+- **TASK-080:** Prove the runtime-only AittaDB credential boundary. Depends on: `TASK-059`, `TASK-068`, `TASK-069`, `TASK-093`, `TASK-094`, `TASK-072`, `TASK-096`, `TASK-074`, `TASK-075`, `TASK-076`, `TASK-077`, `TASK-078`, `TASK-079`. DoD: source and artifact scans contain no instance credential or token; browser network, HTML, JSON, downloads, redirects, CSP, errors, and Worker logs expose none; the AittaDB service client has no redirect URI or browser origin and only required storage scopes; anonymous clients cannot call its namespace; secret rotation invalidates old credentials without data loss; and focused security tests plus full validation pass.
+
+  Retirement mapping: Replaced by `TASK-111` through `TASK-114`.
+
+- **TASK-081:** Complete hosted pre-registration acceptance. Depends on: `TASK-080`. DoD: one exact acceptance deployment proves public campaign, first registration, immediate package access, acknowledgment, personal and company indications, founder application, edits, withdrawals, reactivation, public totals, owner setup/package/review/moderation/reconciliation/notifications/exports, account deletion, HTML/hypermedia parity, two-user isolation, restart persistence, concurrency, recovery, responsive accessibility, and credential-free logs using only synthetic data; all fixtures are removed or retained intentionally and full validation passes.
+
+  Retirement mapping: Replaced by `TASK-137` through `TASK-151`.
+
+- **TASK-082:** Prepare the AittaDB production Investor App runtime. Depends on: `TASK-081`. Blocked by: explicit owner approval for production AittaDB service-client registration, hosted-secret updates, and an unpublished `invest.aittadb.com` deployment. DoD: a dedicated service client with no origins or redirects and only required storage scopes is stored solely in the production Sites environment, exact origins, quotas, privacy contact, owner identity, bindings, and rollback version are verified, the validated source is deployed without publishing a campaign or mutating unrelated production data, and no secret or private setting enters Git or retained evidence.
+
+  Retirement mapping: Replaced by `TASK-120` through `TASK-122`.
+
+- **TASK-083:** Configure and review the AittaDB pre-registration campaign. Depends on: `TASK-082`. Blocked by: the owner must supply or approve the real public copy, private package, acknowledgment, phase, country, amount, privacy, retention, and legal-boundary settings. DoD: the configured owner completes setup through the production owner UI, reviews public preview and every enabled private section, confirms non-binding and privacy wording, verifies no empty or synthetic content remains, keeps the campaign unpublished, and retained evidence contains no private package text, participant data, credential, or internal strategy.
+
+  Retirement mapping: Replaced by `TASK-123`, `TASK-124`, and `TASK-152`.
+
+- **TASK-084:** Publish `invest.aittadb.com` for pre-registration. Depends on: `TASK-083`. Blocked by: explicit owner approval of the exact production preview and publication action. DoD: the owner explicitly publishes the reviewed campaign, signed-out and signed-in production smoke tests prove the public, participant, and owner boundaries without synthetic submissions or unrelated data mutation, monitoring and rollback checks pass, the deployed source and environment revisions are recorded without secrets, and no merge to `main` occurs before PR approval.
+
+  Retirement mapping: Replaced by `TASK-125`, `TASK-126`, and `TASK-153`.
+
+- **TASK-085:** Remove temporary OAuth acceptance administration. Depends on: `TASK-030`. DoD: the proof client grants are revoked and the client is disabled or removed, its hosted secret and unused proof-only configuration are removed from the Investor acceptance environment, the temporary AittaDB administrator subject is removed by the AittaDB project, anonymous and former-admin access fail as expected, no unrelated acceptance setting or data changes, and retained evidence contains no identity, credential, token, or private environment value.
+
+  Retirement mapping: Replaced by `TASK-127` through `TASK-130`.
