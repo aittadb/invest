@@ -54,6 +54,8 @@ import {
 } from "./in-memory-audit-notification-repositories.ts";
 import {
   DevelopmentInMemoryIndicationRepository,
+  MAX_INDICATION_CANONICAL_DEPTH,
+  MAX_INDICATION_CANONICAL_NODES,
   prepareParticipantIndicationMutation,
   prepareParticipantIndicationReplay,
   type IndicationMutationResult,
@@ -495,12 +497,10 @@ function decodeOperationReceipt(
   expectedKey: StorageKey,
   amount: AmountConfiguration,
 ): StoredOperationReceipt {
-  if (
-    !record ||
-    record.revision !== 1 ||
-    storageKeyString(record.key) !== storageKeyString(expectedKey)
-  ) unavailable();
-  const source = exactRecord(record.value, RECEIPT_DOCUMENT_KEYS);
+  if (!record) unavailable();
+  const envelope = exactStoredRecordEnvelope(record, expectedKey);
+  if (envelope.revision !== 1) unavailable();
+  const source = exactRecord(envelope.value, RECEIPT_DOCUMENT_KEYS);
   if (
     source.kind !== "participant-investment-operation" ||
     source.schemaVersion !== PARTICIPANT_OPERATION_SCHEMA_VERSION ||
@@ -552,14 +552,12 @@ async function readParticipantIndex(
   if (record === null) {
     return Object.freeze({ record: null, ids: Object.freeze([]) });
   }
-  if (storageKeyString(record.key) !== storageKeyString(key)) unavailable();
-  const source = exactRecord(record.value, INDEX_DOCUMENT_KEYS);
+  const envelope = exactStoredRecordEnvelope(record, key);
+  const source = exactRecord(envelope.value, INDEX_DOCUMENT_KEYS);
   if (
     source.kind !== "participant-investment-index" ||
     source.schemaVersion !== PARTICIPANT_INDEX_SCHEMA_VERSION ||
-    !Number.isSafeInteger(record.revision) ||
-    record.revision < 1 ||
-    source.revision !== record.revision
+    source.revision !== envelope.revision
   ) unavailable();
   const values = exactDenseArray(source.indicationIds, MAX_OWNED_INDICATIONS);
   const ids: InvestmentIndicationId[] = [];
@@ -569,7 +567,14 @@ async function readParticipantIndex(
     ids.push(parsed.value);
   }
   if (!sameStrings(ids, [...ids].sort(compareIds))) unavailable();
-  return Object.freeze({ record, ids: Object.freeze(ids) });
+  return Object.freeze({
+    record: Object.freeze({
+      key,
+      revision: envelope.revision,
+      value: source as StorageDocument,
+    }),
+    ids: Object.freeze(ids),
+  });
 }
 
 async function participantIndexMutation(
@@ -749,7 +754,25 @@ function sameDocument(left: unknown, right: unknown): boolean {
   }
 }
 
-function canonicalJson(value: unknown, ancestors = new Set<object>()): string {
+type CanonicalJsonState = {
+  nodes: number;
+};
+
+function canonicalJson(value: unknown): string {
+  return canonicalJsonValue(value, 0, new Set<object>(), { nodes: 0 });
+}
+
+function canonicalJsonValue(
+  value: unknown,
+  depth: number,
+  ancestors: ReadonlySet<object>,
+  state: CanonicalJsonState,
+): string {
+  state.nodes += 1;
+  if (
+    depth > MAX_INDICATION_CANONICAL_DEPTH ||
+    state.nodes > MAX_INDICATION_CANONICAL_NODES
+  ) invalid();
   if (value === null || typeof value === "string" || typeof value === "boolean") {
     return JSON.stringify(value);
   }
@@ -777,7 +800,12 @@ function canonicalJson(value: unknown, ancestors = new Set<object>()): string {
         !descriptor.enumerable ||
         !("value" in descriptor)
       ) invalid();
-      entries.push(canonicalJson(descriptor.value, nextAncestors));
+      entries.push(canonicalJsonValue(
+        descriptor.value,
+        depth + 1,
+        nextAncestors,
+        state,
+      ));
     }
     return `[${entries.join(",")}]`;
   }
@@ -793,9 +821,11 @@ function canonicalJson(value: unknown, ancestors = new Set<object>()): string {
       !descriptor.enumerable ||
       !("value" in descriptor)
     ) invalid();
-    return `${JSON.stringify(candidate)}:${canonicalJson(
+    return `${JSON.stringify(candidate)}:${canonicalJsonValue(
       descriptor.value,
+      depth + 1,
       nextAncestors,
+      state,
     )}`;
   });
   return `{${fields.join(",")}}`;
@@ -916,6 +946,24 @@ function requiredIndicationId(value: unknown): InvestmentIndicationId {
   const parsed = parseStableId<"investment-indication">(value);
   if (!parsed.ok) invalid();
   return parsed.value;
+}
+
+function exactStoredRecordEnvelope(
+  value: unknown,
+  expectedKey: StorageKey,
+): Readonly<{ revision: number; value: unknown }> {
+  const envelope = exactRecord(value, STORAGE_RECORD_KEYS);
+  const keyValue = exactRecord(envelope.key, STORAGE_KEY_KEYS);
+  if (
+    keyValue.collection !== expectedKey.collection ||
+    keyValue.id !== expectedKey.id ||
+    !Number.isSafeInteger(envelope.revision) ||
+    (envelope.revision as number) < 1
+  ) unavailable();
+  return Object.freeze({
+    revision: envelope.revision as number,
+    value: envelope.value,
+  });
 }
 
 function exactRecord(

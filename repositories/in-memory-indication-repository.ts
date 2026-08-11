@@ -55,7 +55,7 @@ import {
   type StorageRecord,
 } from "../domain/storage-adapter.ts";
 
-const INDICATION_SCHEMA_VERSION = 3;
+const INDICATION_SCHEMA_VERSION = 4;
 const CURRENT_INDICATIONS = storageCollection("investment-indications");
 const INDICATION_HISTORY = storageCollection("investment-indication-history");
 const INDICATION_FIELDS = storageCollection("investment-indication-fields");
@@ -65,6 +65,8 @@ const ACTIVE_UNIQUENESS_KEYS = storageCollection(
 export const MAX_INDICATION_STORAGE_RECORD_BYTES = 65_536;
 export const MAX_INDICATION_STORAGE_TRANSACTION_BYTES = 1_048_576;
 export const MAX_SERIALIZED_INDICATION_FIELDS_BYTES = 65_536;
+export const MAX_INDICATION_CANONICAL_DEPTH = 32;
+export const MAX_INDICATION_CANONICAL_NODES = 4_096;
 export const INDICATION_FIELDS_CHUNK_RAW_BYTES = 8_192;
 export const MAX_INDICATION_FIELDS_CHUNKS = Math.ceil(
   MAX_SERIALIZED_INDICATION_FIELDS_BYTES / INDICATION_FIELDS_CHUNK_RAW_BYTES,
@@ -311,7 +313,12 @@ export async function prepareParticipantIndicationMutation(
   });
   return Object.freeze({
     ...replay,
-    fingerprint: await operationFingerprint(kind, actor, parsed),
+    fingerprint: await operationFingerprint(
+      kind,
+      actor,
+      parsed,
+      replay.requestFingerprint,
+    ),
   });
 }
 
@@ -450,15 +457,16 @@ export class DevelopmentInMemoryIndicationRepository
       this.#amountConfiguration,
       this.#parsingOptions,
     );
-    const fingerprint = await operationFingerprint(
-      "create",
-      actor,
-      parsed,
-    );
     const requestFingerprint = await exactRequestFingerprint(
       "create",
       actor,
       envelope,
+    );
+    const fingerprint = await operationFingerprint(
+      "create",
+      actor,
+      parsed,
+      requestFingerprint,
     );
 
     const created = domainMutation(() =>
@@ -571,11 +579,16 @@ export class DevelopmentInMemoryIndicationRepository
       this.#amountConfiguration,
       this.#parsingOptions,
     );
-    const fingerprint = await operationFingerprint("edit", actor, parsed);
     const requestFingerprint = await exactRequestFingerprint(
       "edit",
       actor,
       envelope,
+    );
+    const fingerprint = await operationFingerprint(
+      "edit",
+      actor,
+      parsed,
+      requestFingerprint,
     );
 
     const current = await this.#readCurrent(
@@ -622,11 +635,16 @@ export class DevelopmentInMemoryIndicationRepository
     const replay = await this.#replayIfKnown("withdraw", actor, envelope);
     if (replay !== null) return withdrawnResult(replay);
     const parsed = parseTransitionRequest(request);
-    const fingerprint = await operationFingerprint("withdraw", actor, parsed);
     const requestFingerprint = await exactRequestFingerprint(
       "withdraw",
       actor,
       envelope,
+    );
+    const fingerprint = await operationFingerprint(
+      "withdraw",
+      actor,
+      parsed,
+      requestFingerprint,
     );
 
     const current = await this.#readCurrent(
@@ -670,11 +688,16 @@ export class DevelopmentInMemoryIndicationRepository
     const replay = await this.#replayIfKnown("reactivate", actor, envelope);
     if (replay !== null) return activeResult(replay);
     const parsed = parseTransitionRequest(request);
-    const fingerprint = await operationFingerprint("reactivate", actor, parsed);
     const requestFingerprint = await exactRequestFingerprint(
       "reactivate",
       actor,
       envelope,
+    );
+    const fingerprint = await operationFingerprint(
+      "reactivate",
+      actor,
+      parsed,
+      requestFingerprint,
     );
 
     const current = await this.#readCurrent(
@@ -718,11 +741,16 @@ export class DevelopmentInMemoryIndicationRepository
     const replay = await this.#replayIfKnown("reject", actor, envelope);
     if (replay !== null) return rejectedResult(replay);
     const parsed = parseRejectRequest(request);
-    const fingerprint = await operationFingerprint("reject", actor, parsed);
     const requestFingerprint = await exactRequestFingerprint(
       "reject",
       actor,
       envelope,
+    );
+    const fingerprint = await operationFingerprint(
+      "reject",
+      actor,
+      parsed,
+      requestFingerprint,
     );
 
     const current = await this.#readCurrent(parsed.id, "owner", actor.subject);
@@ -1387,6 +1415,7 @@ async function materializeIndication(
     const fingerprint = await fingerprintForStoredIndication(
       indication,
       transition.operationId,
+      transition.requestFingerprint,
     );
     if (
       fingerprint !== transition.operationFingerprint ||
@@ -1999,6 +2028,7 @@ function actorDocument(
 async function fingerprintForStoredIndication(
   indication: InvestmentIndication,
   operationId: StorageOperationId,
+  requestFingerprint: string,
 ): Promise<string> {
   const entry = indication.history[indication.history.length - 1];
   if (entry === undefined) unavailable();
@@ -2020,6 +2050,7 @@ async function fingerprintForStoredIndication(
         ? { reason: entry.rejection.reason }
         : {}),
     }),
+    requestFingerprint,
   );
 }
 
@@ -2044,6 +2075,7 @@ async function operationFingerprint(
   kind: MutationKind,
   actor: ParticipantIndicationActor | OwnerIndicationActor,
   request: ParsedMutationRequest,
+  requestFingerprint: string,
 ): Promise<string> {
   const payload: StorageDocument = {
     kind,
@@ -2053,6 +2085,7 @@ async function operationFingerprint(
     id: request.id,
     occurredAt: request.occurredAt,
     historyEntryId: request.historyEntryId,
+    requestFingerprint,
     ...(request.fields === undefined
       ? {}
       : { fields: fieldsDocument(request.fields) }),
@@ -2355,7 +2388,25 @@ function isSha256(value: string): boolean {
   return /^sha256:[0-9a-f]{64}$/.test(value);
 }
 
-function canonicalJson(value: unknown, ancestors = new Set<object>()): string {
+type CanonicalJsonState = {
+  nodes: number;
+};
+
+function canonicalJson(value: unknown): string {
+  return canonicalJsonValue(value, 0, new Set<object>(), { nodes: 0 });
+}
+
+function canonicalJsonValue(
+  value: unknown,
+  depth: number,
+  ancestors: ReadonlySet<object>,
+  state: CanonicalJsonState,
+): string {
+  state.nodes += 1;
+  if (
+    depth > MAX_INDICATION_CANONICAL_DEPTH ||
+    state.nodes > MAX_INDICATION_CANONICAL_NODES
+  ) unavailable();
   if (value === null || typeof value === "string" || typeof value === "boolean") {
     return JSON.stringify(value);
   }
@@ -2368,14 +2419,20 @@ function canonicalJson(value: unknown, ancestors = new Set<object>()): string {
   nextAncestors.add(value);
   if (Array.isArray(value)) {
     const entries = exactDenseArray(value, value.length);
-    return `[${entries.map((entry) => canonicalJson(entry, nextAncestors)).join(",")}]`;
+    return `[${
+      entries.map((entry) =>
+        canonicalJsonValue(entry, depth + 1, nextAncestors, state)
+      ).join(",")
+    }]`;
   }
   const source = objectRecord(value);
   if (source === null) unavailable();
   return `{${Object.keys(source)
     .sort()
     .map((key) =>
-      `${JSON.stringify(key)}:${canonicalJson(source[key], nextAncestors)}`
+      `${JSON.stringify(key)}:${
+        canonicalJsonValue(source[key], depth + 1, nextAncestors, state)
+      }`
     )
     .join(",")}}`;
 }

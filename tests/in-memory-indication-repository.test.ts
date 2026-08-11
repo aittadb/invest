@@ -40,6 +40,8 @@ import {
 } from "../domain/storage-adapter.ts";
 import {
   DevelopmentInMemoryIndicationRepository,
+  MAX_INDICATION_CANONICAL_DEPTH,
+  MAX_INDICATION_CANONICAL_NODES,
   MAX_INDICATION_FIELDS_CHUNKS,
   MAX_INDICATION_MATERIALIZATION_READS,
   MAX_INDICATION_STORAGE_MUTATIONS,
@@ -756,6 +758,85 @@ test("exact retries survive normalizer evolution without accepting changed raw i
   );
 });
 
+test("historical request fingerprints are chained into immutable transition integrity", async () => {
+  const contexts = await packageContexts();
+  const parsingOptions: InvestmentIndicationParsingOptions = Object.freeze({
+    companyIdentifier: Object.freeze({
+      normalize: () => "SHARED-CANONICAL-ID",
+    }),
+  });
+  const originalRequest = createRequest({
+    operationId: "indication-operation:request-fingerprint-chain",
+    id: COMPANY_ONE,
+    occurredAt: "2026-08-10T09:00:00.000Z",
+    historyEntryId: "indication-history:request-fingerprint-chain",
+    fields: companyFields({ companyIdentifier: "Original raw identifier" }),
+  });
+  const changedRequest = {
+    ...originalRequest,
+    fields: companyFields({ companyIdentifier: "Altered raw identifier" }),
+  };
+
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const original = repository(
+    storage,
+    ALICE_SUBJECT,
+    amountConfiguration,
+    parsingOptions,
+  );
+  await original.create(originalRequest, contexts.aliceCurrent);
+  await original.edit(editRequest({
+    operationId: "indication-operation:request-fingerprint-chain-edit",
+    id: COMPANY_ONE,
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T10:00:00.000Z",
+    historyEntryId: "indication-history:request-fingerprint-chain-edit",
+    fields: companyFields({
+      companyIdentifier: "Original raw identifier",
+      note: "Keep revision one historical.",
+    }),
+  }), contexts.aliceCurrent);
+
+  const changedState = new MemoryStorageState();
+  await repository(
+    new DeterministicMemoryStorageAdapter(changedState, true),
+    ALICE_SUBJECT,
+    amountConfiguration,
+    parsingOptions,
+  ).create(changedRequest, contexts.aliceCurrent);
+  const changedFingerprint = requiredRecordWhere(
+    changedState,
+    "investment-indication-history",
+    (record) => record.value.revision === 1,
+  ).value.requestFingerprint;
+  assert.match(String(changedFingerprint), /^sha256:[0-9a-f]{64}$/u);
+
+  mutateStoredDocument(
+    state,
+    requiredRecordWhere(
+      state,
+      "investment-indication-history",
+      (record) => record.value.revision === 1,
+    ),
+    (document) => {
+      document.requestFingerprint = changedFingerprint;
+    },
+  );
+
+  const reopened = repository(
+    storage,
+    ALICE_SUBJECT,
+    amountConfiguration,
+    parsingOptions,
+  );
+  await rejectsStorage(() => reopened.get(COMPANY_ONE), "UNAVAILABLE");
+  await rejectsStorage(
+    () => reopened.create(changedRequest, contexts.aliceCurrent),
+    "UNAVAILABLE",
+  );
+});
+
 test("owner rotation preserves historical rejection attribution and current authorization", async () => {
   const state = new MemoryStorageState();
   const storage = new DeterministicMemoryStorageAdapter(state, true);
@@ -1154,6 +1235,25 @@ test("indication writes reject a malformed transaction result matrix", async (t)
       name: "wrong field chunk key",
       apply: (result) => corruptTransactionRecord(result, 2, (record) => {
         mutableRecord(record.key).id = "indication-fields:wrong";
+      }),
+    },
+    {
+      name: "over-depth record value",
+      apply: (result) => corruptTransactionRecord(result, 0, (record) => {
+        record.value = nestedCanonicalValue(
+          MAX_INDICATION_CANONICAL_DEPTH + 1,
+        );
+      }),
+    },
+    {
+      name: "over-node record value",
+      apply: (result) => corruptTransactionRecord(result, 0, (record) => {
+        record.value = {
+          values: Array.from(
+            { length: MAX_INDICATION_CANONICAL_NODES },
+            () => null,
+          ),
+        };
       }),
     },
   ];
@@ -1945,6 +2045,14 @@ function corruptTransactionRecord(
   assert(candidate && typeof candidate === "object" && !Array.isArray(candidate));
   mutate(candidate as Record<string, unknown>);
   return { replayed: result.replayed, records };
+}
+
+function nestedCanonicalValue(depth: number): StorageDocument {
+  let value: StorageDocument = { end: true };
+  for (let index = 0; index < depth; index += 1) {
+    value = { child: value };
+  }
+  return value;
 }
 
 function jsonBytes(value: unknown): number {

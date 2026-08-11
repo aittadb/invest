@@ -25,9 +25,14 @@ import {
   StorageFailure,
   type StorageAdapter,
   type StorageDocument,
+  type StorageRecord,
   type StorageTransactionRequest,
   type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
+import {
+  MAX_INDICATION_CANONICAL_DEPTH,
+  MAX_INDICATION_CANONICAL_NODES,
+} from "../repositories/in-memory-indication-repository.ts";
 import { StorageParticipantInvestmentInterestRepository } from "../repositories/storage-participant-investment-repository.ts";
 import {
   createParticipantInvestmentInterestService,
@@ -546,6 +551,31 @@ test("atomic transaction results reject a closed malformed envelope matrix", asy
         (record) => ({ ...record, value: { changed: true } }),
       ),
     },
+    {
+      name: "over-depth record value",
+      transform: (result) => replaceFirstResultRecord(
+        result,
+        (record) => ({
+          ...record,
+          value: nestedCanonicalValue(MAX_INDICATION_CANONICAL_DEPTH + 1),
+        }),
+      ),
+    },
+    {
+      name: "over-node record value",
+      transform: (result) => replaceFirstResultRecord(
+        result,
+        (record) => ({
+          ...record,
+          value: {
+            values: Array.from(
+              { length: MAX_INDICATION_CANONICAL_NODES },
+              () => null,
+            ),
+          },
+        }),
+      ),
+    },
   ];
 
   for (const candidate of cases) {
@@ -571,6 +601,104 @@ test("atomic transaction results reject a closed malformed envelope matrix", asy
       }));
       assert.equal(failure.code, "UNAVAILABLE");
       assert.doesNotMatch(String(failure), /malformed|private|extra|changed/iu);
+    });
+  }
+});
+
+test("stored operation receipts and participant indexes require closed envelopes", async (context) => {
+  const cases: readonly Readonly<{
+    name: string;
+    collection: string;
+    transform(record: StorageRecord): unknown;
+    replay: boolean;
+  }>[] = [
+    {
+      name: "receipt extra member",
+      collection: "participant-investment-operations",
+      transform: (record) => ({ ...record, privateDetail: "not disclosed" }),
+      replay: true,
+    },
+    {
+      name: "receipt key accessor",
+      collection: "participant-investment-operations",
+      transform: (record) => Object.defineProperty(
+        { revision: record.revision, value: record.value },
+        "key",
+        {
+          enumerable: true,
+          get: () => {
+            throw new Error("private receipt getter");
+          },
+        },
+      ),
+      replay: true,
+    },
+    {
+      name: "index custom prototype",
+      collection: "participant-investment-indexes",
+      transform: (record) => Object.assign(Object.create({}), record),
+      replay: false,
+    },
+    {
+      name: "index extra key member",
+      collection: "participant-investment-indexes",
+      transform: (record) => ({
+        ...record,
+        key: { ...record.key, privateDetail: "not disclosed" },
+      }),
+      replay: false,
+    },
+  ];
+
+  for (const [index, candidate] of cases.entries()) {
+    await context.test(candidate.name, async () => {
+      const state = new MemoryStorageState();
+      const input = Object.freeze({
+        operationId: `investment-operation:closed-envelope-${index}`,
+        fields: personalFields(),
+      });
+      const initialRepository =
+        new StorageParticipantInvestmentInterestRepository(
+          new MemoryStorageAdapter(state),
+          ALICE,
+          AMOUNT,
+        );
+      const acknowledgment = await currentContext(
+        ALICE,
+        `closed-envelope-${index}`,
+      );
+      await serviceFor(
+        initialRepository,
+        ALICE,
+        acknowledgment,
+        () => new Date("2026-08-12T10:00:00.000Z"),
+      ).create(input);
+
+      const repository = new StorageParticipantInvestmentInterestRepository(
+        new ReadTransformStorageAdapter(
+          new MemoryStorageAdapter(state),
+          candidate.collection,
+          candidate.transform,
+        ),
+        ALICE,
+        AMOUNT,
+      );
+      const failure = await captureStorageFailure(() =>
+        candidate.replay
+          ? serviceFor(
+            repository,
+            ALICE,
+            acknowledgment,
+            () => new Date("2026-08-12T11:00:00.000Z"),
+          ).create(input)
+          : repository.listOwned()
+      );
+      assert.equal(failure.code, "UNAVAILABLE");
+      assert.doesNotMatch(
+        String(failure),
+        /private|receipt getter|not disclosed/iu,
+      );
+      assert.equal(state.operations.size, 1);
     });
   }
 });
@@ -708,6 +836,14 @@ function replaceFirstResultRecord(
     ...result,
     records: [transform(first), ...result.records.slice(1)],
   };
+}
+
+function nestedCanonicalValue(depth: number): StorageDocument {
+  let value: StorageDocument = { end: true };
+  for (let index = 0; index < depth; index += 1) {
+    value = { child: value };
+  }
+  return value;
 }
 
 async function currentContext(
@@ -896,4 +1032,32 @@ class ResultTransformStorageAdapter implements StorageAdapter {
     const result = await this.#delegate.transact(request);
     return this.#transform(result) as StorageTransactionResult;
   }
+}
+
+class ReadTransformStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #collection: string;
+  readonly #transform: (record: StorageRecord) => unknown;
+
+  constructor(
+    delegate: StorageAdapter,
+    collection: string,
+    transform: (record: StorageRecord) => unknown,
+  ) {
+    this.#delegate = delegate;
+    this.#collection = collection;
+    this.#transform = transform;
+  }
+
+  async read(
+    key: Parameters<StorageAdapter["read"]>[0],
+  ): Promise<StorageRecord | null> {
+    const record = await this.#delegate.read(key);
+    if (record === null || key.collection !== this.#collection) return record;
+    return this.#transform(record) as StorageRecord;
+  }
+
+  list: StorageAdapter["list"] = (request) => this.#delegate.list(request);
+  transact: StorageAdapter["transact"] = (request) =>
+    this.#delegate.transact(request);
 }
