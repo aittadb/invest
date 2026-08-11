@@ -279,6 +279,7 @@ test("factory exposes only named application repository capabilities", async () 
     "participantPackageReader",
     "participantPackageAcknowledgments",
     "participantFounderApplications",
+    "participantInvestmentPolicyCampaign",
     "participantInvestmentInterests",
   ]);
   assert.deepEqual(
@@ -309,6 +310,15 @@ test("factory exposes only named application repository capabilities", async () 
     () => participantRequest.participantPackageReader(foreignSubject.value),
     (error) => storageFailure(error, "UNAVAILABLE"),
   );
+  const policyCampaign =
+    participantRequest.participantInvestmentPolicyCampaign();
+  assert.equal(
+    participantRequest.participantInvestmentPolicyCampaign(),
+    policyCampaign,
+  );
+  assert.deepEqual(Object.keys(policyCampaign), ["readSetup"]);
+  assert.equal(Object.isFrozen(policyCampaign), true);
+  assertNoGenericStorageSurface(policyCampaign, storage);
   await assert.rejects(
     accessReader.read(foreignAccount.value),
     (error) => storageFailure(error, "UNAVAILABLE"),

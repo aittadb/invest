@@ -2075,6 +2075,7 @@ test("hosted investment interests persist their full lifecycle across workers an
     "withdraw-investment-interest",
   ]);
 
+  await configureHostedInvestmentCampaign(service, "open");
   const replayProof = await investmentResource(
     hostedPackageWorker(service),
     env,
@@ -2296,6 +2297,7 @@ test("hosted investment creation and reactivation recheck phase and package poli
     withdrawProof.document,
     "withdraw-investment-interest",
   );
+  await configureHostedInvestmentCampaign(service, "closed");
   const withdrawn = await submitInvestmentMutation(
     hostedPackageWorker(service),
     env,
@@ -2308,6 +2310,7 @@ test("hosted investment creation and reactivation recheck phase and package poli
     }),
   );
   assert.equal(withdrawn.status, 200);
+  await configureHostedInvestmentCampaign(service, "open");
   const reactivateProof = await investmentResource(
     hostedPackageWorker(service),
     env,
@@ -2369,37 +2372,56 @@ test("hosted investment creation and reactivation recheck phase and package poli
   assert.equal(recordsIn(service, "investment-aggregate-states").length, 1);
 });
 
-test("hosted investment mutation rejects policy heads changed during one request", async () => {
-  const service = new SyntheticAittaDBService();
-  const env = configuredEnvironment({ OWNER_EMAIL });
-  await configureHostedInvestmentFixture(service);
-  const proof = await investmentResource(hostedPackageWorker(service), env);
-  const action = requiredAction(
-    proof.document,
-    "create-personal-investment-interest",
-  );
-  service.interceptReadAfter("campaign-setup-current", 2, async () => {
-    await configureHostedInvestmentCampaign(service, "closed");
-  });
+for (
+  const policyHeadCollection of [
+    "campaign-setup-current",
+    "private-participant-profiles",
+    "private-package-version-heads",
+    "private-package-acceptance-heads",
+  ] as const
+) {
+  test(
+    `hosted investment mutation rejects a changed ${policyHeadCollection} head`,
+    async () => {
+      const service = new SyntheticAittaDBService();
+      const env = configuredEnvironment({ OWNER_EMAIL });
+      await configureHostedInvestmentFixture(service);
+      const proof = await investmentResource(hostedPackageWorker(service), env);
+      const action = requiredAction(
+        proof.document,
+        "create-personal-investment-interest",
+      );
+      service.interceptTransactionBefore("investment-indications", () => {
+        bumpHostedRecordRevision(service, policyHeadCollection);
+      });
 
-  const response = await submitInvestmentMutation(
-    hostedPackageWorker(service),
-    env,
-    proof,
-    action,
-    actionBody(action, {
-      "operation-id": "investment-operation:hosted-policy-race",
-      "residence-country": "FI",
-      amount: 25_000,
-      "availability-period": "Within twelve months.",
-    }),
-  );
+      const response = await submitInvestmentMutation(
+        hostedPackageWorker(service),
+        env,
+        proof,
+        action,
+        actionBody(action, {
+          "operation-id":
+            `investment-operation:hosted-policy-race-${policyHeadCollection}`,
+          "residence-country": "FI",
+          amount: 25_000,
+          "availability-period": "Within twelve months.",
+        }),
+      );
 
-  assert.equal(response.status, 503);
-  assert.equal(recordsIn(service, "investment-indications").length, 0);
-  assert.equal(recordsIn(service, "investment-indication-history").length, 0);
-  assert.equal(recordsIn(service, "investment-aggregate-states").length, 0);
-});
+      assert.equal(response.status, 412);
+      assert.equal(recordsIn(service, "investment-indications").length, 0);
+      assert.equal(
+        recordsIn(service, "investment-indication-history").length,
+        0,
+      );
+      assert.equal(
+        recordsIn(service, "investment-aggregate-states").length,
+        0,
+      );
+    },
+  );
+}
 
 test("hosted maximum investment collection stays inside the shared request budget", async () => {
   const service = new SyntheticAittaDBService();
@@ -4586,6 +4608,10 @@ class SyntheticAittaDBService {
     successfulMatchesRemaining: number;
     run(): void | Promise<void>;
   }> | null = null;
+  #transactionInterception: Readonly<{
+    collection: string;
+    run(): void | Promise<void>;
+  }> | null = null;
 
   failNextTransactionContaining(collection: string): void {
     this.failTransactionContainingAfter(collection, 0);
@@ -4616,6 +4642,14 @@ class SyntheticAittaDBService {
       successfulMatchesRemaining: successfulMatches,
       run,
     });
+  }
+
+  interceptTransactionBefore(
+    collection: string,
+    run: () => void | Promise<void>,
+  ): void {
+    assert.ok(collection.length > 0);
+    this.#transactionInterception = Object.freeze({ collection, run });
   }
 
   readonly fetch = async (input: string, init: RequestInit): Promise<Response> => {
@@ -4694,10 +4728,10 @@ class SyntheticAittaDBService {
     if (transactionBytes > MAX_HOSTED_TRANSACTION_BYTES) {
       return protocolFailure("invalid_request");
     }
-    return this.transact(JSON.parse(transactionBody) as unknown);
+    return await this.transact(JSON.parse(transactionBody) as unknown);
   };
 
-  private transact(value: unknown): Response {
+  private async transact(value: unknown): Promise<Response> {
     const transaction = requiredObject(requiredObject(value).transaction);
     const operationId = requiredString(transaction.operation_id);
     const mutations = transaction.mutations;
@@ -4726,6 +4760,14 @@ class SyntheticAittaDBService {
     const mutationCollections = mutations.map((candidate) =>
       requiredString(requiredObject(requiredObject(candidate).key).collection)
     );
+    const interception = this.#transactionInterception;
+    if (
+      interception !== null &&
+      mutationCollections.includes(interception.collection)
+    ) {
+      this.#transactionInterception = null;
+      await interception.run();
+    }
     const failure = this.#transactionFailure;
     if (failure !== null && mutationCollections.includes(failure.collection)) {
       if (failure.successfulMatchesRemaining === 0) {
@@ -6249,6 +6291,22 @@ function recordsIn(
   return [...service.records.values()].filter(
     (record) => record.key.collection === collection,
   );
+}
+
+function bumpHostedRecordRevision(
+  service: SyntheticAittaDBService,
+  collection: string,
+): void {
+  const records = recordsIn(service, collection);
+  assert.equal(records.length, 1);
+  const record = records[0];
+  assert(record);
+  const identity = `${record.key.collection}/${record.key.id}`;
+  service.records.set(identity, Object.freeze({
+    key: record.key,
+    revision: record.revision + 1,
+    value: structuredClone(record.value),
+  }));
 }
 
 function configuredEnvironment(

@@ -313,10 +313,20 @@ cached-head read, acknowledgment GET uses at most four, and an ordinary
 maximum-count investment collection remains bounded; unusually deep combined
 indication histories fail closed at the same ceiling. Route read 513 or total
 read 1,064 fails
-before adapter access. Public campaign reads and storage transactions are
-outside this participant read counter, while all profile, package, gate,
-acceptance-head, acceptance-record, founder-application, investment-indication,
-and participant-route reads are inside it.
+before adapter access. General public campaign reads and storage transactions
+are outside this participant read counter. Investment policy opens its private
+campaign-head reader inside the participant scope, so those reads and all
+profile, package, gate, acceptance-head, acceptance-record,
+founder-application, investment-indication, and participant-route reads are
+inside it.
+
+After the investment route obtains a stable campaign, participant, package, and
+acknowledgment sample, the scope supplies exactly four non-mutating revision
+checks to each create, edit, or reactivate transaction. A change to any sampled
+head before commit fails the transaction precondition and rolls back every
+indication, aggregate, audit, index, and receipt write. Exact operation replays
+return their immutable receipt before fresh checks, and withdrawal deliberately
+does not depend on current campaign or package policy.
 
 Within the scope, one read-only package reader reuses up to 64 verified immutable
 version reconstructions. Cache hits recharge complete ancestry and logical read

@@ -16,7 +16,9 @@ import {
   parseStorageCollection,
   parseStorageKey,
   parseStorageOperationId,
+  storageKeyString,
   type StorageAdapter,
+  type StorageCheckMutation,
   type StorageCollection,
   type StorageDocument,
   type StorageKey,
@@ -136,6 +138,10 @@ export type ParticipantRequestRepositoryScope = Readonly<{
   participantFounderApplications(
     contributionAreaChoices: readonly ContributionAreaChoice[],
   ): ParticipantFounderApplicationRepositories;
+  participantInvestmentPolicyCampaign(): Pick<
+    AtomicCampaignAuditRepository,
+    "readSetup"
+  >;
   participantInvestmentInterests(
     amountConfiguration: AmountConfiguration,
     parsingOptions?: InvestmentIndicationParsingOptions,
@@ -249,7 +255,20 @@ type ParticipantRequestReadBudget = {
   remainingReads: number;
   remainingRouteReads: number;
   routeReadsActive: boolean;
+  investmentPolicyHeads: Map<string, InvestmentPolicyHead>;
 };
+
+type InvestmentPolicyHead = Readonly<{
+  key: StorageKey;
+  expectedRevision: number | null;
+}>;
+
+const INVESTMENT_POLICY_HEAD_COLLECTIONS = Object.freeze([
+  "campaign-setup-current",
+  "private-participant-profiles",
+  "private-package-version-heads",
+  "private-package-acceptance-heads",
+] as const);
 
 function createParticipantRequestRepositoryScope(
   storage: StorageAdapter,
@@ -260,6 +279,7 @@ function createParticipantRequestRepositoryScope(
     remainingReads: PARTICIPANT_REQUEST_STORAGE_READ_LIMIT,
     remainingRouteReads: PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT,
     routeReadsActive: false,
+    investmentPolicyHeads: new Map(),
   };
   const readStorage = participantRequestStorage(storage, budget, false);
   const mutationStorage = participantRequestStorage(storage, budget, true);
@@ -268,6 +288,12 @@ function createParticipantRequestRepositoryScope(
     mutationStorage,
     account,
   );
+  const campaignPolicyRepository = new StorageCampaignRepository(
+    readStorage,
+  );
+  const campaignPolicyReader = Object.freeze({
+    readSetup: () => campaignPolicyRepository.readSetup(),
+  });
   const packages = StoragePackageVersionRepository.requestScopedReader(
     readStorage,
   );
@@ -354,6 +380,10 @@ function createParticipantRequestRepositoryScope(
         ),
       });
     },
+    participantInvestmentPolicyCampaign: () => {
+      beginRouteReads();
+      return campaignPolicyReader;
+    },
     participantInvestmentInterests: (
       amountConfiguration: AmountConfiguration,
       parsingOptions: InvestmentIndicationParsingOptions = {},
@@ -364,6 +394,7 @@ function createParticipantRequestRepositoryScope(
         account.subject,
         amountConfiguration,
         parsingOptions,
+        () => investmentPolicyAssertions(budget),
       );
     },
   });
@@ -382,7 +413,9 @@ function participantRequestStorage(
       ) unavailable();
       budget.remainingReads -= 1;
       if (budget.routeReadsActive) budget.remainingRouteReads -= 1;
-      return await storage.read(key);
+      const record = await storage.read(key);
+      observeInvestmentPolicyHead(budget, key, record);
+      return record;
     },
     async list() {
       unavailable();
@@ -392,6 +425,52 @@ function participantRequestStorage(
       return await storage.transact(request);
     },
   });
+}
+
+function observeInvestmentPolicyHead(
+  budget: ParticipantRequestReadBudget,
+  key: StorageKey,
+  record: StorageRecord | null,
+): void {
+  if (
+    !INVESTMENT_POLICY_HEAD_COLLECTIONS.includes(
+      key.collection as typeof INVESTMENT_POLICY_HEAD_COLLECTIONS[number],
+    )
+  ) {
+    return;
+  }
+  if (
+    record !== null &&
+    (storageKeyString(record.key) !== storageKeyString(key) ||
+      !Number.isSafeInteger(record.revision) ||
+      record.revision < 1)
+  ) {
+    unavailable();
+  }
+  budget.investmentPolicyHeads.set(storageKeyString(key), Object.freeze({
+    key: Object.freeze({ ...key }),
+    expectedRevision: record?.revision ?? null,
+  }));
+}
+
+function investmentPolicyAssertions(
+  budget: ParticipantRequestReadBudget,
+): readonly StorageCheckMutation[] {
+  const observations = [...budget.investmentPolicyHeads.values()];
+  const assertions = INVESTMENT_POLICY_HEAD_COLLECTIONS.map((collection) => {
+    const matches = observations.filter(
+      (observation) => observation.key.collection === collection,
+    );
+    if (matches.length !== 1) unavailable();
+    const observation = matches[0];
+    if (observation === undefined) unavailable();
+    return Object.freeze({
+      type: "check" as const,
+      key: Object.freeze({ ...observation.key }),
+      expectedRevision: observation.expectedRevision,
+    });
+  });
+  return Object.freeze(assertions);
 }
 
 async function claimReplay(
