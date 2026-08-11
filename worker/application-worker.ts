@@ -20,6 +20,7 @@ import {
   participantRegistrationNoticesFromCampaignPolicy,
 } from "../domain/participant-registration-resource.ts";
 import { PARTICIPANT_PROFILE_PATH } from "../domain/participant-profile-resource.ts";
+import { PARTICIPANT_HOME_PATH } from "../domain/participant-navigation.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   parsePublicCampaignConfiguration,
@@ -177,16 +178,6 @@ export function createApplicationWorker(
             participantRequest,
           )
         : null;
-      const participantRegistration = dependencies.dispatchRoute === undefined &&
-          applicationRuntime !== null
-        ? await runtimeParticipantRegistrationRoute(
-            applicationRuntime,
-            actor,
-            isOwner,
-            resourceUrl,
-            url.pathname,
-          )
-        : null;
       const ownerPackage = dependencies.dispatchRoute === undefined
         ? dependencies.ownerPackage ?? packageRoutes?.owner
         : undefined;
@@ -235,6 +226,19 @@ export function createApplicationWorker(
         actor,
         participantAccessReader,
       );
+      const participantRegistration = dependencies.dispatchRoute === undefined &&
+          applicationRuntime !== null &&
+          (url.pathname === PARTICIPANT_REGISTRATION_PATH ||
+            (url.pathname === PARTICIPANT_HOME_PATH &&
+              participantAccess === null))
+        ? await runtimeParticipantRegistrationRoute(
+            applicationRuntime,
+            actor,
+            isOwner,
+            resourceUrl,
+            url.pathname,
+          )
+        : null;
       const participantProfile = dependencies.dispatchRoute === undefined &&
           applicationRuntime !== null
         ? runtimeParticipantProfileRoute(
@@ -290,6 +294,8 @@ export function createApplicationWorker(
                 normalApplication && participantFounderInterestAvailable,
               participantInvestmentInterests:
                 normalApplication && participantInvestmentInterestsAvailable,
+              participantProfileSelfService:
+                normalApplication && participantProfile !== null,
               ownerCampaignEditor:
                 normalApplication && campaignEditorAvailable,
               ownerCampaignSetup:
@@ -333,6 +339,9 @@ export function createApplicationWorker(
               },
               {
                 ownerPackageAvailable,
+                participantRegistrationAvailable:
+                  participantRegistration !== null,
+                participantProfileAvailable: participantProfile !== null,
                 ownerIndicationModerationAvailable,
                 ownerReviewExportsAvailable,
                 ownerAuditHistoryAvailable,
@@ -377,6 +386,8 @@ function applicationRenderEnvironment(
 
 type InjectedRouteAvailability = Readonly<{
   ownerPackageAvailable: boolean;
+  participantRegistrationAvailable: boolean;
+  participantProfileAvailable: boolean;
   ownerIndicationModerationAvailable: boolean;
   ownerReviewExportsAvailable: boolean;
   ownerAuditHistoryAvailable: boolean;
@@ -439,6 +450,8 @@ function createInjectedRouteDispatcher(
           : []),
       ],
       {
+        registration: available.participantRegistrationAvailable,
+        profileSelfService: available.participantProfileAvailable,
         founderInterest: available.participantFounderInterestAvailable,
         investmentInterests: available.participantInvestmentInterestsAvailable,
       },
@@ -507,7 +520,8 @@ function runtimeParticipantProfileRoute(
   participantRequest: ParticipantRequestRepositoryScope | null,
 ): ParticipantProfileRouteDependencies | null {
   if (
-    pathname !== PARTICIPANT_PROFILE_PATH ||
+    (pathname !== PARTICIPANT_HOME_PATH &&
+      pathname !== PARTICIPANT_PROFILE_PATH) ||
     actor === null ||
     isOwner ||
     participantAccess === null
@@ -574,7 +588,8 @@ async function runtimeParticipantRegistrationRoute(
   pathname: string,
 ): Promise<ParticipantRegistrationRouteDependencies | null> {
   if (
-    pathname !== PARTICIPANT_REGISTRATION_PATH ||
+    (pathname !== PARTICIPANT_REGISTRATION_PATH &&
+      pathname !== PARTICIPANT_HOME_PATH) ||
     actor === null ||
     isOwner
   ) {
@@ -942,6 +957,7 @@ function withRuntimeConfiguration(
     ownerAuditHistory: boolean;
     participantFounderInterest: boolean;
     participantInvestmentInterests: boolean;
+    participantProfileSelfService: boolean;
     ownerCampaignEditor: boolean;
     ownerCampaignSetup: boolean;
     ownerAittadbConnection: boolean;

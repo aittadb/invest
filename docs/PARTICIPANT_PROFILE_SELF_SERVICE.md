@@ -1,10 +1,11 @@
 # Participant Profile Self-Service
 
 Participant profile self-service is an injectable registered-reader resource at
-`/participant/profile`. Hosted composition installs it only for that exact path
-and a signed-in non-owner with a subject- and email-bound participant-access
-projection. Every read and mutation uses a fresh `StorageParticipantRepository`
-bound again to the same trusted account.
+`/participant/profile`. Hosted composition serves it only for that exact path
+and advertises it from `/participant` when a signed-in non-owner has a subject-
+and email-bound participant-access projection. Every read and mutation uses the
+same finite request-scoped participant repository bound again to the trusted
+account.
 
 ## Representations
 
@@ -56,7 +57,9 @@ not available. A still-granted marketing consent remains independently
 withdrawable. Recording deletion intent does not itself erase records or
 coordinate founder applications, investment indications, or aggregates; that
 atomic application operation belongs to the later account-deletion coordination
-work.
+work. The participant entry representation continues to link to this resource
+as a profile view and retains only currently permitted package access and
+sign-out alongside it; founder and investment workflow actions are withheld.
 
 ## Mutation Boundary
 

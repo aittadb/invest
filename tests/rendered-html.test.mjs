@@ -488,6 +488,9 @@ test("the root resource negotiates equivalent public hypermedia JSON", async () 
     document.actions.map((action) => action.name),
     ["sign-in", "pre-register-investor", "pre-register-founder"],
   );
+  for (const action of document.actions) {
+    assert.equal(new URL(action.href).searchParams.get("return_to"), "/participant");
+  }
   assert.ok(document.links.some((link) => link.rel.includes("self")));
   assert.doesNotMatch(JSON.stringify(document), /email|credential|private package content/i);
 

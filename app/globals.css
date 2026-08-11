@@ -827,6 +827,10 @@ footer {
   font-size: 1.8rem;
 }
 
+.participant-profile-link {
+  margin-top: 20px;
+}
+
 .participant-summary dl,
 .participant-package-detail dl {
   margin: 0;

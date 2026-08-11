@@ -25,6 +25,8 @@ import {
 } from "./participant-navigation.ts";
 import { FOUNDER_INTEREST_PATH } from "./participant-founder-interest-resource.ts";
 import { INVESTMENT_INTEREST_PATH } from "./participant-investment-interest-resource.ts";
+import { PARTICIPANT_PROFILE_PATH } from "./participant-profile-resource.ts";
+import { PARTICIPANT_REGISTRATION_PATH } from "./participant-registration-resource.ts";
 import {
   INVESTOR_APP_API_VERSION,
   type HypermediaLink,
@@ -107,8 +109,18 @@ export type PrivatePackageDocument = Readonly<{
 
 export type ParticipantHomeCapabilities = Readonly<{
   manageCampaign?: boolean;
+  profileSelfService?: boolean;
   founderInterest?: boolean;
   investmentInterests?: boolean;
+}>;
+
+export type ParticipantRegistrationRequiredDocument = Readonly<{
+  api_version: typeof INVESTOR_APP_API_VERSION;
+  type: "participant-entry";
+  id: "participant-registration-required";
+  data: Readonly<{ status: "registration_required" }>;
+  links: readonly HypermediaLink[];
+  actions: readonly HypermediaAction[];
 }>;
 
 /**
@@ -227,6 +239,9 @@ export function createParticipantHomeDocument(
     links: [
       { rel: ["self", "participant-home"], href: absolute(PARTICIPANT_HOME_PATH) },
       { rel: ["campaign"], href: absolute("/") },
+      ...(capabilities.profileSelfService
+        ? [{ rel: ["participant-profile"], href: absolute(PARTICIPANT_PROFILE_PATH) }]
+        : []),
       ...(currentPackage === null
         ? []
         : [{ rel: ["private-package"], href: absolute(PRIVATE_PACKAGE_PATH) }]),
@@ -248,6 +263,15 @@ export function createParticipantHomeDocument(
             "Read information package",
             absolute(PRIVATE_PACKAGE_PATH),
           )]),
+      ...(capabilities.profileSelfService
+        ? [safeAction(
+            "open-participant-profile",
+            participant.accountStatus === "active"
+              ? "Manage profile"
+              : "View profile",
+            absolute(PARTICIPANT_PROFILE_PATH),
+          )]
+        : []),
       ...(capabilities.manageCampaign
         ? [safeAction(
             "manage-campaign",
@@ -269,6 +293,39 @@ export function createParticipantHomeDocument(
             absolute(INVESTMENT_INTEREST_PATH),
           )]
         : []),
+      safeAction(
+        "sign-out",
+        "Sign out",
+        absolute(chatGPTSignOutPath("/")),
+      ),
+    ],
+  };
+}
+
+export function createParticipantRegistrationRequiredDocument(
+  requestUrl: string,
+): ParticipantRegistrationRequiredDocument {
+  const absolute = (href: string) => new URL(href, requestUrl).href;
+
+  return {
+    api_version: INVESTOR_APP_API_VERSION,
+    type: "participant-entry",
+    id: "participant-registration-required",
+    data: { status: "registration_required" },
+    links: [
+      { rel: ["self", "participant-home"], href: absolute(PARTICIPANT_HOME_PATH) },
+      { rel: ["campaign"], href: absolute("/") },
+      {
+        rel: ["participant-registration"],
+        href: absolute(PARTICIPANT_REGISTRATION_PATH),
+      },
+    ],
+    actions: [
+      safeAction(
+        "open-participant-registration",
+        "Complete registration",
+        absolute(PARTICIPANT_REGISTRATION_PATH),
+      ),
       safeAction(
         "sign-out",
         "Sign out",

@@ -10,6 +10,7 @@ import {
   OWNER_REVIEW_EXPORTS_HEADER,
   PARTICIPANT_FOUNDER_INTEREST_HEADER,
   PARTICIPANT_INVESTMENT_INTERESTS_HEADER,
+  PARTICIPANT_PROFILE_SELF_SERVICE_HEADER,
   hasOwnerAittaDBConnection,
   hasOwnerCampaignEditorCapability,
   hasOwnerCampaignSetupCapability,
@@ -18,6 +19,7 @@ import {
   hasOwnerReviewExports,
   hasParticipantFounderInterest,
   hasParticipantInvestmentInterests,
+  hasParticipantProfileSelfService,
   withRuntimeCapabilities,
 } from "../http/runtime-capabilities.ts";
 
@@ -31,6 +33,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
       [OWNER_REVIEW_EXPORTS_HEADER]: "available",
       [PARTICIPANT_FOUNDER_INTEREST_HEADER]: "available",
       [PARTICIPANT_INVESTMENT_INTERESTS_HEADER]: "available",
+      [PARTICIPANT_PROFILE_SELF_SERVICE_HEADER]: "available",
       [OWNER_AITTADB_CONNECTION_HEADER]: "available",
     },
   });
@@ -42,6 +45,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
     ownerReviewExports: false,
     participantFounderInterest: false,
     participantInvestmentInterests: false,
+    participantProfileSelfService: false,
     ownerAittadbConnection: false,
   });
   assert.equal(unavailable.headers.get(OWNER_PACKAGE_WORKSPACE_HEADER), null);
@@ -60,6 +64,10 @@ test("the Worker replaces client-supplied owner feature availability", () => {
     unavailable.headers.get(PARTICIPANT_INVESTMENT_INTERESTS_HEADER),
     null,
   );
+  assert.equal(
+    unavailable.headers.get(PARTICIPANT_PROFILE_SELF_SERVICE_HEADER),
+    null,
+  );
   assert.equal(unavailable.headers.get(OWNER_AITTADB_CONNECTION_HEADER), null);
   assert.equal(hasOwnerPackageWorkspace("AVAILABLE"), false);
   assert.equal(hasOwnerCampaignEditorCapability("AVAILABLE"), false);
@@ -68,6 +76,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   assert.equal(hasOwnerReviewExports("AVAILABLE"), false);
   assert.equal(hasParticipantFounderInterest("AVAILABLE"), false);
   assert.equal(hasParticipantInvestmentInterests("AVAILABLE"), false);
+  assert.equal(hasParticipantProfileSelfService("AVAILABLE"), false);
   assert.equal(hasOwnerAittaDBConnection("AVAILABLE"), false);
 
   const available = withRuntimeCapabilities(spoofed, {
@@ -78,6 +87,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
     ownerReviewExports: true,
     participantFounderInterest: true,
     participantInvestmentInterests: true,
+    participantProfileSelfService: true,
     ownerAittadbConnection: true,
   });
   assert.equal(
@@ -123,6 +133,12 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   assert.equal(
     hasParticipantInvestmentInterests(
       available.headers.get(PARTICIPANT_INVESTMENT_INTERESTS_HEADER),
+    ),
+    true,
+  );
+  assert.equal(
+    hasParticipantProfileSelfService(
+      available.headers.get(PARTICIPANT_PROFILE_SELF_SERVICE_HEADER),
     ),
     true,
   );

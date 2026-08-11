@@ -19,7 +19,14 @@ import {
 import {
   OWNER_PACKAGE_WORKSPACE_HEADER,
   PARTICIPANT_FOUNDER_INTEREST_HEADER,
+  PARTICIPANT_PROFILE_SELF_SERVICE_HEADER,
+  hasParticipantFounderInterest,
+  hasParticipantProfileSelfService,
 } from "../http/runtime-capabilities.ts";
+import {
+  PARTICIPANT_ACCESS_HEADER,
+  participantAccessFromRuntimeHeader,
+} from "../http/runtime-participant.ts";
 import type { OwnerPackageDocument } from "../domain/owner-package-resource.ts";
 import {
   FOUNDER_INTEREST_PATH,
@@ -2960,6 +2967,324 @@ test("hosted delayed profile replays reject impossible consent ancestry and pres
     ]),
     validProfileRecords,
   );
+});
+
+test("hosted signed-in entry advances through equivalent registration and participant states", async () => {
+  const service = new SyntheticAittaDBService();
+  const setup = explicitCampaignSetup();
+  await new StorageCampaignRepository(hostedStorageAdapter(service)).saveSetup({
+    operationId: "campaign-operation:participant-entry",
+    recordedAt: "2026-08-10T09:00:00.000Z",
+    expectedRevision: null,
+    setup,
+  });
+  const currentPackage = await appendHostedPackageHistory(service, 1);
+  const renderedRequests: Request[] = [];
+  let clockTick = 0;
+  const createEntryWorker = () => createApplicationWorker({
+    async fetchApplication(request) {
+      renderedRequests.push(request);
+      const participant = participantAccessFromRuntimeHeader(
+        request.headers.get(PARTICIPANT_ACCESS_HEADER),
+      );
+      const active = participant?.accountStatus === "active";
+      const controls = [
+        ...(participant?.currentPackage
+          ? [
+              '<a data-action="read-private-package" href="/participant/package">Information package</a>',
+            ]
+          : []),
+        ...(hasParticipantProfileSelfService(
+            request.headers.get(PARTICIPANT_PROFILE_SELF_SERVICE_HEADER),
+          )
+          ? [
+              '<a data-action="open-participant-profile" href="/participant/profile">Profile</a>',
+            ]
+          : []),
+        ...(active && hasParticipantFounderInterest(
+            request.headers.get(PARTICIPANT_FOUNDER_INTEREST_HEADER),
+          )
+          ? [
+              '<a data-action="open-founder-interest" href="/participant/founder-interest">Founder interest</a>',
+            ]
+          : []),
+        '<a data-action="sign-out" href="/signout-with-chatgpt">Sign out</a>',
+      ];
+      return new Response(
+        `<main><h1>${participant?.accountStatus ?? "missing"}</h1>${
+          controls.join("")
+        }</main>`,
+        { headers: { "content-type": "text/html; charset=utf-8" } },
+      );
+    },
+    fetchOptimizedImage: async () => new Response("image"),
+    resolveApplicationRuntime: createHostedApplicationRuntimeResolver({
+      fetch: service.fetch,
+      now: () => new Date(NOW.valueOf() + clockTick++ * 1_000),
+    }),
+  });
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  const identityHeaders = {
+    "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+    "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+  };
+  const firstWorker = createEntryWorker();
+
+  const publicEntry = await firstWorker.fetch(
+    new Request(`${APP_ORIGIN}/`, { headers: { accept: "application/json" } }),
+    env,
+    executionContext,
+  );
+  assert.equal(publicEntry.status, 200);
+  const publicDocument = await publicEntry.json() as {
+    actions: readonly TestAction[];
+  };
+  assert.ok(publicDocument.actions.length > 0);
+  assert.ok(publicDocument.actions.every((action) =>
+    new URL(action.href).searchParams.get("return_to") === "/participant"
+  ));
+
+  const entryJson = await firstWorker.fetch(
+    new Request(`${APP_ORIGIN}/participant`, {
+      headers: { accept: "application/json", ...identityHeaders },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(entryJson.status, 200);
+  assert.equal(entryJson.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.equal(entryJson.headers.get("set-cookie"), null);
+  const entryDocument = await entryJson.json() as {
+    type: string;
+    data: { status: string };
+    actions: readonly TestAction[];
+  };
+  assert.equal(entryDocument.type, "participant-entry");
+  assert.equal(entryDocument.data.status, "registration_required");
+  assert.deepEqual(actionNames(entryDocument), [
+    "open-participant-registration",
+    "sign-out",
+  ]);
+
+  const entryHtml = await firstWorker.fetch(
+    new Request(`${APP_ORIGIN}/participant`, {
+      headers: { accept: "text/html", ...identityHeaders },
+      redirect: "manual",
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(entryHtml.status, 303);
+  assert.equal(
+    entryHtml.headers.get("location"),
+    requiredAction(entryDocument, "open-participant-registration").href,
+  );
+  assert.equal(entryHtml.headers.get("cache-control"), "no-store");
+  assert.equal(renderedRequests.length, 0);
+
+  const unsupported = await firstWorker.fetch(
+    new Request(`${APP_ORIGIN}/participant`, {
+      headers: {
+        accept: "application/vnd.aittadb-invest+json; version=9.0",
+        ...identityHeaders,
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(unsupported.status, 406);
+
+  const malformedIdentity = await firstWorker.fetch(
+    new Request(`${APP_ORIGIN}/participant`, {
+      headers: {
+        accept: "application/json",
+        "oai-authenticated-user-id": "   ",
+        "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(malformedIdentity.status, 401);
+
+  const ownerEntry = await firstWorker.fetch(
+    ownerRequest("/participant"),
+    env,
+    executionContext,
+  );
+  assert.equal(ownerEntry.status, 404);
+  assert.doesNotMatch(
+    await ownerEntry.text(),
+    /participant@example\.test|Required process|Optional campaign/u,
+  );
+
+  const unavailableService = new SyntheticAittaDBService();
+  const unavailableWorker = createApplicationWorker({
+    fetchApplication: async () => new Response("application fallback", {
+      status: 404,
+    }),
+    fetchOptimizedImage: async () => new Response("image"),
+    resolveApplicationRuntime: createHostedApplicationRuntimeResolver({
+      fetch: unavailableService.fetch,
+      now: () => NOW,
+    }),
+  });
+  const unavailableEntry = await unavailableWorker.fetch(
+    new Request(`${APP_ORIGIN}/participant`, {
+      headers: { accept: "application/json", ...identityHeaders },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(unavailableEntry.status, 404);
+  assert.doesNotMatch(
+    await unavailableEntry.text(),
+    /participant@example\.test|registration_required/u,
+  );
+
+  const registration = await participantRegistration(firstWorker, env);
+  const registrationAction = requiredAction(
+    registration.document,
+    "register-participant-access",
+  );
+  const registered = await submitRegistration(
+    firstWorker,
+    env,
+    registration,
+    actionBody(registrationAction, {
+      "display-name": "Entry flow participant",
+      country: "FI",
+      "declared-interest": "both",
+      "participation-context": "individual",
+      "process-email-notice-acknowledged": true,
+      "marketing-consent": false,
+    }),
+  );
+  assert.equal(registered.status, 201);
+
+  const activeWorker = createEntryWorker();
+  const activeJson = await activeWorker.fetch(
+    participantRequest("/participant"),
+    env,
+    executionContext,
+  );
+  assert.equal(activeJson.status, 200);
+  const activeDocument = await activeJson.json() as {
+    type: string;
+    data: {
+      account_status: string;
+      current_package: { version_id: string } | null;
+    };
+    actions: readonly TestAction[];
+  };
+  assert.equal(activeDocument.type, "participant-home");
+  assert.equal(activeDocument.data.account_status, "active");
+  assert.equal(
+    activeDocument.data.current_package?.version_id,
+    currentPackage.snapshot.id,
+  );
+  assert.deepEqual(actionNames(activeDocument), [
+    "read-private-package",
+    "open-participant-profile",
+    "open-founder-interest",
+    "sign-out",
+  ]);
+
+  const activeHtml = await activeWorker.fetch(
+    new Request(`${APP_ORIGIN}/participant`, {
+      headers: { accept: "text/html", ...identityHeaders },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(activeHtml.status, 200);
+  const activeMarkup = await activeHtml.text();
+  assert.match(activeMarkup, /<h1>active<\/h1>/u);
+  for (const name of actionNames(activeDocument)) {
+    assert.match(activeMarkup, new RegExp(`data-action="${name}"`, "u"));
+  }
+  assert.equal(renderedRequests.length, 1);
+  assert.equal(
+    hasParticipantProfileSelfService(
+      renderedRequests[0]?.headers.get(
+        PARTICIPANT_PROFILE_SELF_SERVICE_HEADER,
+      ) ?? null,
+    ),
+    true,
+  );
+
+  const profile = await participantProfile(activeWorker, env);
+  const deletionAction = requiredAction(
+    profile.document,
+    "request-account-deletion",
+  );
+  const deleted = await submitProfile(
+    activeWorker,
+    env,
+    profile,
+    deletionAction,
+    actionBody(deletionAction, {
+      "confirm-account-deletion-request": true,
+    }),
+  );
+  assert.equal(deleted.status, 200);
+
+  const deletedWorker = createEntryWorker();
+  const deletedJson = await deletedWorker.fetch(
+    participantRequest("/participant"),
+    env,
+    executionContext,
+  );
+  assert.equal(deletedJson.status, 200);
+  const deletedDocument = await deletedJson.json() as {
+    data: { account_status: string };
+    actions: readonly TestAction[];
+  };
+  assert.equal(deletedDocument.data.account_status, "deletion-requested");
+  assert.deepEqual(actionNames(deletedDocument), [
+    "read-private-package",
+    "open-participant-profile",
+    "sign-out",
+  ]);
+  assert.equal(
+    requiredAction(deletedDocument, "open-participant-profile").name,
+    "open-participant-profile",
+  );
+  assert.doesNotMatch(
+    JSON.stringify(deletedDocument),
+    /founder-interest|investment-interests/u,
+  );
+
+  const deletionHtml = await deletedWorker.fetch(
+    new Request(`${APP_ORIGIN}/participant`, {
+      headers: { accept: "text/html", ...identityHeaders },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(deletionHtml.status, 200);
+  const deletionMarkup = await deletionHtml.text();
+  assert.match(deletionMarkup, /<h1>deletion-requested<\/h1>/u);
+  for (const name of actionNames(deletedDocument)) {
+    assert.match(deletionMarkup, new RegExp(`data-action="${name}"`, "u"));
+  }
+  assert.doesNotMatch(deletionMarkup, /open-founder-interest/u);
+  assert.equal(renderedRequests.length, 2);
+
+  const disclosureProbe = JSON.stringify({
+    entryDocument,
+    activeDocument,
+    deletedDocument,
+  });
+  for (const privateValue of [
+    SERVICE_CLIENT_SECRET,
+    ACCESS_TOKEN,
+    MUTATION_KEY,
+    TRANSPORT_ORIGIN,
+    PRIVATE_POLICY_SENTINEL,
+  ]) {
+    assert.doesNotMatch(disclosureProbe, new RegExp(privateValue, "u"));
+  }
 });
 
 test("hosted package routes persist atomic private versions and current acknowledgments", async () => {

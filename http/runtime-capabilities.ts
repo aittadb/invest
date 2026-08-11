@@ -10,6 +10,8 @@ export const PARTICIPANT_FOUNDER_INTEREST_HEADER =
   "x-investor-app-participant-founder-interest";
 export const PARTICIPANT_INVESTMENT_INTERESTS_HEADER =
   "x-investor-app-participant-investment-interests";
+export const PARTICIPANT_PROFILE_SELF_SERVICE_HEADER =
+  "x-investor-app-participant-profile-self-service";
 export const OWNER_AITTADB_CONNECTION_HEADER =
   "x-investor-app-owner-aittadb-connection";
 export const OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER =
@@ -28,6 +30,7 @@ export function withRuntimeCapabilities(
     ownerAuditHistory?: boolean;
     participantFounderInterest?: boolean;
     participantInvestmentInterests?: boolean;
+    participantProfileSelfService?: boolean;
     ownerAittadbConnection?: boolean;
   }>,
 ): Request {
@@ -38,6 +41,7 @@ export function withRuntimeCapabilities(
   headers.delete(OWNER_AUDIT_HISTORY_HEADER);
   headers.delete(PARTICIPANT_FOUNDER_INTEREST_HEADER);
   headers.delete(PARTICIPANT_INVESTMENT_INTERESTS_HEADER);
+  headers.delete(PARTICIPANT_PROFILE_SELF_SERVICE_HEADER);
   headers.delete(OWNER_AITTADB_CONNECTION_HEADER);
   headers.delete(OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER);
   headers.delete(OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER);
@@ -58,6 +62,9 @@ export function withRuntimeCapabilities(
   }
   if (capabilities.participantInvestmentInterests) {
     headers.set(PARTICIPANT_INVESTMENT_INTERESTS_HEADER, "available");
+  }
+  if (capabilities.participantProfileSelfService) {
+    headers.set(PARTICIPANT_PROFILE_SELF_SERVICE_HEADER, "available");
   }
   if (capabilities.ownerAittadbConnection) {
     headers.set(OWNER_AITTADB_CONNECTION_HEADER, "available");
@@ -104,6 +111,12 @@ export function hasParticipantFounderInterest(value: string | null): boolean {
 }
 
 export function hasParticipantInvestmentInterests(
+  value: string | null,
+): boolean {
+  return value === "available";
+}
+
+export function hasParticipantProfileSelfService(
   value: string | null,
 ): boolean {
   return value === "available";

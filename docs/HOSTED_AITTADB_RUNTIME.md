@@ -15,17 +15,18 @@ package management only in the configured-owner route group. For a signed-in
 non-owner, it derives the trusted `participantAccess` projection from that
 subject's persistent profile, current package, and current acknowledgment gate.
 An unregistered subject stops after the profile read without opening package or
-acknowledgment storage. On `/participant/registration`, the runtime instead
-combines a fresh subject-bound participant repository, the hosted mutation
-session, and versioned evidence derived from the persisted campaign revision
-and only its two registration notices. The participant repository stores the
-exact acknowledged snapshots and can recover an old exact committed retry after
-a policy update or Worker restart without accepting stale evidence for a new
-registration. Founder composition opens private campaign policy and a fresh
-subject-bound profile/application pair only for the exact founder resource after
-participant authorization. Indication, aggregate, moderation, export, deletion
-coordination, and profile-route composition still require their own named
-persistent capabilities.
+acknowledgment storage. Public registration controls return from ChatGPT sign-in
+to `/participant`. An unregistered HTML request then receives a non-cacheable
+redirect to `/participant/registration`; JSON receives the equivalent versioned
+entry action. For either entry or the exact registration path, the runtime
+combines a subject-bound participant repository, the hosted mutation session,
+and versioned evidence derived from the persisted campaign revision and only
+its two registration notices. The next request after registration reconstructs
+the current package and permitted profile and workflow controls from persistent
+state. A deletion-requested entry retains package reading, profile viewing, and
+sign-out while withholding founder and investment actions. Indication,
+aggregate, moderation, export, and coordinated deletion persistence still
+require their own named capabilities.
 
 This source composition and its deterministic protocol services are not hosted
 acceptance evidence. Activation remains blocked until the configured AittaDB
@@ -123,9 +124,10 @@ over the request's trusted subject and provider email label. Its
 registration-only recovery capability can read immutable profile revision 1 but
 cannot write a stale-policy submission. Notice snapshots remain inside the
 subject-bound profile records; no notice key contains participant identity.
-Profile self-service uses the same named capability only after the trusted
-participant-access projection has been resolved for the exact profile path,
-then binds every route callback to that account again.
+Profile self-service uses the request scope's named participant-profile
+repository only after the trusted participant-access projection has resolved
+the same account. The exact profile path may read or mutate it; `/participant`
+uses only the resulting availability signal for HTML and hypermedia navigation.
 It intentionally has no generic builder or adapter accessor. The Worker calls
 these methods centrally and passes routes only their declared interfaces and
 mutation session; it never passes the adapter or factory into route context.
@@ -313,9 +315,10 @@ the factory's named campaign, package, and founder methods centrally. It install
 campaign editor, and owner package handlers only inside
 `createOwnerRouteHandler`, and projects only subject-bound package and founder
 capabilities into the participant route group after trusted participant
-authorization. Owner
-capability headers are server-replaced and are never authorization by
-themselves; generic runtime availability adds no browser header or navigation
+authorization. Registration and profile entry capabilities are likewise
+composed only after trusted identity and participant-state checks. Their
+server-replaced rendering headers are presentation signals, never authorization
+boundaries; generic runtime availability adds no browser header or navigation
 item.
 
 Public route composition receives only `publicCampaignReader()`. That reader is

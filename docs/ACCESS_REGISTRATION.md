@@ -1,11 +1,14 @@
 # Access Registration
 
 Access registration is an injectable participant resource at
-`/participant/registration`. Hosted composition installs it only for the exact
-path and a signed-in non-owner, using the credential-closed AittaDB repository
-factory and browser mutation session. Notice text comes only from the persisted
-private campaign policy. Registered participants can continue to the separately
-composed profile self-service resource.
+`/participant/registration`. Hosted composition installs it for that exact path
+and uses the same capability to resolve an unregistered signed-in non-owner at
+`/participant`, using the credential-closed AittaDB repository factory and
+browser mutation session. Notice text comes only from the persisted private
+campaign policy. The public campaign's registration controls return from sign-in
+to `/participant`; HTML receives a non-cacheable `303` to the registration form,
+while hypermedia JSON receives a `participant-entry` document whose
+`open-participant-registration` action has that same target.
 
 ## Representations
 
@@ -37,8 +40,10 @@ After successful registration, both representations show the same current
 profile projection, immutable notice-evidence version, exact acknowledged
 process and marketing texts, process acknowledgment state, and current
 marketing-consent state. Registered HTML and JSON advertise no registration
-mutation or mutation proof. Package and participant links become available for
-later runtime composition.
+mutation or mutation proof. The next request to `/participant` reconstructs
+authorization from persisted profile, package, and acknowledgment state; it can
+then expose the current package and separately composed profile and workflow
+controls without trusting the registration response.
 
 ## Mutation Boundary
 
@@ -119,12 +124,13 @@ envelope expansion; the complete protocol command is tested below 65,536 bytes.
 The production adapter additionally enforces the backend's advertised record,
 mutation-count, and transaction-byte limits.
 
-Hosted composition reads the full campaign setup only on the registration path,
-projects only its revision and process and optional-marketing notices into the
-route evidence, and binds every repository and proof operation to the trusted
-account subject and provider email label. Anonymous users and configured owners
-do not open private campaign or participant registration storage. A foreign
-signed-in account sees only its own missing or current profile.
+Hosted composition reads the full campaign setup only on the registration path
+or an unregistered signed-in `/participant` entry request, projects only its
+revision and process and optional-marketing notices into the route evidence, and
+binds every repository and proof operation to the trusted account subject and
+provider email label. Anonymous users and configured owners do not open private
+campaign or participant registration storage. A signed-in account sees only its
+own missing or current profile.
 
 HTML loads `/participant-registration.css` from the same origin. Registration
 responses are non-cacheable, use a same-origin stylesheet and form CSP, set

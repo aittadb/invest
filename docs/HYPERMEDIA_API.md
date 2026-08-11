@@ -64,7 +64,7 @@ The public campaign resource currently has this shape:
       "name": "sign-in",
       "title": "Register your interest",
       "method": "GET",
-      "href": "https://example.com/signin-with-chatgpt?return_to=%2F",
+      "href": "https://example.com/signin-with-chatgpt?return_to=%2Fparticipant",
       "type": "text/html",
       "fields": []
     }
@@ -98,13 +98,23 @@ marketing-consent state. Later profile revisions must retain the notice evidence
 from immutable profile revision 1. Registered HTML shows that same state, and
 neither representation exposes another registration action or CSRF proof.
 
+The signed-out campaign's sign-in and pre-registration actions all return to
+`/participant`. For an authenticated non-owner with no participant profile,
+JSON at that URI returns resource type `participant-entry`, status
+`registration_required`, and `open-participant-registration`; HTML returns a
+non-cacheable `303` to that action's target. Owners and deployments without
+usable registration configuration receive the fixed unavailable surface.
+
 `GET /participant` has resource type `participant-home`. Its `data` contains the
 authorized account label, declared interest and participation context, account
 status, public campaign name, and a bounded current-package status projection.
 The resource links back to the public campaign and, when available, to
-`/participant/package`. Its currently supported actions are
-`read-private-package`, `manage-campaign` for a separately authorized owner, and
-`sign-out`.
+`/participant/package` and `/participant/profile`. Its available actions may
+include `read-private-package`, `open-participant-profile`, separately composed
+founder or investment controls, `manage-campaign` for a separately authorized
+owner, and `sign-out`. All are projected from the same trusted state used by
+HTML. Deletion-requested state withholds founder and investment controls and
+labels profile access as a view.
 
 `GET /participant/package` has resource type `private-package` and exposes the
 current version's bounded status metadata: creation time, change summary,
@@ -138,10 +148,11 @@ navigation and persistence are installed only by the hosted participant
 composition.
 
 These participant URIs negotiate HTML and version `0.1` hypermedia JSON. A
-signed-out JSON request receives `401 authentication_required`; an authenticated
-subject without matching participant state receives the same generic `404`
-shape as a missing record. Unsupported explicit versions return `406` before a
-representation is selected.
+signed-out JSON request receives `401 authentication_required`; an
+authenticated subject without matching participant state receives registration
+entry only when that capability is deliberately composed, and otherwise gets
+the same generic `404` shape as a missing record. Unsupported explicit versions
+return `406` before a representation is selected.
 
 Mutation actions will also declare their request media type and typed fields. Fields can describe body, path, query, or header location; required state; sensitivity; current or default value; allowed choices; and length, numeric, or byte constraints.
 

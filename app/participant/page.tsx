@@ -12,6 +12,7 @@ import {
 } from "@/domain/participant-navigation";
 import { FOUNDER_INTEREST_PATH } from "@/domain/participant-founder-interest-resource";
 import { INVESTMENT_INTEREST_PATH } from "@/domain/participant-investment-interest-resource";
+import { PARTICIPANT_PROFILE_PATH } from "@/domain/participant-profile-resource";
 import {
   campaignFromRuntimeHeader,
   CAMPAIGN_CONFIGURATION_HEADER,
@@ -19,8 +20,10 @@ import {
 import {
   hasParticipantFounderInterest,
   hasParticipantInvestmentInterests,
+  hasParticipantProfileSelfService,
   PARTICIPANT_FOUNDER_INTEREST_HEADER,
   PARTICIPANT_INVESTMENT_INTERESTS_HEADER,
+  PARTICIPANT_PROFILE_SELF_SERVICE_HEADER,
 } from "@/http/runtime-capabilities";
 
 export const dynamic = "force-dynamic";
@@ -49,6 +52,9 @@ export default async function ParticipantHome() {
       requestHeaders.get(PARTICIPANT_INVESTMENT_INTERESTS_HEADER),
     ),
   });
+  const profileSelfServiceAvailable = hasParticipantProfileSelfService(
+    requestHeaders.get(PARTICIPANT_PROFILE_SELF_SERVICE_HEADER),
+  );
 
   return (
     <div className="participant-page">
@@ -60,6 +66,9 @@ export default async function ParticipantHome() {
           <Link href="/">View campaign</Link>
           {currentPackage ? (
             <Link href={PRIVATE_PACKAGE_PATH}>Information package</Link>
+          ) : null}
+          {profileSelfServiceAvailable ? (
+            <Link href={PARTICIPANT_PROFILE_PATH}>Profile</Link>
           ) : null}
           {founderInterestAvailable ? (
             <Link href={FOUNDER_INTEREST_PATH}>Founder interest</Link>
@@ -91,6 +100,16 @@ export default async function ParticipantHome() {
                 ? "Registration active"
                 : "Deletion requested"}
             </h2>
+            {profileSelfServiceAvailable ? (
+              <Link
+                className="button button--quiet participant-profile-link"
+                href={PARTICIPANT_PROFILE_PATH}
+              >
+                {participant.accountStatus === "active"
+                  ? "Manage profile"
+                  : "View profile"}
+              </Link>
+            ) : null}
           </div>
           <dl>
             <div>

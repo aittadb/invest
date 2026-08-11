@@ -1,6 +1,7 @@
 import {
   createParticipantAuthenticationRequiredDocument,
   createParticipantHomeDocument,
+  createParticipantRegistrationRequiredDocument,
   createPrivatePackageDocument,
   type ParticipantHomeCapabilities,
 } from "../../domain/participant-home-resource.ts";
@@ -8,6 +9,7 @@ import {
   PARTICIPANT_HOME_PATH,
   PRIVATE_PACKAGE_PATH,
 } from "../../domain/participant-navigation.ts";
+import { PARTICIPANT_REGISTRATION_PATH } from "../../domain/participant-registration-resource.ts";
 import { negotiateRepresentation } from "../../http/content-negotiation.ts";
 import type { ApplicationRouteHandler } from "../contracts.ts";
 import {
@@ -20,7 +22,7 @@ import {
 export type ParticipantRouteCapabilities = Omit<
   ParticipantHomeCapabilities,
   "manageCampaign"
->;
+> & Readonly<{ registration?: boolean }>;
 
 export function createParticipantHomeRouteHandler(
   capabilities: ParticipantRouteCapabilities = {},
@@ -54,6 +56,11 @@ export function createParticipantHomeRouteHandler(
       }
 
       if (!context.participantAccess) {
+        if (capabilities.registration && !context.isOwner) {
+          return hypermediaResponse(
+            createParticipantRegistrationRequiredDocument(context.resourceUrl),
+          );
+        }
         return resourceNotFoundResponse(context.resourceUrl);
       }
 
@@ -74,6 +81,24 @@ export function createParticipantHomeRouteHandler(
         context.campaign?.name ?? null,
         { ...capabilities, manageCampaign: context.isOwner },
       ));
+    }
+
+    if (
+      !context.participantAccess &&
+      context.actor !== null &&
+      !context.isOwner &&
+      capabilities.registration
+    ) {
+      return withAcceptVary(new Response(null, {
+        status: 303,
+        headers: {
+          "Cache-Control": "no-store",
+          Location: new URL(
+            PARTICIPANT_REGISTRATION_PATH,
+            context.resourceUrl,
+          ).href,
+        },
+      }));
     }
 
     return withAcceptVary(await context.renderApplication());

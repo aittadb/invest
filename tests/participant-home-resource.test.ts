@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   authorizeParticipantAccess,
   createParticipantHomeDocument,
+  createParticipantRegistrationRequiredDocument,
   createPrivatePackageDocument,
   parseAuthorizedParticipantAccess,
   type ParticipantAuthorizationState,
@@ -124,6 +125,14 @@ test("public and participant documents project only authorized capabilities", ()
     syntheticPublicCampaign,
   );
   assert.equal(
+    new URL(visitor.actions[0]?.href ?? "https://campaign.example/")
+      .searchParams.get("return_to"),
+    "/participant",
+  );
+  assert.ok(visitor.actions.every((action) =>
+    new URL(action.href).searchParams.get("return_to") === "/participant"
+  ));
+  assert.equal(
     visitor.links.some((link) => link.rel.includes("participant-home")),
     false,
   );
@@ -231,6 +240,74 @@ test("participant documents expose only configured and permitted interest workfl
   );
   assert.doesNotMatch(
     JSON.stringify(inactiveHome),
+    /founder-interest|investment-interests/u,
+  );
+});
+
+test("participant entry and profile capabilities reflect registration state", () => {
+  const entry = createParticipantRegistrationRequiredDocument(
+    "https://campaign.example/participant",
+  );
+  assert.equal(entry.type, "participant-entry");
+  assert.equal(entry.data.status, "registration_required");
+  assert.deepEqual(entry.actions.map(({ name }) => name), [
+    "open-participant-registration",
+    "sign-out",
+  ]);
+  assert.equal(
+    entry.actions[0]?.href,
+    "https://campaign.example/participant/registration",
+  );
+  assert.ok(
+    entry.links.some(({ rel }) => rel.includes("participant-registration")),
+  );
+
+  const active = createParticipantHomeDocument(
+    "https://campaign.example/participant",
+    authorizedParticipant("both"),
+    syntheticPublicCampaign.name,
+    { profileSelfService: true },
+  );
+  assert.deepEqual(active.actions.map(({ name }) => name), [
+    "read-private-package",
+    "open-participant-profile",
+    "sign-out",
+  ]);
+  assert.equal(
+    active.actions.find(({ name }) => name === "open-participant-profile")
+      ?.title,
+    "Manage profile",
+  );
+  assert.ok(
+    active.links.some(({ rel }) => rel.includes("participant-profile")),
+  );
+
+  const deletionRequested = createParticipantHomeDocument(
+    "https://campaign.example/participant",
+    {
+      ...authorizedParticipant("both"),
+      accountStatus: "deletion-requested",
+    },
+    syntheticPublicCampaign.name,
+    {
+      profileSelfService: true,
+      founderInterest: true,
+      investmentInterests: true,
+    },
+  );
+  assert.deepEqual(deletionRequested.actions.map(({ name }) => name), [
+    "read-private-package",
+    "open-participant-profile",
+    "sign-out",
+  ]);
+  assert.equal(
+    deletionRequested.actions.find(
+      ({ name }) => name === "open-participant-profile"
+    )?.title,
+    "View profile",
+  );
+  assert.doesNotMatch(
+    JSON.stringify(deletionRequested),
     /founder-interest|investment-interests/u,
   );
 });

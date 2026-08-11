@@ -265,7 +265,11 @@ test("participant resources preserve authentication, ownership, and negotiation"
 test("participant route composition advertises only injected workflow handlers", async () => {
   const handler = createParticipantRouteHandler(
     [],
-    { founderInterest: true, investmentInterests: true },
+    {
+      profileSelfService: true,
+      founderInterest: true,
+      investmentInterests: true,
+    },
   );
   const response = requiredResponse(
     await handler(
@@ -284,11 +288,71 @@ test("participant route composition advertises only injected workflow handlers",
     document.actions.map((action: { name: string }) => action.name),
     [
       "read-private-package",
+      "open-participant-profile",
       "open-founder-interest",
       "open-investment-interests",
       "sign-out",
     ],
   );
+});
+
+test("participant entry negotiates registration for HTML and JSON", async () => {
+  const handler = createParticipantRouteHandler([], { registration: true });
+  const signedIn = actor("participant-subject", "participant@example.com");
+  const json = requiredResponse(
+    await handler(
+      routeContext("https://campaign.example/participant", {
+        requestHeaders: { accept: "application/json" },
+        actor: signedIn,
+      }),
+    ),
+  );
+  assert.equal(json.status, 200);
+  assert.equal(json.headers.get("vary"), "Accept");
+  const document = await json.json();
+  assert.equal(document.type, "participant-entry");
+  assert.equal(document.data.status, "registration_required");
+  assert.deepEqual(
+    document.actions.map((action: { name: string }) => action.name),
+    ["open-participant-registration", "sign-out"],
+  );
+
+  const html = requiredResponse(
+    await handler(
+      routeContext("https://campaign.example/participant", {
+        requestHeaders: { accept: "text/html" },
+        actor: signedIn,
+      }),
+    ),
+  );
+  assert.equal(html.status, 303);
+  assert.equal(
+    html.headers.get("location"),
+    document.actions[0]?.href,
+  );
+  assert.equal(html.headers.get("cache-control"), "no-store");
+  assert.equal(html.headers.get("vary"), "Accept");
+
+  const owner = requiredResponse(
+    await handler(
+      routeContext("https://campaign.example/participant", {
+        requestHeaders: { accept: "application/json" },
+        actor: signedIn,
+        isOwner: true,
+      }),
+    ),
+  );
+  assert.equal(owner.status, 404);
+
+  const unavailable = requiredResponse(
+    await handleParticipantHomeRoutes(
+      routeContext("https://campaign.example/participant", {
+        requestHeaders: { accept: "application/json" },
+        actor: signedIn,
+      }),
+    ),
+  );
+  assert.equal(unavailable.status, 404);
 });
 
 test("owner routes preserve authentication, authorization, and representation behavior", async () => {

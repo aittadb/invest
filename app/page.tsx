@@ -10,7 +10,6 @@ import {
   PARTICIPANT_HOME_PATH,
   PRIVATE_PACKAGE_PATH,
 } from "@/domain/participant-navigation";
-import { participationPath } from "@/domain/public-campaign-resource";
 import {
   campaignFromRuntimeHeader,
   CAMPAIGN_CONFIGURATION_HEADER,
@@ -42,7 +41,7 @@ export default async function Home() {
     );
   }
 
-  const signInPath = chatGPTSignInPath("/");
+  const signInPath = chatGPTSignInPath(PARTICIPANT_HOME_PATH);
   const participantPrimaryPath = participant?.currentPackage
     ? PRIVATE_PACKAGE_PATH
     : PARTICIPANT_HOME_PATH;
@@ -183,7 +182,7 @@ export default async function Home() {
                       className="text-link"
                       href={participant
                         ? PARTICIPANT_HOME_PATH
-                        : participationPath(path.kind)}
+                        : signInPath}
                     >
                       {participant ? "View your participation" : path.actionLabel}
                     </a>

@@ -39,12 +39,6 @@ export type PublicCampaignDocument = Readonly<{
   actions: readonly HypermediaAction[];
 }>;
 
-export function participationPath(
-  kind: "investor" | "founder",
-): string {
-  return chatGPTSignInPath(`/?intent=${kind}`);
-}
-
 export function createPublicCampaignDocument(
   requestUrl: string,
   configuration: PublicCampaignConfiguration | null,
@@ -114,13 +108,13 @@ export function createPublicCampaignDocument(
         action(
           "sign-in",
           configuration.hero.primaryActionLabel,
-          absolute(chatGPTSignInPath("/")),
+          absolute(chatGPTSignInPath(PARTICIPANT_HOME_PATH)),
         ),
         ...configuration.participation.paths.map((path) =>
           action(
             `pre-register-${path.kind}`,
             path.actionLabel,
-            absolute(participationPath(path.kind)),
+            absolute(chatGPTSignInPath(PARTICIPANT_HOME_PATH)),
           ),
         ),
       ]
