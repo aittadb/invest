@@ -59,4 +59,10 @@ test("active Sites hosting configuration rejects private or ambiguous fields", (
     () => parseActiveSitesHostingConfiguration("not-json"),
     SyntaxError,
   );
+  assert.throws(
+    () => parseActiveSitesHostingConfiguration(
+      '{"project_id":"private","project_id":"appgprj_Synthetic123","d1":null,"r2":null}',
+    ),
+    /active Sites hosting configuration is invalid/u,
+  );
 });

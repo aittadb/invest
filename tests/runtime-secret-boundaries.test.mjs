@@ -15,6 +15,34 @@ const TRANSPORT_ORIGIN = "https://task111-private-runtime.example.test";
 const ENTRY_HREF = `${ISSUER}/bounded-storage`;
 const STORAGE_SCOPES = "storage.read storage.write storage.delete";
 const OWNER_ACTOR_EMAIL = "task111-private-owner@identity.example.test";
+const HTML_CONTENT_TYPE = "text/html; charset=utf-8";
+const JSON_CONTENT_TYPE =
+  "application/vnd.aittadb-invest+json; version=0.1; charset=utf-8";
+const SETUP_CSP =
+  "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' https:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+const EXPECTED_RESPONSES = Object.freeze({
+  "public HTML": responseContract(200, HTML_CONTENT_TYPE),
+  "public JSON": responseContract(200, JSON_CONTENT_TYPE),
+  "participant authentication redirect": responseContract(
+    307,
+    null,
+    null,
+    "/signin-with-chatgpt?return_to=%2Fparticipant",
+  ),
+  "participant HTML failure": responseContract(404, HTML_CONTENT_TYPE),
+  "participant JSON failure": responseContract(404, JSON_CONTENT_TYPE),
+  "owner authentication redirect": responseContract(
+    307,
+    null,
+    null,
+    "/signin-with-chatgpt?return_to=%2Fowner",
+  ),
+  "owner HTML": responseContract(200, HTML_CONTENT_TYPE),
+  "owner setup CSP HTML": responseContract(200, HTML_CONTENT_TYPE, SETUP_CSP),
+  "owner JSON": responseContract(200, JSON_CONTENT_TYPE),
+  "download route fixed failure": responseContract(404, HTML_CONTENT_TYPE),
+  "unsupported representation error": responseContract(406, JSON_CONTENT_TYPE),
+});
 const SYNTHETIC_CANARIES = Object.freeze([
   "TASK111_SyntheticCredential_Canary_7w9L3vX2",
   "TASK111.SyntheticBearerToken.Canary.4nQ8xL2pV7sK9mR5",
@@ -108,10 +136,10 @@ test("built Worker representations, redirects, CSP, errors, and logs do not disc
 
     for (const [label, current] of requests) {
       const response = await worker.fetch(current, environment, executionContext());
-      assertBoundaryResponse(label, response);
-      const material = await responseMaterial(label, response);
+      const body = await response.text();
+      assertBoundaryResponse(label, response, body);
+      const material = responseMaterial(label, response, body);
       assertNoCanaries(material, label);
-      assert.ok(response.status >= 200 && response.status <= 599, label);
     }
     assert.ok(storage.tokenRequests > 0);
     assert.ok(storage.discoveryRequests > 0);
@@ -185,7 +213,8 @@ test("successful private download does not reflect closed runtime values", async
     response.headers.get("content-security-policy"),
     "default-src 'none'; sandbox",
   );
-  const material = await responseMaterial("successful private download", response);
+  const body = await response.text();
+  const material = responseMaterial("successful private download", response, body);
   assertNoCanaries(material, "successful private download");
 });
 
@@ -207,40 +236,73 @@ function executionContext() {
   };
 }
 
-function assertBoundaryResponse(label, response) {
-  const contentType = response.headers.get("content-type") ?? "";
-  if (label === "public HTML" || label === "owner HTML" ||
-    label === "owner setup CSP HTML" ||
-    label === "participant HTML failure") {
-    assert.match(contentType, /^text\/html(?:;|$)/u, label);
-  }
-  if (label === "public JSON" || label === "participant JSON failure" ||
-    label === "owner JSON") {
-    assert.match(contentType, /^application\/vnd\.aittadb-invest\+json(?:;|$)/u,
-      label);
-  }
-  if (label === "owner setup CSP HTML") {
-    assert.notEqual(response.headers.get("content-security-policy"), null, label);
-  }
+function assertBoundaryResponse(label, response, body) {
+  const expected = EXPECTED_RESPONSES[label];
+  assert.notEqual(expected, undefined, label);
+  assert.equal(response.status, expected.status, label);
+  assert.equal(response.headers.get("content-type"), expected.contentType, label);
+  assert.equal(response.headers.get("content-security-policy"), expected.csp, label);
+  assert.equal(response.headers.get("location"), expected.location, label);
+  assert.equal(response.headers.get("content-disposition"), null, label);
+
   if (label.endsWith("authentication redirect")) {
-    assert.ok(response.status >= 300 && response.status < 400, label);
-    assert.notEqual(response.headers.get("location"), null, label);
-  }
-  if (label === "download route fixed failure") {
-    assert.ok(response.status >= 400, label);
-    assert.equal(response.headers.get("content-disposition"), null, label);
-  }
-  if (label === "unsupported representation error") {
-    assert.equal(response.status, 406, label);
+    assert.equal(body, "", label);
+  } else if (label === "public HTML") {
+    assert.match(body, /<h1>Campaign unavailable<\/h1>/u, label);
+  } else if (label === "participant HTML failure" ||
+    label === "download route fixed failure") {
+    assert.match(body, />404<\/h1>/u, label);
+    assert.match(body, />This page could not be found\.<\/h2>/u, label);
+  } else if (label === "owner HTML") {
+    assert.match(body, />Owner workspace<\/p>/u, label);
+  } else if (label === "owner setup CSP HTML") {
+    assert.match(body, /<h1>Initial setup<\/h1>/u, label);
+  } else {
+    assertBoundaryJson(label, body);
   }
 }
 
-async function responseMaterial(label, response) {
+function assertBoundaryJson(label, body) {
+  const value = JSON.parse(body);
+  if (label === "public JSON") {
+    assert.equal(value.type, "investment-pre-registration", label);
+    assert.equal(value.id, "unavailable", label);
+    assert.deepEqual(
+      { published: value.data.published, status: value.data.status },
+      { published: false, status: "unavailable" },
+      label,
+    );
+  } else if (label === "owner JSON") {
+    assert.equal(value.type, "owner-home", label);
+    assert.equal(value.id, "owner", label);
+    assert.equal(value.data.setup_status, "required", label);
+  } else if (label === "participant JSON failure") {
+    assert.equal(value.type, "error", label);
+    assert.deepEqual(value.data, {
+      code: "not_found",
+      message: "The requested resource was not found.",
+    }, label);
+  } else if (label === "unsupported representation error") {
+    assert.equal(value.type, "error", label);
+    assert.deepEqual(value.data, {
+      code: "not_acceptable",
+      message: "The requested representation is not available.",
+    }, label);
+  } else {
+    assert.fail(`Missing JSON response assertion for ${label}`);
+  }
+}
+
+function responseContract(status, contentType, csp = null, location = null) {
+  return Object.freeze({ status, contentType, csp, location });
+}
+
+function responseMaterial(label, response, body) {
   return [
     label,
     `${response.status} ${response.statusText}`,
     ...[...response.headers].flat(),
-    await response.text(),
+    body,
   ].join("\n");
 }
 

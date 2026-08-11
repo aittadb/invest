@@ -4,6 +4,7 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -118,12 +119,17 @@ test("scanner verifies complete Sites archive contents and rejects unsafe entry 
   const leakedStage = join(directory, "leaked");
   const linkedStage = join(directory, "linked");
   const namedStage = join(directory, "named");
+  const unnormalizedStage = join(directory, "unnormalized");
   const privateManifestStage = join(directory, "private-manifest");
+  const duplicateManifestStage = join(directory, "duplicate-manifest");
   const cleanArchive = join(directory, "clean.tar.gz");
   const leakedArchive = join(directory, "leaked.tar.gz");
   const linkedArchive = join(directory, "linked.tar.gz");
   const namedArchive = join(directory, "named.tar.gz");
+  const gzipNamedArchive = join(directory, "gzip-named.tar.gz");
+  const unnormalizedArchive = join(directory, "unnormalized.tar.gz");
   const privateManifestArchive = join(directory, "private-manifest.tar.gz");
+  const duplicateManifestArchive = join(directory, "duplicate-manifest.tar.gz");
   const probe = join(directory, "probe.txt");
   writeFileSync(probe, "clean probe\n", "utf8");
 
@@ -131,13 +137,23 @@ test("scanner verifies complete Sites archive contents and rejects unsafe entry 
   stageArchive(leakedStage, `export default ${JSON.stringify(CANARIES[2])};\n`);
   stageArchive(linkedStage, "export default {};\n");
   stageArchive(namedStage, "export default {};\n");
+  stageArchive(unnormalizedStage, "export default {};\n");
   stageArchive(privateManifestStage, "export default {};\n", {
     project_id: "appgprj_synthetic",
     d1: null,
     r2: null,
     internal_owner_alias: "private deployment value",
   });
-  symlinkSync("server/index.js", join(linkedStage, "dist", "linked-worker.js"));
+  stageArchive(duplicateManifestStage, "export default {};\n");
+  writeFileSync(
+    join(duplicateManifestStage, "dist", ".openai", "hosting.json"),
+    '{"project_id":"appgprj_Private123","project_id":"appgprj_synthetic","d1":null,"r2":null}',
+    "utf8",
+  );
+  symlinkSync(
+    "server/index.js",
+    join(linkedStage, "dist", `${CANARIES[0]}.js`),
+  );
   writeFileSync(
     join(namedStage, "dist", `${CANARIES[0]}.txt`),
     "clean body\n",
@@ -147,7 +163,13 @@ test("scanner verifies complete Sites archive contents and rejects unsafe entry 
   createArchive(leakedStage, leakedArchive);
   createArchive(linkedStage, linkedArchive);
   createArchive(namedStage, namedArchive);
+  createArchive(unnormalizedStage, unnormalizedArchive, false);
   createArchive(privateManifestStage, privateManifestArchive);
+  createArchive(duplicateManifestStage, duplicateManifestArchive);
+  writeFileSync(
+    gzipNamedArchive,
+    withGzipFilename(readFileSync(cleanArchive), CANARIES[1]),
+  );
 
   const clean = runScanner(["--scan-path", probe, "--archive", cleanArchive]);
   assert.equal(clean.status, 0, output(clean));
@@ -157,9 +179,26 @@ test("scanner verifies complete Sites archive contents and rejects unsafe entry 
   const linked = runScanner(["--scan-path", probe, "--archive", linkedArchive]);
   assert.equal(linked.status, 1);
   assert.match(output(linked), /unsafe type/u);
+  assertNoCanary(output(linked));
   const named = runScanner(["--scan-path", probe, "--archive", namedArchive]);
   assert.equal(named.status, 1);
   assertNoCanary(output(named));
+  const gzipNamed = runScanner([
+    "--scan-path",
+    probe,
+    "--archive",
+    gzipNamedArchive,
+  ]);
+  assert.equal(gzipNamed.status, 1);
+  assertNoCanary(output(gzipNamed));
+  const unnormalized = runScanner([
+    "--scan-path",
+    probe,
+    "--archive",
+    unnormalizedArchive,
+  ]);
+  assert.equal(unnormalized.status, 1);
+  assert.match(output(unnormalized), /non-normalized owner metadata/u);
   const privateManifest = runScanner([
     "--scan-path",
     probe,
@@ -168,6 +207,14 @@ test("scanner verifies complete Sites archive contents and rejects unsafe entry 
   ]);
   assert.equal(privateManifest.status, 1);
   assert.match(output(privateManifest), /invalid active hosting manifest/u);
+  const duplicateManifest = runScanner([
+    "--scan-path",
+    probe,
+    "--archive",
+    duplicateManifestArchive,
+  ]);
+  assert.equal(duplicateManifest.status, 1);
+  assert.match(output(duplicateManifest), /invalid active hosting manifest/u);
 });
 
 function stageArchive(stage, worker, hosting = {
@@ -195,8 +242,21 @@ function stageArchive(stage, worker, hosting = {
   );
 }
 
-function createArchive(stage, archive) {
-  execFileSync("tar", ["-czf", archive, "-C", stage, "dist"]);
+function createArchive(stage, archive, normalizeOwnership = true) {
+  const ownership = normalizeOwnership
+    ? ["--uid", "0", "--gid", "0", "--uname", "root", "--gname", "root"]
+    : [];
+  execFileSync("tar", ["-czf", archive, ...ownership, "-C", stage, "dist"]);
+}
+
+function withGzipFilename(bytes, filename) {
+  const header = Buffer.from(bytes.subarray(0, 10));
+  header[3] |= 0x08;
+  return Buffer.concat([
+    header,
+    Buffer.from(`${filename}\0`, "latin1"),
+    bytes.subarray(10),
+  ]);
 }
 
 function runScanner(argumentsList, environment = process.env) {

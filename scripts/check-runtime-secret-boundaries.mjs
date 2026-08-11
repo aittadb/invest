@@ -302,14 +302,16 @@ function scanExternalPath(path, canaries) {
   }
 }
 
-function scanReleaseFile(path, bytes, canaries) {
+function scanReleaseFile(path, bytes, canaries, logicalPath = path) {
   const text = bytes.toString("utf8");
   scannedFiles.add(path);
   scanExactCanaries(path, text, canaries);
   scanPatterns(path, text, ACTIVE_ARTIFACT_PATTERNS, "contains active");
   scanPatterns(path, text, HIGH_CONFIDENCE_CREDENTIAL_PATTERNS, "contains");
-  if (isTextFile(path, bytes)) scanCommittedSecretAssignments(path, text);
-  if (isActiveHostingManifest(path)) {
+  if (isTextFile(logicalPath, bytes)) {
+    scanCommittedSecretAssignments(path, text, logicalPath);
+  }
+  if (isActiveHostingManifest(logicalPath)) {
     try {
       parseActiveSitesHostingConfiguration(text);
     } catch {
@@ -324,6 +326,11 @@ function scanArchive(archivePath, canaries) {
     throw new Error("Invalid archive.");
   }
   const archiveBytes = readFileSync(archivePath);
+  scanReleaseMetadata(
+    "archive:compressed-metadata",
+    archiveBytes.toString("latin1"),
+    canaries,
+  );
   const expandedArchive = gunzipSync(archiveBytes, {
     maxOutputLength: MAX_ARCHIVE_UNCOMPRESSED_BYTES,
   }).toString("utf8");
@@ -336,20 +343,34 @@ function scanArchive(archivePath, canaries) {
     encoding: "utf8",
     maxBuffer: MAX_ARCHIVE_LIST_BYTES,
   }).split("\n").filter(Boolean);
+  const numericVerbose = execFileSync(
+    "tar",
+    ["--numeric-owner", "-tvzf", archivePath],
+    {
+      encoding: "utf8",
+      maxBuffer: MAX_ARCHIVE_LIST_BYTES,
+    },
+  ).split("\n").filter(Boolean);
   if (
     entries.length < 1 ||
     entries.length > MAX_ARCHIVE_ENTRIES ||
-    entries.length !== verbose.length
+    entries.length !== verbose.length ||
+    entries.length !== numericVerbose.length
   ) {
     throw new Error("Invalid archive.");
   }
   const seenEntries = new Set();
   for (let index = 0; index < entries.length; index += 1) {
     const entry = entries[index];
-    scanReleaseMetadata(`archive:name:${index}`, entry, canaries);
-    scanReleaseMetadata(`archive:metadata:${index}`, verbose[index] ?? "", canaries);
+    const reportPath = `archive:entry:${index}`;
+    scanReleaseMetadata(reportPath, entry, canaries);
+    scanReleaseMetadata(reportPath, verbose[index] ?? "", canaries);
+    scanReleaseMetadata(reportPath, numericVerbose[index] ?? "", canaries);
+    if (!hasNormalizedArchiveOwnership(numericVerbose[index] ?? "")) {
+      addFinding(reportPath, 0, "has non-normalized owner metadata");
+    }
     if (seenEntries.has(entry)) {
-      addFinding(`archive:${entry}`, 0, "duplicates an archive entry");
+      addFinding(reportPath, 0, "duplicates an archive entry");
       continue;
     }
     seenEntries.add(entry);
@@ -359,19 +380,23 @@ function scanArchive(archivePath, canaries) {
     }
     const kind = verbose[index]?.at(0);
     if (entry.endsWith("/")) {
-      if (kind !== "d") addFinding(`archive:${entry}`, 0, "has an unsafe type");
+      if (kind !== "d") addFinding(reportPath, 0, "has an unsafe type");
       continue;
     }
     if (kind !== "-") {
-      addFinding(`archive:${entry}`, 0, "has an unsafe type");
+      addFinding(reportPath, 0, "has an unsafe type");
       continue;
     }
     const bytes = execFileSync("tar", ["-xOzf", archivePath, entry], {
       encoding: "buffer",
       maxBuffer: MAX_ARCHIVE_BYTES,
     });
-    scanReleaseFile(`archive:${entry}`, bytes, canaries);
+    scanReleaseFile(reportPath, bytes, canaries, entry);
   }
+}
+
+function hasNormalizedArchiveOwnership(metadata) {
+  return /^[^\s]+\s+(?:\d+\s+0\s+0|0\/0)\s+/u.test(metadata);
 }
 
 function scanReleaseMetadata(path, text, canaries) {
@@ -490,13 +515,13 @@ function isApprovedSyntheticCredentialFixture(path, label, value) {
     value === expected;
 }
 
-function scanCommittedSecretAssignments(path, text) {
+function scanCommittedSecretAssignments(path, text, logicalPath = path) {
   LITERAL_ASSIGNMENT.lastIndex = 0;
   for (const match of text.matchAll(LITERAL_ASSIGNMENT)) {
     const [, name, , value] = match;
     if (
       isSecretBearingName(name) &&
-      !isGeneratedFrameworkNonce(path, name, value) &&
+      !isGeneratedFrameworkNonce(logicalPath, name, value) &&
       looksCommitted(name, value)
     ) {
       addFinding(path, match.index, "contains a committed secret assignment", text);
@@ -508,7 +533,7 @@ function scanCommittedSecretAssignments(path, text) {
     const [, , name, , value] = match;
     if (
       isSecretBearingName(name) &&
-      !isGeneratedFrameworkNonce(path, name, value) &&
+      !isGeneratedFrameworkNonce(logicalPath, name, value) &&
       looksCommitted(name, value)
     ) {
       addFinding(path, match.index, "contains a committed secret property", text);
