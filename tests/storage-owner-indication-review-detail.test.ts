@@ -48,7 +48,10 @@ import {
   StorageOwnerIndicationReviewDetailRepository,
   type OwnerIndicationReviewIdResolver,
 } from "../repositories/storage-owner-indication-review-detail-repository.ts";
-import { StorageParticipantInvestmentInterestRepository } from "../repositories/storage-participant-investment-repository.ts";
+import {
+  StorageParticipantInvestmentInterestRepository,
+  initializeParticipantInvestmentOwnership,
+} from "../repositories/storage-participant-investment-repository.ts";
 import {
   OWNER_INDICATION_REJECTION_NOTIFICATION_SUBJECT,
   ownerIndicationRejectionNotificationBody,
@@ -572,8 +575,13 @@ async function seedEditedIndication(
   state: MemoryStorageState,
   editCount = 1,
 ): Promise<InvestmentIndication> {
+  const storage = new MemoryStorageAdapter(state);
+  await initializeParticipantInvestmentOwnership(storage, PARTICIPANT, {
+    operationId: "investment-ownership-initialization:owner-detail-fixture",
+    indications: [],
+  });
   const repository = new StorageParticipantInvestmentInterestRepository(
-    new MemoryStorageAdapter(state),
+    storage,
     PARTICIPANT,
     AMOUNT,
   );

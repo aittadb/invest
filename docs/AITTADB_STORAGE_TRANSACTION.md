@@ -77,9 +77,17 @@ operation over the root, index, and summary. Its caller must supply the complete
 sorted subject inventory. The repository checks every supplied entry against
 the exact subject-bound current record and its immutable terminal transition,
 rejects more than four active entries, and accepts an ID-only schema-4 witness
-only through this explicit boundary. A changed retry conflicts. A missing,
-incomplete, over-capacity, malformed, mismatched, or moving state is unavailable
-and changes nothing.
+only through this explicit boundary. The immutable root identifies exact
+retries, which return the original initialization counts even after later valid
+lifecycle activity; current metadata is still checked independently for
+completeness and stability. A changed retry conflicts. A missing, incomplete,
+over-capacity, malformed, mismatched, or moving state is unavailable and changes
+nothing.
+
+This storage primitive is not a production provisioning or migration workflow.
+`TASK-158` must compose authoritative empty initialization with first
+registration, and `TASK-159` must provide the bounded operator-only migration
+path for legacy participants before hosted investment persistence is ready.
 
 One capacity proof reads the root, summary, and index, then exactly the current
 and terminal record for each owned ID, and finally re-reads the summary. It does

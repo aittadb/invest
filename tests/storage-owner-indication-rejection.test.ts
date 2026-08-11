@@ -43,7 +43,10 @@ import {
   StorageOwnerIndicationRejectionRepository,
   type OwnerIndicationReviewIdResolver,
 } from "../repositories/storage-owner-indication-rejection-repository.ts";
-import { StorageParticipantInvestmentInterestRepository } from "../repositories/storage-participant-investment-repository.ts";
+import {
+  StorageParticipantInvestmentInterestRepository,
+  initializeParticipantInvestmentOwnership,
+} from "../repositories/storage-participant-investment-repository.ts";
 import type { RejectIndicationWithEffectsRequest } from "../services/owner-indication-moderation.ts";
 import { createParticipantInvestmentInterestService } from "../worker/investment-interest-service.ts";
 import {
@@ -570,8 +573,13 @@ test("outer rejection transaction stays bounded and contains every effect", asyn
 async function seedActiveIndication(
   state: MemoryStorageState,
 ): Promise<Readonly<{ indication: InvestmentIndication }>> {
+  const storage = new MemoryStorageAdapter(state);
+  await initializeParticipantInvestmentOwnership(storage, PARTICIPANT, {
+    operationId: "investment-ownership-initialization:owner-rejection-fixture",
+    indications: [],
+  });
   const repository = new StorageParticipantInvestmentInterestRepository(
-    new MemoryStorageAdapter(state),
+    storage,
     PARTICIPANT,
     AMOUNT,
   );

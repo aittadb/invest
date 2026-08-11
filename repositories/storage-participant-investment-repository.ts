@@ -157,6 +157,7 @@ type ParticipantIndex = Readonly<{
 }>;
 
 type CompleteParticipantIndex = Readonly<{
+  root: ParticipantOwnershipRoot;
   index: ParticipantIndex;
   witness: ParticipantIndicationCompletenessWitness;
 }>;
@@ -236,14 +237,9 @@ export async function initializeParticipantInvestmentOwnership(
     ) unavailable();
     const existingRoot = await readParticipantOwnershipRoot(adapter, subject);
     if (existingRoot !== null) {
-      if (
-        existingRoot.operationId !== parsed.operationId ||
-        existingRoot.initializationFingerprint !== parsed.fingerprint
-      ) conflict();
+      requireMatchingInitializationRoot(existingRoot, parsed, "request");
       const complete = await readCompleteParticipantIndex(adapter, subject);
-      if (!sameOwnershipEntries(complete.witness.indications, parsed.indications)) {
-        unavailable();
-      }
+      requireMatchingInitializationRoot(complete.root, parsed, "stored");
       return ownershipInitializationResult(parsed.indications, true);
     }
 
@@ -295,9 +291,7 @@ export async function initializeParticipantInvestmentOwnership(
     verifyInitializationTransactionResult(result, transaction.mutations);
     if (result.replayed) {
       const complete = await readCompleteParticipantIndex(adapter, subject);
-      if (!sameOwnershipEntries(complete.witness.indications, parsed.indications)) {
-        unavailable();
-      }
+      requireMatchingInitializationRoot(complete.root, parsed, "stored");
     }
     return ownershipInitializationResult(parsed.indications, result.replayed);
   } catch (error) {
@@ -1027,6 +1021,19 @@ function ownershipInitializationResult(
   });
 }
 
+function requireMatchingInitializationRoot(
+  root: ParticipantOwnershipRoot,
+  parsed: ParsedOwnershipInitialization,
+  mismatch: "request" | "stored",
+): void {
+  if (
+    root.operationId === parsed.operationId &&
+    root.initializationFingerprint === parsed.fingerprint
+  ) return;
+  if (mismatch === "request") conflict();
+  unavailable();
+}
+
 function verifyInitializationTransactionResult(
   result: unknown,
   mutations: readonly StorageMutation[],
@@ -1122,7 +1129,8 @@ async function readCompleteParticipantIndex(
   storage: Pick<StorageAdapter, "read">,
   subject: ActorSubject,
 ): Promise<CompleteParticipantIndex> {
-  if (await readParticipantOwnershipRoot(storage, subject) === null) unavailable();
+  const root = await readParticipantOwnershipRoot(storage, subject);
+  if (root === null) unavailable();
   const witnessBefore = await readParticipantIndicationCompletenessWitness(
     storage,
     subject,
@@ -1142,7 +1150,7 @@ async function readCompleteParticipantIndex(
     subject,
   );
   if (!sameWitness(witnessBefore, witnessAfter)) unavailable();
-  return Object.freeze({ index, witness: witnessAfter });
+  return Object.freeze({ root, index, witness: witnessAfter });
 }
 
 async function readParticipantCapacity(

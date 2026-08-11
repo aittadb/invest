@@ -238,6 +238,15 @@ must never call this function as an absence fallback. Existing-root corruption
 is unavailable and requires operator investigation rather than automatic
 reinitialization.
 
+This primitive does not yet make hosted participant investment persistence
+ready. `TASK-158` must atomically provision empty ownership metadata with first
+registration, and `TASK-159` must provide the credential-closed complete
+inventory migration for legacy participants. Ordinary hosted investment routes
+must remain unavailable for a subject until the applicable prerequisite has
+completed. Exact initialization retries use immutable root evidence and return
+their original counts after later valid lifecycle activity, but every retry
+still validates the current root, index, summary, and compact ownership heads.
+
 The exact adapter-read ceilings are 204 for capacity, 203 for first
 initialization, 205 for an initialized restart, and 407 for a maximum-size
 initialization that loses a concurrent exact race and verifies the winner. A
