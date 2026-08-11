@@ -91,8 +91,9 @@ import { createOwnerInitialSetupRouteHandler } from "./routes/owner-initial-setu
 import { createOwnerRouteHandler } from "./routes/owner.ts";
 import {
   createOwnerAggregateReconciliationRouteHandler,
+  isExactOwnerAggregateReconciliationMutation,
   MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_BYTES,
-  MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_FIELDS,
+  ownerAggregateReconciliationMutationFieldLimit,
   type OwnerAggregateReconciliationRouteOptions,
 } from "./routes/owner-aggregate-reconciliation.ts";
 import {
@@ -1205,7 +1206,7 @@ async function runtimeOwnerAggregateReconciliation(
     return Object.freeze({
       repository: runtime.repositoryFactory.ownerAggregateReconciliation(
         ownerSubject.value,
-        campaign.setup.amountAggregate.amount,
+        campaign,
       ),
       guardMutation: (request: Request) =>
         runtime.mutationSession.verifyMutation(
@@ -1216,8 +1217,10 @@ async function runtimeOwnerAggregateReconciliation(
             maxBodyBytes:
               MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_BYTES,
             maxFields:
-              MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_FIELDS,
+              ownerAggregateReconciliationMutationFieldLimit(request),
             repeatedFormFields: [],
+            validateBeforeReplayClaim:
+              isExactOwnerAggregateReconciliationMutation,
           },
         ),
       csrfToken: (request: Request) =>

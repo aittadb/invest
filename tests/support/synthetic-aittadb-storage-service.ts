@@ -59,6 +59,7 @@ export class SyntheticAittaDBStorageService {
   tokenRequests = 0;
   discoveryRequests = 0;
   transactionRequests = 0;
+  listRequests = 0;
   largestRecordBytes = 0;
   largestTransactionBytes = 0;
 
@@ -136,6 +137,21 @@ export class SyntheticAittaDBStorageService {
     return Object.freeze([...this.#records.keys()].sort(compareCodeUnits));
   }
 
+  setRecord(input: Readonly<{
+    collection: string;
+    id: string;
+    revision: number;
+    value: StorageDocument;
+  }>): void {
+    assert.equal(typeof input.collection, "string");
+    assert.equal(typeof input.id, "string");
+    assert.equal(positiveRevision(input.revision), true);
+    this.#records.set(key(input.collection, input.id), Object.freeze({
+      revision: input.revision,
+      value: structuredClone(input.value),
+    }));
+  }
+
   async #token(request: Request): Promise<Response> {
     this.tokenRequests += 1;
     assert.equal(request.method, "POST");
@@ -175,6 +191,7 @@ export class SyntheticAittaDBStorageService {
   }
 
   #list(url: URL): Response {
+    this.listRequests += 1;
     const collection = url.searchParams.get("collection") ?? "";
     this.listCollections.push(collection);
     const limit = Number(url.searchParams.get("limit"));

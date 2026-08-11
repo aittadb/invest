@@ -19,8 +19,10 @@ import {
 } from "../domain/investment-aggregate.ts";
 import {
   StorageFailure,
+  MAX_STORAGE_PAGE_SIZE,
   assertStorageListBoundary,
   assertStorageTransactionBoundary,
+  parseStorageKey,
   storageKeyString,
   type StorageAdapter,
   type StorageCursor,
@@ -33,6 +35,10 @@ import {
 } from "../domain/storage-adapter.ts";
 import {
   DevelopmentInMemoryAggregateRepository,
+  MAX_AGGREGATE_CONTRIBUTION_LIST_PAGES,
+  MAX_AGGREGATE_CONTRIBUTION_LIST_READS,
+  MAX_AGGREGATE_CONTRIBUTION_RECORDS,
+  type AggregateCorrectionRevisionAssertion,
   type ApplyAggregateContributionRequest,
   type InvestmentAggregateRepository,
 } from "../repositories/in-memory-aggregate-repository.ts";
@@ -360,6 +366,157 @@ test("audited corrections commit one retry-stable aggregate and audit transactio
   );
 });
 
+test("audited correction atomically asserts its campaign revision and retries after a race", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state);
+  const seed = new DevelopmentInMemoryAggregateRepository(adapter, currency);
+  await seed.applyContribution(applyRequest(
+    "aggregate-operation:campaign-race-seed",
+    0,
+    contribution("indication:campaign-race", 1, "active", 25_000),
+  ));
+  mutateAggregateRecord(state, (snapshot) => {
+    snapshot.totalAmount = 20_000;
+  });
+  const preview = await seed.previewReconciliation();
+  const campaignKey = requiredTestStorageKey(
+    "campaign-setup-current",
+    "configured-campaign",
+  );
+  state.records.set(storageKeyString(campaignKey), freezeRecord({
+    key: campaignKey,
+    revision: 1,
+    value: { kind: "campaign-revision-fixture" },
+  }));
+  const request = {
+    operationId: "aggregate-operation:campaign-race-correction",
+    confirmation: confirmationFor(preview),
+    ownerSubject: "issuer.invalid/subject:owner",
+    occurredAt: "2026-08-09T12:00:00.000Z",
+  };
+  const raced = new CampaignRevisionRaceAdapter(
+    adapter,
+    state,
+    campaignKey,
+  );
+  const boundToRevisionOne = new DevelopmentInMemoryAggregateRepository(
+    raced,
+    currency,
+    revisionAssertion(campaignKey, 1),
+  );
+
+  await rejectsStorage(
+    () => boundToRevisionOne.applyConfirmedCorrectionWithAudit(request),
+    "PRECONDITION_FAILED",
+  );
+  assert.equal(raced.raced, true);
+  assert.equal(
+    state.records.get(storageKeyString(campaignKey))?.revision,
+    2,
+  );
+  assert.deepEqual(await seed.previewReconciliation(), preview);
+  assert.equal(hasStoredOperation(state, "audited-correction"), false);
+  assert.deepEqual(
+    (await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }))
+      .items,
+    [],
+  );
+
+  const reopened = new DevelopmentInMemoryAggregateRepository(
+    adapter,
+    currency,
+    revisionAssertion(campaignKey, 2),
+  );
+  const corrected = await reopened.applyConfirmedCorrectionWithAudit(request);
+  assert.equal(corrected.replayed, false);
+  assert.deepEqual(corrected.stored, stored(2, 25_000, 1));
+  const replayed = await new DevelopmentInMemoryAggregateRepository(
+    adapter,
+    currency,
+    revisionAssertion(campaignKey, 2),
+  ).applyConfirmedCorrectionWithAudit({
+    ...request,
+    occurredAt: "2026-08-09T12:05:00.000Z",
+  });
+  assert.deepEqual(replayed, { ...corrected, replayed: true });
+});
+
+test("aggregate contribution listing rejects oversized legitimate collections finitely", async () => {
+  const adapter = new ScriptedContributionListAdapter((call) => {
+    const start = call * MAX_STORAGE_PAGE_SIZE;
+    const remaining = MAX_AGGREGATE_CONTRIBUTION_RECORDS + 1 - start;
+    const length = Math.min(MAX_STORAGE_PAGE_SIZE, remaining);
+    return {
+      items: Array.from(
+        { length },
+        (_, index) => contributionStorageRecord(start + index),
+      ),
+      nextCursor: start + length < MAX_AGGREGATE_CONTRIBUTION_RECORDS + 1
+        ? (`aggregate-test-cursor:${start + length}` as StorageCursor)
+        : null,
+    };
+  });
+  const repository = new DevelopmentInMemoryAggregateRepository(
+    adapter,
+    currency,
+  );
+
+  await rejectsStorage(() => repository.previewReconciliation(), "UNAVAILABLE");
+  assert.equal(
+    adapter.listCalls,
+    Math.ceil(MAX_AGGREGATE_CONTRIBUTION_RECORDS / MAX_STORAGE_PAGE_SIZE),
+  );
+  assert.ok(adapter.listCalls <= MAX_AGGREGATE_CONTRIBUTION_LIST_READS);
+});
+
+test("aggregate contribution listing stops endless unique cursors at its page and read ceilings", async () => {
+  const adapter = new ScriptedContributionListAdapter((call) => ({
+    items: [contributionStorageRecord(call)],
+    nextCursor: `aggregate-test-cursor:${call + 1}` as StorageCursor,
+  }));
+  const repository = new DevelopmentInMemoryAggregateRepository(
+    adapter,
+    currency,
+  );
+
+  await rejectsStorage(() => repository.previewReconciliation(), "UNAVAILABLE");
+  assert.equal(adapter.listCalls, MAX_AGGREGATE_CONTRIBUTION_LIST_PAGES);
+  assert.equal(adapter.listCalls, MAX_AGGREGATE_CONTRIBUTION_LIST_READS);
+});
+
+test("aggregate contribution listing rejects malformed and no-progress pages after one read", async () => {
+  const pages = [
+    {
+      items: [],
+      nextCursor: "aggregate-test-cursor:no-progress" as StorageCursor,
+    },
+    {
+      items: [contributionStorageRecord(1)],
+      nextCursor: "" as StorageCursor,
+    },
+    {
+      items: Array.from(
+        { length: MAX_STORAGE_PAGE_SIZE + 1 },
+        (_, index) => contributionStorageRecord(index),
+      ),
+      nextCursor: null,
+    },
+  ] satisfies readonly StoragePage[];
+
+  for (const page of pages) {
+    const adapter = new ScriptedContributionListAdapter(() => page);
+    const repository = new DevelopmentInMemoryAggregateRepository(
+      adapter,
+      currency,
+    );
+    await rejectsStorage(
+      () => repository.previewReconciliation(),
+      "UNAVAILABLE",
+    );
+    assert.equal(adapter.listCalls, 1);
+  }
+});
+
 test("audited correction failure leaves both aggregate and audit untouched", async () => {
   const state = new MemoryStorageState();
   const adapter = new DeterministicMemoryStorageAdapter(state);
@@ -660,6 +817,48 @@ function mutableRecord(value: unknown): MutableRecord {
   return value as MutableRecord;
 }
 
+function requiredTestStorageKey(collection: string, id: string): StorageKey {
+  const parsed = parseStorageKey(collection, id);
+  assert(parsed.ok);
+  return parsed.value;
+}
+
+function revisionAssertion(
+  key: StorageKey,
+  expectedRevision: number,
+): AggregateCorrectionRevisionAssertion {
+  return Object.freeze({ type: "check", key, expectedRevision });
+}
+
+function hasStoredOperation(
+  state: MemoryStorageState,
+  kind: string,
+): boolean {
+  return [...state.records.values()].some((record) =>
+    record.value.operationKind === kind
+  );
+}
+
+function contributionStorageRecord(index: number): StorageRecord {
+  const indicationId = `indication:bounded-${String(index).padStart(4, "0")}`;
+  return freezeRecord({
+    key: requiredTestStorageKey(
+      "investment-aggregate-contributions",
+      indicationId,
+    ),
+    revision: 1,
+    value: {
+      kind: "investment-aggregate-contribution",
+      schemaVersion: 1,
+      indicationId,
+      indicationRevision: 1,
+      status: "active",
+      amount: 1,
+      currency,
+    },
+  });
+}
+
 class MemoryStorageState {
   readonly records = new Map<string, StorageRecord>();
   readonly operations = new Map<
@@ -695,6 +894,80 @@ class RejectAuditedCorrectionAdapter implements StorageAdapter {
       throw new StorageFailure("UNAVAILABLE");
     }
     return this.#delegate.transact(request);
+  }
+}
+
+class CampaignRevisionRaceAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #state: MemoryStorageState;
+  readonly #campaignKey: StorageKey;
+  raced = false;
+
+  constructor(
+    delegate: StorageAdapter,
+    state: MemoryStorageState,
+    campaignKey: StorageKey,
+  ) {
+    this.#delegate = delegate;
+    this.#state = state;
+    this.#campaignKey = campaignKey;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    if (
+      !this.raced &&
+      request.mutations.some((mutation) =>
+        mutation.type === "check" &&
+        storageKeyString(mutation.key) === storageKeyString(this.#campaignKey)
+      )
+    ) {
+      const key = storageKeyString(this.#campaignKey);
+      const current = this.#state.records.get(key);
+      assert(current);
+      this.#state.records.set(key, freezeRecord({
+        key: current.key,
+        revision: current.revision + 1,
+        value: { kind: "campaign-revision-raced" },
+      }));
+      this.raced = true;
+    }
+    return this.#delegate.transact(request);
+  }
+}
+
+class ScriptedContributionListAdapter implements StorageAdapter {
+  readonly #page: (call: number) => StoragePage;
+  listCalls = 0;
+
+  constructor(page: (call: number) => StoragePage) {
+    this.#page = page;
+  }
+
+  async read(): Promise<null> {
+    return null;
+  }
+
+  async list(
+    request: Parameters<StorageAdapter["list"]>[0],
+  ): Promise<StoragePage> {
+    assertStorageListBoundary(request);
+    const call = this.listCalls;
+    this.listCalls += 1;
+    return this.#page(call);
+  }
+
+  async transact(): Promise<StorageTransactionResult> {
+    throw new StorageFailure("UNAVAILABLE");
   }
 }
 

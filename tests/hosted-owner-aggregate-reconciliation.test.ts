@@ -20,7 +20,10 @@ import {
   DevelopmentInMemoryAggregateRepository,
 } from "../repositories/in-memory-aggregate-repository.ts";
 import { DevelopmentInMemoryAuditRepository } from "../repositories/in-memory-audit-notification-repositories.ts";
-import { StorageCampaignRepository } from "../repositories/in-memory-campaign-repository.ts";
+import {
+  StorageCampaignRepository,
+  type CampaignSetup,
+} from "../repositories/in-memory-campaign-repository.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
 import type {
   InvestorAppEnv,
@@ -85,6 +88,7 @@ test("hosted owner reconciles a persistent AittaDB aggregate and audit atomicall
   const resource = await resourceResponse.json() as
     OwnerAggregateReconciliationDocument;
   assert.equal(resource.data.status, "mismatch");
+  assert.equal(resource.data.stored.revision, 2);
   assert.equal(resource.data.stored.amount, 45_000);
   assert.equal(resource.data.calculated.amount, 50_000);
   assert.equal(resource.data.correction_available, true);
@@ -100,18 +104,21 @@ test("hosted owner reconciles a persistent AittaDB aggregate and audit atomicall
   const html = await htmlResponse.text();
   assert.equal(htmlResponse.status, 200);
   assert.match(html, /Stored and calculated totals differ/u);
+  assert.match(html, /<th scope="row">Stored<\/th><td>2<\/td>/u);
   assert.match(html, /<form[^>]+method="post"/u);
   assert.match(html, /name="_csrf"/u);
   for (const field of requiredAction(resource).fields) {
     assert.match(html, new RegExp(`name="${field.name}"`, "u"));
   }
 
+  const listRequestsBeforeCorrection = service.listRequests;
   const correctedResponse = await worker.fetch(
     ownerMutation(actionBody(resource), proof),
     env,
     executionContext,
   );
   assert.equal(correctedResponse.status, 200);
+  assert.equal(service.listRequests, listRequestsBeforeCorrection + 1);
   assert.match(correctedResponse.headers.get("set-cookie") ?? "", /Max-Age=0/u);
   assert.equal(correctedResponse.headers.get(MUTATION_CSRF_HEADER), null);
   const corrected = await correctedResponse.json() as
@@ -213,6 +220,214 @@ test("hosted native form applies the same bounded correction action", async () =
   assert.match(html, /Stored and calculated totals match/u);
   assert.doesNotMatch(html, /<form/u);
   assert.match(response.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+});
+
+test("hosted mutation field boundaries reject before consuming the one-use proof", async () => {
+  for (const mediaType of ["json", "form"] as const) {
+    const service = storageService();
+    await seedMismatch(service);
+    const worker = hostedWorker(service);
+    const env = environment();
+    const resourceResponse = await worker.fetch(
+      ownerRequest(PATH),
+      env,
+      executionContext,
+    );
+    const proof = mutationProof(resourceResponse);
+    const resource = await resourceResponse.json() as
+      OwnerAggregateReconciliationDocument;
+    const valid = actionBody(resource);
+    const overLimit = { ...valid, unexpected: "extra" };
+    const wrongShape = { ...valid, unexpected: "replacement" } as
+      Record<string, unknown>;
+    delete wrongShape.confirmation;
+
+    for (const invalid of [overLimit, wrongShape]) {
+      const response = await worker.fetch(
+        mediaType === "json"
+          ? ownerMutation(invalid, proof)
+          : ownerFormMutation(invalid, proof),
+        env,
+        executionContext,
+      );
+      assert.equal(response.status, 400);
+      assert.equal(response.headers.get("set-cookie"), null);
+      assert.equal(
+        service.recordKeys().filter((key) =>
+          key.startsWith("browser-mutation-replays/")
+        ).length,
+        0,
+      );
+    }
+
+    const corrected = await worker.fetch(
+      mediaType === "json"
+        ? ownerMutation(valid, proof)
+        : ownerFormMutation(valid, proof),
+      env,
+      executionContext,
+    );
+    assert.equal(corrected.status, 200);
+    assert.match(corrected.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+  }
+});
+
+test("hosted maximum aggregate revision exposes comparison without action or proof", async () => {
+  const service = storageService();
+  await seedMismatch(service);
+  service.setRecord({
+    collection: "investment-aggregate-states",
+    id: "current-investment-aggregate",
+    revision: Number.MAX_SAFE_INTEGER,
+    value: {
+      kind: "investment-aggregate-state",
+      schemaVersion: 1,
+      snapshot: {
+        revision: Number.MAX_SAFE_INTEGER,
+        totalAmount: 45_000,
+        currency: "SEK",
+        contributingIndicationCount: 1,
+      },
+    },
+  });
+  const worker = hostedWorker(service);
+  const env = environment();
+
+  const jsonResponse = await worker.fetch(
+    ownerRequest(PATH),
+    env,
+    executionContext,
+  );
+  const resource = await jsonResponse.json() as
+    OwnerAggregateReconciliationDocument;
+  assert.equal(jsonResponse.status, 200);
+  assert.equal(resource.data.status, "mismatch");
+  assert.equal(resource.data.stored.revision, Number.MAX_SAFE_INTEGER);
+  assert.equal(resource.data.correction_required, true);
+  assert.equal(resource.data.correction_available, false);
+  assert.deepEqual(resource.actions, []);
+  assert.equal(jsonResponse.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.equal(jsonResponse.headers.get("set-cookie"), null);
+
+  const htmlResponse = await worker.fetch(
+    ownerRequest(PATH, "text/html"),
+    env,
+    executionContext,
+  );
+  const html = await htmlResponse.text();
+  assert.equal(htmlResponse.status, 200);
+  assert.match(
+    html,
+    new RegExp(`<th scope="row">Stored</th><td>${Number.MAX_SAFE_INTEGER}</td>`, "u"),
+  );
+  assert.match(html, /Correction is unavailable for this stored revision\./u);
+  assert.doesNotMatch(html, /<form/u);
+  assert.equal(htmlResponse.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.equal(htmlResponse.headers.get("set-cookie"), null);
+});
+
+test("hosted correction rolls back on a concurrent campaign change and succeeds after restart", async () => {
+  const service = storageService();
+  const seeded = await seedMismatch(service);
+  const campaigns = new StorageCampaignRepository(storageAdapter(service));
+  let raced = false;
+  const racingFetch: typeof service.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (
+      !raced &&
+      request.method === "POST" &&
+      new URL(request.url).pathname === "/records/transactions"
+    ) {
+      const body = record(await request.clone().json());
+      const transaction = record(body.transaction);
+      const operationId = transaction.operation_id;
+      if (
+        typeof operationId === "string" &&
+        operationId.startsWith("aggregate-correction:")
+      ) {
+        const current = await campaigns.readSetup();
+        assert(current);
+        await campaigns.saveSetup({
+          operationId: "campaign-operation:aggregate-reconciliation-race",
+          recordedAt: "2026-08-11T09:01:00.000Z",
+          expectedRevision: current.revision,
+          setup: campaignSetupWithCurrency(current.setup, "EUR", "Raced campaign"),
+        });
+        raced = true;
+      }
+    }
+    return service.fetch(request);
+  };
+  const worker = hostedWorker(service, racingFetch);
+  const env = environment();
+  const resourceResponse = await worker.fetch(
+    ownerRequest(PATH),
+    env,
+    executionContext,
+  );
+  const proof = mutationProof(resourceResponse);
+  const resource = await resourceResponse.json() as
+    OwnerAggregateReconciliationDocument;
+
+  const failed = await worker.fetch(
+    ownerMutation(actionBody(resource), proof),
+    env,
+    executionContext,
+  );
+  assert.equal(failed.status, 412);
+  assert.equal(raced, true);
+  assert.equal((await campaigns.readSetup())?.revision, 2);
+  assert.equal((await seeded.aggregate.previewReconciliation()).status, "mismatch");
+  assert.equal(
+    (await new DevelopmentInMemoryAuditRepository(seeded.adapter).list({
+      limit: 10,
+    })).items.length,
+    0,
+  );
+  assert.equal(
+    service.recordKeys().some((key) =>
+      key.startsWith("investment-aggregate-operations/aggregate-correction:")
+    ),
+    false,
+  );
+
+  const racedCampaign = await campaigns.readSetup();
+  assert(racedCampaign);
+  await campaigns.saveSetup({
+    operationId: "campaign-operation:aggregate-reconciliation-restore",
+    recordedAt: "2026-08-11T09:02:00.000Z",
+    expectedRevision: racedCampaign.revision,
+    setup: campaignSetupWithCurrency(
+      racedCampaign.setup,
+      "SEK",
+      "Restored campaign",
+    ),
+  });
+  const restarted = hostedWorker(service, service.fetch, 31);
+  const retryResourceResponse = await restarted.fetch(
+    ownerRequest(PATH),
+    env,
+    executionContext,
+  );
+  const retryProof = mutationProof(retryResourceResponse);
+  const retryResource = await retryResourceResponse.json() as
+    OwnerAggregateReconciliationDocument;
+  const corrected = await restarted.fetch(
+    ownerMutation(actionBody(retryResource), retryProof),
+    env,
+    executionContext,
+  );
+  assert.equal(corrected.status, 200);
+
+  const verified = await hostedWorker(service).fetch(
+    ownerRequest(PATH),
+    env,
+    executionContext,
+  );
+  const verifiedResource = await verified.json() as
+    OwnerAggregateReconciliationDocument;
+  assert.equal(verifiedResource.data.status, "match");
+  assert.deepEqual(verifiedResource.actions, []);
 });
 
 test("hosted reconciliation rejects unauthorized callers and storage failure without disclosure", async () => {
@@ -351,8 +566,12 @@ async function driftAggregate(
   });
 }
 
-function hostedWorker(service: SyntheticAittaDBStorageService) {
-  let randomSeed = 7;
+function hostedWorker(
+  service: SyntheticAittaDBStorageService,
+  fetch: typeof service.fetch = service.fetch,
+  initialRandomSeed = 7,
+) {
+  let randomSeed = initialRandomSeed;
   return createApplicationWorker({
     fetchApplication: async (request) =>
       new Response(
@@ -361,7 +580,7 @@ function hostedWorker(service: SyntheticAittaDBStorageService) {
       ),
     fetchOptimizedImage: async () => new Response("image"),
     resolveApplicationRuntime: createHostedApplicationRuntimeResolver({
-      fetch: service.fetch,
+      fetch,
       now: () => NOW,
       randomBytes: (length) => {
         randomSeed = (randomSeed + 1) % 255;
@@ -369,6 +588,21 @@ function hostedWorker(service: SyntheticAittaDBStorageService) {
       },
     }),
   });
+}
+
+function campaignSetupWithCurrency(
+  setup: CampaignSetup,
+  currency: string,
+  name: string,
+) {
+  return {
+    ...setup,
+    publicCampaign: { ...setup.publicCampaign, name },
+    amountAggregate: {
+      ...setup.amountAggregate,
+      amount: { ...setup.amountAggregate.amount, currency },
+    },
+  };
 }
 
 function storageService(

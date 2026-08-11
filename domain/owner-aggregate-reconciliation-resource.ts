@@ -57,7 +57,9 @@ export function createOwnerAggregateReconciliationResource(
   operationId: string,
 ): OwnerAggregateReconciliationResource {
   const correction = actionWhenAllowed(
-    preview.correctionRequired && consistency === "atomic-aggregate-audit",
+    preview.correctionRequired &&
+      preview.stored.revision < Number.MAX_SAFE_INTEGER &&
+      consistency === "atomic-aggregate-audit",
     () => defineAction({
       name: "apply-calculated-aggregate",
       title: "Apply calculated totals",

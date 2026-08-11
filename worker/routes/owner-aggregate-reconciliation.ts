@@ -7,6 +7,10 @@ import {
 import {
   INVESTOR_APP_API_VERSION,
 } from "../../domain/public-campaign-resource.ts";
+import {
+  previewInvestmentAggregateReconciliation,
+  type InvestmentAggregateReconciliationPreview,
+} from "../../domain/investment-aggregate.ts";
 import { parseStorageOperationId, StorageFailure } from "../../domain/storage-adapter.ts";
 import { negotiateRepresentation } from "../../http/content-negotiation.ts";
 import type {
@@ -43,7 +47,28 @@ const MUTATION_KEYS = new Set([
 
 /** Seven correction fields plus the form-only CSRF field, all short scalars. */
 export const MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_BYTES = 4_096;
-export const MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_FIELDS = 8;
+export const MAX_OWNER_AGGREGATE_RECONCILIATION_JSON_FIELDS = MUTATION_KEYS.size;
+export const MAX_OWNER_AGGREGATE_RECONCILIATION_FORM_FIELDS =
+  MUTATION_KEYS.size + 1;
+
+export function ownerAggregateReconciliationMutationFieldLimit(
+  request: Request,
+): number {
+  const contentType = request.headers.get("content-type");
+  const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  return mediaType === "application/x-www-form-urlencoded"
+    ? MAX_OWNER_AGGREGATE_RECONCILIATION_FORM_FIELDS
+    : MAX_OWNER_AGGREGATE_RECONCILIATION_JSON_FIELDS;
+}
+
+export function isExactOwnerAggregateReconciliationMutation(
+  request: VerifiedMutationRequest,
+): boolean {
+  const keys = Object.keys(request.body);
+  return request.method === "POST" &&
+    keys.length === MUTATION_KEYS.size &&
+    keys.every((key) => MUTATION_KEYS.has(key));
+}
 
 type OwnerAggregateReconciliationMutationVerifier = (
   request: Request,
@@ -110,6 +135,7 @@ export function createOwnerAggregateReconciliationRouteHandler(
     }
 
     let clearCookie: string | null = null;
+    let preview: InvestmentAggregateReconciliationPreview | null = null;
     try {
       if (context.request.method === "POST") {
         if (options.repository.correctionConsistency !==
@@ -143,15 +169,27 @@ export function createOwnerAggregateReconciliationRouteHandler(
           verified.body,
           verified.mediaType,
         );
-        await options.repository.applyConfirmedCorrectionWithAudit({
+        const correction = await options.repository
+          .applyConfirmedCorrectionWithAudit({
           operationId: mutation.operationId,
           confirmation: mutation.confirmation,
           ownerSubject: verified.actor.subject,
           occurredAt: currentTimestamp(now),
         });
+        try {
+          preview = previewInvestmentAggregateReconciliation(
+            correction.stored,
+            correction.preview.calculated,
+          );
+        } catch {
+          throw new StorageFailure("UNAVAILABLE");
+        }
+        if (preview.correctionRequired) {
+          throw new StorageFailure("UNAVAILABLE");
+        }
       }
 
-      const preview = await options.repository.previewReconciliation();
+      preview ??= await options.repository.previewReconciliation();
       const operationId = requiredOperationId(issueOperationId());
       const consistency = options.repository.correctionConsistency satisfies
         AggregateCorrectionConsistency;
@@ -324,12 +362,14 @@ function renderResource(
     : "Stored and calculated totals differ.";
   const form = resource.correctionForm === null || csrf === null
     ? data.correction_required
-      ? "<p>Correction is unavailable until atomic aggregate and audit storage is configured.</p>"
+      ? data.correction_consistency === "atomic-aggregate-audit"
+        ? "<p>Correction is unavailable for this stored revision.</p>"
+        : "<p>Correction is unavailable until atomic aggregate and audit storage is configured.</p>"
       : ""
     : renderCorrectionForm(resource.correctionForm, csrf);
   return page(
     "Aggregate reconciliation",
-    `<main><p class="section-kicker">Owner workspace</p><h1>Aggregate reconciliation</h1><p>${escapeHtml(status)}</p><table><thead><tr><th scope="col">Source</th><th scope="col">Amount</th><th scope="col">Currency</th><th scope="col">Indications</th></tr></thead><tbody><tr><th scope="row">Stored</th><td>${data.stored.amount}</td><td>${escapeHtml(data.stored.currency)}</td><td>${data.stored.contributing_indication_count}</td></tr><tr><th scope="row">Calculated</th><td>${data.calculated.amount}</td><td>${escapeHtml(data.calculated.currency)}</td><td>${data.calculated.contributing_indication_count}</td></tr></tbody></table>${form}<p><a href="/owner">Back to owner workspace</a></p></main>`,
+    `<main><p class="section-kicker">Owner workspace</p><h1>Aggregate reconciliation</h1><p>${escapeHtml(status)}</p><table><thead><tr><th scope="col">Source</th><th scope="col">Revision</th><th scope="col">Amount</th><th scope="col">Currency</th><th scope="col">Indications</th></tr></thead><tbody><tr><th scope="row">Stored</th><td>${data.stored.revision}</td><td>${data.stored.amount}</td><td>${escapeHtml(data.stored.currency)}</td><td>${data.stored.contributing_indication_count}</td></tr><tr><th scope="row">Calculated</th><td>-</td><td>${data.calculated.amount}</td><td>${escapeHtml(data.calculated.currency)}</td><td>${data.calculated.contributing_indication_count}</td></tr></tbody></table>${form}<p><a href="/owner">Back to owner workspace</a></p></main>`,
   );
 }
 

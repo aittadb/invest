@@ -42,6 +42,7 @@ import {
   verifyCampaignSetupRevisionCheckRecord,
   type AtomicCampaignAuditRepository,
   type CampaignRepository,
+  type CampaignSetupRevision,
   type PublicCampaignPresentationReader,
 } from "./in-memory-campaign-repository.ts";
 import {
@@ -266,12 +267,13 @@ export class StorageApplicationRepositoryFactory {
 
   ownerAggregateReconciliation(
     ownerSubject: ActorSubject,
-    amountConfiguration: AmountConfiguration,
+    campaign: CampaignSetupRevision,
   ): AtomicInvestmentAggregateCorrectionRepository {
     return new OwnerBoundInvestmentAggregateCorrectionRepository(
       this.#storage,
       ownerSubject,
-      amountConfiguration.currency,
+      campaign.setup.amountAggregate.amount.currency,
+      campaignSetupRevisionCheck(campaign.revision),
     );
   }
 

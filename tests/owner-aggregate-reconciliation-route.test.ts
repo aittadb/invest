@@ -58,7 +58,7 @@ test("owner reconciliation renders one equivalent HTML form and JSON action", as
     data: {
       status: string;
       correction_available: boolean;
-      stored: { amount: number };
+      stored: { revision: number; amount: number };
       calculated: { amount: number };
     };
     actions: Array<{
@@ -70,6 +70,7 @@ test("owner reconciliation renders one equivalent HTML form and JSON action", as
   assert.equal(document.type, "owner-aggregate-reconciliation");
   assert.equal(document.data.status, "mismatch");
   assert.equal(document.data.correction_available, true);
+  assert.equal(document.data.stored.revision, 1);
   assert.equal(document.data.stored.amount, 8_000);
   assert.equal(document.data.calculated.amount, 10_000);
   assert.deepEqual(document.actions.map((action) => action.name), [
@@ -94,6 +95,7 @@ test("owner reconciliation renders one equivalent HTML form and JSON action", as
   assert.equal(html.status, 200);
   assert.equal(html.headers.get(MUTATION_CSRF_HEADER), CSRF_TOKEN);
   assert.match(body, /Stored and calculated totals differ/);
+  assert.match(body, /<th scope="row">Stored<\/th><td>1<\/td>/u);
   assert.match(body, /name="operation-id" value="aggregate-correction:test-operation"/);
   assert.match(body, new RegExp(`name="${MUTATION_CSRF_FIELD}"`));
   assert.match(body, /Apply the calculated totals shown above/);
@@ -160,7 +162,14 @@ test("JSON and form mutations enforce the guard and bind the exact preview", asy
       ? /"status":"match"/
       : /Stored and calculated totals match/);
     assert.equal(responseBody.includes("apply-calculated-aggregate"), false);
+    assert.match(
+      responseBody,
+      mediaType === "application/json"
+        ? /"stored":\{"revision":2,/u
+        : /<th scope="row">Stored<\/th><td>2<\/td>/u,
+    );
     assert.equal(repository.applyCalls.length, 1);
+    assert.equal(repository.previewCalls, 0);
     assert.deepEqual(repository.applyCalls[0], {
       operationId: OPERATION_ID,
       confirmation: {
@@ -175,6 +184,54 @@ test("JSON and form mutations enforce the guard and bind the exact preview", asy
       occurredAt: OCCURRED_AT,
     });
   }
+});
+
+test("maximum stored revision omits correction actions and proof in HTML and JSON", async () => {
+  const repository = new FakeAtomicReconciliationRepository(overflowPreview());
+  let proofCalls = 0;
+  const handler = createOwnerAggregateReconciliationRouteHandler({
+    repository,
+    guardMutation: await mutationGuard(),
+    csrfToken: async () => {
+      proofCalls += 1;
+      return CSRF_TOKEN;
+    },
+    issueOperationId: () => OPERATION_ID,
+  });
+
+  const json = await requiredResponse(await handler(context(new Request(
+    `${ORIGIN}${PATH}`,
+    { headers: { Accept: "application/json" } },
+  ))));
+  const document = await json.json() as {
+    data: {
+      correction_required: boolean;
+      correction_available: boolean;
+      stored: { revision: number };
+    };
+    actions: unknown[];
+  };
+  assert.equal(document.data.correction_required, true);
+  assert.equal(document.data.correction_available, false);
+  assert.equal(document.data.stored.revision, Number.MAX_SAFE_INTEGER);
+  assert.deepEqual(document.actions, []);
+  assert.equal(json.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.equal(json.headers.get("set-cookie"), null);
+
+  const html = await requiredResponse(await handler(context(new Request(
+    `${ORIGIN}${PATH}`,
+    { headers: { Accept: "text/html" } },
+  ))));
+  const body = await html.text();
+  assert.match(
+    body,
+    new RegExp(`<th scope="row">Stored</th><td>${Number.MAX_SAFE_INTEGER}</td>`, "u"),
+  );
+  assert.match(body, /Correction is unavailable for this stored revision\./u);
+  assert.doesNotMatch(body, /<form/u);
+  assert.equal(html.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.equal(html.headers.get("set-cookie"), null);
+  assert.equal(proofCalls, 0);
 });
 
 test("hosted proof cookies are issued and consumed without surviving correction", async () => {
@@ -503,6 +560,24 @@ function matchingPreview(): InvestmentAggregateReconciliationPreview {
       contributingIndicationCount: 1,
     },
     correctionRequired: false,
+  } as InvestmentAggregateReconciliationPreview;
+}
+
+function overflowPreview(): InvestmentAggregateReconciliationPreview {
+  return {
+    status: "mismatch",
+    stored: {
+      revision: Number.MAX_SAFE_INTEGER,
+      totalAmount: 8_000,
+      currency: "EUR",
+      contributingIndicationCount: 1,
+    },
+    calculated: {
+      totalAmount: 10_000,
+      currency: "EUR",
+      contributingIndicationCount: 1,
+    },
+    correctionRequired: true,
   } as InvestmentAggregateReconciliationPreview;
 }
 

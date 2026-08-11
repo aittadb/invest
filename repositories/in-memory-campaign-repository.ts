@@ -191,10 +191,14 @@ export type CampaignSetupHistoryPage = Readonly<{
   nextCursor: StorageCursor | null;
 }>;
 
+export type CampaignSetupRevisionCheck = StorageCheckMutation & Readonly<{
+  expectedRevision: number;
+}>;
+
 /** Exact current-setup assertion used by atomic dependent writes. */
 export function campaignSetupRevisionCheck(
   revision: unknown,
-): StorageCheckMutation {
+): CampaignSetupRevisionCheck {
   if (!Number.isSafeInteger(revision) || (revision as number) < 1) {
     throw new StorageFailure("INVALID_REQUEST");
   }

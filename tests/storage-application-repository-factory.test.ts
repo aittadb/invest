@@ -17,6 +17,7 @@ import {
   MemoryStorageAdapter,
   MemoryStorageState,
 } from "./support/memory-storage-adapter.ts";
+import { explicitCampaignSetup } from "./support/campaign-repository-contract.ts";
 
 const CLAIM = replayClaim();
 const NOW = new Date("2026-08-10T12:00:00.000Z");
@@ -346,14 +347,23 @@ test("factory exposes only named application repository capabilities", async () 
     publicAggregate: { visibility: "hidden" },
   });
   assert(amount.ok);
+  const campaign = await campaignRepository.saveSetup({
+    operationId: "campaign-operation:factory-aggregate-reconciliation",
+    recordedAt: NOW.toISOString(),
+    expectedRevision: null,
+    setup: {
+      ...explicitCampaignSetup(),
+      amountAggregate: amount.value,
+    },
+  });
   const reconciliation = factory.ownerAggregateReconciliation(
     ownerSubject.value,
-    amount.value.amount,
+    campaign,
   );
   assert.notEqual(
     factory.ownerAggregateReconciliation(
       ownerSubject.value,
-      amount.value.amount,
+      campaign,
     ),
     reconciliation,
   );

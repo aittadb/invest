@@ -5,6 +5,7 @@ import type {
 } from "../http/browser-mutation-session.ts";
 import type {
   AtomicCampaignAuditRepository,
+  CampaignSetupRevision,
   PublicCampaignPresentationReader,
 } from "../repositories/in-memory-campaign-repository.ts";
 import type { ActorSubject } from "../domain/foundation.ts";
@@ -44,7 +45,7 @@ export type ApplicationRepositoryFactory = Readonly<{
   ownerManualNotificationActivity(): AtomicManualNotificationActivityRepository;
   ownerAggregateReconciliation(
     ownerSubject: ActorSubject,
-    amountConfiguration: AmountConfiguration,
+    campaign: CampaignSetupRevision,
   ): AtomicInvestmentAggregateCorrectionRepository;
   participantRequest(
     account: ParticipantAccount,

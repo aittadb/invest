@@ -33,6 +33,7 @@ import {
   parseStorageOperationId,
   storageKeyString,
   type StorageAdapter,
+  type StorageCheckMutation,
   type StorageCollection,
   type StorageCursor,
   type StorageDocument,
@@ -40,6 +41,7 @@ import {
   type StorageKey,
   type StorageMutation,
   type StorageOperationId,
+  type StoragePage,
   type StorageRecord,
 } from "../domain/storage-adapter.ts";
 import {
@@ -57,6 +59,11 @@ const CURRENT_AGGREGATE_KEY = requiredStorageKey(
   AGGREGATE_STATES,
   "current-investment-aggregate",
 );
+
+export const MAX_AGGREGATE_CONTRIBUTION_LIST_PAGES = 20;
+export const MAX_AGGREGATE_CONTRIBUTION_LIST_READS = 20;
+export const MAX_AGGREGATE_CONTRIBUTION_RECORDS = 1_000;
+const MAX_AGGREGATE_CONTRIBUTION_CURSOR_LENGTH = 2_048;
 
 const AGGREGATE_DOCUMENT_KEYS = new Set([
   "kind",
@@ -106,6 +113,12 @@ const PREVIEW_KEYS = new Set([
   "stored",
   "calculated",
   "correctionRequired",
+]);
+const STORAGE_PAGE_KEYS = new Set(["items", "nextCursor"]);
+const REVISION_ASSERTION_KEYS = new Set([
+  "type",
+  "key",
+  "expectedRevision",
 ]);
 
 export type AggregateContributionDisposition =
@@ -158,6 +171,9 @@ export type ApplyAuditedAggregateCorrectionResult = Readonly<{
   auditEvent: AuditEvent;
   replayed: boolean;
 }>;
+
+export type AggregateCorrectionRevisionAssertion = StorageCheckMutation &
+  Readonly<{ expectedRevision: number }>;
 
 /** Storage-backed aggregate contract shared by development and production adapters. */
 export interface InvestmentAggregateRepository {
@@ -335,10 +351,20 @@ export class DevelopmentInMemoryAggregateRepository
 
   readonly #storage: StorageAdapter;
   readonly #currency: CurrencyCode;
+  readonly #correctionRevisionAssertion:
+    AggregateCorrectionRevisionAssertion | null;
 
-  constructor(storage: StorageAdapter, currency: CurrencyCode) {
+  constructor(
+    storage: StorageAdapter,
+    currency: CurrencyCode,
+    correctionRevisionAssertion: AggregateCorrectionRevisionAssertion | null =
+      null,
+  ) {
     this.#storage = storage;
     this.#currency = requiredCurrency(currency);
+    this.#correctionRevisionAssertion = correctionRevisionAssertion === null
+      ? null
+      : requiredCorrectionRevisionAssertion(correctionRevisionAssertion);
   }
 
   async readStored(): Promise<StoredInvestmentAggregateSnapshot> {
@@ -589,6 +615,15 @@ export class DevelopmentInMemoryAggregateRepository
       operationId,
       confirmation: requiredJsonValue(request.confirmation),
       ownerSubject,
+      ...(this.#correctionRevisionAssertion === null
+        ? {}
+        : {
+            revisionAssertion: {
+              key: storageKeyString(this.#correctionRevisionAssertion.key),
+              expectedRevision:
+                this.#correctionRevisionAssertion.expectedRevision,
+            },
+          }),
     });
     const replay = await this.#readOperation(
       operationId,
@@ -654,9 +689,14 @@ export class DevelopmentInMemoryAggregateRepository
           ),
         },
         preparedAudit.mutation,
+        ...(this.#correctionRevisionAssertion === null
+          ? []
+          : [this.#correctionRevisionAssertion]),
       ],
     });
 
+    const expectedRecords = this.#correctionRevisionAssertion === null ? 3 : 4;
+    if (transaction.records.length !== expectedRecords) unavailable();
     const aggregateRecord = transaction.records[0];
     const operationRecord = transaction.records[1];
     if (!aggregateRecord || !operationRecord) unavailable();
@@ -673,6 +713,12 @@ export class DevelopmentInMemoryAggregateRepository
       this.#currency,
     );
     verifyPreparedAuditAppend(preparedAudit, transaction.records[2]);
+    if (this.#correctionRevisionAssertion !== null) {
+      verifyCorrectionRevisionAssertion(
+        transaction.records[3],
+        this.#correctionRevisionAssertion,
+      );
+    }
     const result = auditedCorrectionResult(
       decodedOperation,
       transaction.replayed,
@@ -713,14 +759,25 @@ export class DevelopmentInMemoryAggregateRepository
     const indicationIds = new Set<string>();
     const cursors = new Set<string>();
     let cursor: StorageCursor | undefined;
-    let hasMore = true;
+    let pageCount = 0;
+    let listReads = 0;
 
-    while (hasMore) {
-      const page = await this.#storage.list({
+    while (true) {
+      if (
+        pageCount >= MAX_AGGREGATE_CONTRIBUTION_LIST_PAGES ||
+        listReads >= MAX_AGGREGATE_CONTRIBUTION_LIST_READS
+      ) unavailable();
+      listReads += 1;
+      const page = requiredContributionPage(await this.#storage.list({
         collection: AGGREGATE_CONTRIBUTIONS,
         limit: MAX_STORAGE_PAGE_SIZE,
         ...(cursor === undefined ? {} : { cursor }),
-      });
+      }));
+      pageCount += 1;
+      if (
+        contributions.length + page.items.length >
+          MAX_AGGREGATE_CONTRIBUTION_RECORDS
+      ) unavailable();
       for (const record of page.items) {
         const contribution = decodeContributionRecord(record, this.#currency);
         if (indicationIds.has(contribution.indicationId)) unavailable();
@@ -728,10 +785,16 @@ export class DevelopmentInMemoryAggregateRepository
         contributions.push(contribution);
       }
       if (page.nextCursor === null) {
-        hasMore = false;
-        continue;
+        break;
       }
-      if (cursors.has(page.nextCursor)) unavailable();
+      if (
+        page.items.length === 0 ||
+        pageCount >= MAX_AGGREGATE_CONTRIBUTION_LIST_PAGES ||
+        listReads >= MAX_AGGREGATE_CONTRIBUTION_LIST_READS ||
+        contributions.length >= MAX_AGGREGATE_CONTRIBUTION_RECORDS ||
+        page.nextCursor === cursor ||
+        cursors.has(page.nextCursor)
+      ) unavailable();
       cursors.add(page.nextCursor);
       cursor = page.nextCursor;
     }
@@ -798,11 +861,13 @@ export class OwnerBoundInvestmentAggregateCorrectionRepository
     storage: StorageAdapter,
     ownerSubject: ActorSubject,
     currency: CurrencyCode,
+    campaignRevisionAssertion: AggregateCorrectionRevisionAssertion,
   ) {
     this.#ownerSubject = requiredOwnerSubject(ownerSubject);
     this.#repository = new DevelopmentInMemoryAggregateRepository(
       storage,
       requiredCurrency(currency),
+      requiredCorrectionRevisionAssertion(campaignRevisionAssertion),
     );
     Object.freeze(this);
   }
@@ -1504,6 +1569,71 @@ async function aggregateAuditEventId(
 function requiredJsonValue(value: unknown): JsonValue {
   canonicalJson(value);
   return value as JsonValue;
+}
+
+function requiredContributionPage(value: unknown): StoragePage {
+  try {
+    const source = objectRecord(value);
+    if (source === null || !hasExactKeys(source, STORAGE_PAGE_KEYS)) unavailable();
+    const items = source.items;
+    const nextCursor = source.nextCursor;
+    if (
+      !Array.isArray(items) ||
+      items.length > MAX_STORAGE_PAGE_SIZE ||
+      (nextCursor !== null &&
+        (typeof nextCursor !== "string" ||
+          nextCursor.length < 1 ||
+          nextCursor.length > MAX_AGGREGATE_CONTRIBUTION_CURSOR_LENGTH))
+    ) unavailable();
+    return Object.freeze({
+      items: Object.freeze([...items] as StorageRecord[]),
+      nextCursor: nextCursor as StorageCursor | null,
+    });
+  } catch (error) {
+    if (error instanceof StorageFailure) throw error;
+    unavailable();
+  }
+}
+
+function requiredCorrectionRevisionAssertion(
+  value: AggregateCorrectionRevisionAssertion,
+): AggregateCorrectionRevisionAssertion {
+  try {
+    const source = objectRecord(value);
+    const key = source === null ? null : objectRecord(source.key);
+    const parsedKey = key === null
+      ? null
+      : parseStorageKey(key.collection, key.id);
+    if (
+      source === null ||
+      !hasExactKeys(source, REVISION_ASSERTION_KEYS) ||
+      source.type !== "check" ||
+      parsedKey === null ||
+      !parsedKey.ok ||
+      !Number.isSafeInteger(source.expectedRevision) ||
+      (source.expectedRevision as number) < 1
+    ) invalidRequest();
+    return Object.freeze({
+      type: "check" as const,
+      key: parsedKey.value,
+      expectedRevision: source.expectedRevision as number,
+    });
+  } catch (error) {
+    if (error instanceof StorageFailure) throw error;
+    invalidRequest();
+  }
+}
+
+function verifyCorrectionRevisionAssertion(
+  value: StorageRecord | null | undefined,
+  assertion: AggregateCorrectionRevisionAssertion,
+): void {
+  if (
+    value === null ||
+    value === undefined ||
+    storageKeyString(value.key) !== storageKeyString(assertion.key) ||
+    value.revision !== assertion.expectedRevision
+  ) unavailable();
 }
 
 function canonicalJson(value: unknown, ancestors = new Set<object>()): string {

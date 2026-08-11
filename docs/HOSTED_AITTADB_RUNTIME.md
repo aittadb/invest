@@ -45,9 +45,11 @@ sampled campaign revision as an atomic transaction check, so a concurrent
 policy change cannot authorize a stale write.
 
 The configured owner reconciliation resource loads the persisted campaign
-amount configuration, binds correction authority to the trusted owner subject,
-and atomically persists the corrected aggregate, retry receipt, and audit
-evidence.
+revision and amount configuration, binds correction authority to the trusted
+owner subject, and atomically persists the corrected aggregate, retry receipt,
+audit evidence, and an exact non-mutating assertion that the same campaign
+revision is still current. Its contribution scan stops at 1,000 records or 20
+page reads and rejects malformed or non-progressing pagination.
 
 The persistent owner indication-detail primitive can resolve one deployment-key
 opaque review ID to a bounded verified current record and notification without a
@@ -157,9 +159,10 @@ package reader, subject-bound package acknowledgment, one participant-access
 state reader, and one participant-bound founder campaign/profile/application
 scope.
 Its owner aggregate method
-returns a fresh configured-owner-bound capability with only preview and atomic
-audited correction operations; it exposes no adapter, generic collection, or
-participant subject selector.
+accepts the complete immutable campaign revision rather than a detached currency
+value and returns a fresh configured-owner-bound capability with only preview
+and atomic audited correction operations. It exposes no adapter, generic
+collection, campaign key, or participant subject selector.
 That reader creates fresh profile and acknowledgment repositories for each
 trusted account and combines them only through the bounded projection service.
 The named `participantRepository(account)` capability returns a fresh repository
