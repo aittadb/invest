@@ -41,6 +41,7 @@ import {
   type StorageOperationId,
 } from "../domain/storage-adapter.ts";
 import {
+  founderApplicationAbsenceCheck,
   MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS,
   MAX_FOUNDER_APPLICATION_STORAGE_READS,
   StorageFounderApplicationRepository,
@@ -141,13 +142,16 @@ type StoredInvestmentWithdrawal = Readonly<{
   historyEntryId: StableId<"investment-indication-history-entry">;
 }>;
 
-type StoredAccountDeletionReceipt = Readonly<{
-  operationFingerprint: string;
+type StoredAccountDeletionEffects = Readonly<{
   profileRevision: number;
-  requestedAt: Timestamp;
   founderApplication: StoredFounderDisposition | null;
   investmentWithdrawals: readonly StoredInvestmentWithdrawal[];
   aggregate: StoredInvestmentAggregateSnapshot;
+}>;
+
+type StoredAccountDeletionReceipt = StoredAccountDeletionEffects & Readonly<{
+  operationFingerprint: string;
+  requestedAt: Timestamp;
   auditEventId: StableId<"audit-event">;
   mutationCount: number;
 }>;
@@ -260,6 +264,16 @@ export class StorageParticipantAccountDeletionRepository
     const founderBefore = await founderRepository.get(this.#founderApplicationId);
     let founderApplication = founderBefore;
     let founderChanged = false;
+    let founderMutationCount = 0;
+    if (founderBefore === null) {
+      await stageMutations(staged, request.operationId, [
+        await founderApplicationAbsenceCheck(
+          account.subject,
+          this.#founderApplicationId,
+        ),
+      ]);
+      founderMutationCount = 1;
+    }
     if (founderBefore?.status === "received") {
       const withdrawn = await founderRepository.withdraw({
         operationId: request.operationId,
@@ -274,6 +288,7 @@ export class StorageParticipantAccountDeletionRepository
       if (withdrawn.replayed) unavailable();
       founderApplication = withdrawn.snapshot;
       founderChanged = true;
+      founderMutationCount = 2;
     }
 
     const investments =
@@ -287,7 +302,17 @@ export class StorageParticipantAccountDeletionRepository
         },
         this.#parsingOptions,
       );
-    const audit = await preparedAudit(account.subject, request);
+    const effects = accountDeletionEffects(
+      profile.revision,
+      founderApplication,
+      founderChanged,
+      investments,
+    );
+    const audit = await preparedAudit(
+      account.subject,
+      request,
+      await accountDeletionEffectFingerprint(effects),
+    );
     await stageMutations(staged, request.operationId, [audit.mutation]);
 
     const receiptKey = await operationReceiptKey(
@@ -295,16 +320,13 @@ export class StorageParticipantAccountDeletionRepository
       request.operationId,
     );
     const mutationCount = 2 +
-      (founderChanged ? 2 : 0) +
+      founderMutationCount +
       investments.mutationCount +
       2;
     if (mutationCount > MAX_STORAGE_TRANSACTION_MUTATIONS) unavailable();
     const receipt = receiptMutation(
       request,
-      profile.revision,
-      founderApplication,
-      founderChanged,
-      investments,
+      effects,
       audit,
       mutationCount,
       receiptKey,
@@ -354,7 +376,11 @@ export class StorageParticipantAccountDeletionRepository
     const replayAmount = historicalAmountConfiguration(
       receipt.aggregate.currency,
     );
-    const audit = await preparedAudit(account.subject, request);
+    const audit = await preparedAudit(
+      account.subject,
+      request,
+      await accountDeletionEffectFingerprint(receipt),
+    );
     requireMatchingReceipt(
       receipt,
       request,
@@ -540,17 +566,20 @@ async function verifyInvestmentReplay(
 async function preparedAudit(
   subject: ActorSubject,
   request: ParsedAccountDeletionRequest,
+  effectFingerprint: string,
 ): Promise<PreparedAuditAppend> {
   const event: AuditEvent = Object.freeze({
     id: await derivedId<"audit-event">(
       "participant-deletion-audit",
       subject,
       request.operationId,
+      effectFingerprint,
     ),
     operationId: await derivedId<"audit-operation">(
       "participant-deletion-operation",
       subject,
       request.operationId,
+      effectFingerprint,
     ),
     occurredAt: request.requestedAt,
     actor: Object.freeze({ type: "participant", subject }),
@@ -571,10 +600,7 @@ async function preparedAudit(
 
 function receiptMutation(
   request: ParsedAccountDeletionRequest,
-  profileRevision: number,
-  founderApplication: FounderApplication | null,
-  founderChanged: boolean,
-  investments: PreparedParticipantAccountDeletionInvestmentWithdrawalSet,
+  effects: StoredAccountDeletionEffects,
   audit: PreparedAuditAppend,
   mutationCount: number,
   key: StorageKey,
@@ -587,25 +613,11 @@ function receiptMutation(
       kind: "participant-account-deletion-operation",
       schemaVersion: RECEIPT_SCHEMA_VERSION,
       operationFingerprint: request.operationFingerprint,
-      profileRevision,
+      profileRevision: effects.profileRevision,
       requestedAt: request.requestedAt,
-      founderApplication: founderApplication === null
-        ? null
-        : Object.freeze({
-            id: founderApplication.id,
-            revision: founderApplication.revision,
-            changed: founderChanged,
-          }),
-      investmentWithdrawals: Object.freeze(
-        investments.withdrawals.map(({ indication, historyEntryId }) =>
-          Object.freeze({
-            indicationId: indication.id,
-            indicationRevision: indication.revision,
-            historyEntryId,
-          })
-        ),
-      ),
-      aggregate: aggregateDocument(investments.aggregate),
+      founderApplication: effects.founderApplication,
+      investmentWithdrawals: effects.investmentWithdrawals,
+      aggregate: aggregateDocument(effects.aggregate),
       auditEventId: audit.event.id,
       mutationCount,
     }),
@@ -731,7 +743,9 @@ function requireMatchingReceipt(
   audit: PreparedAuditAppend,
 ): void {
   const expectedMutations = 2 +
-    (receipt.founderApplication?.changed ? 2 : 0) +
+    (receipt.founderApplication === null
+      ? 1
+      : receipt.founderApplication.changed ? 2 : 0) +
     4 * receipt.investmentWithdrawals.length +
     (receipt.investmentWithdrawals.length === 0 ? 2 : 3) +
     2;
@@ -745,6 +759,46 @@ function requireMatchingReceipt(
     receipt.mutationCount !== expectedMutations ||
     receipt.mutationCount > MAX_STORAGE_TRANSACTION_MUTATIONS
   ) unavailable();
+}
+
+function accountDeletionEffects(
+  profileRevision: number,
+  founderApplication: FounderApplication | null,
+  founderChanged: boolean,
+  investments: PreparedParticipantAccountDeletionInvestmentWithdrawalSet,
+): StoredAccountDeletionEffects {
+  return Object.freeze({
+    profileRevision,
+    founderApplication: founderApplication === null
+      ? null
+      : Object.freeze({
+          id: founderApplication.id,
+          revision: founderApplication.revision,
+          changed: founderChanged,
+        }),
+    investmentWithdrawals: Object.freeze(
+      investments.withdrawals.map(({ indication, historyEntryId }) =>
+        Object.freeze({
+          indicationId: indication.id,
+          indicationRevision: indication.revision,
+          historyEntryId,
+        })
+      ),
+    ),
+    aggregate: investments.aggregate,
+  });
+}
+
+async function accountDeletionEffectFingerprint(
+  effects: StoredAccountDeletionEffects,
+): Promise<string> {
+  return fingerprint(Object.freeze({
+    kind: "participant-account-deletion-effects",
+    profileRevision: effects.profileRevision,
+    founderApplication: effects.founderApplication,
+    investmentWithdrawals: effects.investmentWithdrawals,
+    aggregate: aggregateDocument(effects.aggregate),
+  }));
 }
 
 function deletionResult(

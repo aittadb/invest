@@ -124,7 +124,9 @@ for the complete set, while each affected contribution advances to the exact
 withdrawn indication revision. A stale outer commit therefore changes all of
 those records or none. The subject-bound account-deletion coordinator adds the
 two profile records, at most two founder records, one closed audit event, and
-one immutable operation receipt before the shared boundary's single commit.
+one immutable operation receipt before the shared boundary's single commit. An
+absent founder application contributes an atomic absence check so a concurrent
+creation cannot cross deletion.
 The maximum shape is exactly 25 mutations. A missing or malformed effect makes
 receipt replay unavailable; changed operation reuse conflicts, and
 response-loss recovery reads the receipt without repeating a write. Replay
@@ -136,7 +138,10 @@ amount validation, so later campaign currency, increment, or limit changes do
 not invalidate a new deletion or an exact delayed retry. Replay also verifies
 the final stored contribution for each affected indication; an empty or
 inactive set still verifies its two ownership-barrier mutations through the
-receipt's exact mutation count.
+receipt's exact mutation count. The audit identity commits the complete receipt
+effect fingerprint, which independently binds profile revision, founder
+disposition, every withdrawal, and the historical aggregate result without
+adding a twenty-sixth mutation.
 
 The machine-readable `transaction_shape` declares:
 

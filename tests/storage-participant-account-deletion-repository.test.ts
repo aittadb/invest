@@ -6,6 +6,7 @@ import {
   type AmountConfiguration,
 } from "../domain/amount-aggregate-configuration.ts";
 import {
+  MAX_FOUNDER_APPLICATION_REVISIONS,
   parseContributionAreaChoices,
   type ContributionAreaChoice,
 } from "../domain/founder-application.ts";
@@ -34,6 +35,7 @@ import {
 import {
   StorageFailure,
   type StorageAdapter,
+  type StorageDocument,
   type StorageListRequest,
   type StoragePage,
   type StorageTransactionRequest,
@@ -152,7 +154,7 @@ test("empty deletion remains replayable after independent consent withdrawal", a
   const fixture = await seededFixture({ founder: false, activeInvestments: 0 });
   const request = deletionRequest("participant-operation:deletion-empty", 1);
   const first = await fixture.coordinator.requestAccountDeletion(request);
-  assert.equal(first.mutationCount, 6);
+  assert.equal(first.mutationCount, 7);
   assert.equal(first.founderApplication, null);
   assert.deepEqual(first.investmentWithdrawals, []);
   assert.deepEqual(first.aggregate, {
@@ -208,7 +210,7 @@ test("inactive and founder-only deletion preserve the bounded empty barrier", as
     const result = await fixture.coordinator.requestAccountDeletion(
       deletionRequest("participant-operation:deletion-inactive", 1),
     );
-    assert.equal(result.mutationCount, 6);
+    assert.equal(result.mutationCount, 7);
     assert.deepEqual(result.investmentWithdrawals, []);
     assert.deepEqual(
       await new StorageParticipantInvestmentInterestRepository(
@@ -265,8 +267,8 @@ test("response loss and malformed commit evidence recover from the receipt", asy
   for (const mode of ["throw", "malformed"] as const) {
     for (const scenario of [
       Object.freeze({ name: "active", founder: true, active: 1, inactive: 0, mutations: 13 }),
-      Object.freeze({ name: "empty", founder: false, active: 0, inactive: 0, mutations: 6 }),
-      Object.freeze({ name: "inactive", founder: false, active: 0, inactive: 1, mutations: 6 }),
+      Object.freeze({ name: "empty", founder: false, active: 0, inactive: 0, mutations: 7 }),
+      Object.freeze({ name: "inactive", founder: false, active: 0, inactive: 1, mutations: 7 }),
     ]) {
       await t.test(`${mode} ${scenario.name}`, async () => {
         const fixture = await seededFixture({
@@ -364,7 +366,10 @@ test("exact replay rejects corrupted persisted deletion evidence", async (t) => 
     };
     value.lastMutation.operationId =
       "participant-operation:different-deletion-profile-evidence";
-    fixture.state.records.set(identity, Object.freeze({ ...record, value }));
+    fixture.state.records.set(identity, Object.freeze({
+      ...record,
+      value: value as unknown as StorageDocument,
+    }));
 
     const failure = await captureStorageFailure(() =>
       coordinator(fixture.storage, ALICE).requestAccountDeletion(request)
@@ -410,6 +415,70 @@ test("exact replay rejects corrupted persisted deletion evidence", async (t) => 
     fixture.state.records.set(identity, Object.freeze({
       ...record,
       value: Object.freeze({ ...record.value, amount: 9_999 }),
+    }));
+
+    const failure = await captureStorageFailure(() =>
+      coordinator(fixture.storage, ALICE).requestAccountDeletion(request)
+    );
+    assert.equal(failure.code, "UNAVAILABLE");
+  });
+
+  await t.test("coherently omitted receipt withdrawal", async () => {
+    const fixture = await seededFixture({ founder: false, activeInvestments: 2 });
+    const request = deletionRequest(
+      "participant-operation:deletion-omitted-receipt-withdrawal",
+      1,
+    );
+    await fixture.coordinator.requestAccountDeletion(request);
+    const [identity, record] = requiredStoredRecord(
+      fixture.state,
+      "participant-account-deletion-operations",
+    );
+    const value = structuredClone(record.value) as unknown as {
+      investmentWithdrawals: unknown[];
+      mutationCount: number;
+    };
+    value.investmentWithdrawals = value.investmentWithdrawals.slice(0, 1);
+    value.mutationCount = 12;
+    fixture.state.records.set(identity, Object.freeze({
+      ...record,
+      value: value as unknown as StorageDocument,
+    }));
+
+    const failure = await captureStorageFailure(() =>
+      coordinator(fixture.storage, ALICE).requestAccountDeletion(request)
+    );
+    assert.equal(failure.code, "UNAVAILABLE");
+  });
+
+  await t.test("changed receipt aggregate snapshot", async () => {
+    const fixture = await seededFixture({ founder: false, activeInvestments: 1 });
+    const request = deletionRequest(
+      "participant-operation:deletion-changed-receipt-aggregate",
+      1,
+    );
+    await fixture.coordinator.requestAccountDeletion(request);
+    const [identity, record] = requiredStoredRecord(
+      fixture.state,
+      "participant-account-deletion-operations",
+    );
+    const value = structuredClone(record.value) as unknown as {
+      aggregate: {
+        revision: number;
+        totalAmount: number;
+        currency: string;
+        contributingIndicationCount: number;
+      };
+    };
+    value.aggregate = {
+      ...value.aggregate,
+      revision: value.aggregate.revision + 1,
+      totalAmount: 1_000,
+      contributingIndicationCount: 1,
+    };
+    fixture.state.records.set(identity, Object.freeze({
+      ...record,
+      value: value as unknown as StorageDocument,
     }));
 
     const failure = await captureStorageFailure(() =>
@@ -494,6 +563,39 @@ test("transaction failure, stale input, and foreign access change nothing", asyn
 });
 
 test("concurrent direct activation rolls back every deletion effect", async (t) => {
+  await t.test("founder creation", async () => {
+    const fixture = await seededFixture({ founder: false, activeInvestments: 0 });
+    const racing = new BeforeTransactionStorageAdapter(
+      fixture.storage,
+      () => createFounderApplication(fixture.storage, ALICE.subject),
+    );
+    const failure = await captureStorageFailure(() =>
+      coordinator(racing, ALICE).requestAccountDeletion(
+        deletionRequest("participant-operation:deletion-race-founder", 1),
+      )
+    );
+    assert.equal(failure.code, "PRECONDITION_FAILED");
+    assert.equal(racing.injected, true);
+    assert.equal(
+      (await new StorageFounderApplicationRepository(
+        fixture.storage,
+        ALICE.subject,
+        CHOICES,
+      ).get(FOUNDER_APPLICATION_ID))?.status,
+      "received",
+    );
+    assert.equal(
+      (await new StorageParticipantRepository(fixture.storage, ALICE).current())
+        ?.snapshot.accountDeletionRequest.state,
+      "not-requested",
+    );
+    assert.equal(
+      recordsIn(fixture.state, "participant-account-deletion-operations").length,
+      0,
+    );
+    assert.equal(deletionAuditCount(fixture.state), 0);
+  });
+
   await t.test("create", async () => {
     const fixture = await seededFixture({ founder: true, activeInvestments: 0 });
     const context = await currentContext(ALICE.subject, "deletion-race-create");
@@ -589,10 +691,12 @@ test("concurrent direct activation rolls back every deletion effect", async (t) 
   });
 });
 
-test("maximum 100-record ownership inventory stays inside the atomic boundary", async () => {
+test("maximum response-loss shape stays inside the full atomic boundary", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
   await registerParticipant(storage, ALICE);
+  await createFounderApplication(storage, ALICE.subject);
+  await advanceFounderToDeletionMaximum(storage, ALICE.subject);
   const context = await currentContext(ALICE.subject, "deletion-100-records");
   const indications = new DevelopmentInMemoryIndicationRepository(
     storage,
@@ -641,11 +745,18 @@ test("maximum 100-record ownership inventory stays inside the atomic boundary", 
     indications: ownership,
   });
 
-  const result = await coordinator(storage, ALICE).requestAccountDeletion(
+  const counted = new CountingStorageAdapter(storage);
+  const result = await coordinator(
+    new CommitEvidenceAdapter(counted, "throw"),
+    ALICE,
+  ).requestAccountDeletion(
     deletionRequest("participant-operation:deletion-100", 1),
   );
+  assert.equal(result.replayed, true);
+  assert.equal(result.founderApplication?.revision, 16);
+  assert.equal(result.founderApplication?.status, "withdrawn");
   assert.equal(result.investmentWithdrawals.length, 4);
-  assert.equal(result.mutationCount, 23);
+  assert.equal(result.mutationCount, 25);
   assert.equal(result.aggregate.totalAmount, 0);
   assert.equal(result.aggregate.contributingIndicationCount, 0);
   const current = await new StorageParticipantInvestmentInterestRepository(
@@ -658,15 +769,8 @@ test("maximum 100-record ownership inventory stays inside the atomic boundary", 
     current.every(({ lifecycle }) => lifecycle.status !== "active"),
     true,
   );
-
-  const counted = new CountingStorageAdapter(storage);
-  const replay = await coordinator(counted, ALICE).requestAccountDeletion(
-    deletionRequest("participant-operation:deletion-100", 1),
-  );
-  assert.equal(replay.replayed, true);
-  assert.equal(replay.investmentWithdrawals.length, 4);
   assert.equal(counted.listCalls, 0);
-  assert.equal(counted.transactCalls, 0);
+  assert.equal(counted.transactCalls, 1);
   assert.ok(
     counted.readCalls <= MAX_PARTICIPANT_ACCOUNT_DELETION_OPERATION_READS,
     `${counted.readCalls} account-deletion replay reads exceeded the operation ceiling`,
@@ -784,6 +888,37 @@ async function createFounderApplication(
     fields: founderFields(),
   });
   assert.equal(result.snapshot.status, "received");
+}
+
+async function advanceFounderToDeletionMaximum(
+  storage: StorageAdapter,
+  participantSubject: ActorSubject,
+): Promise<void> {
+  const repository = new StorageFounderApplicationRepository(
+    storage,
+    participantSubject,
+    CHOICES,
+  );
+  for (
+    let revision = 1;
+    revision < MAX_FOUNDER_APPLICATION_REVISIONS - 1;
+    revision += 1
+  ) {
+    const nextRevision = revision + 1;
+    const result = await repository.edit({
+      operationId: `founder-operation:account-deletion-edit-${nextRevision}`,
+      id: FOUNDER_APPLICATION_ID,
+      expectedRevision: revision,
+      occurredAt: new Date(
+        Date.parse("2026-08-12T09:00:00.000Z") + revision * 60_000,
+      ).toISOString(),
+      historyEntryId:
+        `founder-history:account-deletion-edit-${nextRevision}`,
+      fields: founderFields(),
+    });
+    assert.equal(result.snapshot.revision, nextRevision);
+    assert.equal(result.snapshot.status, "received");
+  }
 }
 
 function coordinator(

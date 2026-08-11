@@ -364,6 +364,20 @@ type PolicyRevisionEvidence = Readonly<{
   participantProfileRevision: number | null;
 }>;
 
+/** Exact absence assertion used when account deletion observes no application. */
+export async function founderApplicationAbsenceCheck(
+  participantSubject: unknown,
+  applicationId: unknown,
+): Promise<StorageCheckMutation> {
+  const subject = requiredActorSubject(participantSubject);
+  const id = requiredApplicationId(applicationId);
+  return Object.freeze({
+    type: "check",
+    key: await currentApplicationKey(subject, id),
+    expectedRevision: null,
+  });
+}
+
 /**
  * Subject-bound repository composed entirely through a supplied StorageAdapter.
  * Current and transition records contain only bounded metadata; each create or
