@@ -21,6 +21,7 @@ If exposure is suspected, do not echo or paste the value. Escalate privately wit
 - Owner setup must prevent first-user takeover and bind authorization to a stable backend identity.
 - Every server route must enforce authorization independently.
 - Browser mutation identity comes only from the trusted session resolver, never request-supplied actor fields or untrusted headers.
+- Actor subjects reject unpaired UTF-16 surrogates before subject-derived identifiers or ownership keys are computed; valid supplementary-code-point pairs remain distinct identity values.
 - Participant reads pass only a parsed trusted account to an explicitly composed credential-bound state reader. Environment bindings are never participant authority. The Worker deletes or replaces its bounded internal participant render header, and foreign, missing, malformed, or unavailable state grants no private capability.
 - First persistent participant registration commits the profile and authoritative empty investment-ownership root, index, and completeness summary in one transaction. Existing profiles, partial ownership metadata, conflicts, and failed or malformed transaction evidence must never trigger an ordinary-request initialization fallback.
 - Browser mutations require an exact configured origin, an unexpired session, an expiring server-verified CSRF proof, and a bounded supported body before feature code runs.

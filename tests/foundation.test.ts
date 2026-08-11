@@ -85,6 +85,25 @@ test("timestamps, stable identifiers, and actor subjects preserve canonical valu
   assert.equal(parseActorSubject(" subject-with-padding ").ok, false);
 });
 
+test("actor subjects reject unpaired surrogates and preserve valid pairs", () => {
+  const malformedSubjects = [
+    "issuer.example/user:\uD800",
+    "issuer.example/user:\uDC00",
+    "issuer.example/user:\uD800\uD800\uDC00",
+    "issuer.example/user:\uD800\uDC00\uDC00",
+    "issuer.example/user:\uDC00\uD800",
+  ];
+  for (const subject of malformedSubjects) {
+    assert.equal(parseActorSubject(subject).ok, false, subject);
+  }
+
+  const supplementarySubject = "issuer.example/user:\uD83D\uDE00";
+  assert.deepEqual(parseActorSubject(supplementarySubject), {
+    ok: true,
+    value: supplementarySubject,
+  });
+});
+
 test("validation-result helpers retain only structured issues", () => {
   assert.deepEqual(valid("ready"), { ok: true, value: "ready" });
   assert.deepEqual(invalid({ code: "required", path: "name" }), {

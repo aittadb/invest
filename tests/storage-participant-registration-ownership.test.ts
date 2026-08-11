@@ -340,6 +340,38 @@ test("ownership replay adapter failures are fresh and non-disclosing", async () 
   assert.equal(stateFingerprint(state), before);
 });
 
+test("distinct malformed subjects cannot register or collide in ownership storage", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const malformedSubjects = [
+    "oidc:registration:\uD800",
+    "oidc:registration:\uDC00",
+  ];
+
+  assert.notEqual(malformedSubjects[0], malformedSubjects[1]);
+  assert.deepEqual(
+    [...new TextEncoder().encode(malformedSubjects[0] ?? "")],
+    [...new TextEncoder().encode(malformedSubjects[1] ?? "")],
+  );
+
+  for (const [index, subject] of malformedSubjects.entries()) {
+    const failure = await captureStorageFailure(() =>
+      applicationFactory(storage)
+        .participantRepository({
+          subject,
+          accountEmailLabel: `malformed-${index}@example.test`,
+        } as unknown as ParticipantAccount)
+        .register({
+          ...registrationRequest(),
+          operationId: `participant-operation:malformed-subject-${index}`,
+        })
+    );
+    assert.equal(failure.code, "INVALID_REQUEST");
+    assert.equal(state.records.size, 0);
+    assert.equal(state.operations.size, 0);
+  }
+});
+
 function applicationFactory(storage: StorageAdapter) {
   return new StorageApplicationRepositoryFactory(
     storage,
