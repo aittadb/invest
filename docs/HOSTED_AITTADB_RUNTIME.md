@@ -419,10 +419,12 @@ subject-bound repository survives the HTTP request.
 
 ## Legacy Indication Summary Migration
 
-Schema-4 indication current records do not contain the bounded participant
-collection summary used by schema 5. They are never upgraded by a browser GET,
+Legacy schema-4 indication current records use full-field operation
+fingerprints, while current compact schema-5 records use field-reference
+fingerprints. Neither summaryless shape contains the bounded participant
+collection summary used by schema 6. They are never upgraded by a browser GET,
 page render, route composition, or ordinary Sites startup. Before activating a
-runtime that consumes schema-5 summaries, an operator must prepare an exact
+runtime that consumes schema-6 summaries, an operator must prepare an exact
 authoritative inventory in this closed form:
 
 ```json
@@ -437,13 +439,19 @@ authoritative inventory in this closed form:
 }
 ```
 
-The array is sorted by subject and indication ID, contains no duplicates, and
-is capped at 100 entries per command run. Empty inventories are valid. Store
-the file only under ignored `migration-inventories/`; it is private operator
-input and must not be committed, logged, attached to issues, or placed in Sites
-configuration. The command derives its byte ceiling from the maximum canonical
-100-entry document and reads at most that ceiling plus one byte through one
-opened file handle, so file growth or path replacement cannot widen the input.
+The array is sorted by subject and indication ID, contains no repeated entry,
+and globally keyed indication IDs may appear only once even under different
+subjects. It is capped at 100 entries per command run. Empty inventories are
+valid. Store the file only under ignored `migration-inventories/`; it is private
+operator input and must not be committed, logged, attached to issues, or placed
+in Sites configuration. The command derives its byte ceiling from the maximum
+canonical 100-entry document and performs bounded positional reads of at most
+that ceiling plus one byte through one opened file handle. It compares that
+handle's device, inode, size, modification time, and change time before and
+after the read.
+Growth or in-place same-size replacement therefore fails before parsing or
+storage access, while a path replacement cannot substitute bytes for the
+already-opened input.
 
 Configure `AITTADB_MIGRATION_ISSUER`, optional
 `AITTADB_MIGRATION_TRANSPORT_ORIGIN`, `AITTADB_MIGRATION_ENTRY_HREF`,
@@ -464,12 +472,15 @@ npm run migrate:legacy-indication-summaries -- migration-inventories/indications
 
 For every item, the command reads the exact current key and fully reconstructs
 all immutable transitions and referenced field chunks. It validates identities,
-revisions, lifecycle, raw-request and normalized operation fingerprints,
-current metadata, and the authenticated uniqueness coordinate before one
-compare-and-set write. Active indications require their exact lease; withdrawn
-and rejected indications reject an exact stale lease still naming them.
-Migration changes only the current envelope from schema 4 to schema 5; the
-domain revision and immutable records do not change. Missing, crossed, corrupt,
+revisions, lifecycle, raw-request and schema-specific normalized operation
+fingerprints, and current metadata before one compare-and-set write. It derives
+every distinct historical personal or normalized company uniqueness coordinate
+from those authenticated fields. Active indications require the exact final
+lease, while any other historical lease still naming the indication fails;
+withdrawn and rejected records therefore cannot carry a stale lease for either
+their final or any edited identifier. Migration changes only a summaryless
+schema-4 or compact schema-5 current envelope to schema 6; the domain revision
+and immutable records do not change. Missing, crossed, corrupt,
 or concurrently changed state stops the run through one fixed failure surface.
 Output contains only scanned, migrated, and already-current counts.
 
@@ -663,7 +674,8 @@ Legacy indication-summary coverage separately proves empty and maximum-history
 inventories, closed manifest parsing, complete ancestry and lease validation,
 missing/crossed/corrupt rejection, exact retries, concurrent exact migration,
 concurrent domain change, response-loss recovery, restart/resume, content-free
-results, pairwise dedicated credential closure, maximum canonical file input,
-file-growth rejection, strict schema-5 participant summaries across participant
-and owner projections, and the absence of migration writes or imports from
-browser GET paths.
+results, pairwise dedicated credential closure, global indication-ID
+uniqueness, maximum canonical file input, growth and same-size replacement
+rejection, every historical lease coordinate, strict schema-6 participant
+summaries across participant and owner projections, and the absence of
+migration writes or imports from browser GET paths.

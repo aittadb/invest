@@ -75,8 +75,14 @@ export {
 } from "../services/owner-indication-review-tokens.ts";
 
 const LEGACY_INDICATION_SCHEMA_VERSION = 4;
-const INDICATION_SCHEMA_VERSION = 5;
+const COMPACT_INDICATION_SCHEMA_VERSION = 5;
 const CURRENT_INDICATION_SCHEMA_VERSION = 6;
+type IndicationTransitionSchemaVersion =
+  | typeof LEGACY_INDICATION_SCHEMA_VERSION
+  | typeof COMPACT_INDICATION_SCHEMA_VERSION;
+type IndicationCurrentSchemaVersion =
+  | IndicationTransitionSchemaVersion
+  | typeof CURRENT_INDICATION_SCHEMA_VERSION;
 const CURRENT_INDICATIONS = storageCollection("investment-indications");
 const INDICATION_HISTORY = storageCollection("investment-indication-history");
 const INDICATION_FIELDS = storageCollection("investment-indication-fields");
@@ -104,6 +110,9 @@ export const MAX_INDICATION_STORAGE_READS =
   2 + 2 * MAX_INDICATION_MATERIALIZATION_READS;
 export const MAX_INDICATION_STORAGE_MUTATIONS =
   5 + MAX_INDICATION_FIELDS_CHUNKS;
+export const MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_READS =
+  2 + MAX_INDICATION_MATERIALIZATION_READS +
+  MAX_INVESTMENT_INDICATION_REVISIONS;
 export const MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE = 25;
 export const MAX_OWNER_INDICATION_REVIEW_ITEM_READS =
   3 + 2 * MAX_INDICATION_FIELDS_CHUNKS;
@@ -441,12 +450,14 @@ type PreparedFieldsChunk = Readonly<{
 }>;
 
 type StoredFields = Readonly<{
+  schemaVersion: IndicationTransitionSchemaVersion;
   reference: StoredFieldsReference;
   fields: InvestmentIndicationFields;
   chunks: readonly PreparedFieldsChunk[];
 }>;
 
 type StoredTransition = Readonly<{
+  schemaVersion: IndicationTransitionSchemaVersion;
   operationId: StorageOperationId;
   operationFingerprint: string;
   requestFingerprint: string;
@@ -461,9 +472,7 @@ type StoredTransition = Readonly<{
 }>;
 
 type StoredCurrent = Readonly<{
-  schemaVersion:
-    | typeof INDICATION_SCHEMA_VERSION
-    | typeof CURRENT_INDICATION_SCHEMA_VERSION;
+  schemaVersion: IndicationCurrentSchemaVersion;
   operationId: StorageOperationId;
   operationFingerprint: string;
   requestFingerprint: string;
@@ -479,6 +488,7 @@ type StoredCurrent = Readonly<{
 
 type MaterializedIndication = Readonly<{
   indication: InvestmentIndication;
+  firstTransitionSchemaVersion: IndicationTransitionSchemaVersion;
   terminal: StoredTransition;
   fieldsByRevision: ReadonlyMap<number, StoredFields>;
   current: StoredCurrent | null;
@@ -598,6 +608,8 @@ export async function readParticipantIndicationOwnershipHead(
     current.revision,
   );
   if (
+    (current.schemaVersion !== CURRENT_INDICATION_SCHEMA_VERSION &&
+      current.schemaVersion !== transition.schemaVersion) ||
     transition.operationId !== current.operationId ||
     transition.operationFingerprint !== current.operationFingerprint ||
     transition.requestFingerprint !== current.requestFingerprint ||
@@ -605,15 +617,24 @@ export async function readParticipantIndicationOwnershipHead(
     (current.revision === 1) !== (transition.transitionKind === "created")
   ) unavailable();
   const lifecycleStatus = lifecycleStatusForTransition(transition.transitionKind);
-  await verifyOwnershipTransition(transition, lifecycleStatus);
+  let fields: StoredFields | null = null;
   if (lifecycleStatus === "active") {
-    const fields = await readStoredFields(
+    fields = await readStoredFields(
       storage,
       subject,
       indicationId,
       transition.fields,
     );
     await verifyStoredActiveLease(storage, current, fields.fields, lifecycleStatus);
+  }
+  if (transition.schemaVersion === LEGACY_INDICATION_SCHEMA_VERSION) {
+    const verified = await verifyOwnerReviewTerminal(
+      transition,
+      fields?.fields ?? null,
+    );
+    if (verified.status !== lifecycleStatus) unavailable();
+  } else {
+    await verifyOwnershipTransition(transition, lifecycleStatus);
   }
   return Object.freeze({
     indicationId: current.indicationId,
@@ -1094,6 +1115,7 @@ export class DevelopmentInMemoryIndicationRepository
       current.revision,
       null,
     );
+    requireCurrentMaterializationSchema(current, materialized);
     if (
       canonicalJson(storedCurrentIndicationDocument(
         current.schemaVersion,
@@ -1270,7 +1292,8 @@ export class DevelopmentInMemoryIndicationRepository
 
 /**
  * Verify one explicitly inventoried current indication and migrate only its
- * schema-4 head. This capability is intentionally not part of browser routes.
+ * summaryless schema-4 or compact schema-5 head. This capability is
+ * intentionally not part of browser routes.
  */
 export async function migrateLegacyIndicationCurrentSummary(
   storage: StorageAdapter,
@@ -1290,6 +1313,7 @@ export async function migrateLegacyIndicationCurrentSummary(
     current.revision,
     null,
   );
+  requireCurrentMaterializationSchema(current, materialized);
   const expectedStoredDocument = storedCurrentIndicationDocument(
     current.schemaVersion,
     materialized.indication,
@@ -1301,17 +1325,7 @@ export async function migrateLegacyIndicationCurrentSummary(
   if (canonicalJson(expectedStoredDocument) !== canonicalJson(current.document)) {
     unavailable();
   }
-  const lease = await indicationLease(materialized.indication);
-  const leaseRecord = await storage.read(lease.key);
-  if (materialized.indication.lifecycle.status === "active") {
-    if (leaseRecord === null) unavailable();
-    verifyLeaseRecord(leaseRecord, lease, id);
-  } else if (
-    leaseRecord !== null &&
-    storedLeaseIndicationId(leaseRecord, lease) === id
-  ) {
-    unavailable();
-  }
+  await verifyMigrationHistoricalLeases(storage, materialized.indication);
 
   if (current.schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION) {
     return "already-current";
@@ -1601,7 +1615,8 @@ function storedIndicationCoordinates(value: unknown): Readonly<{
 }> {
   const candidate = objectRecord(value);
   if (candidate === null) unavailable();
-  const source = candidate.schemaVersion === INDICATION_SCHEMA_VERSION
+  const source = candidate.schemaVersion === LEGACY_INDICATION_SCHEMA_VERSION ||
+      candidate.schemaVersion === COMPACT_INDICATION_SCHEMA_VERSION
     ? exactRecord(candidate, LEGACY_CURRENT_DOCUMENT_KEYS)
     : candidate.schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION
     ? exactRecord(candidate, CURRENT_DOCUMENT_KEYS)
@@ -1618,6 +1633,8 @@ function requireCurrentMatchesTerminal(
   terminal: StoredTransition,
 ): void {
   if (
+    (current.schemaVersion !== CURRENT_INDICATION_SCHEMA_VERSION &&
+      current.schemaVersion !== terminal.schemaVersion) ||
     current.operationId !== terminal.operationId ||
     current.operationFingerprint !== terminal.operationFingerprint ||
     current.requestFingerprint !== terminal.requestFingerprint ||
@@ -1629,6 +1646,17 @@ function requireCurrentMatchesTerminal(
   ) {
     unavailable();
   }
+}
+
+function requireCurrentMaterializationSchema(
+  current: StoredCurrent,
+  materialized: MaterializedIndication,
+): void {
+  if (
+    current.schemaVersion !== CURRENT_INDICATION_SCHEMA_VERSION &&
+    (materialized.firstTransitionSchemaVersion !== current.schemaVersion ||
+      materialized.terminal.schemaVersion !== current.schemaVersion)
+  ) unavailable();
 }
 
 async function verifyOwnerReviewParticipantSummary(
@@ -1686,7 +1714,7 @@ async function verifyOwnerReviewParticipantSummary(
 
 async function verifyOwnerReviewTerminal(
   terminal: StoredTransition,
-  fields: InvestmentIndicationFields,
+  fields: InvestmentIndicationFields | null,
 ): Promise<OwnerVerifiedLifecycle> {
   const source = exactRecord(terminal.document, TRANSITION_DOCUMENT_KEYS);
   const acknowledgment = storedAcknowledgment(source.acknowledgment);
@@ -1753,18 +1781,24 @@ async function verifyOwnerReviewTerminal(
     expectedRevision: terminal.revision === 1 ? null : terminal.revision - 1,
     ...(terminal.transitionKind === "created" ||
         terminal.transitionKind === "edited"
-      ? { fields }
+      ? { fields: fields ?? unavailable() }
       : {}),
     ...(reason === undefined ? {} : { reason }),
   }) satisfies ParsedMutationRequest;
-  if (
-    terminal.operationFingerprint !== await operationFingerprint(
+  const fingerprint = terminal.schemaVersion === LEGACY_INDICATION_SCHEMA_VERSION
+    ? await legacyOperationFingerprint(
+        mutationKindForTransition(terminal.transitionKind),
+        actor,
+        request,
+        terminal.requestFingerprint,
+      )
+    : await operationFingerprint(
       mutationKindForTransition(terminal.transitionKind),
       actor,
       request,
       terminal.requestFingerprint,
-    )
-  ) {
+    );
+  if (terminal.operationFingerprint !== fingerprint) {
     unavailable();
   }
 
@@ -1802,7 +1836,7 @@ async function verifyStoredActiveLease(
     fingerprint,
     document: Object.freeze({
       kind: "active-indication-lease",
-      schemaVersion: INDICATION_SCHEMA_VERSION,
+      schemaVersion: COMPACT_INDICATION_SCHEMA_VERSION,
       indicationId: current.indicationId,
       uniquenessFingerprint: fingerprint,
     }),
@@ -2133,17 +2167,20 @@ function decodeStoredCurrent(
 ): StoredCurrent {
   const candidate = objectRecord(record.value);
   if (candidate === null) unavailable();
-  const schemaVersion = candidate.schemaVersion === INDICATION_SCHEMA_VERSION
-    ? INDICATION_SCHEMA_VERSION
+  const schemaVersion = candidate.schemaVersion ===
+      LEGACY_INDICATION_SCHEMA_VERSION
+    ? LEGACY_INDICATION_SCHEMA_VERSION
+    : candidate.schemaVersion === COMPACT_INDICATION_SCHEMA_VERSION
+    ? COMPACT_INDICATION_SCHEMA_VERSION
     : candidate.schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION
     ? CURRENT_INDICATION_SCHEMA_VERSION
     : unavailable();
   const source = exactStoredDocument(
     record,
     expectedKey,
-    schemaVersion === INDICATION_SCHEMA_VERSION
-      ? LEGACY_CURRENT_DOCUMENT_KEYS
-      : CURRENT_DOCUMENT_KEYS,
+    schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION
+      ? CURRENT_DOCUMENT_KEYS
+      : LEGACY_CURRENT_DOCUMENT_KEYS,
     "investment-indication-current",
     schemaVersion,
   );
@@ -2154,9 +2191,9 @@ function decodeStoredCurrent(
   const participantSubject = storedActorSubject(source.participantSubject);
   const revision = storedRevision(source.revision);
   const fields = storedFieldsReference(source.fields);
-  const participantSummary = schemaVersion === INDICATION_SCHEMA_VERSION
-    ? null
-    : storedParticipantSummary(source.participantSummary);
+  const participantSummary = schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION
+    ? storedParticipantSummary(source.participantSummary)
+    : null;
   const storageRevisionOffset = record.revision === revision
     ? 0
     : schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION &&
@@ -2224,11 +2261,20 @@ function decodeStoredTransition(
   expectedId: InvestmentIndicationId,
   expectedRevision: number,
 ): StoredTransition {
+  const candidate = objectRecord(record.value);
+  if (candidate === null) unavailable();
+  const schemaVersion = candidate.schemaVersion ===
+      LEGACY_INDICATION_SCHEMA_VERSION
+    ? LEGACY_INDICATION_SCHEMA_VERSION
+    : candidate.schemaVersion === COMPACT_INDICATION_SCHEMA_VERSION
+    ? COMPACT_INDICATION_SCHEMA_VERSION
+    : unavailable();
   const source = exactStoredDocument(
     record,
     expectedKey,
     TRANSITION_DOCUMENT_KEYS,
     "investment-indication-transition",
+    schemaVersion,
   );
   const operationId = storedOperationId(source.operationId);
   const operationFingerprint = storedFingerprint(source.operationFingerprint);
@@ -2247,6 +2293,7 @@ function decodeStoredTransition(
     record.revision !== 1
   ) unavailable();
   return Object.freeze({
+    schemaVersion,
     operationId,
     operationFingerprint,
     requestFingerprint,
@@ -2292,9 +2339,18 @@ async function materializeIndication(
     }),
   );
 
-  const references = new Map<number, StoredFieldsReference>();
+  const references = new Map<number, Readonly<{
+    reference: StoredFieldsReference;
+    schemaVersion: IndicationTransitionSchemaVersion;
+  }>>();
   let prior: StoredFieldsReference | null = null;
+  let priorTransitionSchemaVersion = LEGACY_INDICATION_SCHEMA_VERSION;
   for (const transition of transitions) {
+    if (
+      priorTransitionSchemaVersion === COMPACT_INDICATION_SCHEMA_VERSION &&
+      transition.schemaVersion === LEGACY_INDICATION_SCHEMA_VERSION
+    ) unavailable();
+    priorTransitionSchemaVersion = transition.schemaVersion;
     if (
       transition.transitionKind === "created" ||
       transition.transitionKind === "edited"
@@ -2306,18 +2362,36 @@ async function materializeIndication(
         canonicalJson(fieldsReferenceDocument(transition.fields))
     ) unavailable();
     const known = references.get(transition.fields.revision);
-    if (
-      known !== undefined &&
-      canonicalJson(fieldsReferenceDocument(known)) !==
+    if (known !== undefined && (
+      known.schemaVersion !== transition.schemaVersion &&
+        (transition.transitionKind === "created" ||
+          transition.transitionKind === "edited") ||
+      canonicalJson(fieldsReferenceDocument(known.reference)) !==
         canonicalJson(fieldsReferenceDocument(transition.fields))
-    ) unavailable();
-    references.set(transition.fields.revision, transition.fields);
+    )) unavailable();
+    if (
+      transition.transitionKind === "created" ||
+      transition.transitionKind === "edited"
+    ) {
+      references.set(transition.fields.revision, Object.freeze({
+        reference: transition.fields,
+        schemaVersion: transition.schemaVersion,
+      }));
+    } else if (known === undefined) {
+      unavailable();
+    }
     prior = transition.fields;
   }
   const fieldsByRevision = new Map<number, StoredFields>(await Promise.all(
-    [...references.entries()].map(async ([fieldsRevision, reference]) => [
+    [...references.entries()].map(async ([fieldsRevision, stored]) => [
       fieldsRevision,
-      await readStoredFields(storage, subject, id, reference),
+      await readStoredFields(
+        storage,
+        subject,
+        id,
+        stored.reference,
+        stored.schemaVersion,
+      ),
     ] as const),
   ));
 
@@ -2386,14 +2460,22 @@ async function materializeIndication(
         storedOwnerActor(source.actor),
       ));
     }
-    const fingerprint = await fingerprintForStoredIndication(
-      indication,
-      transition.operationId,
-      transition.requestFingerprint,
-    );
+    const fingerprint = transition.schemaVersion ===
+        LEGACY_INDICATION_SCHEMA_VERSION
+      ? await legacyFingerprintForStoredIndication(
+          indication,
+          transition.operationId,
+          transition.requestFingerprint,
+        )
+      : await fingerprintForStoredIndication(
+          indication,
+          transition.operationId,
+          transition.requestFingerprint,
+        );
     if (
       fingerprint !== transition.operationFingerprint ||
-      canonicalJson(transitionIndicationDocument(
+      canonicalJson(storedTransitionIndicationDocument(
+        transition.schemaVersion,
         indication,
         transition.operationId,
         transition.operationFingerprint,
@@ -2404,8 +2486,15 @@ async function materializeIndication(
   }
   if (indication === null) unavailable();
   const terminal = transitions.at(-1);
-  if (terminal === undefined) unavailable();
-  return Object.freeze({ indication, terminal, fieldsByRevision, current: null });
+  const first = transitions[0];
+  if (terminal === undefined || first === undefined) unavailable();
+  return Object.freeze({
+    indication,
+    firstTransitionSchemaVersion: first.schemaVersion,
+    terminal,
+    fieldsByRevision,
+    current: null,
+  });
 }
 
 function exactStoredDocument(
@@ -2413,7 +2502,7 @@ function exactStoredDocument(
   expectedKey: StorageKey,
   expectedKeys: ReadonlySet<string>,
   expectedKind: string,
-  expectedSchemaVersion = INDICATION_SCHEMA_VERSION,
+  expectedSchemaVersion = COMPACT_INDICATION_SCHEMA_VERSION,
 ): Record<string, unknown> {
   const envelope = exactRecord(record, STORAGE_RECORD_KEYS);
   const key = exactRecord(envelope.key, STORAGE_KEY_KEYS);
@@ -2717,6 +2806,7 @@ async function prepareStoredFields(
     }));
   }
   return Object.freeze({
+    schemaVersion: COMPACT_INDICATION_SCHEMA_VERSION,
     reference,
     fields,
     chunks: Object.freeze(chunks),
@@ -2753,17 +2843,31 @@ async function readStoredFields(
   subject: ActorSubject,
   id: InvestmentIndicationId,
   reference: StoredFieldsReference,
+  expectedSchemaVersion: IndicationTransitionSchemaVersion | null = null,
 ): Promise<StoredFields> {
   const parts = await Promise.all(
     Array.from({ length: reference.chunks }, async (_, index) => {
       const key = await indicationFieldsChunkKey(id, reference.revision, index);
       const record = await storage.read(key);
       if (record === null) unavailable();
+      const candidate = objectRecord(record.value);
+      if (candidate === null) unavailable();
+      const schemaVersion = candidate.schemaVersion ===
+          LEGACY_INDICATION_SCHEMA_VERSION
+        ? LEGACY_INDICATION_SCHEMA_VERSION
+        : candidate.schemaVersion === COMPACT_INDICATION_SCHEMA_VERSION
+        ? COMPACT_INDICATION_SCHEMA_VERSION
+        : unavailable();
+      if (
+        expectedSchemaVersion !== null &&
+        schemaVersion !== expectedSchemaVersion
+      ) unavailable();
       const source = exactStoredDocument(
         record,
         key,
         FIELDS_CHUNK_DOCUMENT_KEYS,
         "investment-indication-fields-chunk",
+        schemaVersion,
       );
       if (
         record.revision !== 1 ||
@@ -2781,14 +2885,16 @@ async function readStoredFields(
         ? reference.bytes - index * INDICATION_FIELDS_CHUNK_RAW_BYTES
         : INDICATION_FIELDS_CHUNK_RAW_BYTES;
       if (bytes.byteLength !== expectedBytes) unavailable();
-      return bytes;
+      return Object.freeze({ bytes, schemaVersion });
     }),
   );
+  const schemaVersion = parts[0]?.schemaVersion ?? unavailable();
+  if (parts.some((part) => part.schemaVersion !== schemaVersion)) unavailable();
   const bytes = new Uint8Array(reference.bytes);
   let offset = 0;
   for (const part of parts) {
-    bytes.set(part, offset);
-    offset += part.byteLength;
+    bytes.set(part.bytes, offset);
+    offset += part.bytes.byteLength;
   }
   if (
     offset !== reference.bytes ||
@@ -2814,6 +2920,7 @@ async function readStoredFields(
     canonicalJson(fieldsDocument(fields.value)) !== text
   ) unavailable();
   return Object.freeze({
+    schemaVersion,
     reference,
     fields: fields.value,
     chunks: Object.freeze([]),
@@ -2874,9 +2981,7 @@ function currentIndicationDocument(
 }
 
 function storedCurrentIndicationDocument(
-  schemaVersion:
-    | typeof INDICATION_SCHEMA_VERSION
-    | typeof CURRENT_INDICATION_SCHEMA_VERSION,
+  schemaVersion: IndicationCurrentSchemaVersion,
   indication: InvestmentIndication,
   operationId: StorageOperationId,
   fingerprint: string,
@@ -2894,7 +2999,7 @@ function storedCurrentIndicationDocument(
   }
   return Object.freeze({
     kind: "investment-indication-current",
-    schemaVersion: INDICATION_SCHEMA_VERSION,
+    schemaVersion,
     operationId,
     operationFingerprint: fingerprint,
     requestFingerprint,
@@ -2933,11 +3038,29 @@ function transitionIndicationDocument(
   requestFingerprint: string,
   fields: StoredFieldsReference,
 ): StorageDocument {
+  return storedTransitionIndicationDocument(
+    COMPACT_INDICATION_SCHEMA_VERSION,
+    indication,
+    operationId,
+    fingerprint,
+    requestFingerprint,
+    fields,
+  );
+}
+
+function storedTransitionIndicationDocument(
+  schemaVersion: IndicationTransitionSchemaVersion,
+  indication: InvestmentIndication,
+  operationId: StorageOperationId,
+  fingerprint: string,
+  requestFingerprint: string,
+  fields: StoredFieldsReference,
+): StorageDocument {
   const entry = indication.history.at(-1);
   if (entry === undefined || entry.revision !== indication.revision) unavailable();
   return Object.freeze({
     kind: "investment-indication-transition",
-    schemaVersion: INDICATION_SCHEMA_VERSION,
+    schemaVersion,
     operationId,
     operationFingerprint: fingerprint,
     requestFingerprint,
@@ -2974,7 +3097,7 @@ function fieldsChunkDocument(
 ): StorageDocument {
   return Object.freeze({
     kind: "investment-indication-fields-chunk",
-    schemaVersion: INDICATION_SCHEMA_VERSION,
+    schemaVersion: COMPACT_INDICATION_SCHEMA_VERSION,
     indicationId: id,
     participantSubject: subject,
     fieldsRevision: reference.revision,
@@ -3102,6 +3225,35 @@ function actorDocument(
   return { type: actor.type, subject: actor.subject };
 }
 
+async function legacyFingerprintForStoredIndication(
+  indication: InvestmentIndication,
+  operationId: StorageOperationId,
+  requestFingerprint: string,
+): Promise<string> {
+  const entry = indication.history[indication.history.length - 1];
+  if (entry === undefined) unavailable();
+  return legacyOperationFingerprint(
+    mutationKindForTransition(entry.transition),
+    entry.actor,
+    Object.freeze({
+      operationId,
+      id: indication.id,
+      occurredAt: entry.occurredAt,
+      historyEntryId: entry.id,
+      expectedRevision: indication.revision === 1
+        ? null
+        : indication.revision - 1,
+      ...(entry.transition === "created" || entry.transition === "edited"
+        ? { fields: entry.fields }
+        : {}),
+      ...(entry.transition === "rejected" && entry.rejection !== null
+        ? { reason: entry.rejection.reason }
+        : {}),
+    }),
+    requestFingerprint,
+  );
+}
+
 async function fingerprintForStoredIndication(
   indication: InvestmentIndication,
   operationId: StorageOperationId,
@@ -3169,6 +3321,29 @@ async function operationFingerprint(
   );
 }
 
+async function legacyOperationFingerprint(
+  kind: MutationKind,
+  actor: ParticipantIndicationActor | OwnerIndicationActor,
+  request: ParsedMutationRequest,
+  requestFingerprint: string,
+): Promise<string> {
+  const payload: StorageDocument = {
+    kind,
+    operationId: request.operationId,
+    actor: actorDocument(actor),
+    expectedRevision: request.expectedRevision,
+    id: request.id,
+    occurredAt: request.occurredAt,
+    historyEntryId: request.historyEntryId,
+    requestFingerprint,
+    ...(request.fields === undefined
+      ? {}
+      : { fields: fieldsDocument(request.fields) }),
+    ...(request.reason === undefined ? {} : { reason: request.reason }),
+  };
+  return hashDocument(payload);
+}
+
 async function compactOperationFingerprint(
   kind: MutationKind,
   actor: ParticipantIndicationActor | OwnerIndicationActor,
@@ -3231,6 +3406,13 @@ async function indicationLease(
   indication: InvestmentIndication,
 ): Promise<ActiveLease> {
   const uniquenessKey = investmentIndicationUniquenessKey(indication);
+  return leaseForUniquenessKey(uniquenessKey, indication.id);
+}
+
+async function leaseForUniquenessKey(
+  uniquenessKey: ActiveIndicationUniquenessKey,
+  indicationId: InvestmentIndicationId,
+): Promise<ActiveLease> {
   const hexadecimal = await sha256Hex(
     `active-indication-uniqueness\u0000${uniquenessKey}`,
   );
@@ -3245,11 +3427,59 @@ async function indicationLease(
     fingerprint,
     document: Object.freeze({
       kind: "active-indication-lease",
-      schemaVersion: INDICATION_SCHEMA_VERSION,
-      indicationId: indication.id,
+      schemaVersion: COMPACT_INDICATION_SCHEMA_VERSION,
+      indicationId,
       uniquenessFingerprint: fingerprint,
     }),
   });
+}
+
+async function verifyMigrationHistoricalLeases(
+  storage: Pick<StorageAdapter, "read">,
+  indication: InvestmentIndication,
+): Promise<void> {
+  const currentKey = investmentIndicationUniquenessKey(indication);
+  const coordinates = new Set<ActiveIndicationUniquenessKey>();
+  for (const entry of indication.history) {
+    coordinates.add(indicationUniquenessKeyForFields(
+      indication.participantSubject,
+      entry.fields,
+    ));
+  }
+  if (
+    coordinates.size < 1 ||
+    coordinates.size > MAX_INVESTMENT_INDICATION_REVISIONS ||
+    !coordinates.has(currentKey)
+  ) unavailable();
+  for (const uniquenessKey of coordinates) {
+    const lease = await leaseForUniquenessKey(uniquenessKey, indication.id);
+    const record = await storage.read(lease.key);
+    if (
+      indication.lifecycle.status === "active" &&
+      uniquenessKey === currentKey
+    ) {
+      if (record === null) unavailable();
+      verifyLeaseRecord(record, lease, indication.id);
+    } else if (
+      record !== null &&
+      storedLeaseIndicationId(record, lease) === indication.id
+    ) {
+      unavailable();
+    }
+  }
+}
+
+function indicationUniquenessKeyForFields(
+  participantSubject: ActorSubject,
+  fields: InvestmentIndicationFields,
+): ActiveIndicationUniquenessKey {
+  return (fields.kind === "personal"
+    ? JSON.stringify(["personal", participantSubject])
+    : JSON.stringify([
+        "company",
+        fields.registrationCountry,
+        fields.companyIdentifier,
+      ])) as ActiveIndicationUniquenessKey;
 }
 
 async function activeLeaseMutations(
@@ -3296,15 +3526,25 @@ function storedLeaseIndicationId(
   record: StorageRecord,
   expected: ActiveLease,
 ): InvestmentIndicationId {
+  const candidate = objectRecord(record.value);
+  if (candidate === null) unavailable();
+  const schemaVersion = candidate.schemaVersion ===
+      LEGACY_INDICATION_SCHEMA_VERSION
+    ? LEGACY_INDICATION_SCHEMA_VERSION
+    : candidate.schemaVersion === COMPACT_INDICATION_SCHEMA_VERSION
+    ? COMPACT_INDICATION_SCHEMA_VERSION
+    : unavailable();
   const source = exactStoredDocument(
     record,
     expected.key,
     LEASE_DOCUMENT_KEYS,
     "active-indication-lease",
+    schemaVersion,
   );
   const indicationId = storedIndicationId(source.indicationId);
   const expectedDocument = Object.freeze({
     ...expected.document,
+    schemaVersion,
     indicationId,
   });
   if (

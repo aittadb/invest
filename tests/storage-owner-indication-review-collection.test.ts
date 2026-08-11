@@ -626,6 +626,29 @@ test("owner indication review corruption fails within the item read ceiling", as
   }
 });
 
+test("owner indication review accepts an exact compact schema-5 head", async () => {
+  const state = new MemoryStorageState();
+  await seedIndication(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    "compact-schema-five",
+    companyFields(),
+  );
+  mutateFirstRecord(state, "investment-indications", (value) => {
+    value.schemaVersion = 5;
+    delete value.participantSummary;
+  });
+
+  const page = await ownerRepository(
+    new MemoryStorageAdapter(state),
+    OWNER,
+  ).list({ limit: 1 });
+  assert.equal(page.items.length, 1);
+  assert.equal(page.items[0]?.kind, "company");
+  assert.equal(page.items[0]?.status, "active");
+  assert.equal(page.items[0]?.revision, 1);
+});
+
 test("owner indication review derives active withdrawn and rejected lifecycle", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);

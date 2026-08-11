@@ -37,11 +37,16 @@ import {
 } from "../domain/storage-adapter.ts";
 import {
   DevelopmentInMemoryIndicationRepository,
+  MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_READS,
+  readParticipantIndicationOwnershipHead,
   type CreateIndicationRequest,
   type EditIndicationRequest,
   type WithdrawIndicationRequest,
 } from "../repositories/in-memory-indication-repository.ts";
-import { executeLegacyIndicationSummaryMigrationCommand } from "../scripts/migrate-legacy-indication-summaries.ts";
+import {
+  executeLegacyIndicationSummaryMigrationCommand,
+  MAX_LEGACY_INDICATION_SUMMARY_MANIFEST_READ_CALLS,
+} from "../scripts/migrate-legacy-indication-summaries.ts";
 import {
   MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES,
   MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_ENTRIES,
@@ -80,6 +85,10 @@ test("migration inventory is closed, sorted, bounded, and permits empty work", a
     { ...manifest([]), extra: true },
     { schemaVersion: 2, indications: [] },
     { schemaVersion: 1, indications: [valid, valid] },
+    {
+      schemaVersion: 1,
+      indications: [entry(ALICE, ALICE_ID), entry(BOB, ALICE_ID)],
+    },
     { schemaVersion: 1, indications: [entry(BOB, BOB_ID), valid] },
     { schemaVersion: 1, indications: [{ ...valid, extra: true }] },
     { schemaVersion: 1, indications: [{ ...valid, indicationId: "" }] },
@@ -108,12 +117,32 @@ test("migration inventory is closed, sorted, bounded, and permits empty work", a
   }
 });
 
-test("migrates one fully verified schema-4 head without changing domain state", async () => {
+test("inventory rejects one global indication ID under different subjects before storage", async () => {
+  const observed = new CountingStorageAdapter(new ThrowingStorageAdapter());
+  const failure = await captureAsync(() =>
+    runLegacyIndicationSummaryMigration(
+      observed,
+      manifest([
+        entry(ALICE, ALICE_ID),
+        entry(BOB, ALICE_ID),
+      ]),
+    )
+  );
+  assert.equal(failure.code, "INVALID_REQUEST");
+  assert.equal(observed.reads, 0);
+  assert.equal(observed.transactions, 0);
+});
+
+test("migrates one fully verified compact schema-5 head without changing domain state", async () => {
   const fixture = await seededLegacy(ALICE, ALICE_ID);
   const beforeCollections = immutableCollectionEvidence(fixture.state);
   const beforeCurrent = currentRecord(fixture.state, ALICE_ID);
-  assert.equal(beforeCurrent.value.schemaVersion, 4);
+  assert.equal(beforeCurrent.value.schemaVersion, 5);
   assert.equal(beforeCurrent.revision, fixture.snapshot.revision);
+  assert.deepEqual(
+    await repository(fixture.storage, ALICE).get(ALICE_ID),
+    fixture.snapshot,
+  );
 
   const first = await runLegacyIndicationSummaryMigration(
     fixture.storage,
@@ -121,7 +150,7 @@ test("migrates one fully verified schema-4 head without changing domain state", 
   );
   assert.deepEqual(first, { scanned: 1, migrated: 1, alreadyCurrent: 0 });
   const migrated = currentRecord(fixture.state, ALICE_ID);
-  assert.equal(migrated.value.schemaVersion, 5);
+  assert.equal(migrated.value.schemaVersion, 6);
   assert.equal(migrated.value.revision, fixture.snapshot.revision);
   assert.equal(migrated.revision, fixture.snapshot.revision + 1);
   assert.equal(Object.hasOwn(migrated.value, "participantSummary"), true);
@@ -153,7 +182,7 @@ test("a migrated head remains mutable with its storage revision offset", async (
     await packageContext(ALICE),
   );
   const current = currentRecord(fixture.state, ALICE_ID);
-  assert.equal(current.value.schemaVersion, 5);
+  assert.equal(current.value.schemaVersion, 6);
   assert.equal(current.value.revision, 2);
   assert.equal(current.revision, 3);
   assert.equal(
@@ -164,6 +193,110 @@ test("a migrated head remains mutable with its storage revision offset", async (
     await repository(fixture.storage, ALICE).get(ALICE_ID),
     edited.snapshot,
   );
+});
+
+test("migrates a valid schema-4 fingerprint chain without misreading schema 5", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const participant = repository(storage, ALICE);
+  const created = await participant.create(
+    createRequest(ALICE_ID, "true-legacy-create", 1),
+    await packageContext(ALICE),
+  );
+  await downgradeIndicationToLegacy(state, ALICE_ID, created.snapshot);
+  assert.equal(currentRecord(state, ALICE_ID).value.schemaVersion, 4);
+  assert.deepEqual(await repository(storage, ALICE).get(ALICE_ID), created.snapshot);
+
+  assert.deepEqual(
+    await runLegacyIndicationSummaryMigration(
+      storage,
+      manifest([entry(ALICE, ALICE_ID)]),
+    ),
+    { scanned: 1, migrated: 1, alreadyCurrent: 0 },
+  );
+  const migrated = currentRecord(state, ALICE_ID);
+  assert.equal(migrated.value.schemaVersion, 6);
+  assert.equal(migrated.value.revision, 1);
+  assert.equal(migrated.revision, 2);
+  assert.deepEqual(await repository(storage, ALICE).get(ALICE_ID), created.snapshot);
+
+  const edited = await participant.edit(
+    editRequest(ALICE_ID, 2),
+    await packageContext(ALICE),
+  );
+  const current = currentRecord(state, ALICE_ID);
+  assert.equal(current.value.schemaVersion, 6);
+  assert.equal(current.value.revision, 2);
+  assert.equal(current.revision, 3);
+  assert.equal(
+    [...state.records.values()].find((record) =>
+      record.key.collection === "investment-indication-history" &&
+      record.value.indicationId === ALICE_ID &&
+      record.value.revision === 1
+    )?.value.schemaVersion,
+    4,
+  );
+  assert.equal(
+    [...state.records.values()].find((record) =>
+      record.key.collection === "investment-indication-history" &&
+      record.value.indicationId === ALICE_ID &&
+      record.value.revision === 2
+    )?.value.schemaVersion,
+    5,
+  );
+  assert.deepEqual(await repository(storage, ALICE).get(ALICE_ID), edited.snapshot);
+});
+
+test("schema-5 compact heads are accepted and schema-5 summary hybrids are rejected", async () => {
+  const compact = await seededLegacy(ALICE, ALICE_ID);
+  assert.equal(currentRecord(compact.state, ALICE_ID).value.schemaVersion, 5);
+  assert.deepEqual(
+    await repository(compact.storage, ALICE).get(ALICE_ID),
+    compact.snapshot,
+  );
+  assert.deepEqual(
+    await readParticipantIndicationOwnershipHead(
+      compact.storage,
+      ALICE,
+      ALICE_ID,
+    ),
+    {
+      indicationId: ALICE_ID,
+      indicationRevision: 1,
+      lifecycleStatus: "active",
+    },
+  );
+
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await repository(storage, ALICE).create(
+    createRequest(ALICE_ID, "schema-collision", 1),
+    await packageContext(ALICE),
+  );
+  mutateRecordWhere(
+    state,
+    "investment-indications",
+    () => true,
+    (value) => {
+      value.schemaVersion = 5;
+    },
+  );
+  const failure = await captureAsync(() =>
+    repository(storage, ALICE).get(ALICE_ID)
+  );
+  assert.equal(failure.code, "UNAVAILABLE");
+  assert.equal(failure.cause, undefined);
+
+  const observed = new CountingStorageAdapter(storage);
+  const migrationFailure = await captureAsync(() =>
+    runLegacyIndicationSummaryMigration(
+      observed,
+      manifest([entry(ALICE, ALICE_ID)]),
+    )
+  );
+  assert.equal(migrationFailure.code, "UNAVAILABLE");
+  assert.equal(migrationFailure.cause, undefined);
+  assert.equal(observed.transactions, 0);
 });
 
 test("an already-migrated head is fully authenticated before exact retry", async () => {
@@ -198,7 +331,7 @@ test("browser-readable indication GET never performs a legacy migration write", 
   const snapshot = await repository(observed, ALICE).get(ALICE_ID);
   assert.deepEqual(snapshot, fixture.snapshot);
   assert.equal(observed.transactions, 0);
-  assert.equal(currentRecord(fixture.state, ALICE_ID).value.schemaVersion, 4);
+  assert.equal(currentRecord(fixture.state, ALICE_ID).value.schemaVersion, 5);
 
   const productionFiles = await sourceFilesBelow("worker", "http", "app");
   for (const path of productionFiles) {
@@ -274,7 +407,7 @@ test("migration verifies missing, crossed, corrupt, and active-lease evidence", 
       assert.equal(failure.code, "UNAVAILABLE");
       assert.equal(failure.message.includes(ALICE), false);
       assert.equal(failure.message.includes(ALICE_ID), false);
-      assert.equal(currentRecord(fixture.state, ALICE_ID).value.schemaVersion, 4);
+      assert.equal(currentRecord(fixture.state, ALICE_ID).value.schemaVersion, 5);
     });
   }
 
@@ -326,8 +459,48 @@ test("inactive migration rejects its exact stale uniqueness lease", async (t) =>
       assert.equal(failure.cause, undefined);
       assert.equal(String(failure).includes(ALICE), false);
       assert.equal(String(failure).includes(ALICE_ID), false);
-      assert.equal(currentRecord(state, ALICE_ID).value.schemaVersion, 4);
+      assert.equal(currentRecord(state, ALICE_ID).value.schemaVersion, 5);
     });
+  }
+});
+
+test("migration verifies every historical company uniqueness coordinate", async (t) => {
+  for (const lifecycle of ["withdrawn", "rejected"] as const) {
+    await t.test(`${lifecycle} without stale leases`, async () => {
+      const fixture = await editedInactiveCompany(lifecycle);
+      const observed = new CountingStorageAdapter(fixture.storage);
+      assert.deepEqual(
+        await runLegacyIndicationSummaryMigration(
+          observed,
+          manifest([entry(ALICE, ALICE_ID)]),
+        ),
+        { scanned: 1, migrated: 1, alreadyCurrent: 0 },
+      );
+      assert.ok(
+        observed.reads <= MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_READS,
+      );
+    });
+
+    for (const coordinate of ["original", "edited"] as const) {
+      await t.test(`${lifecycle} stale ${coordinate} lease`, async () => {
+        const fixture = await editedInactiveCompany(lifecycle);
+        const stale = coordinate === "original"
+          ? fixture.originalLease
+          : fixture.editedLease;
+        fixture.state.records.set(storageKeyString(stale.key), stale);
+        const failure = await captureAsync(() =>
+          runLegacyIndicationSummaryMigration(
+            fixture.storage,
+            manifest([entry(ALICE, ALICE_ID)]),
+          )
+        );
+        assert.equal(failure.code, "UNAVAILABLE");
+        assert.equal(failure.cause, undefined);
+        assert.equal(String(failure).includes(ALICE), false);
+        assert.equal(String(failure).includes(ALICE_ID), false);
+        assert.equal(currentRecord(fixture.state, ALICE_ID).value.schemaVersion, 5);
+      });
+    }
   }
 });
 
@@ -359,6 +532,46 @@ test("maximum immutable ancestry migrates after every revision is verified", asy
     "withdrawn",
   );
   assert.deepEqual(await repository(storage, ALICE).get(ALICE_ID), withdrawn.snapshot);
+});
+
+test("maximum distinct historical uniqueness inventory stays read-bounded", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const participant = repository(storage, ALICE);
+  const context = await packageContext(ALICE);
+  await participant.create({
+    operationId: "indication-operation:maximum-coordinate-create",
+    id: ALICE_ID,
+    occurredAt: timestamp(1),
+    historyEntryId: "indication-history:maximum-coordinate-create",
+    expectedRevision: null,
+    fields: companyFields("REG-001"),
+  }, context);
+  for (let revision = 2; revision < MAX_INVESTMENT_INDICATION_REVISIONS; revision += 1) {
+    await participant.edit({
+      operationId: `indication-operation:maximum-coordinate-${revision}`,
+      id: ALICE_ID,
+      occurredAt: timestamp(revision),
+      historyEntryId: `indication-history:maximum-coordinate-${revision}`,
+      expectedRevision: revision - 1,
+      fields: companyFields(`REG-${String(revision).padStart(3, "0")}`),
+    }, context);
+  }
+  await participant.withdraw(withdrawRequest(
+    ALICE_ID,
+    MAX_INVESTMENT_INDICATION_REVISIONS,
+  ));
+  downgradeCurrent(state, ALICE_ID);
+
+  const observed = new CountingStorageAdapter(storage);
+  assert.deepEqual(
+    await runLegacyIndicationSummaryMigration(
+      observed,
+      manifest([entry(ALICE, ALICE_ID)]),
+    ),
+    { scanned: 1, migrated: 1, alreadyCurrent: 0 },
+  );
+  assert.ok(observed.reads <= MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_READS);
 });
 
 test("exact concurrent migration and response loss recover without a second write", async () => {
@@ -425,8 +638,8 @@ test("restart resumes a partially completed inventory through exact retries", as
   assert.equal((await captureAsync(() =>
     runLegacyIndicationSummaryMigration(interrupted, inventory)
   )).code, "UNAVAILABLE");
-  assert.equal(currentRecord(state, ALICE_ID).value.schemaVersion, 5);
-  assert.equal(currentRecord(state, BOB_ID).value.schemaVersion, 4);
+  assert.equal(currentRecord(state, ALICE_ID).value.schemaVersion, 6);
+  assert.equal(currentRecord(state, BOB_ID).value.schemaVersion, 5);
 
   assert.deepEqual(
     await runLegacyIndicationSummaryMigration(
@@ -626,6 +839,10 @@ test("operator command rejects manifest growth after one max-plus-one read", asy
         openManifest: async () => ({
           stat: async () => ({
             size: MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES,
+            device: "1",
+            inode: "2",
+            modifiedAtNanoseconds: "3",
+            changedAtNanoseconds: "4",
             isFile: () => true,
           }),
           read: async (buffer, offset, length) => {
@@ -657,6 +874,168 @@ test("operator command rejects manifest growth after one max-plus-one read", asy
   assert.equal(closes, 1);
   assert.equal(fetches, 0);
 });
+
+test("operator command bounds pathological short manifest reads", async () => {
+  let reads = 0;
+  let closes = 0;
+  let fetches = 0;
+  await assert.rejects(
+    () => executeLegacyIndicationSummaryMigrationCommand(
+      ["--apply", "--manifest", "short-read-private.json"],
+      migrationEnvironment(),
+      {
+        openManifest: async () => ({
+          stat: async () => ({
+            size: MAX_LEGACY_INDICATION_SUMMARY_MANIFEST_READ_CALLS + 1,
+            device: "1",
+            inode: "2",
+            modifiedAtNanoseconds: "3",
+            changedAtNanoseconds: "4",
+            isFile: () => true,
+          }),
+          read: async (buffer, offset) => {
+            reads += 1;
+            buffer[offset] = 0x20;
+            return { bytesRead: 1 };
+          },
+          close: async () => {
+            closes += 1;
+          },
+        }),
+        fetch: async () => {
+          fetches += 1;
+          throw new Error("Unexpected fetch.");
+        },
+      },
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message ===
+        "Legacy indication summary migration configuration is invalid.",
+  );
+  assert.equal(reads, MAX_LEGACY_INDICATION_SUMMARY_MANIFEST_READ_CALLS);
+  assert.equal(closes, 1);
+  assert.equal(fetches, 0);
+});
+
+test("operator command rejects same-size in-place manifest replacement", async () => {
+  const reviewed = JSON.stringify(manifest([
+    entry(ALICE, ALICE_ID),
+  ]));
+  const replacement = JSON.stringify(manifest([
+    entry(
+      actorSubject("issuer.invalid/subject:carol-migration"),
+      indicationId("indication:migration:carol"),
+    ),
+  ]));
+  assert.notEqual(replacement, reviewed);
+  assert.equal(replacement.length, reviewed.length);
+  const replacementBytes = new TextEncoder().encode(replacement);
+  let stats = 0;
+  let reads = 0;
+  let closes = 0;
+  let fetches = 0;
+  await assert.rejects(
+    () => executeLegacyIndicationSummaryMigrationCommand(
+      ["--apply", "--manifest", "replaced-private.json"],
+      migrationEnvironment(),
+      {
+        openManifest: async () => ({
+          stat: async () => {
+            stats += 1;
+            return {
+              size: replacementBytes.byteLength,
+              device: "1",
+              inode: "2",
+              modifiedAtNanoseconds: stats === 1 ? "3" : "5",
+              changedAtNanoseconds: stats === 1 ? "4" : "6",
+              isFile: () => true,
+            };
+          },
+          read: async (buffer, offset) => {
+            reads += 1;
+            if (offset !== 0) return { bytesRead: 0 };
+            buffer.set(replacementBytes, offset);
+            return { bytesRead: replacementBytes.byteLength };
+          },
+          close: async () => {
+            closes += 1;
+          },
+        }),
+        fetch: async () => {
+          fetches += 1;
+          throw new Error("Unexpected fetch.");
+        },
+      },
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message ===
+        "Legacy indication summary migration configuration is invalid.",
+  );
+  assert.equal(stats, 2);
+  assert.equal(reads, 2);
+  assert.equal(closes, 1);
+  assert.equal(fetches, 0);
+});
+
+async function editedInactiveCompany(
+  lifecycle: "withdrawn" | "rejected",
+): Promise<Readonly<{
+  state: MemoryStorageState;
+  storage: MemoryStorageAdapter;
+  originalLease: StorageRecord;
+  editedLease: StorageRecord;
+}>> {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const participant = repository(storage, ALICE);
+  await participant.create({
+    operationId: `indication-operation:historical-${lifecycle}-create`,
+    id: ALICE_ID,
+    occurredAt: timestamp(1),
+    historyEntryId: `indication-history:historical-${lifecycle}-create`,
+    expectedRevision: null,
+    fields: companyFields("REG-ORIGINAL"),
+  }, await packageContext(ALICE));
+  const originalLease = activeLeaseRecord(state);
+  await participant.edit({
+    operationId: `indication-operation:historical-${lifecycle}-edit`,
+    id: ALICE_ID,
+    occurredAt: timestamp(2),
+    historyEntryId: `indication-history:historical-${lifecycle}-edit`,
+    expectedRevision: 1,
+    fields: companyFields("REG-EDITED"),
+  }, await packageContext(ALICE));
+  const editedLease = activeLeaseRecord(state);
+  if (lifecycle === "withdrawn") {
+    await participant.withdraw(withdrawRequest(ALICE_ID, 3));
+  } else {
+    await repository(storage, OWNER).reject({
+      operationId: "indication-operation:historical-reject",
+      id: ALICE_ID,
+      occurredAt: timestamp(3),
+      historyEntryId: "indication-history:historical-reject",
+      expectedRevision: 2,
+      reason: "Private historical-coordinate rejection.",
+    });
+  }
+  downgradeCurrent(state, ALICE_ID);
+  return Object.freeze({
+    state,
+    storage,
+    originalLease,
+    editedLease,
+  });
+}
+
+function activeLeaseRecord(state: MemoryStorageState): StorageRecord {
+  const record = [...state.records.values()].find((candidate) =>
+    candidate.key.collection === "investment-indication-active-keys"
+  );
+  assert(record);
+  return structuredClone(record);
+}
 
 async function seededLegacy(
   subject: ActorSubject,
@@ -757,6 +1136,20 @@ function personalFields(note: string): StorageDocument {
   };
 }
 
+function companyFields(companyIdentifier: string): StorageDocument {
+  return {
+    kind: "company",
+    companyName: "Historical coordinate company",
+    registrationCountry: "FI",
+    companyIdentifier,
+    representativeName: "Authorized representative",
+    representativeAuthorityDeclared: true,
+    amount: 2_000,
+    availabilityPeriod: "Within twelve months.",
+    note: "Historical uniqueness proof.",
+  };
+}
+
 function amountConfiguration(): AmountConfiguration {
   const parsed = parseAmountAggregateConfiguration({
     amount: {
@@ -807,13 +1200,123 @@ function downgradeCurrent(
 ): void {
   const record = currentRecord(state, id);
   const value = { ...record.value } as Record<string, unknown>;
-  value.schemaVersion = 4;
+  value.schemaVersion = 5;
   delete value.participantSummary;
   state.records.set(storageKeyString(record.key), Object.freeze({
     key: record.key,
     revision: record.value.revision as number,
     value: Object.freeze(value) as StorageDocument,
   }));
+}
+
+async function downgradeIndicationToLegacy(
+  state: MemoryStorageState,
+  id: InvestmentIndicationId,
+  snapshot: InvestmentIndication,
+): Promise<void> {
+  const fingerprints = new Map<number, string>();
+  for (const record of [...state.records.values()]) {
+    if (
+      record.key.collection !== "investment-indication-history" ||
+      record.value.indicationId !== id
+    ) continue;
+    const value = structuredClone(record.value) as Record<string, unknown>;
+    const revision = value.revision as number;
+    const history = snapshot.history.find((entry) => entry.revision === revision);
+    assert(history);
+    const transition = String(value.transitionKind);
+    const payload: Record<string, unknown> = {
+      kind: transition === "created"
+        ? "create"
+        : transition === "edited"
+        ? "edit"
+        : transition === "withdrawn"
+        ? "withdraw"
+        : transition === "reactivated"
+        ? "reactivate"
+        : "reject",
+      operationId: value.operationId,
+      actor: value.actor,
+      expectedRevision: revision === 1 ? null : revision - 1,
+      id,
+      occurredAt: value.occurredAt,
+      historyEntryId: value.historyEntryId,
+      requestFingerprint: value.requestFingerprint,
+      ...(transition === "created" || transition === "edited"
+        ? { fields: history.fields }
+        : {}),
+      ...(transition === "rejected"
+        ? {
+            reason: (value.rejection as Record<string, unknown>).reason,
+          }
+        : {}),
+    };
+    const fingerprint = `sha256:${await testSha256Hex(
+      canonicalTestJson(payload),
+    )}`;
+    value.schemaVersion = 4;
+    value.operationFingerprint = fingerprint;
+    fingerprints.set(revision, fingerprint);
+    state.records.set(storageKeyString(record.key), Object.freeze({
+      key: record.key,
+      revision: record.revision,
+      value: Object.freeze(value) as StorageDocument,
+    }));
+  }
+  assert.equal(fingerprints.size, snapshot.revision);
+
+  for (const record of [...state.records.values()]) {
+    if (
+      record.value.indicationId !== id ||
+      (record.key.collection !== "investment-indication-fields" &&
+        record.key.collection !== "investment-indication-active-keys")
+    ) continue;
+    const value = structuredClone(record.value) as Record<string, unknown>;
+    value.schemaVersion = 4;
+    state.records.set(storageKeyString(record.key), Object.freeze({
+      key: record.key,
+      revision: record.revision,
+      value: Object.freeze(value) as StorageDocument,
+    }));
+  }
+
+  const current = currentRecord(state, id);
+  const value = structuredClone(current.value) as Record<string, unknown>;
+  value.schemaVersion = 4;
+  value.operationFingerprint = fingerprints.get(snapshot.revision);
+  delete value.participantSummary;
+  state.records.set(storageKeyString(current.key), Object.freeze({
+    key: current.key,
+    revision: snapshot.revision,
+    value: Object.freeze(value) as StorageDocument,
+  }));
+}
+
+function canonicalTestJson(value: unknown): string {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    typeof value === "number"
+  ) return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalTestJson).join(",")}]`;
+  }
+  assert.equal(typeof value, "object");
+  const source = value as Record<string, unknown>;
+  return `{${Object.keys(source).sort().map((key) =>
+    `${JSON.stringify(key)}:${canonicalTestJson(source[key])}`
+  ).join(",")}}`;
+}
+
+async function testSha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function currentRecord(
@@ -978,12 +1481,14 @@ class ThrowingStorageAdapter implements StorageAdapter {
 
 class CountingStorageAdapter implements StorageAdapter {
   readonly #delegate: StorageAdapter;
+  reads = 0;
   transactions = 0;
 
   constructor(delegate: StorageAdapter) {
     this.#delegate = delegate;
   }
   read(key: StorageKey): Promise<StorageRecord | null> {
+    this.reads += 1;
     return this.#delegate.read(key);
   }
   list(request: StorageListRequest): Promise<StoragePage> {

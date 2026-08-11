@@ -64,6 +64,7 @@ export function parseLegacyIndicationSummaryMigrationInventory(
       MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_ENTRIES,
     );
     const entries: LegacyIndicationSummaryMigrationEntry[] = [];
+    const indicationIds = new Set<InvestmentIndicationId>();
     let priorIdentity: string | null = null;
     for (const candidate of candidates) {
       const entry = exactRecord(candidate, ENTRY_KEYS);
@@ -73,8 +74,12 @@ export function parseLegacyIndicationSummaryMigrationInventory(
       );
       if (!participantSubject.ok || !indicationId.ok) invalidRequest();
       const identity = `${participantSubject.value}\u0000${indicationId.value}`;
-      if (priorIdentity !== null && identity <= priorIdentity) invalidRequest();
+      if (
+        (priorIdentity !== null && identity <= priorIdentity) ||
+        indicationIds.has(indicationId.value)
+      ) invalidRequest();
       priorIdentity = identity;
+      indicationIds.add(indicationId.value);
       entries.push(Object.freeze({
         participantSubject: participantSubject.value,
         indicationId: indicationId.value,

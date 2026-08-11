@@ -81,8 +81,8 @@ npm run validate
 
 `npm run build` works from a clean checkout with the inert hosting example. Before packaging or publishing, create an ignored `.openai/hosting.json` containing the exact Sites project identifier for that deployment; `npm run sites:package` refuses to proceed without it.
 
-Legacy schema-4 indication heads are upgraded only by the backend operator
-command documented in
+Legacy schema-4 and compact schema-5 indication heads receive the schema-6
+participant summary only through the backend operator command documented in
 [`docs/HOSTED_AITTADB_RUNTIME.md`](docs/HOSTED_AITTADB_RUNTIME.md). Put the
 reviewed authoritative inventory under the ignored `migration-inventories/`
 directory and run the command with a separate namespace-bound read/write

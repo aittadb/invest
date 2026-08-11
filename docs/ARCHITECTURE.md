@@ -272,18 +272,24 @@ For each accepted capacity snapshot, root, summary, and index reads precede two 
 
 Full indication reads reconstruct bounded transition ancestry from exact data-only records, verify every field reference, chunk topology, byte count, content hash, normalized operation fingerprint, storage revision, required active lease, and ownership summary, then compare the reconstruction with current metadata. A separate immutable fingerprint binds the exact authoritative request fields before deployment policy or normalizers are applied, and every normalized transition fingerprint commits that raw-request fingerprint plus the compact normalized field commitment when fields change, so exact retries return their original revision after policy evolution while changed or corrupted request evidence cannot adopt the operation. Stored values with accessors, unexpected own keys, or non-data prototypes fail closed; canonical comparisons have explicit depth and node ceilings, and ownership-root, summary, participant-index, and operation-receipt reads validate their complete outer record and key envelopes before field access. Capacity uses the compact proof above rather than full reconstruction. Current owner configuration authorizes access, while immutable historical owner attribution survives an authorized owner rotation. Exported record, transaction, mutation, materialization-read, capacity-read, initialization-read, and delayed-replay-read ceilings are enforced and observed in the reusable repository contract.
 
-Schema-5 current heads add one bounded participant collection summary while
-immutable transitions and field chunks remain schema 4. New domain mutations
-write the summary directly. Existing schema-4 heads remain readable without a
-write, and browser GET handling has no migration capability. The backend-only
+Schema-6 current heads add one bounded participant collection summary. Exact
+legacy schema-4 ancestry uses full-field operation fingerprints, while compact
+schema-5 ancestry commits field references; new transitions and field chunks
+remain schema 5. New domain mutations write a schema-6 head directly. Existing
+summaryless schema-4 and compact schema-5 heads remain readable without a write,
+and browser GET handling has no migration capability. The backend-only
 `migrateLegacyIndicationCurrentSummary` primitive accepts one explicitly
 inventoried subject and indication ID, reconstructs and authenticates every
-revision, field payload, operation fingerprint, current binding, and active
-uniqueness lease, then compare-and-sets only the current head. The domain
-revision is unchanged; its storage revision advances once. Exact retries,
-concurrent identical upgrades, and lost responses recover by validating the
-complete resulting envelope, while a concurrent domain mutation or any
-missing, crossed, or corrupt evidence fails closed.
+revision, field payload, schema-specific operation fingerprint, current binding,
+and every distinct historical personal or normalized company uniqueness
+coordinate. It requires the exact final lease for an active indication and
+rejects any stale historical lease that still names the inventoried indication,
+then compare-and-sets only the current head to schema 6. The domain revision is
+unchanged; its storage revision advances once and retains that one-revision
+offset through later domain mutations. Exact retries, concurrent identical
+upgrades, and lost responses recover by validating the complete resulting
+envelope, while a concurrent domain mutation or any missing, crossed, or corrupt
+evidence fails closed.
 
 `StorageOwnerIndicationReviewCollectionRepository` is the narrow persistent
 collection projection over those current indication records. Construction binds

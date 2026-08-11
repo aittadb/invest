@@ -15,6 +15,7 @@ import {
 
 const TOKEN_REQUEST_TIMEOUT_MS = 10_000;
 const STORAGE_REQUEST_TIMEOUT_MS = 30_000;
+export const MAX_LEGACY_INDICATION_SUMMARY_MANIFEST_READ_CALLS = 32;
 
 type MigrationEnvironment = Readonly<Record<string, string | undefined>>;
 
@@ -37,7 +38,7 @@ export type LegacyIndicationSummaryMigrationCommandDependencies = Readonly<{
 }>;
 
 export type LegacyIndicationSummaryMigrationManifestFile = Readonly<{
-  stat(): Promise<Readonly<{ size: number; isFile(): boolean }>>;
+  stat(): Promise<LegacyIndicationSummaryMigrationManifestMetadata>;
   read(
     buffer: Uint8Array,
     offset: number,
@@ -45,6 +46,15 @@ export type LegacyIndicationSummaryMigrationManifestFile = Readonly<{
     position: number,
   ): Promise<Readonly<{ bytesRead: number }>>;
   close(): Promise<void>;
+}>;
+
+export type LegacyIndicationSummaryMigrationManifestMetadata = Readonly<{
+  size: number;
+  device: string;
+  inode: string;
+  modifiedAtNanoseconds: string;
+  changedAtNanoseconds: string;
+  isFile(): boolean;
 }>;
 
 export type LegacyIndicationSummaryMigrationManifestOpener = (
@@ -166,7 +176,23 @@ function parseCommandConfigurationUnchecked(
 async function openManifest(
   path: string,
 ): Promise<LegacyIndicationSummaryMigrationManifestFile> {
-  return open(path, "r");
+  const file = await open(path, "r");
+  return Object.freeze({
+    stat: async () => {
+      const metadata = await file.stat({ bigint: true });
+      return Object.freeze({
+        size: Number(metadata.size),
+        device: metadata.dev.toString(),
+        inode: metadata.ino.toString(),
+        modifiedAtNanoseconds: metadata.mtimeNs.toString(),
+        changedAtNanoseconds: metadata.ctimeNs.toString(),
+        isFile: () => metadata.isFile(),
+      });
+    },
+    read: (buffer, offset, length, position) =>
+      file.read(buffer, offset, length, position),
+    close: () => file.close(),
+  });
 }
 
 async function readManifest(
@@ -177,19 +203,17 @@ async function readManifest(
   try {
     file = await opener(path);
     const metadata = await file.stat();
-    if (
-      !metadata.isFile() ||
-      !Number.isSafeInteger(metadata.size) ||
-      metadata.size < 1 ||
-      metadata.size > MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES
-    ) {
-      invalid();
-    }
+    validateManifestMetadata(metadata);
     const bytes = new Uint8Array(
       MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES + 1,
     );
     let offset = 0;
+    let readCalls = 0;
     while (offset < bytes.byteLength) {
+      readCalls += 1;
+      if (readCalls > MAX_LEGACY_INDICATION_SUMMARY_MANIFEST_READ_CALLS) {
+        invalid();
+      }
       const requested = bytes.byteLength - offset;
       const result = await file.read(bytes, offset, requested, offset);
       if (
@@ -205,6 +229,9 @@ async function readManifest(
       offset > MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES ||
       offset !== metadata.size
     ) invalid();
+    const finalMetadata = await file.stat();
+    validateManifestMetadata(finalMetadata);
+    if (!sameManifestMetadata(metadata, finalMetadata)) invalid();
     const text = new TextDecoder("utf-8", { fatal: true }).decode(
       bytes.subarray(0, offset),
     );
@@ -214,6 +241,32 @@ async function readManifest(
   } finally {
     if (file !== null) await file.close().catch(() => undefined);
   }
+}
+
+function validateManifestMetadata(
+  metadata: LegacyIndicationSummaryMigrationManifestMetadata,
+): void {
+  if (
+    !metadata.isFile() ||
+    !Number.isSafeInteger(metadata.size) ||
+    metadata.size < 1 ||
+    metadata.size > MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES ||
+    !/^\d+$/u.test(metadata.device) ||
+    !/^\d+$/u.test(metadata.inode) ||
+    !/^-?\d+$/u.test(metadata.modifiedAtNanoseconds) ||
+    !/^-?\d+$/u.test(metadata.changedAtNanoseconds)
+  ) invalid();
+}
+
+function sameManifestMetadata(
+  left: LegacyIndicationSummaryMigrationManifestMetadata,
+  right: LegacyIndicationSummaryMigrationManifestMetadata,
+): boolean {
+  return left.size === right.size &&
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.modifiedAtNanoseconds === right.modifiedAtNanoseconds &&
+    left.changedAtNanoseconds === right.changedAtNanoseconds;
 }
 
 function exactPath(value: unknown): string {
