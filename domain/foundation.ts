@@ -13,6 +13,8 @@ export type StableId<Entity extends string = "entity"> = Branded<
 export type ActorSubject = Branded<string, "ActorSubject">;
 export type CountryCode = Branded<string, "CountryCode">;
 
+export const MAX_STABLE_ID_LENGTH = 128;
+
 export type Actor =
   | Readonly<{ type: "visitor" }>
   | Readonly<{ type: "participant"; subject: ActorSubject }>
@@ -100,7 +102,7 @@ export function parseTimestamp(value: unknown): ValidationResult<Timestamp> {
   return valid(value as Timestamp);
 }
 
-const STABLE_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
+const STABLE_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]*[A-Za-z0-9])?$/;
 
 export function parseStableId<Entity extends string = "entity">(
   value: unknown,
@@ -109,7 +111,10 @@ export function parseStableId<Entity extends string = "entity">(
     return invalid({ code: "invalid_type", path: "id" });
   }
 
-  if (!STABLE_ID_PATTERN.test(value)) {
+  if (
+    value.length > MAX_STABLE_ID_LENGTH ||
+    !STABLE_ID_PATTERN.test(value)
+  ) {
     return invalid({ code: value.length === 0 ? "required" : "invalid_format", path: "id" });
   }
 

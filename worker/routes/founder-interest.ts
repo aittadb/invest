@@ -4,7 +4,11 @@ import {
   type FounderApplication,
   type FounderApplicationFields,
 } from "../../domain/founder-application.ts";
-import { parseActorSubject, type ActorSubject } from "../../domain/foundation.ts";
+import {
+  MAX_STABLE_ID_LENGTH,
+  parseActorSubject,
+  type ActorSubject,
+} from "../../domain/foundation.ts";
 import {
   FOUNDER_INTEREST_PATH,
   FOUNDER_SECONDARY_AREAS_FIELD,
@@ -84,7 +88,7 @@ export const MAX_FOUNDER_INTEREST_MUTATION_FIELDS =
 
 const MAX_URL_ENCODED_BYTES_PER_UTF8_BYTE = 3;
 const MAX_UTF8_BYTES_PER_UTF16_CODE_UNIT = 3;
-const MAX_STABLE_ID_BYTES = 128;
+const MAX_STABLE_ID_BYTES = MAX_STABLE_ID_LENGTH;
 const MAX_CSRF_TOKEN_BYTES = 256;
 const MAX_REVISION_BYTES = String(Number.MAX_SAFE_INTEGER - 1).length;
 const MAX_METHOD_OVERRIDE_BYTES = "DELETE".length;
@@ -395,7 +399,7 @@ export function founderWithdrawalReplayScope(
     replay === null ||
     typeof replay.operationId !== "string" ||
     replay.operationId.length < 1 ||
-    replay.operationId.length > 127 ||
+    replay.operationId.length > MAX_STABLE_ID_LENGTH ||
     !Number.isSafeInteger(replay.expectedRevision) ||
     replay.expectedRevision < 1 ||
     replay.expectedRevision >= Number.MAX_SAFE_INTEGER

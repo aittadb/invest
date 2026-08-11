@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   DomainError,
+  MAX_STABLE_ID_LENGTH,
   invalid,
   parseActorSubject,
   parseCountryCode,
@@ -73,6 +74,8 @@ test("timestamps, stable identifiers, and actor subjects preserve canonical valu
     ok: true,
     value: "campaign:example-01",
   });
+  assert.equal(parseStableId("i".repeat(MAX_STABLE_ID_LENGTH)).ok, true);
+  assert.equal(parseStableId("i".repeat(MAX_STABLE_ID_LENGTH + 1)).ok, false);
   assert.equal(parseStableId(" id with spaces ").ok, false);
 
   assert.deepEqual(parseActorSubject("issuer.example/user:CaseSensitive"), {

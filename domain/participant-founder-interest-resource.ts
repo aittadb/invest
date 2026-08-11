@@ -26,6 +26,7 @@ import {
   INVESTOR_APP_API_VERSION,
   type HypermediaLink,
 } from "./public-campaign-resource.ts";
+import { MAX_STABLE_ID_LENGTH } from "./foundation.ts";
 
 export const FOUNDER_INTEREST_PATH = "/participant/founder-interest";
 export const FOUNDER_WITHDRAWAL_REPLAY_ACTION =
@@ -261,8 +262,8 @@ function operationIdField(value: string): ActionField {
     required: true,
     presentation: "hidden",
     minLength: 1,
-    maxLength: 127,
-    maxBytes: 127,
+    maxLength: MAX_STABLE_ID_LENGTH,
+    maxBytes: MAX_STABLE_ID_LENGTH,
     value,
   };
 }

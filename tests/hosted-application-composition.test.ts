@@ -45,6 +45,7 @@ import {
 } from "../domain/participant-profile-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
+  MAX_STABLE_ID_LENGTH,
   parseActorSubject,
   parseStableId,
   parseTimestamp,
@@ -1498,11 +1499,26 @@ test("hosted terminal withdrawal recovery uses one exact scoped proof across res
   );
 
   const received = await founderResource(worker, env);
+  const maximumOperationId = "w".repeat(MAX_STABLE_ID_LENGTH);
+  const withdrawalAction = requiredAction(
+    received.document,
+    "withdraw-founder-application",
+  );
+  const operationField = withdrawalAction.fields.find(
+    (field) => field.name === "operation-id",
+  );
+  assert(operationField);
+  assert.equal(operationField.max_length, MAX_STABLE_ID_LENGTH);
+  assert.equal(operationField.max_bytes, MAX_STABLE_ID_LENGTH);
   const withdrawalBody = actionBody(
-    requiredAction(received.document, "withdraw-founder-application"),
-    { "confirm-withdrawal": true },
+    withdrawalAction,
+    {
+      "operation-id": maximumOperationId,
+      "confirm-withdrawal": true,
+    },
   );
   const operationId = String(withdrawalBody["operation-id"]);
+  assert.equal(operationId, maximumOperationId);
   const lostResponse = await submitFounderMutation(
     worker,
     env,
@@ -1511,6 +1527,13 @@ test("hosted terminal withdrawal recovery uses one exact scoped proof across res
     withdrawalBody,
   );
   assert.equal(lostResponse.status, 200);
+  const projectedDocument = await lostResponse.clone().json() as
+    FounderInterestDocument;
+  assert.equal(projectedDocument.data.status, "withdrawn");
+  assert.equal(projectedDocument.data.revision, 2);
+  assert.deepEqual(actionNames(projectedDocument), [
+    FOUNDER_WITHDRAWAL_REPLAY_ACTION,
+  ]);
   await lostResponse.body?.cancel();
 
   const spentOriginalProof = await submitFounderMutation(
@@ -1545,6 +1568,13 @@ test("hosted terminal withdrawal recovery uses one exact scoped proof across res
     FOUNDER_WITHDRAWAL_REPLAY_ACTION,
   ]);
   assert.match(terminalHtml.html, /Retry recorded withdrawal/u);
+  assert.match(
+    terminalHtml.html,
+    new RegExp(
+      `name="operation-id" type="hidden" value="${maximumOperationId}"`,
+      "u",
+    ),
+  );
   assert.doesNotMatch(
     terminalHtml.html,
     /data-action-name="(?:create|edit|withdraw)-founder-application"/u,
@@ -1554,6 +1584,33 @@ test("hosted terminal withdrawal recovery uses one exact scoped proof across res
   const committedOperation = service.operations.get(operationId);
   assert(committedOperation);
   const claimsBeforeExact = recordsIn(service, "browser-mutation-replays").length;
+  const exactHtml = await submitFounderHtmlMutation(
+    worker,
+    env,
+    terminalHtml.cookie,
+    [
+      [MUTATION_CSRF_FIELD, terminalHtml.csrfToken],
+      [MUTATION_METHOD_FIELD, "DELETE"],
+      ["operation-id", maximumOperationId],
+      ["expected-revision", "1"],
+      ["confirm-withdrawal", "true"],
+    ],
+  );
+  assert.equal(exactHtml.status, 200);
+  assert.match(
+    exactHtml.headers.get("content-type") ?? "",
+    /^text\/html/u,
+  );
+  const exactHtmlBody = await exactHtml.text();
+  assert.match(exactHtmlBody, /Withdrawn/u);
+  assert.match(exactHtmlBody, /Retry recorded withdrawal/u);
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    claimsBeforeExact + 1,
+  );
+  assert.deepEqual(founderCollectionSnapshot(service), committedFounder);
+  assert.strictEqual(service.operations.get(operationId), committedOperation);
+
   const exact = await submitFounderMutation(
     worker,
     env,
@@ -1570,7 +1627,7 @@ test("hosted terminal withdrawal recovery uses one exact scoped proof across res
   ]);
   assert.equal(
     recordsIn(service, "browser-mutation-replays").length,
-    claimsBeforeExact + 1,
+    claimsBeforeExact + 2,
   );
   assert.deepEqual(founderCollectionSnapshot(service), committedFounder);
   assert.strictEqual(service.operations.get(operationId), committedOperation);
@@ -1656,6 +1713,99 @@ test("hosted terminal withdrawal recovery uses one exact scoped proof across res
     replayBody,
   );
   assert.equal(restartedReuse.status, 403);
+});
+
+test("hosted founder withdrawal rejects one-over stable operation IDs before JSON or HTML mutation", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-operation-limit",
+    { declaredInterest: "founder" },
+  );
+
+  const worker = hostedPackageWorker(service);
+  const initial = await founderResource(worker, env);
+  assert.equal(
+    (await submitFounderMutation(
+      worker,
+      env,
+      initial,
+      "POST",
+      actionBody(
+        requiredAction(initial.document, "create-founder-application"),
+        founderFields(),
+      ),
+    )).status,
+    201,
+  );
+
+  const overLimitOperationId = "x".repeat(MAX_STABLE_ID_LENGTH + 1);
+  const before = founderCollectionSnapshot(service);
+  const received = await founderResource(worker, env);
+  const withdrawalAction = requiredAction(
+    received.document,
+    "withdraw-founder-application",
+  );
+  const overLimitBody = actionBody(withdrawalAction, {
+    "operation-id": overLimitOperationId,
+    "confirm-withdrawal": true,
+  });
+  const jsonRejected = await submitFounderMutation(
+    worker,
+    env,
+    received,
+    "DELETE",
+    overLimitBody,
+  );
+  assert.equal(jsonRejected.status, 400);
+  assert.match(
+    jsonRejected.headers.get("content-type") ?? "",
+    /^application\/vnd\.aittadb-invest\+json/u,
+  );
+  assert.doesNotMatch(
+    await jsonRejected.text(),
+    new RegExp(overLimitOperationId, "u"),
+  );
+  assert.deepEqual(founderCollectionSnapshot(service), before);
+  assert.equal(service.operations.has(overLimitOperationId), false);
+
+  const htmlResource = await founderHtmlResource(worker, env);
+  const htmlRejected = await submitFounderHtmlMutation(
+    worker,
+    env,
+    htmlResource.cookie,
+    [
+      [MUTATION_CSRF_FIELD, htmlResource.csrfToken],
+      [MUTATION_METHOD_FIELD, "DELETE"],
+      ["operation-id", overLimitOperationId],
+      ["expected-revision", "1"],
+      ["confirm-withdrawal", "true"],
+    ],
+  );
+  assert.equal(htmlRejected.status, 400);
+  assert.match(
+    htmlRejected.headers.get("content-type") ?? "",
+    /^text\/html/u,
+  );
+  assert.doesNotMatch(
+    await htmlRejected.text(),
+    new RegExp(overLimitOperationId, "u"),
+  );
+  assert.deepEqual(founderCollectionSnapshot(service), before);
+  assert.equal(service.operations.has(overLimitOperationId), false);
+
+  const unchanged = await founderResource(hostedPackageWorker(service), env);
+  assert.equal(unchanged.document.data.status, "received");
+  assert.equal(unchanged.document.data.revision, 1);
+  assert.deepEqual(actionNames(unchanged.document), [
+    "edit-founder-application",
+    "withdraw-founder-application",
+  ]);
 });
 
 test("hosted founder applications remain readable and withdrawable after interest and phase changes", async () => {
@@ -5717,6 +5867,8 @@ type TestAction = Readonly<{
     name: string;
     value?: unknown;
     default?: unknown;
+    max_length?: number;
+    max_bytes?: number;
     choices?: readonly Readonly<{ value: string; title: string }>[];
   }>[];
 }>;
