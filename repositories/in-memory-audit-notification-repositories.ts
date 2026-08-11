@@ -674,6 +674,7 @@ export class StorageManualNotificationRepository
     if (snapshot.revision !== (expectedRevision === null ? 1 : expectedRevision + 1)) {
       unavailable();
     }
+    if (!hasContinuousNotificationOwner(snapshot.record)) unavailable();
     const id = snapshot.record.template.id;
     const currentKey = await currentNotificationKey(id);
     const historyKey = await notificationHistoryKey(id, snapshot.revision);

@@ -349,7 +349,7 @@ test("oversized notification revision fails before immutable-history traversal",
   assert.equal(counted.lists, 0);
 });
 
-test("foreign notification copy and sent actors fail closed", async () => {
+test("foreign notification copy and sent actors fail before mutation", async () => {
   for (const activity of ["copy", "sent"] as const) {
     const state = new MemoryStorageState();
     const rejected = await rejectIndication(
@@ -360,8 +360,8 @@ test("foreign notification copy and sent actors fail closed", async () => {
     const notifications = new DevelopmentInMemoryManualNotificationRepository(
       new MemoryStorageAdapter(state),
     );
-    if (activity === "copy") {
-      await notifications.recordCopy({
+    const failure = activity === "copy"
+      ? await captureFailure(() => notifications.recordCopy({
         operationId: "notification-operation:foreign-copy",
         notificationId: notification.record.template.id,
         expectedRevision: notification.revision,
@@ -370,9 +370,8 @@ test("foreign notification copy and sent actors fail closed", async () => {
           copiedAt: "2026-08-12T12:10:00.000Z",
           copiedBy: { type: "owner", subject: FOREIGN_OWNER },
         },
-      });
-    } else {
-      await notifications.markSent({
+      }))
+      : await captureFailure(() => notifications.markSent({
         operationId: "notification-operation:foreign-sent",
         notificationId: notification.record.template.id,
         expectedRevision: notification.revision,
@@ -381,18 +380,13 @@ test("foreign notification copy and sent actors fail closed", async () => {
           sentAt: "2026-08-12T12:10:00.000Z",
           sentBy: { type: "owner", subject: FOREIGN_OWNER },
         },
-      });
-    }
-
-    const reviewId = await REVIEW_IDS.reviewIdForCurrentKey(
-      await ownerIndicationCurrentStorageKey(rejected.id),
-      OWNER,
-    );
-    const failure = await captureFailure(() =>
-      detailRepository(new MemoryStorageAdapter(state)).get(reviewId)
-    );
+      }));
     assert.equal(failure.code, "UNAVAILABLE");
     assert.doesNotMatch(String(failure), /foreign|owner|participant/iu);
+    const current = await notifications.get(notification.record.template.id);
+    assert.equal(current?.revision, 1);
+    assert.deepEqual(current?.record.copyEvidence, []);
+    assert.equal(current?.record.sentMarker, null);
   }
 });
 
@@ -429,9 +423,14 @@ test("v1 owner continuity rejects A-to-B activity after rotation to C", async ()
     evidence: {
       id: "notification-copy:intermediate-owner",
       copiedAt: "2026-08-12T12:10:00.000Z",
-      copiedBy: { type: "owner", subject: INTERMEDIATE_OWNER },
+      copiedBy: { type: "owner", subject: OWNER },
     },
   });
+  rewriteEveryNotificationActivityActor(
+    state,
+    "copy",
+    INTERMEDIATE_OWNER,
+  );
 
   for (const currentOwner of [INTERMEDIATE_OWNER, ROTATED_OWNER]) {
     const reviewId = await REVIEW_IDS.reviewIdForCurrentKey(key, currentOwner);
@@ -515,7 +514,10 @@ test("coherently rewritten copy and sent actors fail closed", async () => {
       });
     }
     rewriteEveryNotificationActivityActor(state, activity, FOREIGN_OWNER);
-    assert(await notifications.get(notification.record.template.id));
+    const repositoryFailure = await captureFailure(() =>
+      notifications.get(notification.record.template.id)
+    );
+    assert.equal(repositoryFailure.code, "UNAVAILABLE");
 
     const reviewId = await REVIEW_IDS.reviewIdForCurrentKey(
       await ownerIndicationCurrentStorageKey(rejected.id),
