@@ -42,7 +42,12 @@ import {
   type RuntimeCampaignPreview,
 } from "../http/runtime-preview.ts";
 import type { PublicCampaignPresentationReader } from "../repositories/in-memory-campaign-repository.ts";
-import type { FounderApplicationReviewCollectionRepository } from "../repositories/in-memory-founder-application-repository.ts";
+import type {
+  FounderApplicationReviewCollectionRepository,
+  FounderApplicationReviewDetailRepository,
+  FounderApplicationReviewListRequest,
+  FounderApplicationReviewRepository,
+} from "../repositories/in-memory-founder-application-repository.ts";
 import type {
   PublicCampaignStateReader,
   PublishedPublicCampaignState,
@@ -51,6 +56,7 @@ import type {
   ParticipantFounderApplicationRepositories,
   ParticipantRequestRepositoryScope,
 } from "../repositories/storage-application-repository-factory.ts";
+import type { ParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
 import {
   StorageFailure,
   parseStorageOperationId,
@@ -89,7 +95,11 @@ import {
   type OwnerAuditNotificationRouteDependencies,
 } from "./routes/owner-audit-notification-history.ts";
 import { createOwnerCampaignEditorRouteHandler } from "./routes/owner-campaign-editor.ts";
-import { createOwnerFounderReviewCollectionRouteHandler } from "./routes/owner-founder-review.ts";
+import {
+  createOwnerFounderReviewCollectionRouteHandler,
+  createOwnerFounderReviewDetailRouteHandler,
+  createOwnerFounderReviewRouteHandler,
+} from "./routes/owner-founder-review.ts";
 import { createOwnerInitialSetupRouteHandler } from "./routes/owner-initial-setup.ts";
 import { createOwnerRouteHandler } from "./routes/owner.ts";
 import {
@@ -149,6 +159,7 @@ export type ApplicationWorkerDependencies = Readonly<{
   ownerReviewExports?: OwnerReviewExportRouteDependencies;
   ownerAuditHistory?: OwnerAuditHistoryRouteDependencies;
   ownerFounderReview?: FounderApplicationReviewCollectionRepository;
+  ownerFounderReviewDetail?: FounderApplicationReviewDetailRepository;
   ownerAuditNotificationHistory?: OwnerAuditNotificationRouteDependencies;
   ownerAggregateReconciliation?: OwnerAggregateReconciliationRouteOptions;
   participantFounderInterest?: FounderInterestRouteDependencies;
@@ -262,6 +273,12 @@ export function createApplicationWorker(
           runtimeOwnerFounderReview(applicationRuntime)
         : undefined;
       const ownerFounderReviewAvailable = ownerFounderReview !== undefined;
+      const ownerFounderReviewDetail = dependencies.dispatchRoute === undefined
+        ? dependencies.ownerFounderReviewDetail ??
+          runtimeOwnerFounderReviewDetail(applicationRuntime)
+        : undefined;
+      const ownerFounderReviewDetailAvailable =
+        ownerFounderReviewDetail !== undefined;
       const participantInvestmentInterestsAvailable =
         dependencies.dispatchRoute === undefined &&
         dependencies.participantInvestmentInterests !== undefined;
@@ -415,6 +432,7 @@ export function createApplicationWorker(
         ownerReviewExportsAvailable ||
         ownerAuditHistoryAvailable ||
         ownerFounderReviewAvailable ||
+        ownerFounderReviewDetailAvailable ||
         ownerAggregateReconciliation !== undefined ||
         participantFounderInterestAvailable ||
         participantInvestmentInterestsAvailable ||
@@ -431,6 +449,7 @@ export function createApplicationWorker(
               ownerIndicationModeration,
               ownerAuditHistory,
               ownerFounderReview,
+              ownerFounderReviewDetail,
               ownerAuditNotificationHistory,
               ownerAggregateReconciliation,
               participantFounderInterest ?? null,
@@ -513,6 +532,31 @@ type ResolvedPackageRoutes = Readonly<{
   participantAcknowledgment?: ParticipantPackageAcknowledgmentRouteDependencies;
 }>;
 
+function ownerFounderReviewRouteHandlers(
+  collection: FounderApplicationReviewCollectionRepository | undefined,
+  detail: FounderApplicationReviewDetailRepository | undefined,
+): readonly ApplicationRouteHandler[] {
+  if (collection !== undefined && detail !== undefined) {
+    const repository: FounderApplicationReviewRepository = Object.freeze({
+      list: (request: FounderApplicationReviewListRequest) =>
+        collection.list(request),
+      get: (reviewId: unknown) => detail.get(reviewId),
+    });
+    return Object.freeze([createOwnerFounderReviewRouteHandler(repository)]);
+  }
+  if (collection !== undefined) {
+    return Object.freeze([
+      createOwnerFounderReviewCollectionRouteHandler(collection),
+    ]);
+  }
+  if (detail !== undefined) {
+    return Object.freeze([
+      createOwnerFounderReviewDetailRouteHandler(detail),
+    ]);
+  }
+  return Object.freeze([]);
+}
+
 function createInjectedRouteDispatcher(
   dependencies: ApplicationWorkerDependencies,
   campaignWorkspace: CampaignWorkspaceDeploymentCapability | null,
@@ -525,6 +569,9 @@ function createInjectedRouteDispatcher(
   ownerAuditHistory: OwnerAuditHistoryRouteDependencies | undefined,
   ownerFounderReview:
     | FounderApplicationReviewCollectionRepository
+    | undefined,
+  ownerFounderReviewDetail:
+    | FounderApplicationReviewDetailRepository
     | undefined,
   ownerAuditNotificationHistory:
     OwnerAuditNotificationRouteDependencies | undefined,
@@ -597,11 +644,10 @@ function createInjectedRouteDispatcher(
           : ownerAuditHistory
           ? [createOwnerAuditHistoryRouteHandler(ownerAuditHistory)]
           : []),
-        ...(ownerFounderReview
-          ? [createOwnerFounderReviewCollectionRouteHandler(
-              ownerFounderReview,
-            )]
-          : []),
+        ...ownerFounderReviewRouteHandlers(
+          ownerFounderReview,
+          ownerFounderReviewDetail,
+        ),
         ...(ownerAggregateReconciliation
           ? [createOwnerAggregateReconciliationRouteHandler(
               ownerAggregateReconciliation,
@@ -1256,6 +1302,17 @@ function runtimeOwnerAuditNotificationHistory(
         randomOperationId("manual-notification-activity"),
       now: runtime.now,
     });
+  } catch {
+    return undefined;
+  }
+}
+
+function runtimeOwnerFounderReviewDetail(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+): FounderApplicationReviewDetailRepository | undefined {
+  if (runtime === null) return undefined;
+  try {
+    return runtime.repositoryFactory.ownerFounderApplicationReviewDetail();
   } catch {
     return undefined;
   }

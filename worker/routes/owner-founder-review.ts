@@ -28,6 +28,7 @@ import {
 export const OWNER_FOUNDER_REVIEW_COLLECTION_PATH =
   "/owner/founder-applications";
 const DEFAULT_PAGE_SIZE = 25;
+const REVIEW_ID_PATTERN = /^founder-review:[0-9a-f]{64}$/u;
 
 export function createOwnerFounderReviewCollectionRouteHandler(
   repository: FounderApplicationReviewCollectionRepository,
@@ -114,7 +115,7 @@ function createFounderReviewHandler(
       }
 
       if (detail === null) return null;
-      if (context.url.search !== "") {
+      if (route.reviewId === null || context.url.search !== "") {
         throw new StorageFailure("INVALID_REQUEST");
       }
       const item = await detail.get(route.reviewId);
@@ -152,7 +153,7 @@ function createFounderReviewHandler(
 
 type FounderReviewRoute =
   | Readonly<{ kind: "collection" }>
-  | Readonly<{ kind: "detail"; reviewId: string }>;
+  | Readonly<{ kind: "detail"; reviewId: string | null }>;
 
 function parseRoute(
   url: URL,
@@ -171,9 +172,12 @@ function parseRoute(
   try {
     reviewId = decodeURIComponent(encoded);
   } catch {
-    return { kind: "detail", reviewId: "invalid" };
+    return { kind: "detail", reviewId: null };
   }
-  return { kind: "detail", reviewId };
+  return {
+    kind: "detail",
+    reviewId: REVIEW_ID_PATTERN.test(reviewId) ? reviewId : null,
+  };
 }
 
 function parsePageRequest(
@@ -226,7 +230,7 @@ function safeFounderReviewResourceUrl(
   safe.pathname = route.kind === "collection"
     ? OWNER_FOUNDER_REVIEW_COLLECTION_PATH
     : `${OWNER_FOUNDER_REVIEW_COLLECTION_PATH}/${
-      encodeURIComponent(route.reviewId)
+      encodeURIComponent(route.reviewId ?? "invalid")
     }`;
   safe.search = "";
   safe.hash = "";

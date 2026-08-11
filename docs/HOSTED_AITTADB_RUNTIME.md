@@ -8,13 +8,12 @@ token provider, one bounded AittaDB `StorageAdapter`, one backend repository
 factory, and one browser-mutation session per immutable Sites environment.
 
 The runtime now composes named persistent campaign, package, participant-access,
-participant founder-application, owner founder-review collection, owner audit,
-owner manual-notification, and owner aggregate-reconciliation capabilities over
-that adapter.
-`createApplicationWorker` installs
+participant founder-application, owner founder-review collection and detail,
+owner audit, owner manual-notification, and owner aggregate-reconciliation
+capabilities over that adapter. `createApplicationWorker` installs
 `/owner/setup`, campaign editing, draft preview, publish/unpublish, owner package
-management, the exact founder-review collection, and aggregate reconciliation
-only in the
+management, the founder-review collection and detail resources, notification
+history, and aggregate reconciliation only in the
 configured-owner route group. For a signed-in
 non-owner, it derives the trusted `participantAccess` projection from that
 subject's persistent profile, current package, and current acknowledgment gate.
@@ -172,12 +171,11 @@ redirect and carry the bearer value only to the validated transport target.
 adapter and exposes only named, narrow capability methods for browser-mutation
 replay, the atomic campaign/audit repository, the public campaign projection
 reader, the owner package workspace, the owner-bound indication-review
-collection, the bounded owner founder-review collection, the immutable audit
-reader, the atomic manual-notification activity repository, a participant
-package reader, subject-bound package acknowledgment, one participant-access
-state reader, and one participant-bound founder campaign/profile/application
-scope.
-Its owner aggregate method
+collection, the bounded owner founder-review collection and direct detail
+lookup, the immutable audit reader, the atomic manual-notification activity
+repository, a participant package reader, subject-bound package acknowledgment,
+one participant-access state reader, and one participant-bound founder
+campaign/profile/application scope. Its owner aggregate method
 accepts the complete immutable campaign revision rather than a detached currency
 value and returns a fresh configured-owner-bound capability with only preview
 and atomic audited correction operations. It exposes no adapter, generic
@@ -214,15 +212,23 @@ backend cursor, decrypted current-record key, or adapter enters runtime
 configuration output, campaign content, rendering, logs, or browser-visible
 failures.
 
-The owner founder-review capability is a singleton read port with only `list`.
-It exposes neither the adapter nor a detail lookup. Each request lists at most 25
-current founder records, binds each to its immutable terminal transition, and
-validates each current field payload within a fixed 325-record-read ceiling. It
-returns only one-way review identifiers and the
-collection summary allowlist. A new factory can continue an existing AittaDB
-cursor after a Worker restart. AittaDB's validated cursor contract keeps
-principal, namespace, and physical-key data out of that continuation; the
-Worker does not log or decode it.
+Owner founder review uses two independent singleton read ports. The collection
+port exposes only `list`; each request lists at most 25 current founder records,
+binds each to its immutable terminal transition, and validates each current
+field payload within a fixed 325-record-read ceiling. It returns only one-way
+review identifiers and the collection summary allowlist. A new factory can
+continue an existing AittaDB cursor after a Worker restart. AittaDB's validated
+cursor contract keeps principal, namespace, and physical-key data out of that
+continuation; the Worker does not log or decode it.
+
+The detail port exposes only `get`. It maps one valid one-way review identifier
+to one current-record key without listing, then reconstructs and verifies the
+bounded immutable application ancestry within a fixed 210-record-read ceiling.
+Malformed identifiers read nothing and missing identifiers read only the
+derived current key. Hosted routing composes the two ports so a collection item
+links to its available detail while either port remains independently testable.
+Anonymous and non-owner callers are rejected before either founder-review port
+is invoked.
 
 `StorageCampaignRepository` is production-neutral and retains no state outside
 its supplied adapter. `StorageFounderApplicationRepository` follows the same

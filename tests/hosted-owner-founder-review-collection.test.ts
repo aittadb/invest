@@ -6,10 +6,16 @@ import {
   type ContributionAreaChoice,
 } from "../domain/founder-application.ts";
 import { parseActorSubject, type ActorSubject } from "../domain/foundation.ts";
-import type { OwnerFounderReviewCollectionDocument } from "../domain/owner-founder-review-resource.ts";
+import type {
+  OwnerFounderReviewCollectionDocument,
+  OwnerFounderReviewDetailDocument,
+} from "../domain/owner-founder-review-resource.ts";
 import { OWNER_FOUNDER_REVIEW_HEADER } from "../http/runtime-capabilities.ts";
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
-import { StorageFounderApplicationRepository } from "../repositories/in-memory-founder-application-repository.ts";
+import {
+  MAX_FOUNDER_APPLICATION_REVIEW_DETAIL_RECORD_READS,
+  StorageFounderApplicationRepository,
+} from "../repositories/in-memory-founder-application-repository.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
 import type {
   InvestorAppEnv,
@@ -197,9 +203,245 @@ test("hosted collection authorization and owner discovery are non-disclosing", a
   );
 });
 
+test("hosted owner founder detail preserves lifecycle parity across restart", async () => {
+  const service = storageService();
+  const participant = await seedApplication(
+    storageAdapter(service),
+    ALICE,
+    "alice-detail",
+    "area:engineering",
+  );
+  const edited = await participant.edit({
+    operationId: "founder-operation:hosted-review-alice-detail-edit",
+    expectedRevision: 1,
+    id: "founder-application:self",
+    occurredAt: "2026-08-10T11:00:00.000Z",
+    historyEntryId: "founder-history:hosted-review-alice-detail-edit",
+    fields: founderFields("area:product"),
+  });
+  assert.equal(edited.revision, 2);
+  const withdrawn = await participant.withdraw({
+    operationId: "founder-operation:hosted-review-alice-detail-withdraw",
+    expectedRevision: 2,
+    id: "founder-application:self",
+    occurredAt: "2026-08-10T12:00:00.000Z",
+    historyEntryId: "founder-history:hosted-review-alice-detail-withdraw",
+  });
+  assert.equal(withdrawn.revision, 3);
+
+  const env = configuredEnvironment();
+  const worker = hostedWorker(service, []);
+  const collectionResponse = await worker.fetch(
+    ownerRequest("/owner/founder-applications?page_size=1"),
+    env,
+    executionContext,
+  );
+  const collection = await collectionResponse.json() as
+    OwnerFounderReviewCollectionDocument;
+  const itemLink = collection.links.find((link) => link.rel.includes("item"));
+  assert(itemLink);
+  assert.equal(itemLink.href.includes(ALICE), false);
+  const detailUrl = new URL(itemLink.href);
+  assert.match(
+    detailUrl.pathname,
+    /^\/owner\/founder-applications\/founder-review%3A[0-9a-f]{64}$/u,
+  );
+
+  const readStart = service.readKeys.length;
+  const listStart = service.listCollections.length;
+  const jsonResponse = await worker.fetch(
+    ownerRequest(detailUrl.pathname),
+    env,
+    executionContext,
+  );
+  assert.equal(jsonResponse.status, 200);
+  assert.equal(jsonResponse.headers.get("cache-control"), "no-store");
+  assert.equal(jsonResponse.headers.get("referrer-policy"), "no-referrer");
+  const detail = await jsonResponse.json() as OwnerFounderReviewDetailDocument;
+  assert.equal(detail.id, collection.data.items[0]?.review_id);
+  assert.equal(detail.data.status, "withdrawn");
+  assert.equal(detail.data.revision, 3);
+  assert.equal(detail.data.primary_contribution_area_id, "area:product");
+  assert.equal(detail.data.note, PRIVATE_NOTE);
+  assert.deepEqual(
+    detail.data.history.map((entry) => entry.transition),
+    ["created", "edited", "withdrawn"],
+  );
+  assert.equal(detail.links.some((link) =>
+    link.rel.includes("collection") &&
+    link.href === `${APP_ORIGIN}/owner/founder-applications`
+  ), true);
+  for (const hidden of [ALICE, OWNER_SUBJECT, OWNER_EMAIL]) {
+    assert.equal(JSON.stringify(detail).includes(hidden), false);
+    assert.equal(itemLink.href.includes(hidden), false);
+  }
+  assert.equal(service.listCollections.length, listStart);
+  assert.ok(
+    service.readKeys.length - readStart <=
+      MAX_FOUNDER_APPLICATION_REVIEW_DETAIL_RECORD_READS,
+  );
+
+  const htmlReadStart = service.readKeys.length;
+  const htmlResponse = await worker.fetch(
+    ownerRequest(detailUrl.pathname, "text/html"),
+    env,
+    executionContext,
+  );
+  const html = await htmlResponse.text();
+  assert.equal(htmlResponse.status, 200);
+  assert.match(html, /Founder application/u);
+  assert.match(html, /Experience developing hosted data products\./u);
+  assert.match(html, /area:product/u);
+  assert.match(html, /Private hosted founder note must stay out of summaries\./u);
+  assert.match(html, /created/u);
+  assert.match(html, /edited/u);
+  assert.match(html, /withdrawn/u);
+  assert.doesNotMatch(html, /sites-founder-|sites-owner-subject|owner@example/u);
+  assert.ok(
+    service.readKeys.length - htmlReadStart <=
+      MAX_FOUNDER_APPLICATION_REVIEW_DETAIL_RECORD_READS,
+  );
+
+  const restartedWorker = hostedWorker(service, []);
+  const restartReadStart = service.readKeys.length;
+  const restartedResponse = await restartedWorker.fetch(
+    ownerRequest(detailUrl.pathname),
+    env,
+    executionContext,
+  );
+  assert.equal(restartedResponse.status, 200);
+  assert.deepEqual(await restartedResponse.json(), detail);
+  assert.ok(
+    service.readKeys.length - restartReadStart <=
+      MAX_FOUNDER_APPLICATION_REVIEW_DETAIL_RECORD_READS,
+  );
+});
+
+test("hosted founder detail denials and invalid IDs do not disclose or read", async () => {
+  const service = storageService();
+  await seedApplication(
+    storageAdapter(service),
+    ALICE,
+    "alice-denial",
+    "area:engineering",
+  );
+  const env = configuredEnvironment();
+  const worker = hostedWorker(service, []);
+  const collectionResponse = await worker.fetch(
+    ownerRequest("/owner/founder-applications?page_size=1"),
+    env,
+    executionContext,
+  );
+  const collection = await collectionResponse.json() as
+    OwnerFounderReviewCollectionDocument;
+  const itemLink = collection.links.find((link) => link.rel.includes("item"));
+  assert(itemLink);
+  const detailPath = new URL(itemLink.href).pathname;
+  const deniedReadStart = founderApplicationReadCount(service);
+
+  const anonymous = await worker.fetch(
+    new Request(new URL(detailPath, APP_ORIGIN), {
+      headers: { accept: "application/json" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(anonymous.status, 401);
+  assert.doesNotMatch(await anonymous.text(), /sites-founder-|Private hosted/u);
+
+  const foreign = await worker.fetch(
+    new Request(new URL(detailPath, APP_ORIGIN), {
+      headers: {
+        accept: "text/html",
+        "oai-authenticated-user-id": "sites-foreign-user",
+        "oai-authenticated-user-email": "foreign@example.test",
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(foreign.status, 404);
+  assert.doesNotMatch(await foreign.text(), /sites-founder-|Private hosted/u);
+  assert.equal(founderApplicationReadCount(service), deniedReadStart);
+
+  const malformed = await worker.fetch(
+    ownerRequest(
+      `/owner/founder-applications/${encodeURIComponent(ALICE)}`,
+    ),
+    env,
+    executionContext,
+  );
+  assert.equal(malformed.status, 400);
+  const malformedBody = await malformed.text();
+  assert.doesNotMatch(malformedBody, /sites-founder-|Private hosted/u);
+  assert.match(malformedBody, /owner\/founder-applications\/invalid/u);
+  assert.equal(founderApplicationReadCount(service), deniedReadStart);
+
+  const missingId = `founder-review:${"f".repeat(64)}`;
+  const missing = await worker.fetch(
+    ownerRequest(
+      `/owner/founder-applications/${encodeURIComponent(missingId)}`,
+    ),
+    env,
+    executionContext,
+  );
+  assert.equal(missing.status, 404);
+  const missingBody = await missing.text();
+  assert.equal(missingBody.includes(PRIVATE_NOTE), false);
+  assert.equal(missingBody.includes(ALICE), false);
+  assert.equal(founderApplicationReadCount(service), deniedReadStart + 1);
+});
+
+test("hosted founder detail maps corrupt persistent data to a finite error", async () => {
+  const service = storageService();
+  await seedApplication(
+    storageAdapter(service),
+    ALICE,
+    "alice-corrupt",
+    "area:engineering",
+  );
+  const env = configuredEnvironment();
+  const normalWorker = hostedWorker(service, []);
+  const collectionResponse = await normalWorker.fetch(
+    ownerRequest("/owner/founder-applications?page_size=1"),
+    env,
+    executionContext,
+  );
+  const collection = await collectionResponse.json() as
+    OwnerFounderReviewCollectionDocument;
+  const itemLink = collection.links.find((link) => link.rel.includes("item"));
+  assert(itemLink);
+
+  const corruptSubject = "sites-founder-corrupt-crossed-record";
+  const corruptWorker = hostedWorker(
+    service,
+    [],
+    corruptCurrentFounderRecordFetch(service, corruptSubject),
+  );
+  const readStart = service.readKeys.length;
+  const listStart = service.listCollections.length;
+  const response = await corruptWorker.fetch(
+    ownerRequest(new URL(itemLink.href).pathname),
+    env,
+    executionContext,
+  );
+  const body = await response.text();
+  assert.equal(response.status, 503);
+  assert.match(body, /temporarily_unavailable/u);
+  for (const hidden of [ALICE, corruptSubject, PRIVATE_NOTE]) {
+    assert.equal(body.includes(hidden), false);
+  }
+  assert.equal(service.listCollections.length, listStart);
+  assert.ok(
+    service.readKeys.length - readStart <=
+      MAX_FOUNDER_APPLICATION_REVIEW_DETAIL_RECORD_READS,
+  );
+});
+
 function hostedWorker(
   service: SyntheticAittaDBStorageService,
   renderedRequests: Request[],
+  applicationFetch: typeof globalThis.fetch = service.fetch,
 ) {
   return createApplicationWorker({
     fetchApplication: async (request) => {
@@ -208,7 +450,7 @@ function hostedWorker(
     },
     fetchOptimizedImage: async () => new Response("image"),
     resolveApplicationRuntime: createHostedApplicationRuntimeResolver({
-      fetch: service.fetch,
+      fetch: applicationFetch,
       now: () => NOW,
       randomBytes(length) {
         return Uint8Array.from({ length }, (_, index) => (index + 17) % 256);
@@ -232,7 +474,7 @@ async function seedApplication(
   applicantSubject: ActorSubject,
   suffix: string,
   primaryContributionAreaId: string,
-): Promise<void> {
+): Promise<StorageFounderApplicationRepository> {
   const repository = new StorageFounderApplicationRepository(
     storage,
     applicantSubject,
@@ -244,19 +486,58 @@ async function seedApplication(
     id: "founder-application:self",
     occurredAt: "2026-08-10T10:00:00.000Z",
     historyEntryId: `founder-history:hosted-review-${suffix}`,
-    fields: {
-      expertiseSummary: "Experience developing hosted data products.",
-      intendedContribution: "Contribute to focused product delivery.",
-      primaryContributionAreaId,
-      secondaryContributionAreaIds: [],
-      approximateAvailability: "Two days each week.",
-      possibleStartTiming: "After mutual confirmation.",
-      compensationExpectation: "Open to discussion.",
-      professionalProfileLinks: [],
-      note: PRIVATE_NOTE,
-    },
+    fields: founderFields(primaryContributionAreaId),
   });
   assert.equal(result.revision, 1);
+  return repository;
+}
+
+function founderFields(primaryContributionAreaId: string) {
+  return {
+    expertiseSummary: "Experience developing hosted data products.",
+    intendedContribution: "Contribute to focused product delivery.",
+    primaryContributionAreaId,
+    secondaryContributionAreaIds: [],
+    approximateAvailability: "Two days each week.",
+    possibleStartTiming: "After mutual confirmation.",
+    compensationExpectation: "Open to discussion.",
+    professionalProfileLinks: [],
+    note: PRIVATE_NOTE,
+  };
+}
+
+function corruptCurrentFounderRecordFetch(
+  service: SyntheticAittaDBStorageService,
+  corruptSubject: string,
+): typeof globalThis.fetch {
+  return async (input, init) => {
+    const request = new Request(input, init);
+    const response = await service.fetch(request);
+    const pathname = new URL(request.url).pathname;
+    if (
+      request.method !== "GET" ||
+      !pathname.startsWith("/records/founder-applications/") ||
+      response.status !== 200
+    ) {
+      return response;
+    }
+    const document = await response.json() as {
+      data: { value: Record<string, unknown> };
+    };
+    document.data.value.applicantSubject = corruptSubject;
+    return new Response(JSON.stringify(document), {
+      status: response.status,
+      headers: response.headers,
+    });
+  };
+}
+
+function founderApplicationReadCount(
+  service: SyntheticAittaDBStorageService,
+): number {
+  return service.readKeys.filter((storageKey) =>
+    storageKey.startsWith("founder-applications/")
+  ).length;
 }
 
 function storageService(): SyntheticAittaDBStorageService {

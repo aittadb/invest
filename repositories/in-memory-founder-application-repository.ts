@@ -2487,19 +2487,6 @@ function storageCollection(value: string): StorageCollection {
   return parsed.value;
 }
 
-function requiredStorageAdapter(value: unknown): StorageAdapter {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    typeof (value as StorageAdapter).read !== "function" ||
-    typeof (value as StorageAdapter).list !== "function" ||
-    typeof (value as StorageAdapter).transact !== "function"
-  ) {
-    invalidRequest();
-  }
-  return value as StorageAdapter;
-}
-
 function requiredActorSubject(value: unknown): ActorSubject {
   const parsed = parseActorSubject(value);
   if (!parsed.ok) invalidRequest();

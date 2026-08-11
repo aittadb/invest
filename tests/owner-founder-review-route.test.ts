@@ -300,6 +300,19 @@ test("detail-only routing exposes no collection or unauthorized lookup", async (
   assert.equal((await queried.text()).includes(PRIVATE_NOTE), false);
   assert.equal(repository.getCalls, 1);
 
+  const privateSubject = "issuer.invalid/subject:must-not-be-reflected";
+  const malformed = await requiredResponse(await handler(context(
+    `https://invest.example/owner/founder-applications/${
+      encodeURIComponent(privateSubject)
+    }`,
+    { accept: "application/json" },
+  )));
+  const malformedBody = await malformed.text();
+  assert.equal(malformed.status, 400);
+  assert.equal(malformedBody.includes(privateSubject), false);
+  assert.match(malformedBody, /owner\/founder-applications\/invalid/u);
+  assert.equal(repository.getCalls, 1);
+
   for (const options of [
     { actor: null, isOwner: false },
     { actor: participantActor(), isOwner: false },
