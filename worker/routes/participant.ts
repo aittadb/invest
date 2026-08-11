@@ -7,6 +7,7 @@ import {
 
 export {
   createFounderInterestRouteHandler,
+  founderWithdrawalReplayScopeFor,
   MAX_FOUNDER_INTEREST_MUTATION_BYTES,
   MAX_FOUNDER_INTEREST_MUTATION_FIELDS,
   type FounderInterestRouteDependencies,

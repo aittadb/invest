@@ -25,6 +25,7 @@ const COOKIE_PAIR_MAX_COUNT = 128;
 const COOKIE_PAIR_MAX_LENGTH = 4_096;
 const COOKIE_VALUE_MAX_LENGTH = 2_048;
 const COOKIE_PLAINTEXT_MAX_BYTES = 1_024;
+const EXACT_REPLAY_SCOPE_MAX_BYTES = 512;
 const MIN_SESSION_TTL_SECONDS = 60;
 const MAX_SESSION_TTL_SECONDS = 600;
 const CAPABILITY_ID_BYTES = 16;
@@ -71,11 +72,16 @@ export type BrowserMutationPreReplayValidator = (
   request: VerifiedMutationRequest,
 ) => boolean;
 
+export type BrowserMutationExactReplayScopeResolver = (
+  request: VerifiedMutationRequest,
+) => string | null;
+
 export type BrowserMutationVerificationLimits = Readonly<{
   maxBodyBytes?: number;
   maxFields?: number;
   repeatedFormFields?: readonly string[];
   validateBeforeReplayClaim?: BrowserMutationPreReplayValidator;
+  exactReplayScopeFor?: BrowserMutationExactReplayScopeResolver;
 }>;
 
 export type BrowserMutationSessionDependencies = Readonly<{
@@ -96,6 +102,12 @@ export interface BrowserMutationSession {
     request: Request,
     identity: TrustedSitesMutationIdentity | null,
     appOrigin: string,
+  ): Promise<BrowserMutationProof>;
+  issueExactReplay(
+    request: Request,
+    identity: TrustedSitesMutationIdentity | null,
+    appOrigin: string,
+    scope: string,
   ): Promise<BrowserMutationProof>;
   verifyMutation(
     request: Request,
@@ -125,7 +137,10 @@ type EncryptedSession = Readonly<{
   issuedAt: number;
   expiresAt: number;
   tokenHash: CsrfTokenHash;
+  exactReplayScopeHash: ExactReplayScopeHash | null;
 }>;
+
+type ExactReplayScopeHash = `sha256:${string}`;
 
 type ParsedCapabilityToken = Readonly<{
   capabilityId: string;
@@ -173,6 +188,56 @@ export function createBrowserMutationSession(
         issuedAt,
         expiresAt,
         tokenHash,
+        exactReplayScopeHash: null,
+      });
+      const expiresAtTimestamp = timestampFromEpochSeconds(expiresAt);
+      const cookieName = sessionCookieName(config, capabilityId);
+
+      return Object.freeze({
+        token,
+        expiresAt: expiresAtTimestamp,
+        setCookie: sessionCookie(
+          cookieName,
+          encrypted,
+          config.ttlSeconds,
+        ),
+      });
+    },
+
+    async issueExactReplay(
+      request: Request,
+      identity: TrustedSitesMutationIdentity | null,
+      appOriginValue: string,
+      scope: string,
+    ) {
+      const actor = requiredContext(
+        config,
+        request,
+        identity,
+        appOriginValue,
+      );
+      const exactReplayScopeHash = await hashExactReplayScope(scope);
+      const issuedAt = currentEpochSeconds(config.now);
+      const expiresAt = issuedAt + config.ttlSeconds;
+      if (!Number.isSafeInteger(expiresAt)) unavailable();
+
+      const capabilityId = randomBase64Url(
+        config.randomBytes,
+        CAPABILITY_ID_BYTES,
+      );
+      const token = capabilityId + randomBase64Url(
+        config.randomBytes,
+        CSRF_SECRET_BYTES,
+      );
+      const tokenHash = await hashCsrfToken(token);
+      const encrypted = await encryptSession(config, {
+        capabilityId,
+        actor,
+        appOrigin: config.appOrigin,
+        issuedAt,
+        expiresAt,
+        tokenHash,
+        exactReplayScopeHash,
       });
       const expiresAtTimestamp = timestampFromEpochSeconds(expiresAt);
       const cookieName = sessionCookieName(config, capabilityId);
@@ -258,6 +323,23 @@ export function createBrowserMutationSession(
         }
         if (!accepted) throw new MutationSecurityFailure("INVALID_REQUEST");
       }
+      if (encryptedSession.exactReplayScopeHash !== null) {
+        const resolver = verification.exactReplayScopeFor;
+        if (resolver === undefined) rejectRequest();
+        let scope: unknown;
+        try {
+          scope = resolver(verified);
+        } catch {
+          throw new MutationSecurityFailure("INVALID_REQUEST");
+        }
+        if (
+          typeof scope !== "string" ||
+          await hashExactReplayScope(scope) !==
+            encryptedSession.exactReplayScopeHash
+        ) {
+          throw new MutationSecurityFailure("INVALID_REQUEST");
+        }
+      }
 
       const capabilityId = await replayCapabilityId(
         config,
@@ -294,12 +376,14 @@ function verificationLimits(
   maxFields: number;
   repeatedFormFields: readonly string[];
   validateBeforeReplayClaim: BrowserMutationPreReplayValidator | undefined;
+  exactReplayScopeFor: BrowserMutationExactReplayScopeResolver | undefined;
 }> {
   const maxBodyBytes = input.maxBodyBytes ?? config.maxBodyBytes;
   const maxFields = input.maxFields ?? config.maxFields;
   const repeatedFormFields = input.repeatedFormFields ??
     config.repeatedFormFields;
   const validateBeforeReplayClaim = input.validateBeforeReplayClaim;
+  const exactReplayScopeFor = input.exactReplayScopeFor;
   if (
     !Number.isSafeInteger(maxBodyBytes) ||
     maxBodyBytes < 1 ||
@@ -312,7 +396,9 @@ function verificationLimits(
       !config.repeatedFormFields.includes(field)
     ) ||
     (validateBeforeReplayClaim !== undefined &&
-      typeof validateBeforeReplayClaim !== "function")
+      typeof validateBeforeReplayClaim !== "function") ||
+    (exactReplayScopeFor !== undefined &&
+      typeof exactReplayScopeFor !== "function")
   ) {
     unavailable();
   }
@@ -333,6 +419,7 @@ function verificationLimits(
     maxFields,
     repeatedFormFields: Object.freeze([...repeatedFormFields]),
     validateBeforeReplayClaim,
+    exactReplayScopeFor,
   });
 }
 
@@ -456,7 +543,7 @@ async function encryptSession(
   const cookieName = sessionCookieName(config, session.capabilityId);
   const iv = checkedRandomBytes(config.randomBytes, AES_GCM_IV_BYTES);
   const plaintext = new TextEncoder().encode(JSON.stringify({
-    v: 1,
+    v: session.exactReplayScopeHash === null ? 1 : 2,
     c: session.capabilityId,
     t: session.actor.type,
     s: session.actor.subject,
@@ -464,6 +551,9 @@ async function encryptSession(
     i: session.issuedAt,
     e: session.expiresAt,
     h: session.tokenHash,
+    ...(session.exactReplayScopeHash === null
+      ? {}
+      : { r: session.exactReplayScopeHash }),
   }));
   if (plaintext.byteLength > COOKIE_PLAINTEXT_MAX_BYTES) unavailable();
 
@@ -535,11 +625,17 @@ async function decryptSession(
 
 function parseEncryptedSession(value: unknown): EncryptedSession {
   if (!isRecord(value)) rejectRequest();
-  const expected = ["v", "c", "t", "s", "o", "i", "e", "h"];
+  const legacyKeys = ["v", "c", "t", "s", "o", "i", "e", "h"];
+  const exactReplayKeys = [...legacyKeys, "r"];
+  const expected = value.v === 1
+    ? legacyKeys
+    : value.v === 2
+    ? exactReplayKeys
+    : [];
   if (
+    expected.length === 0 ||
     Object.keys(value).length !== expected.length ||
     expected.some((key) => !(key in value)) ||
-    value.v !== 1 ||
     typeof value.c !== "string" ||
     !isCapabilityId(value.c) ||
     (value.t !== "participant" && value.t !== "owner") ||
@@ -549,7 +645,10 @@ function parseEncryptedSession(value: unknown): EncryptedSession {
     (value.i as number) < 0 ||
     (value.e as number) < 0 ||
     typeof value.h !== "string" ||
-    !/^sha256:[0-9a-f]{64}$/.test(value.h)
+    !/^sha256:[0-9a-f]{64}$/.test(value.h) ||
+    (value.v === 2 &&
+      (typeof value.r !== "string" ||
+        !/^sha256:[0-9a-f]{64}$/.test(value.r)))
   ) {
     rejectRequest();
   }
@@ -563,6 +662,9 @@ function parseEncryptedSession(value: unknown): EncryptedSession {
     issuedAt: value.i as number,
     expiresAt: value.e as number,
     tokenHash: value.h as CsrfTokenHash,
+    exactReplayScopeHash: value.v === 2
+      ? value.r as ExactReplayScopeHash
+      : null,
   });
 }
 
@@ -760,6 +862,23 @@ async function replayCapabilityId(
   return `browser-mutation:v1:${base64Url(new Uint8Array(digest))}`;
 }
 
+async function hashExactReplayScope(
+  value: unknown,
+): Promise<ExactReplayScopeHash> {
+  if (typeof value !== "string") rejectRequest();
+  const encoded = new TextEncoder().encode(value);
+  if (encoded.byteLength < 1 || encoded.byteLength > EXACT_REPLAY_SCOPE_MAX_BYTES) {
+    rejectRequest();
+  }
+  let digest: ArrayBuffer;
+  try {
+    digest = await crypto.subtle.digest("SHA-256", exactArrayBuffer(encoded));
+  } catch {
+    unavailable();
+  }
+  return `sha256:${hex(new Uint8Array(digest))}`;
+}
+
 async function readBoundedBody(
   request: Request,
   maximum: number,
@@ -862,6 +981,12 @@ function randomBase64Url(
   length: number,
 ): string {
   return base64Url(checkedRandomBytes(randomBytes, length));
+}
+
+function hex(bytes: Uint8Array): string {
+  return [...bytes]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function base64Url(bytes: Uint8Array): string {

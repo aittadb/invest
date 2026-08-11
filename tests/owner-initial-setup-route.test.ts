@@ -881,6 +881,13 @@ function mutationSession(
         setCookie: "__Host-test_setup=proof; Path=/; Secure; HttpOnly; SameSite=Lax",
       });
     },
+    async issueExactReplay() {
+      return Object.freeze({
+        token: CSRF_TOKEN,
+        expiresAt: expiresAt.value,
+        setCookie: "__Host-test_setup=proof; Path=/; Secure; HttpOnly; SameSite=Lax",
+      });
+    },
     async verifyMutation(
       request: Request,
       _identity: unknown,

@@ -8,9 +8,12 @@ import { parseActorSubject, type ActorSubject } from "../../domain/foundation.ts
 import {
   FOUNDER_INTEREST_PATH,
   FOUNDER_SECONDARY_AREAS_FIELD,
+  FOUNDER_WITHDRAWAL_REPLAY_ACTION,
   MAX_PROFILE_LINK_FORM_BYTES,
   createFounderInterestCapabilityModel,
+  founderTerminalWithdrawalReplay,
   type FounderInterestCapabilityModel,
+  type FounderTerminalWithdrawalReplay,
 } from "../../domain/participant-founder-interest-resource.ts";
 import {
   INVESTOR_APP_API_VERSION,
@@ -115,6 +118,7 @@ export const MAX_FOUNDER_INTEREST_MUTATION_BYTES =
 export type FounderInterestCsrfTokenProvider = (
   request: Request,
   actorSubject: ActorSubject,
+  exactReplayScope: string | null,
 ) =>
   | string
   | BrowserMutationProof
@@ -124,6 +128,9 @@ export type FounderInterestCsrfTokenProvider = (
 export type FounderInterestMutationVerifier = (
   request: Request,
 ) => Promise<VerifiedMutationRequest & Readonly<{ clearCookie: string }>>;
+
+const FOUNDER_WITHDRAWAL_REPLAY_SCOPE_PREFIX =
+  "participant-founder-withdrawal-replay:v1";
 
 export type FounderInterestRouteDependencies = Readonly<{
   serviceFor: ParticipantFounderInterestServiceFactory;
@@ -367,6 +374,37 @@ function parseFounderMutation(
   invalidRequest();
 }
 
+export function founderWithdrawalReplayScopeFor(
+  request: VerifiedMutationRequest,
+): string | null {
+  try {
+    const mutation = parseFounderMutation(request);
+    return mutation.kind === "withdraw"
+      ? founderWithdrawalReplayScope(mutation.input)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function founderWithdrawalReplayScope(
+  replay: FounderTerminalWithdrawalReplay,
+): string {
+  if (
+    typeof replay !== "object" ||
+    replay === null ||
+    typeof replay.operationId !== "string" ||
+    replay.operationId.length < 1 ||
+    replay.operationId.length > 127 ||
+    !Number.isSafeInteger(replay.expectedRevision) ||
+    replay.expectedRevision < 1 ||
+    replay.expectedRevision >= Number.MAX_SAFE_INTEGER
+  ) {
+    throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+  }
+  return `${FOUNDER_WITHDRAWAL_REPLAY_SCOPE_PREFIX}:${replay.operationId}:${replay.expectedRevision}`;
+}
+
 function parseFounderFields(
   body: Readonly<Record<string, unknown>>,
 ): FounderApplicationFields {
@@ -473,6 +511,9 @@ type ResourceResponseInput = Readonly<{
 
 async function resourceResponse(input: ResourceResponseInput): Promise<Response> {
   const state = await input.service.getState();
+  const terminalWithdrawalReplay = founderTerminalWithdrawalReplay(
+    state.application,
+  );
   const model = createFounderInterestCapabilityModel({
     requestUrl: input.context.resourceUrl,
     ...state,
@@ -488,7 +529,13 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
   );
   const csrf = hasMutationAction
     ? await requiredCsrfProof(
-        await input.csrfTokenFor(input.context.request, input.actorSubject),
+        await input.csrfTokenFor(
+          input.context.request,
+          input.actorSubject,
+          terminalWithdrawalReplay === null
+            ? null
+            : founderWithdrawalReplayScope(terminalWithdrawalReplay),
+        ),
       )
     : null;
 
@@ -735,12 +782,14 @@ function renderForms(
 
   return forms
     .map((form) => {
-      const withdrawal = form.name === "withdraw-founder-application";
+      const withdrawal = form.name === "withdraw-founder-application" ||
+        form.name === FOUNDER_WITHDRAWAL_REPLAY_ACTION;
+      const withdrawalReplay = form.name === FOUNDER_WITHDRAWAL_REPLAY_ACTION;
       return `<section class="founder-form-band${withdrawal ? " founder-form-band--withdraw" : ""}" aria-labelledby="${escapeAttribute(form.name)}-title">
         <div class="founder-form-heading">
           <p class="section-label">${withdrawal ? "Application status" : "Your details"}</p>
           <h2 id="${escapeAttribute(form.name)}-title">${escapeHtml(form.title)}</h2>
-          ${withdrawal ? "<p>Withdrawal closes this application while preserving its history.</p>" : "<p>All required fields describe your current founder interest.</p>"}
+          ${withdrawalReplay ? "<p>The recorded withdrawal remains unchanged.</p>" : withdrawal ? "<p>Withdrawal closes this application while preserving its history.</p>" : "<p>All required fields describe your current founder interest.</p>"}
         </div>
         ${renderForm(form, csrfToken)}
       </section>`;

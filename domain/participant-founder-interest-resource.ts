@@ -28,6 +28,8 @@ import {
 } from "./public-campaign-resource.ts";
 
 export const FOUNDER_INTEREST_PATH = "/participant/founder-interest";
+export const FOUNDER_WITHDRAWAL_REPLAY_ACTION =
+  "retry-founder-application-withdrawal";
 export const FOUNDER_SECONDARY_AREAS_FIELD =
   "secondary-contribution-area-ids";
 export const MAX_PROFILE_LINK_FORM_LENGTH =
@@ -81,6 +83,11 @@ export type FounderInterestCapabilityModel = Readonly<{
   forms: readonly HtmlFormAction[];
 }>;
 
+export type FounderTerminalWithdrawalReplay = Readonly<{
+  operationId: string;
+  expectedRevision: number;
+}>;
+
 export type FounderInterestResourceInput = Readonly<{
   requestUrl: string;
   application: FounderApplication | null;
@@ -99,6 +106,7 @@ export function createFounderInterestCapabilityModel(
 ): FounderInterestCapabilityModel {
   const self = new URL(FOUNDER_INTEREST_PATH, input.requestUrl).href;
   const application = input.application;
+  const terminalWithdrawalReplay = founderTerminalWithdrawalReplay(application);
   const actions = currentActions(
     actionWhenAllowed(
       application === null &&
@@ -152,6 +160,27 @@ export function createFounderInterestCapabilityModel(
           ],
         }),
     ),
+    actionWhenAllowed(terminalWithdrawalReplay !== null, () =>
+      defineAction({
+        name: FOUNDER_WITHDRAWAL_REPLAY_ACTION,
+        title: "Retry recorded withdrawal",
+        method: "DELETE",
+        href: self,
+        requestMediaType: "application/x-www-form-urlencoded",
+        fields: [
+          operationIdField(terminalWithdrawalReplay?.operationId ?? ""),
+          expectedRevisionField(
+            terminalWithdrawalReplay?.expectedRevision ?? 1,
+          ),
+          {
+            name: "confirm-withdrawal",
+            title: "Confirm the recorded withdrawal",
+            type: "boolean",
+            location: "body",
+            required: true,
+          },
+        ],
+      })),
   );
 
   const actionContracts = Object.freeze([...actions]);
@@ -174,6 +203,28 @@ export function createFounderInterestCapabilityModel(
     document,
     actionContracts,
     forms: Object.freeze(actionContracts.map(toHtmlFormAction)),
+  });
+}
+
+/** Recover the exact terminal withdrawal command from verified history. */
+export function founderTerminalWithdrawalReplay(
+  application: FounderApplication | null,
+): FounderTerminalWithdrawalReplay | null {
+  if (application?.status !== "withdrawn" || application.revision < 2) {
+    return null;
+  }
+  const withdrawal = application.history.at(-1);
+  if (
+    withdrawal === undefined ||
+    withdrawal.kind !== "withdrawn" ||
+    withdrawal.status !== "withdrawn" ||
+    withdrawal.revision !== application.revision
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    operationId: withdrawal.id,
+    expectedRevision: application.revision - 1,
   });
 }
 

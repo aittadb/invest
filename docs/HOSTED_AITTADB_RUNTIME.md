@@ -398,7 +398,11 @@ form as an absolute ceiling and explicitly permits only the founder route's
 repeated secondary-contribution field. Setup, editor, package, acknowledgment,
 and founder adapters pass their own byte, field, and repeated-field limits to
 every verification. Those limits are validated before form proof extraction, so
-the larger setup allowance cannot widen another route.
+the larger setup allowance cannot widen another route. General one-use proofs
+retain their version-1 encrypted cookie. A withdrawn founder resource instead
+issues a version-2 one-use proof containing only a SHA-256 digest of its exact
+route, withdrawal operation, and prior revision scope. A verifier without the
+founder scope resolver rejects that cookie, and a changed scope cannot claim it.
 The editor accepts at most 262,144 wire bytes and then enforces a 65,536-byte
 decoded campaign presentation. Initial setup accepts at most 1,048,576 wire
 bytes and then enforces a 262,144-byte decoded setup. Successful HTML and JSON
@@ -467,7 +471,10 @@ sample; each check failure leaves every founder current, history, field,
 policy-revision, audit, and founder-operation effect unchanged. Recovery with
 the same overlapping operation after a null policy sample, exact replay after
 campaign/profile evolution and Worker restart, and changed or stale rejection
-are also covered. The
+are also covered. Hosted response-loss coverage additionally discards a
+committed withdrawal response, obtains the replay-only action and scoped proof
+from terminal HTML and JSON, and proves exact replay across Worker restart while
+changed, stale, foreign, unrelated-method, and reused proofs remain rejected. The
 synthetic hosted services implement and enforce the discovered AittaDB
 read/list/transaction controls rather than bypassing the adapter. Source
 and built-artifact scans complement `npm run instances:check`, which rejects

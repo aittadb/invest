@@ -373,6 +373,100 @@ test("one proof cannot be replayed and concurrent use has one winner", async () 
   assert.equal(harness.claims.claimed.size, 1);
 });
 
+test("exact-replay proofs are bounded, route-scoped, actor-bound, and one-use", async () => {
+  const harness = await configuredHarness();
+  const operationId = "founder-operation:terminal-withdrawal";
+  const expectedRevision = 2;
+  const scope = `participant-founder-withdrawal-replay:v1:${operationId}:${expectedRevision}`;
+  const proof = await harness.session.issueExactReplay(
+    new Request(`${APP_ORIGIN}/participant/founder-interest`),
+    PARTICIPANT,
+    APP_ORIGIN,
+    scope,
+  );
+  assert.doesNotMatch(proof.setCookie, /terminal|withdrawal|founder-operation/u);
+
+  const body = {
+    "operation-id": operationId,
+    "expected-revision": expectedRevision,
+    "confirm-withdrawal": true,
+  };
+  const scopeFor = (
+    request: Readonly<{
+      method: string;
+      body: Readonly<Record<string, unknown>>;
+    }>,
+  ) => request.method === "DELETE"
+      ? `participant-founder-withdrawal-replay:v1:${String(request.body["operation-id"])}:${String(request.body["expected-revision"])}`
+      : null;
+
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.verifyMutation(
+        jsonRequest(proof, body, "DELETE"),
+        PARTICIPANT,
+        APP_ORIGIN,
+      )
+    )).code,
+    "REQUEST_REJECTED",
+  );
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.verifyMutation(
+        jsonRequest(proof, { ...body, "expected-revision": 1 }, "DELETE"),
+        PARTICIPANT,
+        APP_ORIGIN,
+        { exactReplayScopeFor: scopeFor },
+      )
+    )).code,
+    "INVALID_REQUEST",
+  );
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.verifyMutation(
+        jsonRequest(proof, body, "DELETE"),
+        FOREIGN_PARTICIPANT,
+        APP_ORIGIN,
+        { exactReplayScopeFor: scopeFor },
+      )
+    )).code,
+    "REQUEST_REJECTED",
+  );
+  assert.equal(harness.claims.calls.length, 0);
+
+  const exact = await harness.session.verifyMutation(
+    jsonRequest(proof, body, "DELETE"),
+    PARTICIPANT,
+    APP_ORIGIN,
+    { exactReplayScopeFor: scopeFor },
+  );
+  assert.deepEqual(exact.body, body);
+  assert.equal(harness.claims.calls.length, 1);
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.verifyMutation(
+        jsonRequest(proof, body, "DELETE"),
+        PARTICIPANT,
+        APP_ORIGIN,
+        { exactReplayScopeFor: scopeFor },
+      )
+    )).code,
+    "REQUEST_REJECTED",
+  );
+
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.issueExactReplay(
+        new Request(`${APP_ORIGIN}/participant/founder-interest`),
+        PARTICIPANT,
+        APP_ORIGIN,
+        "x".repeat(513),
+      )
+    )).code,
+    "REQUEST_REJECTED",
+  );
+});
+
 test("concurrent refreshes use independent cookies and remain independently usable", async () => {
   const harness = await configuredHarness();
   const [first, second] = await Promise.all([

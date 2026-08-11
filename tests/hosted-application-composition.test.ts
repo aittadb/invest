@@ -30,6 +30,7 @@ import type { OwnerPackageDocument } from "../domain/owner-package-resource.ts";
 import {
   FOUNDER_INTEREST_PATH,
   FOUNDER_SECONDARY_AREAS_FIELD,
+  FOUNDER_WITHDRAWAL_REPLAY_ACTION,
   type FounderInterestDocument,
 } from "../domain/participant-founder-interest-resource.ts";
 import { parseContributionAreaChoices } from "../domain/founder-application.ts";
@@ -1394,7 +1395,9 @@ test("hosted founder applications persist their complete lifecycle across worker
     final.document.data.history.map(({ kind }) => kind),
     ["created", "edited", "withdrawn"],
   );
-  assert.deepEqual(actionNames(final.document), []);
+  assert.deepEqual(actionNames(final.document), [
+    FOUNDER_WITHDRAWAL_REPLAY_ACTION,
+  ]);
   assert.equal(recordsIn(service, "founder-applications").length, 1);
   assert.equal(recordsIn(service, "founder-application-history").length, 3);
   for (const collection of [
@@ -1463,6 +1466,196 @@ test("hosted founder HTML and hypermedia project the same persistent state and a
   assert.match(restartedHtml.html, /Revision 1/u);
   assert.match(restartedHtml.html, new RegExp(privateNote, "u"));
   assert.match(restartedHtml.html, /Engineering/u);
+});
+
+test("hosted terminal withdrawal recovery uses one exact scoped proof across response loss and restart", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-terminal-replay",
+    { declaredInterest: "founder" },
+  );
+
+  const worker = hostedPackageWorker(service);
+  const initial = await founderResource(worker, env);
+  assert.equal(
+    (await submitFounderMutation(
+      worker,
+      env,
+      initial,
+      "POST",
+      actionBody(
+        requiredAction(initial.document, "create-founder-application"),
+        founderFields({ note: "Private terminal replay note." }),
+      ),
+    )).status,
+    201,
+  );
+
+  const received = await founderResource(worker, env);
+  const withdrawalBody = actionBody(
+    requiredAction(received.document, "withdraw-founder-application"),
+    { "confirm-withdrawal": true },
+  );
+  const operationId = String(withdrawalBody["operation-id"]);
+  const lostResponse = await submitFounderMutation(
+    worker,
+    env,
+    received,
+    "DELETE",
+    withdrawalBody,
+  );
+  assert.equal(lostResponse.status, 200);
+  await lostResponse.body?.cancel();
+
+  const spentOriginalProof = await submitFounderMutation(
+    worker,
+    env,
+    received,
+    "DELETE",
+    withdrawalBody,
+  );
+  assert.equal(spentOriginalProof.status, 403);
+
+  const terminal = await founderResource(worker, env);
+  assert.equal(terminal.document.data.status, "withdrawn");
+  assert.equal(terminal.document.data.revision, 2);
+  assert.deepEqual(actionNames(terminal.document), [
+    FOUNDER_WITHDRAWAL_REPLAY_ACTION,
+  ]);
+  const replayAction = requiredAction(
+    terminal.document,
+    FOUNDER_WITHDRAWAL_REPLAY_ACTION,
+  );
+  const replayBody = actionBody(replayAction, {
+    "confirm-withdrawal": true,
+  });
+  assert.deepEqual(replayBody, withdrawalBody);
+  assert(terminal.csrfToken);
+  assert(terminal.cookie);
+  assert.doesNotMatch(terminal.cookie, /founder-operation|participant|withdraw/u);
+
+  const terminalHtml = await founderHtmlResource(worker, env);
+  assert.deepEqual(profileHtmlActionNames(terminalHtml.html), [
+    FOUNDER_WITHDRAWAL_REPLAY_ACTION,
+  ]);
+  assert.match(terminalHtml.html, /Retry recorded withdrawal/u);
+  assert.doesNotMatch(
+    terminalHtml.html,
+    /data-action-name="(?:create|edit|withdraw)-founder-application"/u,
+  );
+
+  const committedFounder = founderCollectionSnapshot(service);
+  const committedOperation = service.operations.get(operationId);
+  assert(committedOperation);
+  const claimsBeforeExact = recordsIn(service, "browser-mutation-replays").length;
+  const exact = await submitFounderMutation(
+    worker,
+    env,
+    terminal,
+    "DELETE",
+    replayBody,
+  );
+  assert.equal(exact.status, 200);
+  const exactDocument = await exact.json() as FounderInterestDocument;
+  assert.equal(exactDocument.data.status, "withdrawn");
+  assert.equal(exactDocument.data.revision, 2);
+  assert.deepEqual(actionNames(exactDocument), [
+    FOUNDER_WITHDRAWAL_REPLAY_ACTION,
+  ]);
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    claimsBeforeExact + 1,
+  );
+  assert.deepEqual(founderCollectionSnapshot(service), committedFounder);
+  assert.strictEqual(service.operations.get(operationId), committedOperation);
+
+  const reused = await submitFounderMutation(
+    worker,
+    env,
+    terminal,
+    "DELETE",
+    replayBody,
+  );
+  assert.equal(reused.status, 403);
+
+  const restartedWorker = hostedPackageWorker(service);
+  const restarted = await founderResource(restartedWorker, env);
+  assert.deepEqual(actionNames(restarted.document), [
+    FOUNDER_WITHDRAWAL_REPLAY_ACTION,
+  ]);
+  const claimsBeforeRejected = recordsIn(
+    service,
+    "browser-mutation-replays",
+  ).length;
+  const changed = await submitFounderMutation(
+    restartedWorker,
+    env,
+    restarted,
+    "DELETE",
+    { ...replayBody, "operation-id": "founder-operation:changed-terminal-retry" },
+  );
+  assert.equal(changed.status, 400);
+  const stale = await submitFounderMutation(
+    restartedWorker,
+    env,
+    restarted,
+    "DELETE",
+    { ...replayBody, "expected-revision": 2 },
+  );
+  assert.equal(stale.status, 400);
+  const unrelated = await submitFounderMutation(
+    restartedWorker,
+    env,
+    restarted,
+    "PATCH",
+    replayBody,
+  );
+  assert.equal(unrelated.status, 400);
+  const foreign = await submitFounderMutation(
+    restartedWorker,
+    env,
+    restarted,
+    "DELETE",
+    replayBody,
+    {
+      subject: "sites-foreign-founder-terminal-retry",
+      email: "foreign-founder-terminal-retry@example.test",
+    },
+  );
+  assert.equal(foreign.status, 404);
+  assert.doesNotMatch(
+    await foreign.text(),
+    /Private terminal replay note|founder-operation|participant-subject/u,
+  );
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    claimsBeforeRejected,
+  );
+
+  const restartedExact = await submitFounderMutation(
+    restartedWorker,
+    env,
+    restarted,
+    "DELETE",
+    replayBody,
+  );
+  assert.equal(restartedExact.status, 200);
+  assert.deepEqual(founderCollectionSnapshot(service), committedFounder);
+  assert.strictEqual(service.operations.get(operationId), committedOperation);
+  const restartedReuse = await submitFounderMutation(
+    restartedWorker,
+    env,
+    restarted,
+    "DELETE",
+    replayBody,
+  );
+  assert.equal(restartedReuse.status, 403);
 });
 
 test("hosted founder applications remain readable and withdrawable after interest and phase changes", async () => {
@@ -1569,7 +1762,9 @@ test("hosted founder applications remain readable and withdrawable after interes
   assert.equal(withdrawn.status, 200);
   const final = await founderResource(hostedPackageWorker(service), env);
   assert.equal(final.document.data.status, "withdrawn");
-  assert.deepEqual(actionNames(final.document), []);
+  assert.deepEqual(actionNames(final.document), [
+    FOUNDER_WITHDRAWAL_REPLAY_ACTION,
+  ]);
 });
 
 test("unsupported founder PUT leaves hosted JSON and HTML proofs reusable", async () => {

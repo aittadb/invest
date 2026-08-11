@@ -18,6 +18,7 @@ import {
 import {
   FOUNDER_INTEREST_PATH,
   FOUNDER_SECONDARY_AREAS_FIELD,
+  FOUNDER_WITHDRAWAL_REPLAY_ACTION,
   MAX_PROFILE_LINK_FORM_BYTES,
   MAX_PROFILE_LINK_FORM_LENGTH,
 } from "../domain/participant-founder-interest-resource.ts";
@@ -164,7 +165,10 @@ test("participant founder route completes lifecycle, retry, stale-write, and his
     dataOf(dataOf(historyOf(withdrawn)[0]).fields).note,
     "Original private note.",
   );
-  assert.deepEqual(actionsOf(withdrawn), []);
+  assert.deepEqual(
+    actionsOf(withdrawn).map((action) => dataOf(action).name),
+    [FOUNDER_WITHDRAWAL_REPLAY_ACTION],
+  );
 
   const withdrawReplay = await harness.dispatch(
     jsonMutation(ALICE, "DELETE", withdrawBody),
@@ -277,14 +281,21 @@ test("founder resource keeps HTML forms and JSON actions in parity", async () =>
   assert.equal(withdrawnFormResponse.status, 200);
   const withdrawnHtml = await withdrawnFormResponse.text();
   assert.match(withdrawnHtml, /Withdrawn/u);
-  assert.doesNotMatch(withdrawnHtml, /<form /u);
+  assert.match(
+    withdrawnHtml,
+    new RegExp(`data-action-name="${FOUNDER_WITHDRAWAL_REPLAY_ACTION}"`, "u"),
+  );
+  assert.doesNotMatch(withdrawnHtml, /data-action-name="(?:create|edit|withdraw)-founder-application"/u);
 
   const withdrawnJson = await jsonDocument(
     await harness.dispatch(getRequest(ALICE, "application/json"), ALICE),
   );
   assert.equal(resourceData(withdrawnJson).revision, 3);
   assert.equal(historyOf(withdrawnJson).length, 3);
-  assert.deepEqual(actionsOf(withdrawnJson), []);
+  assert.deepEqual(
+    actionsOf(withdrawnJson).map((action) => dataOf(action).name),
+    [FOUNDER_WITHDRAWAL_REPLAY_ACTION],
+  );
 });
 
 test("canonical Unicode-expanded profile links remain present and editable", async () => {

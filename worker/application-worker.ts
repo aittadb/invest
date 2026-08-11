@@ -100,6 +100,7 @@ import {
   createParticipantProfileRouteHandler,
   createParticipantRegistrationRouteHandler,
   createParticipantRouteHandler,
+  founderWithdrawalReplayScopeFor,
   MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
   MAX_ACKNOWLEDGMENT_MUTATION_FIELDS,
   MAX_FOUNDER_INTEREST_MUTATION_BYTES,
@@ -810,11 +811,19 @@ async function runtimeParticipantFounderInterestRoute(
             maxBodyBytes: MAX_FOUNDER_INTEREST_MUTATION_BYTES,
             maxFields: MAX_FOUNDER_INTEREST_MUTATION_FIELDS,
             repeatedFormFields: [FOUNDER_SECONDARY_AREAS_FIELD],
+            exactReplayScopeFor: founderWithdrawalReplayScopeFor,
           },
         ),
-      csrfTokenFor: (request, candidateSubject) =>
+      csrfTokenFor: (request, candidateSubject, exactReplayScope) =>
         candidateSubject === account.value.subject
-          ? runtime.mutationSession.issue(request, identity, appOrigin)
+          ? exactReplayScope === null
+            ? runtime.mutationSession.issue(request, identity, appOrigin)
+            : runtime.mutationSession.issueExactReplay(
+                request,
+                identity,
+                appOrigin,
+                exactReplayScope,
+              )
           : Promise.resolve(null),
       createOperationId: () => randomOperationId("founder-operation"),
     });
