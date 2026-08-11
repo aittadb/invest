@@ -23,7 +23,9 @@ import {
 } from "../domain/package-content.ts";
 import {
   INVESTMENT_INTEREST_PATH,
+  INVESTMENT_WITHDRAWAL_REPLAY_ACTION,
   investmentInterestItemPath,
+  investmentWithdrawalReplayPath,
 } from "../domain/participant-investment-interest-resource.ts";
 import type { AuthorizedParticipantAccess } from "../domain/participant-home-resource.ts";
 import {
@@ -195,6 +197,13 @@ test("participant investment route completes personal create, edit, withdraw, re
     "precondition_failed",
   );
 
+  const replayPath = investmentWithdrawalReplayPath(operationId);
+  const activeReplay = await harness.dispatch(
+    getRequest(replayPath, ALICE),
+    ALICE,
+  );
+  assert.equal(activeReplay.status, 404);
+
   const withdrawBody = {
     "operation-id": "investment-operation:route-personal-withdraw",
     "expected-revision": 2,
@@ -209,17 +218,41 @@ test("participant investment route completes personal create, edit, withdraw, re
   const withdrawn = await jsonDocument(withdrawnResponse);
   assert.equal(resourceData(withdrawn).status, "withdrawn");
   assert.deepEqual(actionNames(withdrawn), ["reactivate-investment-interest"]);
+  assert.equal(
+    linkFor(withdrawn, "withdrawal-replay"),
+    `${CANONICAL_ORIGIN}${replayPath}`,
+  );
   assert.deepEqual(
     historyOf(withdrawn).map((entry) => dataOf(entry).transition),
     ["created", "edited", "withdrawn"],
   );
 
+  const replayResource = await harness.dispatch(
+    getRequest(replayPath, ALICE),
+    ALICE,
+  );
+  assert.equal(replayResource.status, 200);
+  const replayDocument = await jsonDocument(replayResource);
+  assert.equal(replayDocument.type, "participant-investment-withdrawal-replay");
+  assert.deepEqual(actionNames(replayDocument), [
+    INVESTMENT_WITHDRAWAL_REPLAY_ACTION,
+  ]);
+  const unsupportedReplay = await harness.dispatch(
+    rawRequest(replayPath, ALICE, "PUT"),
+    ALICE,
+  );
+  assert.equal(unsupportedReplay.status, 405);
+  assert.equal(unsupportedReplay.headers.get("allow"), "GET, DELETE");
+
   const withdrawReplay = await harness.dispatch(
-    jsonMutation(itemPath, ALICE, "DELETE", withdrawBody),
+    jsonMutation(replayPath, ALICE, "DELETE", withdrawBody),
     ALICE,
   );
   assert.equal(withdrawReplay.status, 200);
-  assert.equal(historyOf(await jsonDocument(withdrawReplay)).length, 3);
+  assert.equal(
+    (await jsonDocument(withdrawReplay)).type,
+    "participant-investment-withdrawal-replay",
+  );
 
   const reactivatedResponse = await harness.dispatch(
     jsonMutation(itemPath, ALICE, "POST", {

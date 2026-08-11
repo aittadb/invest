@@ -82,6 +82,7 @@ export type BrowserMutationVerificationLimits = Readonly<{
   repeatedFormFields?: readonly string[];
   validateBeforeReplayClaim?: BrowserMutationPreReplayValidator;
   exactReplayScopeFor?: BrowserMutationExactReplayScopeResolver;
+  requireExactReplayScope?: boolean;
 }>;
 
 export type BrowserMutationSessionDependencies = Readonly<{
@@ -323,6 +324,12 @@ export function createBrowserMutationSession(
         }
         if (!accepted) throw new MutationSecurityFailure("INVALID_REQUEST");
       }
+      if (
+        verification.requireExactReplayScope &&
+        encryptedSession.exactReplayScopeHash === null
+      ) {
+        throw new MutationSecurityFailure("INVALID_REQUEST");
+      }
       if (encryptedSession.exactReplayScopeHash !== null) {
         const resolver = verification.exactReplayScopeFor;
         if (resolver === undefined) rejectRequest();
@@ -377,6 +384,7 @@ function verificationLimits(
   repeatedFormFields: readonly string[];
   validateBeforeReplayClaim: BrowserMutationPreReplayValidator | undefined;
   exactReplayScopeFor: BrowserMutationExactReplayScopeResolver | undefined;
+  requireExactReplayScope: boolean;
 }> {
   const maxBodyBytes = input.maxBodyBytes ?? config.maxBodyBytes;
   const maxFields = input.maxFields ?? config.maxFields;
@@ -384,6 +392,7 @@ function verificationLimits(
     config.repeatedFormFields;
   const validateBeforeReplayClaim = input.validateBeforeReplayClaim;
   const exactReplayScopeFor = input.exactReplayScopeFor;
+  const requireExactReplayScope = input.requireExactReplayScope ?? false;
   if (
     !Number.isSafeInteger(maxBodyBytes) ||
     maxBodyBytes < 1 ||
@@ -398,7 +407,9 @@ function verificationLimits(
     (validateBeforeReplayClaim !== undefined &&
       typeof validateBeforeReplayClaim !== "function") ||
     (exactReplayScopeFor !== undefined &&
-      typeof exactReplayScopeFor !== "function")
+      typeof exactReplayScopeFor !== "function") ||
+    typeof requireExactReplayScope !== "boolean" ||
+    (requireExactReplayScope && exactReplayScopeFor === undefined)
   ) {
     unavailable();
   }
@@ -420,6 +431,7 @@ function verificationLimits(
     repeatedFormFields: Object.freeze([...repeatedFormFields]),
     validateBeforeReplayClaim,
     exactReplayScopeFor,
+    requireExactReplayScope,
   });
 }
 

@@ -16,6 +16,8 @@ export {
 export {
   createInvestmentInterestRouteHandler,
   investmentInterestMutationLimits,
+  investmentWithdrawalReplayScopeFor,
+  investmentWithdrawalReplayScopeRequired,
   MAX_INVESTMENT_DELETE_MUTATION_BYTES,
   MAX_INVESTMENT_DELETE_MUTATION_FIELDS,
   MAX_INVESTMENT_PATCH_MUTATION_BYTES,

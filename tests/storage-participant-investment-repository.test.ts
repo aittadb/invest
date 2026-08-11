@@ -1568,6 +1568,51 @@ test("compact ownership heads authenticate active create and edit with exact lea
   assert.equal(editedReads.readCalls, 4);
 });
 
+test("compact collection summaries authenticate revision-one creation evidence", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "summary-creation-proof");
+  const acknowledgment = await currentContext(ALICE, "summary-creation-proof");
+  let minute = 0;
+  const service = serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      storage,
+      ALICE,
+      AMOUNT,
+    ),
+    ALICE,
+    acknowledgment,
+    () => new Date(
+      Date.parse("2026-08-12T10:00:00.000Z") + minute++ * 60_000,
+    ),
+  );
+  const created = await service.create({
+    operationId: "investment-operation:summary-creation-proof-create",
+    fields: personalFields(),
+  });
+  await service.edit({
+    operationId: "investment-operation:summary-creation-proof-edit",
+    indicationId: created.snapshot.id,
+    expectedRevision: 1,
+    fields: personalFields({ note: "Current fields remain valid." }),
+  });
+  replaceHistoryOperationFingerprint(
+    state,
+    created.snapshot.id,
+    1,
+    `sha256:${"0".repeat(64)}`,
+  );
+
+  const failure = await captureStorageFailure(() =>
+    new StorageParticipantInvestmentInterestRepository(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      AMOUNT,
+    ).listOwned()
+  );
+  assert.equal(failure.code, "UNAVAILABLE");
+});
+
 test("correlated summary and terminal-kind damage cannot hide an active edit", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
@@ -3421,6 +3466,29 @@ function replaceTerminalTransitionKind(
     value: Object.freeze({
       ...record.value,
       transitionKind,
+    }) as StorageDocument,
+  }));
+}
+
+function replaceHistoryOperationFingerprint(
+  state: MemoryStorageState,
+  indicationId: InvestmentIndicationId,
+  revision: number,
+  operationFingerprint: string,
+): void {
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "investment-indication-history" &&
+    record.value.indicationId === indicationId &&
+    record.value.revision === revision
+  );
+  assert(entry);
+  const [identity, record] = entry;
+  state.records.set(identity, Object.freeze({
+    key: record.key,
+    revision: record.revision,
+    value: Object.freeze({
+      ...record.value,
+      operationFingerprint,
     }) as StorageDocument,
   }));
 }

@@ -23,6 +23,9 @@ import {
 } from "./public-campaign-resource.ts";
 
 export const INVESTMENT_INTEREST_PATH = "/participant/investment-interests";
+export const INVESTMENT_WITHDRAWAL_REPLAY_ACTION =
+  "retry-investment-interest-withdrawal";
+export const INVESTMENT_WITHDRAWAL_REPLAY_SEGMENT = "withdrawal-replay";
 
 export type PersonalInvestmentInterestFieldsData = Readonly<{
   kind: "personal";
@@ -113,6 +116,20 @@ export type InvestmentInterestItemDocument = Readonly<{
   actions: readonly HypermediaAction[];
 }>;
 
+export type InvestmentWithdrawalReplayDocument = Readonly<{
+  api_version: typeof INVESTOR_APP_API_VERSION;
+  type: "participant-investment-withdrawal-replay";
+  id: string;
+  data: Readonly<{
+    indication_id: string;
+    status: "withdrawn";
+    revision: number;
+    interest_is_binding: false;
+  }>;
+  links: readonly HypermediaLink[];
+  actions: readonly HypermediaAction[];
+}>;
+
 export type InvestmentInterestCollectionCapabilityModel = Readonly<{
   document: InvestmentInterestCollectionDocument;
   actionContracts: readonly ActionContract[];
@@ -123,6 +140,18 @@ export type InvestmentInterestItemCapabilityModel = Readonly<{
   document: InvestmentInterestItemDocument;
   actionContracts: readonly ActionContract[];
   forms: readonly HtmlFormAction[];
+}>;
+
+export type InvestmentWithdrawalReplayCapabilityModel = Readonly<{
+  document: InvestmentWithdrawalReplayDocument;
+  actionContracts: readonly ActionContract[];
+  forms: readonly HtmlFormAction[];
+}>;
+
+export type InvestmentTerminalWithdrawalReplay = Readonly<{
+  operationId: string;
+  expectedRevision: number;
+  resultingRevision: number;
 }>;
 
 export type InvestmentInterestCollectionResourceInput = Readonly<{
@@ -151,6 +180,12 @@ export type InvestmentInterestItemResourceInput = Readonly<{
     withdraw: string | null;
     reactivate: string | null;
   }>;
+}>;
+
+export type InvestmentWithdrawalReplayResourceInput = Readonly<{
+  requestUrl: string;
+  indication: InvestmentIndication;
+  replay: InvestmentTerminalWithdrawalReplay;
 }>;
 
 /** Project the authorized collection into equivalent JSON actions and forms. */
@@ -230,6 +265,7 @@ export function createInvestmentInterestItemCapabilityModel(
   input: InvestmentInterestItemResourceInput,
 ): InvestmentInterestItemCapabilityModel {
   const self = itemUrl(input.requestUrl, input.indication.id);
+  const withdrawalReplay = investmentTerminalWithdrawalReplay(input.indication);
   const actions = currentActions(
     actionWhenAllowed(input.canEdit, () =>
       editFieldsAction(
@@ -297,6 +333,12 @@ export function createInvestmentInterestItemCapabilityModel(
         rel: Object.freeze(["campaign"]),
         href: absolute(input.requestUrl, "/"),
       }),
+      ...(withdrawalReplay === null
+        ? []
+        : [Object.freeze({
+            rel: Object.freeze(["withdrawal-replay"]),
+            href: withdrawalReplayUrl(input.requestUrl, input.indication.id),
+          })]),
     ]),
     actions: Object.freeze(actionContracts.map(toHypermediaAction)),
   });
@@ -305,6 +347,83 @@ export function createInvestmentInterestItemCapabilityModel(
     document,
     actionContracts,
     forms: Object.freeze(actionContracts.map(toHtmlFormAction)),
+  });
+}
+
+/** Project one terminal withdrawal into its isolated exact-replay resource. */
+export function createInvestmentWithdrawalReplayCapabilityModel(
+  input: InvestmentWithdrawalReplayResourceInput,
+): InvestmentWithdrawalReplayCapabilityModel {
+  const expected = investmentTerminalWithdrawalReplay(input.indication);
+  if (
+    expected === null ||
+    expected.operationId !== input.replay.operationId ||
+    expected.expectedRevision !== input.replay.expectedRevision ||
+    expected.resultingRevision !== input.replay.resultingRevision
+  ) {
+    throw new Error("Invalid investment withdrawal replay resource.");
+  }
+  const self = withdrawalReplayUrl(input.requestUrl, input.indication.id);
+  const item = itemUrl(input.requestUrl, input.indication.id);
+  const action = transitionAction(
+    INVESTMENT_WITHDRAWAL_REPLAY_ACTION,
+    "Retry recorded withdrawal",
+    "DELETE",
+    self,
+    input.replay.operationId,
+    input.replay.expectedRevision,
+    "confirm-withdrawal",
+    "Confirm the recorded withdrawal",
+  );
+  const actionContracts = Object.freeze([action]);
+  const document: InvestmentWithdrawalReplayDocument = Object.freeze({
+    api_version: INVESTOR_APP_API_VERSION,
+    type: "participant-investment-withdrawal-replay",
+    id: `${input.indication.id}:${INVESTMENT_WITHDRAWAL_REPLAY_SEGMENT}`,
+    data: Object.freeze({
+      indication_id: input.indication.id,
+      status: "withdrawn",
+      revision: input.indication.revision,
+      interest_is_binding: false,
+    }),
+    links: Object.freeze([
+      Object.freeze({ rel: Object.freeze(["self"]), href: self }),
+      Object.freeze({ rel: Object.freeze(["investment-interest"]), href: item }),
+      Object.freeze({
+        rel: Object.freeze(["collection", "investment-interests"]),
+        href: absolute(input.requestUrl, INVESTMENT_INTEREST_PATH),
+      }),
+    ]),
+    actions: Object.freeze(actionContracts.map(toHypermediaAction)),
+  });
+  return Object.freeze({
+    document,
+    actionContracts,
+    forms: Object.freeze(actionContracts.map(toHtmlFormAction)),
+  });
+}
+
+/** Recover the exact terminal withdrawal command from verified history. */
+export function investmentTerminalWithdrawalReplay(
+  indication: InvestmentIndication,
+): InvestmentTerminalWithdrawalReplay | null {
+  if (
+    indication.lifecycle.status !== "withdrawn" ||
+    indication.revision < 2
+  ) return null;
+  const withdrawal = indication.history.at(-1);
+  if (
+    withdrawal === undefined ||
+    withdrawal.transition !== "withdrawn" ||
+    withdrawal.status !== "withdrawn" ||
+    withdrawal.revision !== indication.revision ||
+    withdrawal.actor.type !== "participant" ||
+    withdrawal.actor.subject !== indication.participantSubject
+  ) return null;
+  return Object.freeze({
+    operationId: withdrawal.id,
+    expectedRevision: indication.revision - 1,
+    resultingRevision: indication.revision,
   });
 }
 
@@ -353,7 +472,10 @@ function editFieldsAction(
 }
 
 function transitionAction(
-  name: "withdraw-investment-interest" | "reactivate-investment-interest",
+  name:
+    | "withdraw-investment-interest"
+    | "reactivate-investment-interest"
+    | typeof INVESTMENT_WITHDRAWAL_REPLAY_ACTION,
   title: string,
   method: "POST" | "DELETE",
   href: string,
@@ -614,8 +736,19 @@ export function investmentInterestItemPath(id: string): string {
   return `${INVESTMENT_INTEREST_PATH}/${encodeURIComponent(id)}`;
 }
 
+export function investmentWithdrawalReplayPath(id: string): string {
+  return `${investmentInterestItemPath(id)}/${INVESTMENT_WITHDRAWAL_REPLAY_SEGMENT}`;
+}
+
 function itemUrl(requestUrl: string, id: string): string {
   return absolute(requestUrl, investmentInterestItemPath(id));
+}
+
+function withdrawalReplayUrl(requestUrl: string, id: string): string {
+  return absolute(
+    requestUrl,
+    investmentWithdrawalReplayPath(id),
+  );
 }
 
 function absolute(requestUrl: string, path: string): string {

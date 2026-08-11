@@ -139,6 +139,8 @@ import {
   createParticipantRegistrationRouteHandler,
   createParticipantRouteHandler,
   founderWithdrawalReplayScopeFor,
+  investmentWithdrawalReplayScopeFor,
+  investmentWithdrawalReplayScopeRequired,
   MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
   MAX_ACKNOWLEDGMENT_MUTATION_FIELDS,
   MAX_FOUNDER_INTEREST_MUTATION_BYTES,
@@ -1123,11 +1125,24 @@ async function runtimeParticipantInvestmentInterestRoute(
           request,
           identity,
           appOrigin,
-          limits,
+          {
+            ...limits,
+            exactReplayScopeFor: (verified) =>
+              investmentWithdrawalReplayScopeFor(verified, pathname),
+            requireExactReplayScope:
+              investmentWithdrawalReplayScopeRequired(pathname),
+          },
         ),
-      csrfTokenFor: (request, candidateSubject) =>
+      csrfTokenFor: (request, candidateSubject, exactReplayScope) =>
         candidateSubject === account.value.subject
-          ? runtime.mutationSession.issue(request, identity, appOrigin)
+          ? exactReplayScope === null
+            ? runtime.mutationSession.issue(request, identity, appOrigin)
+            : runtime.mutationSession.issueExactReplay(
+                request,
+                identity,
+                appOrigin,
+                exactReplayScope,
+              )
           : Promise.resolve(null),
       createOperationId: () => randomOperationId("investment-operation"),
     });

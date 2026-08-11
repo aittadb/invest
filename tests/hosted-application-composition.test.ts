@@ -46,8 +46,10 @@ import {
 } from "../domain/participant-profile-resource.ts";
 import {
   INVESTMENT_INTEREST_PATH,
+  INVESTMENT_WITHDRAWAL_REPLAY_ACTION,
   type InvestmentInterestCollectionDocument,
   type InvestmentInterestItemDocument,
+  type InvestmentWithdrawalReplayDocument,
 } from "../domain/participant-investment-interest-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
@@ -796,9 +798,9 @@ test("participant access keeps nested package retry reads inside one budget", as
 test("participant request scope enforces exact maximum route and retry read budgets", async () => {
   assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 551);
   assert.equal(PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT, 1_063);
-  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 1_504);
-  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 2_055);
-  assert.equal(MAX_INVESTMENT_COLLECTION_STORAGE_READS, 1_504);
+  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 2_304);
+  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 2_855);
+  assert.equal(MAX_INVESTMENT_COLLECTION_STORAGE_READS, 2_304);
 
   const service = new SyntheticAittaDBService();
   await registerHostedParticipant(
@@ -3611,6 +3613,115 @@ test("hosted withdrawal retains persisted currency after campaign evolution", as
   const aggregateSnapshot = requiredObject(aggregate.value.snapshot);
   assert.equal(aggregateSnapshot.currency, "SEK");
   assert.equal(aggregateSnapshot.totalAmount, 0);
+
+  const committedIndications = hostedRecordsWithoutMutationClaims(service);
+  const committedOperation = service.operations.get(
+    "investment-operation:hosted-currency-withdraw",
+  );
+  assert(committedOperation);
+  const replayPath = `${itemPath}/withdrawal-replay`;
+  const terminalItem = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  assert.equal(
+    terminalItem.document.links.find((link) =>
+      link.rel.includes("withdrawal-replay")
+    )?.href,
+    `${APP_ORIGIN}${replayPath}`,
+  );
+  const replayResource = await investmentWithdrawalReplayResource(
+    hostedPackageWorker(service),
+    env,
+    replayPath,
+  );
+  assert.equal(
+    replayResource.document.type,
+    "participant-investment-withdrawal-replay",
+  );
+  assert.equal(replayResource.document.data.status, "withdrawn");
+  assert.deepEqual(actionNames(replayResource.document), [
+    INVESTMENT_WITHDRAWAL_REPLAY_ACTION,
+  ]);
+  const replayAction = requiredAction(
+    replayResource.document,
+    INVESTMENT_WITHDRAWAL_REPLAY_ACTION,
+  );
+  const replayBody = actionBody(replayAction, {
+    "confirm-withdrawal": true,
+  });
+  assert.equal(
+    String(replayBody["operation-id"]),
+    "investment-operation:hosted-currency-withdraw",
+  );
+  assert.equal(replayBody["expected-revision"], 1);
+
+  const ordinaryResource = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  assert(ordinaryResource.csrfToken);
+  const ordinaryProof = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    ordinaryResource,
+    replayAction,
+    replayBody,
+  );
+  assert.equal(ordinaryProof.status, 400);
+  assert.deepEqual(hostedRecordsWithoutMutationClaims(service), committedIndications);
+
+  const changed = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    replayResource,
+    replayAction,
+    {
+      ...replayBody,
+      "operation-id": "investment-operation:hosted-currency-changed-retry",
+    },
+  );
+  assert.equal(changed.status, 400);
+  assert.deepEqual(hostedRecordsWithoutMutationClaims(service), committedIndications);
+
+  const replay = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    replayResource,
+    replayAction,
+    replayBody,
+  );
+  assert.equal(replay.status, 200);
+  const replayed = await replay.json() as InvestmentWithdrawalReplayDocument;
+  assert.equal(replayed.data.status, "withdrawn");
+  assert.deepEqual(actionNames(replayed), [
+    INVESTMENT_WITHDRAWAL_REPLAY_ACTION,
+  ]);
+  assert.deepEqual(hostedRecordsWithoutMutationClaims(service), committedIndications);
+  assert.strictEqual(
+    service.operations.get("investment-operation:hosted-currency-withdraw"),
+    committedOperation,
+  );
+
+  const spent = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    replayResource,
+    replayAction,
+    replayBody,
+  );
+  assert.equal(spent.status, 403);
+
+  const replayHtml = await investmentHtmlResource(
+    hostedPackageWorker(service),
+    env,
+    replayPath,
+  );
+  assert.match(replayHtml.html, /Retry recorded withdrawal/u);
+  assert.deepEqual(investmentHtmlActionNames(replayHtml.html), [
+    INVESTMENT_WITHDRAWAL_REPLAY_ACTION,
+  ]);
 });
 
 test("hosted investment mutation rejects policy heads changed during one request", async () => {
@@ -6852,6 +6963,12 @@ type InvestmentItemResponse = Readonly<{
   cookie: string | null;
 }>;
 
+type InvestmentWithdrawalReplayResponse = Readonly<{
+  document: InvestmentWithdrawalReplayDocument;
+  csrfToken: string | null;
+  cookie: string | null;
+}>;
+
 type InvestmentHtmlResponse = Readonly<{
   html: string;
   csrfToken: string;
@@ -6877,7 +6994,11 @@ async function investmentResource(
   worker: TestWorker,
   env: InvestorAppEnv,
   pathname = INVESTMENT_INTEREST_PATH,
-): Promise<InvestmentCollectionResponse | InvestmentItemResponse> {
+): Promise<
+  | InvestmentCollectionResponse
+  | InvestmentItemResponse
+  | InvestmentWithdrawalReplayResponse
+> {
   const response = await worker.fetch(
     participantRequest(pathname),
     env,
@@ -6888,11 +7009,24 @@ async function investmentResource(
   const proof = Object.freeze({
     document: await response.json() as
       | InvestmentInterestCollectionDocument
-      | InvestmentInterestItemDocument,
+      | InvestmentInterestItemDocument
+      | InvestmentWithdrawalReplayDocument,
     csrfToken: response.headers.get(MUTATION_CSRF_HEADER),
     cookie: setCookie === null ? null : cookieHeader(setCookie),
   });
-  return proof as InvestmentCollectionResponse | InvestmentItemResponse;
+  return proof as
+    | InvestmentCollectionResponse
+    | InvestmentItemResponse
+    | InvestmentWithdrawalReplayResponse;
+}
+
+function investmentWithdrawalReplayResource(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  pathname: string,
+): Promise<InvestmentWithdrawalReplayResponse> {
+  return investmentResource(worker, env, pathname) as unknown as
+    Promise<InvestmentWithdrawalReplayResponse>;
 }
 
 async function submitInvestmentMutation(
@@ -7749,6 +7883,21 @@ function founderCollectionSnapshot(
       .filter((record) =>
         record.key.collection.startsWith("founder-application")
       )
+      .sort((left, right) => {
+        const leftKey = `${left.key.collection}/${left.key.id}`;
+        const rightKey = `${right.key.collection}/${right.key.id}`;
+        return leftKey.localeCompare(rightKey);
+      })
+      .map(cloneSyntheticRecord),
+  );
+}
+
+function hostedRecordsWithoutMutationClaims(
+  service: SyntheticAittaDBService,
+): readonly SyntheticRecord[] {
+  return Object.freeze(
+    [...service.records.values()]
+      .filter((record) => record.key.collection !== "browser-mutation-replays")
       .sort((left, right) => {
         const leftKey = `${left.key.collection}/${left.key.id}`;
         const rightKey = `${right.key.collection}/${right.key.id}`;

@@ -400,6 +400,27 @@ test("exact-replay proofs are bounded, route-scoped, actor-bound, and one-use", 
       ? `participant-founder-withdrawal-replay:v1:${String(request.body["operation-id"])}:${String(request.body["expected-revision"])}`
       : null;
 
+  const ordinaryProof = await harness.session.issue(
+    new Request(`${APP_ORIGIN}/participant/founder-interest`),
+    PARTICIPANT,
+    APP_ORIGIN,
+  );
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.verifyMutation(
+        jsonRequest(ordinaryProof, body, "DELETE"),
+        PARTICIPANT,
+        APP_ORIGIN,
+        {
+          exactReplayScopeFor: scopeFor,
+          requireExactReplayScope: true,
+        },
+      )
+    )).code,
+    "INVALID_REQUEST",
+  );
+  assert.equal(harness.claims.calls.length, 0);
+
   assert.equal(
     (await captureFailure(() =>
       harness.session.verifyMutation(
@@ -438,7 +459,10 @@ test("exact-replay proofs are bounded, route-scoped, actor-bound, and one-use", 
     jsonRequest(proof, body, "DELETE"),
     PARTICIPANT,
     APP_ORIGIN,
-    { exactReplayScopeFor: scopeFor },
+    {
+      exactReplayScopeFor: scopeFor,
+      requireExactReplayScope: true,
+    },
   );
   assert.deepEqual(exact.body, body);
   assert.equal(harness.claims.calls.length, 1);

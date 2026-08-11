@@ -9,11 +9,17 @@ import type {
 } from "../../domain/investment-indication.ts";
 import {
   INVESTMENT_INTEREST_PATH,
+  INVESTMENT_WITHDRAWAL_REPLAY_SEGMENT,
   createInvestmentInterestCollectionCapabilityModel,
   createInvestmentInterestItemCapabilityModel,
+  createInvestmentWithdrawalReplayCapabilityModel,
+  investmentWithdrawalReplayPath,
+  investmentTerminalWithdrawalReplay,
   type InvestmentInterestCollectionCapabilityModel,
   type InvestmentInterestFieldsData,
   type InvestmentInterestItemCapabilityModel,
+  type InvestmentTerminalWithdrawalReplay,
+  type InvestmentWithdrawalReplayCapabilityModel,
 } from "../../domain/participant-investment-interest-resource.ts";
 import { chatGPTSignInPath } from "../../domain/auth-navigation.ts";
 import {
@@ -140,6 +146,7 @@ export function investmentInterestMutationLimits(
 export type InvestmentInterestCsrfTokenProvider = (
   request: Request,
   actorSubject: ActorSubject,
+  exactReplayScope: string | null,
 ) =>
   | string
   | BrowserMutationProof
@@ -165,7 +172,14 @@ type MatchedInvestmentInterestRoute =
       kind: "item";
       indicationId: StableId<"investment-indication">;
     }>
+  | Readonly<{
+      kind: "withdrawal-replay";
+      indicationId: StableId<"investment-indication">;
+    }>
   | Readonly<{ kind: "invalid" }>;
+
+const INVESTMENT_WITHDRAWAL_REPLAY_SCOPE_PREFIX =
+  "participant-investment-withdrawal-replay:v1";
 
 /** Create the participant-owned investment route group from injected services. */
 export function createInvestmentInterestRouteHandler(
@@ -297,6 +311,10 @@ export function createInvestmentInterestRouteHandler(
       }
 
       const mutation = parseItemMutation(verified, matched.indicationId);
+      if (
+        matched.kind === "withdrawal-replay" &&
+        mutation.kind !== "withdraw"
+      ) invalidRequest();
       if (mutation.kind === "edit") {
         await service.edit(mutation.input);
       } else if (mutation.kind === "withdraw") {
@@ -568,6 +586,69 @@ function parseItemMutation(
   invalidRequest();
 }
 
+export function investmentWithdrawalReplayScopeFor(
+  request: VerifiedMutationRequest,
+  pathname: string,
+): string | null {
+  try {
+    const matched = matchRoute(pathname);
+    if (matched?.kind !== "withdrawal-replay") return null;
+    const mutation = parseItemMutation(request, matched.indicationId);
+    if (mutation.kind !== "withdraw") return null;
+    return investmentWithdrawalReplayScope(
+      request.actor.subject,
+      matched.indicationId,
+      Object.freeze({
+        operationId: mutation.input.operationId,
+        expectedRevision: mutation.input.expectedRevision,
+        resultingRevision: mutation.input.expectedRevision + 1,
+      }),
+    );
+  } catch {
+    return null;
+  }
+}
+
+export function investmentWithdrawalReplayScopeRequired(
+  pathname: string,
+): boolean {
+  return matchRoute(pathname)?.kind === "withdrawal-replay";
+}
+
+export function investmentWithdrawalReplayScope(
+  actorSubject: unknown,
+  indicationId: unknown,
+  replay: InvestmentTerminalWithdrawalReplay,
+): string {
+  const actor = parseActorSubject(actorSubject);
+  const indication = parseStableId<"investment-indication">(indicationId);
+  const operation = parseStorageOperationId(replay?.operationId);
+  if (
+    !actor.ok ||
+    !indication.ok ||
+    !operation.ok ||
+    !Number.isSafeInteger(replay?.expectedRevision) ||
+    replay.expectedRevision < 1 ||
+    !Number.isSafeInteger(replay.resultingRevision) ||
+    replay.resultingRevision !== replay.expectedRevision + 1 ||
+    replay.resultingRevision >= Number.MAX_SAFE_INTEGER
+  ) {
+    throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+  }
+  return JSON.stringify([
+    INVESTMENT_WITHDRAWAL_REPLAY_SCOPE_PREFIX,
+    actor.value,
+    investmentWithdrawalReplayPath(indication.value),
+    "DELETE",
+    indication.value,
+    operation.value,
+    replay.expectedRevision,
+    replay.resultingRevision,
+    "confirm-withdrawal",
+    true,
+  ]);
+}
+
 type PersonalFieldsInput = Readonly<{
   kind: "personal";
   residenceCountry: string;
@@ -723,6 +804,7 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
       input.context,
       input.actorSubject,
       input.csrfTokenFor,
+      null,
     );
     if (input.representation === "hypermedia-json") {
       return withSetCookie(hypermediaResponseWithCsrf(
@@ -744,6 +826,41 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
 
   const state = await input.service.getItemState(input.resource.indicationId);
   if (state === null) throw new StorageFailure("NOT_FOUND");
+  if (input.resource.kind === "withdrawal-replay") {
+    const replay = investmentTerminalWithdrawalReplay(state.indication);
+    if (replay === null) throw new StorageFailure("NOT_FOUND");
+    const model = createInvestmentWithdrawalReplayCapabilityModel({
+      requestUrl: input.context.resourceUrl,
+      indication: state.indication,
+      replay,
+    });
+    const csrf = await csrfProofForActions(
+      model.actionContracts,
+      input.context,
+      input.actorSubject,
+      input.csrfTokenFor,
+      investmentWithdrawalReplayScope(
+        input.actorSubject,
+        state.indication.id,
+        replay,
+      ),
+    );
+    if (input.representation === "hypermedia-json") {
+      return withSetCookie(hypermediaResponseWithCsrf(
+        model.document,
+        input.status,
+        csrf?.token ?? null,
+      ), csrf?.setCookie ?? null);
+    }
+    return withSetCookie(htmlResponse(
+      renderWithdrawalReplayHtml(
+        model,
+        csrf?.token ?? null,
+        input.context.campaign?.name ?? "Campaign",
+      ),
+      input.status,
+    ), csrf?.setCookie ?? null);
+  }
   const model = createInvestmentInterestItemCapabilityModel({
     requestUrl: input.context.resourceUrl,
     ...state,
@@ -762,6 +879,7 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
     input.context,
     input.actorSubject,
     input.csrfTokenFor,
+    null,
   );
   if (input.representation === "hypermedia-json") {
     return withSetCookie(hypermediaResponseWithCsrf(
@@ -786,9 +904,10 @@ async function csrfProofForActions(
   context: ApplicationRouteContext,
   actorSubject: ActorSubject,
   provider: InvestmentInterestCsrfTokenProvider,
+  exactReplayScope: string | null,
 ): Promise<Readonly<{ token: string; setCookie: string | null }> | null> {
   if (!actions.some((action) => action.method !== "GET")) return null;
-  const value = await provider(context.request, actorSubject);
+  const value = await provider(context.request, actorSubject, exactReplayScope);
   const token = typeof value === "string"
     ? value
     : typeof value === "object" && value !== null && "token" in value
@@ -1006,7 +1125,11 @@ function methodNotAllowedResponse(
   const headers = new Headers(response.headers);
   headers.set(
     "Allow",
-    matched.kind === "collection" ? "GET, POST" : "GET, POST, PATCH, DELETE",
+    matched.kind === "collection"
+      ? "GET, POST"
+      : matched.kind === "withdrawal-replay"
+      ? "GET, DELETE"
+      : "GET, POST, PATCH, DELETE",
   );
   return new Response(response.body, {
     status: response.status,
@@ -1060,6 +1183,9 @@ function renderItemHtml(
   const packageNotice = state.acknowledgmentCurrent
     ? ""
     : `<aside class="investment-notice"><strong>Review required</strong><p>Review and accept the current information package before editing or reactivating this indication.</p><a href="${escapeHtml(new URL("/participant/package", model.document.links[0]?.href).href)}">Open information package</a></aside>`;
+  const withdrawalReplay = model.document.links.find((link) =>
+    link.rel.includes("withdrawal-replay")
+  );
   return pageShell(
     title,
     campaignName,
@@ -1075,8 +1201,33 @@ function renderItemHtml(
         <div><p class="investment-eyebrow">Current state</p><h2 id="indication-state">${escapeHtml(statusLabel(data.status))}</h2><p class="investment-meta">Revision ${data.revision} · Updated ${escapeHtml(formatTimestamp(data.updated_at))}</p></div>
         <dl class="investment-details">${renderFields(data.fields)}${data.rejection_reason ? detail("Review note", data.rejection_reason) : ""}</dl>
       </section>
+      ${withdrawalReplay === undefined ? "" : `<p><a class="investment-back" href="${escapeHtml(withdrawalReplay.href)}">Retry recorded withdrawal</a></p>`}
       ${renderForms(model.forms, csrfToken)}
       ${renderHistory(data.history)}
+    </main>`,
+  );
+}
+
+function renderWithdrawalReplayHtml(
+  model: InvestmentWithdrawalReplayCapabilityModel,
+  csrfToken: string | null,
+  campaignName: string,
+): string {
+  const item = model.document.links.find((link) =>
+    link.rel.includes("investment-interest")
+  );
+  if (item === undefined) throw new StorageFailure("UNAVAILABLE");
+  return pageShell(
+    "Retry recorded withdrawal",
+    campaignName,
+    `<main class="investment-main" aria-labelledby="investment-title">
+      <a class="investment-back" href="${escapeHtml(item.href)}">Investment interest</a>
+      <header class="investment-intro">
+        <p class="investment-eyebrow">Withdrawal recovery</p>
+        <h1 id="investment-title">Retry recorded withdrawal</h1>
+        <p>The withdrawal is already recorded. This action returns the same result without changing the indication again.</p>
+      </header>
+      ${renderForms(model.forms, csrfToken)}
     </main>`,
   );
 }
@@ -1245,20 +1396,27 @@ function matchRoute(pathname: string): MatchedInvestmentInterestRoute | null {
   }
   const prefix = `${INVESTMENT_INTEREST_PATH}/`;
   if (!pathname.startsWith(prefix)) return null;
-  const encoded = pathname.slice(prefix.length);
-  if (encoded.length === 0 || encoded.includes("/")) {
+  const segments = pathname.slice(prefix.length).split("/");
+  if (
+    segments.length < 1 ||
+    segments.length > 2 ||
+    segments[0]?.length === 0 ||
+    (segments.length === 2 &&
+      segments[1] !== INVESTMENT_WITHDRAWAL_REPLAY_SEGMENT)
+  ) {
     return Object.freeze({ kind: "invalid" });
   }
   let decoded: string;
   try {
-    decoded = decodeURIComponent(encoded);
+    decoded = decodeURIComponent(segments[0] ?? "");
   } catch {
     return Object.freeze({ kind: "invalid" });
   }
   const id = parseStableId<"investment-indication">(decoded);
-  return id.ok
-    ? Object.freeze({ kind: "item", indicationId: id.value })
-    : Object.freeze({ kind: "invalid" });
+  if (!id.ok) return Object.freeze({ kind: "invalid" });
+  return segments.length === 2
+    ? Object.freeze({ kind: "withdrawal-replay", indicationId: id.value })
+    : Object.freeze({ kind: "item", indicationId: id.value });
 }
 
 function authorizedParticipant(
@@ -1297,9 +1455,9 @@ function requestMethodAllowed(
   value: string,
 ): boolean {
   const method = value.toUpperCase();
-  return route.kind === "collection"
-    ? method === "POST"
-    : method === "POST" || method === "PATCH" || method === "DELETE";
+  if (route.kind === "collection") return method === "POST";
+  if (route.kind === "withdrawal-replay") return method === "DELETE";
+  return method === "POST" || method === "PATCH" || method === "DELETE";
 }
 
 function randomOperationId(): string {

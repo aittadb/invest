@@ -99,7 +99,7 @@ export const MAX_INDICATION_MATERIALIZATION_READS =
 export const MAX_INDICATION_STORAGE_READS =
   2 + 2 * MAX_INDICATION_MATERIALIZATION_READS;
 export const MAX_PARTICIPANT_INDICATION_SUMMARY_READS =
-  4 + MAX_INDICATION_FIELDS_CHUNKS;
+  4 + 2 * MAX_INDICATION_FIELDS_CHUNKS;
 export const MAX_INDICATION_STORAGE_MUTATIONS =
   5 + MAX_INDICATION_FIELDS_CHUNKS;
 export const MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE = 25;
@@ -831,7 +831,18 @@ export class DevelopmentInMemoryIndicationRepository
         1,
       );
     }
-    requireSummaryCreationTransition(created);
+    const createdFields = canonicalJson(fieldsReferenceDocument(created.fields)) ===
+        canonicalJson(fieldsReferenceDocument(current.fields))
+      ? fields
+      : await readStoredFields(
+          this.#storage,
+          subject,
+          indicationId,
+          created.fields,
+        );
+    if (
+      await verifyOwnerReviewTerminal(created, createdFields.fields) !== "active"
+    ) unavailable();
     if (created.occurredAt > terminal.occurredAt) unavailable();
 
     return Object.freeze({
@@ -1548,27 +1559,6 @@ function requireCurrentMatchesTerminal(
     current.revision !== terminal.revision ||
     canonicalJson(fieldsReferenceDocument(current.fields)) !==
       canonicalJson(fieldsReferenceDocument(terminal.fields))
-  ) {
-    unavailable();
-  }
-}
-
-function requireSummaryCreationTransition(
-  transition: StoredTransition,
-): void {
-  const source = exactRecord(transition.document, TRANSITION_DOCUMENT_KEYS);
-  const acknowledgment = storedAcknowledgment(source.acknowledgment);
-  const actor = storedParticipantActor(source.actor);
-  if (
-    transition.transitionKind !== "created" ||
-    transition.revision !== 1 ||
-    transition.fields.revision !== 1 ||
-    acknowledgment.participantSubject !== transition.participantSubject ||
-    actor.subject !== transition.participantSubject ||
-    source.rejection !== null ||
-    canonicalJson(acknowledgmentDocument(acknowledgment)) !==
-      canonicalJson(source.acknowledgment) ||
-    canonicalJson(actorDocument(actor)) !== canonicalJson(source.actor)
   ) {
     unavailable();
   }
