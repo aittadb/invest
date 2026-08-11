@@ -1106,6 +1106,44 @@ test("current profiles require the matching immutable history snapshot", async (
   }
 });
 
+test("matching revision-one records require registration mutation evidence", async (t) => {
+  const nonRegisterActions = [
+    "update",
+    "withdraw-marketing-consent",
+    "request-account-deletion",
+  ] as const;
+
+  for (const action of nonRegisterActions) {
+    await t.test(action, async () => {
+      const seeded = await seededParticipantStorage();
+      const storage = new ReadTransformStorageAdapter(
+        seeded.storage,
+        (key, record) =>
+          record !== null &&
+            (key.collection === "private-participant-profiles" ||
+              key.collection === "private-participant-profile-revisions")
+            ? mutateStoredLastMutation(record, (lastMutation) => {
+                lastMutation.action = action;
+              })
+            : record,
+      );
+      const failure = await captureStorageFailure(() =>
+        new StorageParticipantRepository(storage, aliceAccount()).current()
+      );
+
+      assert.equal(failure.code, "UNAVAILABLE");
+      assert.equal(Object.hasOwn(failure, "cause"), false);
+      assert.deepEqual(toPublicStorageFailure(failure), {
+        error: {
+          code: "UNAVAILABLE",
+          message: "Storage is temporarily unavailable.",
+        },
+      });
+      assert.equal(storage.transactCalls, 0);
+    });
+  }
+});
+
 test("later profiles use one bounded revision-one notice-evidence anchor read", async () => {
   const seeded = await seededParticipantStorage();
   await new StorageParticipantRepository(
@@ -1233,6 +1271,53 @@ test("later profiles reject corrupted immutable registration notice anchors", as
 
       assert.equal(failure.code, "UNAVAILABLE");
       assert.equal(Object.hasOwn(failure, "cause"), false);
+      assert.equal(storage.readCalls, 3);
+      assert.equal(storage.transactCalls, 0);
+    });
+  }
+});
+
+test("later profiles reject non-register revision-one ancestry", async (t) => {
+  const nonRegisterActions = [
+    "update",
+    "withdraw-marketing-consent",
+    "request-account-deletion",
+  ] as const;
+
+  for (const action of nonRegisterActions) {
+    await t.test(action, async () => {
+      const seeded = await seededParticipantStorage();
+      await new StorageParticipantRepository(
+        seeded.storage,
+        aliceAccount(),
+      ).update(updateRequest(
+        `participant-operation:seed-${action}`,
+        1,
+        { displayName: "Later participant profile" },
+      ));
+      const storage = new ReadTransformStorageAdapter(
+        seeded.storage,
+        (key, record) =>
+          record !== null &&
+            key.collection === "private-participant-profile-revisions" &&
+            storedParticipantProfileRevision(record) === 1
+            ? mutateStoredLastMutation(record, (lastMutation) => {
+                lastMutation.action = action;
+              })
+            : record,
+      );
+      const failure = await captureStorageFailure(() =>
+        new StorageParticipantRepository(storage, aliceAccount()).current()
+      );
+
+      assert.equal(failure.code, "UNAVAILABLE");
+      assert.equal(Object.hasOwn(failure, "cause"), false);
+      assert.deepEqual(toPublicStorageFailure(failure), {
+        error: {
+          code: "UNAVAILABLE",
+          message: "Storage is temporarily unavailable.",
+        },
+      });
       assert.equal(storage.readCalls, 3);
       assert.equal(storage.transactCalls, 0);
     });
@@ -1869,6 +1954,17 @@ function mutateStoredProfile(
     const profile = mutableRecord(value.profile);
     mutate(profile);
     value.profile = profile;
+  });
+}
+
+function mutateStoredLastMutation(
+  record: StorageRecord,
+  mutate: (lastMutation: Record<string, unknown>) => void,
+): unknown {
+  return mutateRecordValue(record, (value) => {
+    const lastMutation = mutableRecord(value.lastMutation);
+    mutate(lastMutation);
+    value.lastMutation = lastMutation;
   });
 }
 

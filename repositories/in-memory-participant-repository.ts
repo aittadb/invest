@@ -882,11 +882,11 @@ function decodeParticipantRecord(
     const outerSubject = parseActorSubject(source.subject);
     if (!outerSubject.ok) unavailable();
     if (outerSubject.value !== trustedSubject) return null;
-    validateLastMutation(source.lastMutation);
+    const lastMutation = validateLastMutation(source.lastMutation);
 
     const profile = decodeParticipantProfile(source.profile, trustedSubject);
     if (profile === null) return null;
-    validateParticipantProfileRevision(profileRevision, profile);
+    validateParticipantProfileRevision(profileRevision, profile, lastMutation);
     return profileSnapshot(profileRevision, profile);
   } catch {
     unavailable();
@@ -974,9 +974,11 @@ function decodeParticipantProfile(
 function validateParticipantProfileRevision(
   revision: number,
   profile: ParticipantProfile,
+  lastMutation: ParticipantMutationEvidence,
 ): void {
   if (revision !== 1) return;
   if (
+    lastMutation.action !== "register" ||
     profile.updatedAt !== profile.registeredAt ||
     profile.marketingConsent.state === "withdrawn" ||
     profile.accountDeletionRequest.state !== "not-requested"
