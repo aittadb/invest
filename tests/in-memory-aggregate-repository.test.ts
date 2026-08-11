@@ -47,6 +47,7 @@ import {
 } from "../repositories/in-memory-audit-notification-repositories.ts";
 
 const currency = "XYZ" as CurrencyCode;
+const evolvedCurrency = "EUR" as CurrencyCode;
 
 export type InvestmentAggregateRepositoryContractFixture = Readonly<{
   repository: InvestmentAggregateRepository;
@@ -524,7 +525,7 @@ test("audited correction atomically asserts its advertised campaign revision", a
   assert.deepEqual(replayed, { ...corrected, replayed: true });
 });
 
-test("delayed exact correction retry survives campaign advance while new stale work fails", async () => {
+test("delayed exact correction retry survives campaign and currency evolution", async () => {
   const state = new MemoryStorageState();
   const adapter = new DeterministicMemoryStorageAdapter(state);
   const campaignKey = requiredTestStorageKey(
@@ -559,7 +560,7 @@ test("delayed exact correction retry survives campaign advance while new stale w
   setCampaignRevision(state, campaignKey, 2);
   const revisionTwoRepository = new DevelopmentInMemoryAggregateRepository(
     adapter,
-    currency,
+    evolvedCurrency,
     revisionAssertion(campaignKey, 2),
   );
   const transactionsBeforeRetries = state.transactionCalls;
@@ -568,6 +569,7 @@ test("delayed exact correction retry survives campaign advance while new stale w
     occurredAt: "2026-08-10T12:00:00.000Z",
   });
   assert.deepEqual(delayed, { ...committed, replayed: true });
+  assert.equal(delayed.stored.currency, currency);
 
   await rejectsStorage(
     () => revisionTwoRepository.applyConfirmedCorrectionWithAudit({
@@ -585,12 +587,217 @@ test("delayed exact correction retry survives campaign advance while new stale w
     }),
     "PRECONDITION_FAILED",
   );
+  await rejectsStorage(
+    () => revisionTwoRepository.applyConfirmedCorrectionWithAudit({
+      ...request,
+      operationId: "aggregate-operation:new-current-currency-correction",
+      expectedCampaignRevision: 2,
+      occurredAt: "2026-08-10T12:15:00.000Z",
+    }),
+    "UNAVAILABLE",
+  );
   assert.equal(state.transactionCalls, transactionsBeforeRetries);
   assert.deepEqual(
     (await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }))
       .items,
     [committed.auditEvent],
   );
+});
+
+test("audited corrections reject a closed malformed transaction result matrix", async (t) => {
+  const corruptions: readonly Readonly<{
+    name: string;
+    apply(result: StorageTransactionResult): unknown;
+  }>[] = [
+    {
+      name: "primitive envelope",
+      apply: () => null,
+    },
+    {
+      name: "extra envelope member",
+      apply: (result) => ({ ...result, extra: true }),
+    },
+    {
+      name: "custom envelope prototype",
+      apply: (result) => Object.assign(Object.create({}), result),
+    },
+    {
+      name: "replayed accessor",
+      apply: (result) => Object.defineProperty(
+        { records: result.records },
+        "replayed",
+        { enumerable: true, get: () => result.replayed },
+      ),
+    },
+    {
+      name: "non-boolean replay marker",
+      apply: (result) => ({ ...result, replayed: "false" }),
+    },
+    {
+      name: "records accessor",
+      apply: (result) => Object.defineProperty(
+        { replayed: result.replayed },
+        "records",
+        { enumerable: true, get: () => result.records },
+      ),
+    },
+    {
+      name: "custom records prototype",
+      apply: (result) => ({
+        ...result,
+        records: Object.setPrototypeOf([...result.records], null),
+      }),
+    },
+    {
+      name: "sparse records",
+      apply: (result) => {
+        const records = new Array(result.records.length);
+        records[0] = result.records[0];
+        return { ...result, records };
+      },
+    },
+    {
+      name: "missing record",
+      apply: (result) => ({
+        ...result,
+        records: result.records.slice(0, -1),
+      }),
+    },
+    {
+      name: "extra record",
+      apply: (result) => ({
+        ...result,
+        records: [...result.records, result.records[0]],
+      }),
+    },
+    {
+      name: "reversed record order",
+      apply: (result) => ({
+        ...result,
+        records: [...result.records].reverse(),
+      }),
+    },
+    {
+      name: "extra record member",
+      apply: (result) => replaceTransactionResultRecord(
+        result,
+        0,
+        (record) => ({ ...record, extra: true }),
+      ),
+    },
+    {
+      name: "custom record prototype",
+      apply: (result) => replaceTransactionResultRecord(
+        result,
+        0,
+        (record) => Object.assign(Object.create({}), record),
+      ),
+    },
+    {
+      name: "extra key member",
+      apply: (result) => replaceTransactionResultRecord(
+        result,
+        0,
+        (record) => ({ ...record, key: { ...record.key, extra: true } }),
+      ),
+    },
+    {
+      name: "changed aggregate value",
+      apply: (result) => replaceTransactionResultRecord(
+        result,
+        0,
+        (record) => ({ ...record, value: { changed: true } }),
+      ),
+    },
+    {
+      name: "changed operation value",
+      apply: (result) => replaceTransactionResultRecord(
+        result,
+        1,
+        (record) => ({
+          ...record,
+          value: {
+            ...record.value,
+            operationFingerprint: `sha256:${"0".repeat(64)}`,
+          },
+        }),
+      ),
+    },
+    {
+      name: "changed audit value",
+      apply: (result) => replaceTransactionResultRecord(
+        result,
+        2,
+        (record) => ({
+          ...record,
+          value: { ...record.value, kind: "changed-audit" },
+        }),
+      ),
+    },
+    {
+      name: "changed campaign check revision",
+      apply: (result) => replaceTransactionResultRecord(
+        result,
+        3,
+        (record) => ({ ...record, revision: record.revision + 1 }),
+      ),
+    },
+  ];
+
+  for (const corruption of corruptions) {
+    await t.test(corruption.name, async () => {
+      const state = new MemoryStorageState();
+      const adapter = new DeterministicMemoryStorageAdapter(state);
+      const campaignKey = requiredTestStorageKey(
+        "campaign-setup-current",
+        "configured-campaign",
+      );
+      setCampaignRevision(state, campaignKey, 1);
+      const seed = new DevelopmentInMemoryAggregateRepository(adapter, currency);
+      await seed.applyContribution(applyRequest(
+        `aggregate-operation:malformed-seed-${corruption.name.replaceAll(" ", "-")}`,
+        0,
+        contribution("indication:malformed-result", 1, "active", 25_000),
+      ));
+      mutateAggregateRecord(state, (snapshot) => {
+        snapshot.totalAmount = 20_000;
+      });
+      const preview = await seed.previewReconciliation();
+      const request = {
+        operationId:
+          `aggregate-operation:malformed-${corruption.name.replaceAll(" ", "-")}`,
+        expectedCampaignRevision: 1,
+        confirmation: confirmationFor(preview),
+        ownerSubject: "issuer.invalid/subject:owner",
+        occurredAt: "2026-08-09T12:00:00.000Z",
+      };
+      const malformed = new DevelopmentInMemoryAggregateRepository(
+        new MalformedTransactionResultStorageAdapter(adapter, corruption.apply),
+        currency,
+        revisionAssertion(campaignKey, 1),
+      );
+
+      await rejectsStorage(
+        () => malformed.applyConfirmedCorrectionWithAudit(request),
+        "UNAVAILABLE",
+      );
+      const recovered = await new DevelopmentInMemoryAggregateRepository(
+        adapter,
+        evolvedCurrency,
+        revisionAssertion(campaignKey, 1),
+      ).applyConfirmedCorrectionWithAudit({
+        ...request,
+        occurredAt: "2026-08-09T12:05:00.000Z",
+      });
+      assert.equal(recovered.replayed, true);
+      assert.equal(recovered.stored.currency, currency);
+      assert.deepEqual(
+        (await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }))
+          .items,
+        [recovered.auditEvent],
+      );
+    });
+  }
 });
 
 test("aggregate contribution listing rejects oversized legitimate collections finitely", async () => {
@@ -1068,6 +1275,35 @@ class RejectAuditedCorrectionAdapter implements StorageAdapter {
   }
 }
 
+class MalformedTransactionResultStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #apply: (result: StorageTransactionResult) => unknown;
+
+  constructor(
+    delegate: StorageAdapter,
+    apply: (result: StorageTransactionResult) => unknown,
+  ) {
+    this.#delegate = delegate;
+    this.#apply = apply;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    return this.#apply(
+      await this.#delegate.transact(request),
+    ) as StorageTransactionResult;
+  }
+}
+
 class CampaignRevisionRaceAdapter implements StorageAdapter {
   readonly #delegate: StorageAdapter;
   readonly #state: MemoryStorageState;
@@ -1315,6 +1551,18 @@ function cloneResult(
     replayed,
     records: Object.freeze(result.records.map(cloneRecord)),
   });
+}
+
+function replaceTransactionResultRecord(
+  result: StorageTransactionResult,
+  index: number,
+  replace: (record: StorageRecord) => unknown,
+): unknown {
+  const record = result.records[index];
+  assert(record);
+  const records: unknown[] = [...result.records];
+  records[index] = replace(record);
+  return { ...result, records };
 }
 
 function cloneRecord(record: StorageRecord | null): StorageRecord | null {

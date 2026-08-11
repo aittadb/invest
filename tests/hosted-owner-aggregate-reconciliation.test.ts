@@ -165,6 +165,102 @@ test("hosted owner reconciles a persistent AittaDB aggregate and audit atomicall
   });
 });
 
+test("hosted exact retry survives campaign currency evolution and restart", async () => {
+  const service = storageService();
+  await seedMismatch(service);
+  const worker = hostedWorker(service);
+  const env = environment();
+  const attempts: Array<Readonly<{
+    proof: Readonly<{ token: string; cookie: string }>;
+    resource: OwnerAggregateReconciliationDocument;
+  }>> = [];
+  for (let index = 0; index < 4; index += 1) {
+    const response = await worker.fetch(
+      ownerRequest(PATH),
+      env,
+      executionContext,
+    );
+    attempts.push(Object.freeze({
+      proof: mutationProof(response),
+      resource: await response.json() as OwnerAggregateReconciliationDocument,
+    }));
+  }
+  const original = attempts[0];
+  assert(original);
+  const originalBody = actionBody(original.resource);
+  const originalCurrency = original.resource.data.stored.currency;
+
+  const committed = await worker.fetch(
+    ownerMutation(originalBody, original.proof),
+    env,
+    executionContext,
+  );
+  assert.equal(committed.status, 200);
+
+  const campaigns = new StorageCampaignRepository(storageAdapter(service));
+  const revisionOne = await campaigns.readSetup();
+  assert(revisionOne);
+  await campaigns.saveSetup({
+    operationId: "campaign-operation:currency-evolution-after-correction",
+    recordedAt: "2026-08-11T09:01:00.000Z",
+    expectedRevision: revisionOne.revision,
+    setup: campaignSetupWithCurrency(
+      revisionOne.setup,
+      "EUR",
+      "Currency-evolved campaign",
+    ),
+  });
+
+  const restarted = hostedWorker(service, service.fetch, 41);
+  const listRequestsBeforeRetries = service.listRequests;
+  const exactAttempt = attempts[1];
+  assert(exactAttempt);
+  const exact = await restarted.fetch(
+    ownerMutation(originalBody, exactAttempt.proof),
+    env,
+    executionContext,
+  );
+  assert.equal(exact.status, 200);
+  const exactResource = await exact.json() as
+    OwnerAggregateReconciliationDocument;
+  assert.equal(exactResource.data.campaign_revision, 2);
+  assert.equal(exactResource.data.status, "match");
+  assert.equal(exactResource.data.stored.currency, originalCurrency);
+  assert.equal(exactResource.data.calculated.currency, originalCurrency);
+  assert.deepEqual(exactResource.actions, []);
+
+  const changedAttempt = attempts[2];
+  assert(changedAttempt);
+  const changed = await restarted.fetch(
+    ownerMutation({
+      ...originalBody,
+      "expected-campaign-revision": 2,
+    }, changedAttempt.proof),
+    env,
+    executionContext,
+  );
+  assert.equal(changed.status, 409);
+
+  const staleAttempt = attempts[3];
+  assert(staleAttempt);
+  const stale = await restarted.fetch(
+    ownerMutation({
+      ...originalBody,
+      "operation-id": "aggregate-correction:new-stale-after-currency-evolution",
+    }, staleAttempt.proof),
+    env,
+    executionContext,
+  );
+  assert.equal(stale.status, 412);
+  assert.equal(service.listRequests, listRequestsBeforeRetries);
+  assert.equal(
+    (await new DevelopmentInMemoryAuditRepository(storageAdapter(service)).list({
+      limit: 10,
+    })).items.length,
+    1,
+  );
+});
+
 test("hosted reconciliation rejects stale previews and consumes their proof", async () => {
   const service = storageService();
   const seeded = await seedMismatch(service);

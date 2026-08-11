@@ -65,6 +65,12 @@ export const MAX_AGGREGATE_CONTRIBUTION_LIST_PAGES = 20;
 export const MAX_AGGREGATE_CONTRIBUTION_LIST_READS = 20;
 export const MAX_AGGREGATE_CONTRIBUTION_RECORDS = 1_000;
 const MAX_AGGREGATE_CONTRIBUTION_CURSOR_LENGTH = 2_048;
+const MAX_AGGREGATE_TRANSACTION_RESULT_DEPTH = 32;
+const MAX_AGGREGATE_TRANSACTION_RESULT_NODES = 4_096;
+
+const TRANSACTION_RESULT_KEYS = ["replayed", "records"] as const;
+const STORAGE_RECORD_KEYS = ["key", "revision", "value"] as const;
+const STORAGE_KEY_KEYS = ["collection", "id"] as const;
 
 const AGGREGATE_DOCUMENT_KEYS = new Set([
   "kind",
@@ -664,30 +670,31 @@ export class DevelopmentInMemoryAggregateRepository
       stored: confirmed.replacement,
       auditEvent,
     });
-    let transaction: StorageTransactionResult;
+    const mutations = Object.freeze([
+      {
+        type: "put" as const,
+        key: CURRENT_AGGREGATE_KEY,
+        expectedRevision: aggregate?.record.revision ?? null,
+        value: aggregateDocument(confirmed.replacement),
+      },
+      {
+        type: "put" as const,
+        key: operationStorageKey(operationId),
+        expectedRevision: null,
+        value: operationDocument(
+          "audited-correction",
+          fingerprint,
+          persisted,
+        ),
+      },
+      preparedAudit.mutation,
+      revisionAssertion,
+    ]) satisfies readonly StorageMutation[];
+    let transactionResult: unknown;
     try {
-      transaction = await this.#storage.transact({
+      transactionResult = await this.#storage.transact({
         operationId,
-        mutations: [
-          {
-            type: "put",
-            key: CURRENT_AGGREGATE_KEY,
-            expectedRevision: aggregate?.record.revision ?? null,
-            value: aggregateDocument(confirmed.replacement),
-          },
-          {
-            type: "put",
-            key: operationStorageKey(operationId),
-            expectedRevision: null,
-            value: operationDocument(
-              "audited-correction",
-              fingerprint,
-              persisted,
-            ),
-          },
-          preparedAudit.mutation,
-          revisionAssertion,
-        ],
+        mutations,
       });
     } catch (error) {
       if (!mayHaveCommittedAuditedCorrection(error)) throw error;
@@ -700,7 +707,10 @@ export class DevelopmentInMemoryAggregateRepository
       throw error;
     }
 
-    if (transaction.records.length !== 4) unavailable();
+    const transaction = exactStorageTransactionResult(
+      transactionResult,
+      mutations,
+    );
     const aggregateRecord = transaction.records[0];
     const operationRecord = transaction.records[1];
     if (!aggregateRecord || !operationRecord) unavailable();
@@ -833,11 +843,15 @@ export class DevelopmentInMemoryAggregateRepository
     fingerprint: string,
     ownerSubject: ActorSubject,
   ): Promise<ApplyAuditedAggregateCorrectionResult | null> {
-    const replay = await this.#readOperation(
-      operationId,
-      "audited-correction",
-      fingerprint,
-    );
+    const key = operationStorageKey(operationId);
+    const record = await this.#storage.read(key);
+    const replay = record === null
+      ? null
+      : decodeAuditedCorrectionReplayRecord(
+          record,
+          key,
+          fingerprint,
+        );
     if (replay === null) return null;
 
     const result = auditedCorrectionResult(replay, true);
@@ -1218,6 +1232,42 @@ function decodeOperationRecord(
   expectedFingerprint: string,
   currency: CurrencyCode,
 ): StoredOperationResult {
+  const result = decodeOperationResultValue(
+    record,
+    expectedKey,
+    expectedKind,
+    expectedFingerprint,
+  );
+  return expectedKind === "contribution"
+    ? decodeContributionResult(result, currency)
+    : expectedKind === "correction"
+    ? decodeCorrectionResult(result, currency)
+    : decodeAuditedCorrectionResult(result, currency);
+}
+
+function decodeAuditedCorrectionReplayRecord(
+  record: StorageRecord,
+  expectedKey: StorageKey,
+  expectedFingerprint: string,
+): Omit<ApplyAuditedAggregateCorrectionResult, "replayed"> {
+  const result = decodeOperationResultValue(
+    record,
+    expectedKey,
+    "audited-correction",
+    expectedFingerprint,
+  );
+  return decodeAuditedCorrectionResult(
+    result,
+    immutableAuditedCorrectionCurrency(result),
+  );
+}
+
+function decodeOperationResultValue(
+  record: StorageRecord,
+  expectedKey: StorageKey,
+  expectedKind: OperationKind,
+  expectedFingerprint: string,
+): unknown {
   if (
     storageKeyString(record.key) !== storageKeyString(expectedKey) ||
     record.revision !== 1
@@ -1244,11 +1294,7 @@ function decodeOperationRecord(
   ) {
     throw new StorageFailure("CONFLICT");
   }
-  return expectedKind === "contribution"
-    ? decodeContributionResult(source.result, currency)
-    : expectedKind === "correction"
-    ? decodeCorrectionResult(source.result, currency)
-    : decodeAuditedCorrectionResult(source.result, currency);
+  return source.result;
 }
 
 function decodeContributionResult(
@@ -1328,6 +1374,16 @@ function decodeAuditedCorrectionResult(
   });
   assertAggregateReconciledAuditEvent(prepared.event);
   return deepFreeze({ ...correction, auditEvent: prepared.event });
+}
+
+function immutableAuditedCorrectionCurrency(value: unknown): CurrencyCode {
+  const source = objectRecord(value);
+  const stored = source === null ? null : objectRecord(source.stored);
+  const currency = stored?.currency;
+  if (typeof currency !== "string" || !/^[A-Z]{3}$/.test(currency)) {
+    unavailable();
+  }
+  return currency as CurrencyCode;
 }
 
 function decodePreview(
@@ -1688,6 +1744,243 @@ function verifyCorrectionRevisionAssertion(
     storageKeyString(value.key) !== storageKeyString(assertion.key) ||
     value.revision !== assertion.expectedRevision
   ) unavailable();
+}
+
+function exactStorageTransactionResult(
+  value: unknown,
+  mutations: readonly StorageMutation[],
+): StorageTransactionResult {
+  const source = exactDataObject(value, TRANSACTION_RESULT_KEYS);
+  const records = source === null
+    ? null
+    : exactArrayValues(source.records, mutations.length);
+  if (
+    source === null ||
+    typeof source.replayed !== "boolean" ||
+    records === null
+  ) unavailable();
+
+  return Object.freeze({
+    replayed: source.replayed,
+    records: Object.freeze(records.map((record, index) => {
+      const mutation = mutations[index];
+      if (mutation === undefined) unavailable();
+      return exactMutationResultRecord(record, mutation);
+    })),
+  });
+}
+
+function exactMutationResultRecord(
+  value: unknown,
+  mutation: StorageMutation,
+): StorageRecord | null {
+  if (mutation.type === "delete") {
+    if (value !== null) unavailable();
+    return null;
+  }
+  if (mutation.type === "check" && mutation.expectedRevision === null) {
+    if (value !== null) unavailable();
+    return null;
+  }
+  if (value === null) unavailable();
+
+  const record = exactStorageRecord(value);
+  const expectedRevision = mutation.type === "check"
+    ? mutation.expectedRevision
+    : (mutation.expectedRevision ?? 0) + 1;
+  if (
+    expectedRevision === null ||
+    storageKeyString(record.key) !== storageKeyString(mutation.key) ||
+    record.revision !== expectedRevision
+  ) unavailable();
+
+  if (mutation.type === "put") {
+    try {
+      if (canonicalJson(record.value) !== canonicalJson(mutation.value)) {
+        unavailable();
+      }
+    } catch {
+      unavailable();
+    }
+  }
+  return record;
+}
+
+function exactStorageRecord(value: unknown): StorageRecord {
+  const source = exactDataObject(value, STORAGE_RECORD_KEYS);
+  const keySource = source === null
+    ? null
+    : exactDataObject(source.key, STORAGE_KEY_KEYS);
+  const key = keySource === null
+    ? null
+    : parseStorageKey(keySource.collection, keySource.id);
+  if (
+    source === null ||
+    key === null ||
+    !key.ok ||
+    !Number.isSafeInteger(source.revision) ||
+    (source.revision as number) < 1
+  ) unavailable();
+
+  return Object.freeze({
+    key: key.value,
+    revision: source.revision as number,
+    value: snapshotStorageDocument(source.value),
+  });
+}
+
+function snapshotStorageDocument(value: unknown): StorageDocument {
+  const snapshot = snapshotJsonValue(
+    value,
+    0,
+    { nodes: 0, ancestors: new Set<object>() },
+  );
+  if (
+    typeof snapshot !== "object" ||
+    snapshot === null ||
+    Array.isArray(snapshot)
+  ) unavailable();
+  return snapshot as StorageDocument;
+}
+
+function snapshotJsonValue(
+  value: unknown,
+  depth: number,
+  state: { nodes: number; ancestors: Set<object> },
+): JsonValue {
+  state.nodes += 1;
+  if (
+    depth > MAX_AGGREGATE_TRANSACTION_RESULT_DEPTH ||
+    state.nodes > MAX_AGGREGATE_TRANSACTION_RESULT_NODES
+  ) unavailable();
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) unavailable();
+    return value;
+  }
+  if (typeof value !== "object" || state.ancestors.has(value)) unavailable();
+
+  state.ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const length = exactArrayLength(value);
+      const values = length === null ? null : exactArrayValues(value, length);
+      if (values === null) unavailable();
+      return Object.freeze(
+        values.map((candidate) => snapshotJsonValue(candidate, depth + 1, state)),
+      );
+    }
+
+    const entries = exactDataEntries(value);
+    if (entries === null) unavailable();
+    const snapshot: Record<string, JsonValue> = Object.create(null) as Record<
+      string,
+      JsonValue
+    >;
+    for (const [key, candidate] of entries) {
+      snapshot[key] = snapshotJsonValue(candidate, depth + 1, state);
+    }
+    return Object.freeze(snapshot);
+  } finally {
+    state.ancestors.delete(value);
+  }
+}
+
+function exactDataObject(
+  value: unknown,
+  expectedKeys: readonly string[],
+): Readonly<Record<string, unknown>> | null {
+  const entries = exactDataEntries(value);
+  if (
+    entries === null ||
+    entries.length !== expectedKeys.length ||
+    entries.some(([key]) => !expectedKeys.includes(key))
+  ) return null;
+  return Object.freeze(Object.fromEntries(entries));
+}
+
+function exactDataEntries(
+  value: unknown,
+): readonly (readonly [string, unknown])[] | null {
+  try {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value)
+    ) return null;
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const keys = Reflect.ownKeys(value);
+    if (keys.some((key) => typeof key !== "string")) return null;
+    const entries: Array<readonly [string, unknown]> = [];
+    for (const key of keys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (
+        descriptor === undefined ||
+        !descriptor.enumerable ||
+        !("value" in descriptor)
+      ) return null;
+      entries.push(Object.freeze([key, descriptor.value] as const));
+    }
+    return Object.freeze(entries);
+  } catch {
+    return null;
+  }
+}
+
+function exactArrayLength(value: readonly unknown[]): number | null {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, "length");
+    return descriptor !== undefined &&
+        !descriptor.enumerable &&
+        "value" in descriptor &&
+        Number.isSafeInteger(descriptor.value) &&
+        descriptor.value >= 0 &&
+        descriptor.value <= MAX_AGGREGATE_TRANSACTION_RESULT_NODES
+      ? descriptor.value as number
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function exactArrayValues(
+  value: unknown,
+  expectedLength: number,
+): readonly unknown[] | null {
+  try {
+    if (
+      !Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype ||
+      exactArrayLength(value) !== expectedLength
+    ) return null;
+    const expectedKeys = [
+      ...Array.from({ length: expectedLength }, (_, index) => String(index)),
+      "length",
+    ];
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.length !== expectedKeys.length ||
+      keys.some((key) =>
+        typeof key !== "string" || !expectedKeys.includes(key)
+      )
+    ) return null;
+    const values: unknown[] = [];
+    for (let index = 0; index < expectedLength; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (
+        descriptor === undefined ||
+        !descriptor.enumerable ||
+        !("value" in descriptor)
+      ) return null;
+      values.push(descriptor.value);
+    }
+    return Object.freeze(values);
+  } catch {
+    return null;
+  }
 }
 
 function canonicalJson(value: unknown, ancestors = new Set<object>()): string {

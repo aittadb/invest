@@ -50,10 +50,14 @@ trusted owner subject, and requires new correction work to return that exact
 revision. It atomically persists the corrected aggregate, retry receipt, audit
 evidence, and an exact non-mutating assertion that the advertised campaign
 revision is still current. Existing exact receipts are verified before current
-campaign state so delayed retries survive later campaign revisions, while one
-bounded recovery verification converges an overlapping exact retry on the
-immutable winner. Its contribution scan stops at 1,000 records or 20 page reads
-and rejects malformed or non-progressing pagination.
+campaign state and decoded from their own self-consistent committed currency, so
+delayed retries survive later campaign configuration and currency revisions
+without letting current configuration reinterpret new work. The returned
+transaction must contain a closed boolean replay envelope and four dense ordered
+records matching the submitted aggregate, receipt, audit, and campaign-check
+mutations. One bounded recovery verification converges an overlapping exact
+retry on the immutable winner. Its contribution scan stops at 1,000 records or
+20 page reads and rejects malformed or non-progressing pagination.
 
 The persistent owner indication-detail primitive can resolve one deployment-key
 opaque review ID to a bounded verified current record and notification without a
