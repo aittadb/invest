@@ -134,6 +134,10 @@ export type PreparedAtomicAggregateContribution = Readonly<{
   mutations: readonly StorageMutation[];
 }>;
 
+export type AtomicAggregateCurrencyMode =
+  | "strict"
+  | "allow-empty-rollover";
+
 export type ApplyAggregateCorrectionRequest = Readonly<{
   operationId: unknown;
   confirmation: unknown;
@@ -215,6 +219,7 @@ export async function prepareAtomicAggregateContribution(
   storage: Pick<StorageAdapter, "read">,
   request: ApplyAggregateContributionRequest,
   currency: CurrencyCode,
+  currencyMode: AtomicAggregateCurrencyMode,
 ): Promise<PreparedAtomicAggregateContribution> {
   const parsed = await parseAggregateContributionRequest(request, currency);
   const operationKey = operationStorageKey(parsed.operationId);
@@ -233,7 +238,7 @@ export async function prepareAtomicAggregateContribution(
   const aggregateRecord = await storage.read(CURRENT_AGGREGATE_KEY);
   const stored = aggregateRecord === null
     ? zeroStoredSnapshot(currency)
-    : decodeAggregateRecord(aggregateRecord, currency);
+    : decodeAtomicAggregateRecord(aggregateRecord, currency, currencyMode);
   if (stored.revision !== parsed.expectedStoredRevision) {
     preconditionFailed();
   }
@@ -296,6 +301,22 @@ export async function prepareAtomicAggregateContribution(
     result,
     mutations,
   });
+}
+
+/**
+ * Read the aggregate revision used to stage a larger atomic contribution.
+ * Empty rollover changes only the staged currency; the caller must commit the
+ * returned revision through prepareAtomicAggregateContribution's CAS mutation.
+ */
+export async function readAtomicAggregateContributionHead(
+  storage: Pick<StorageAdapter, "read">,
+  currency: CurrencyCode,
+  currencyMode: AtomicAggregateCurrencyMode,
+): Promise<StoredInvestmentAggregateSnapshot> {
+  const record = await storage.read(CURRENT_AGGREGATE_KEY);
+  return record === null
+    ? zeroStoredSnapshot(currency)
+    : decodeAtomicAggregateRecord(record, currency, currencyMode);
 }
 
 /** Verify the immutable aggregate receipt for a completed atomic operation. */
@@ -1006,6 +1027,29 @@ function decodeAggregateRecord(
   record: StorageRecord,
   currency: CurrencyCode,
 ): StoredInvestmentAggregateSnapshot {
+  const snapshot = decodeAggregateRecordInStoredCurrency(record);
+  if (snapshot.currency !== currency) unavailable();
+  return snapshot;
+}
+
+function decodeAtomicAggregateRecord(
+  record: StorageRecord,
+  currency: CurrencyCode,
+  currencyMode: AtomicAggregateCurrencyMode,
+): StoredInvestmentAggregateSnapshot {
+  const snapshot = decodeAggregateRecordInStoredCurrency(record);
+  if (snapshot.currency === currency) return snapshot;
+  if (
+    currencyMode !== "allow-empty-rollover" ||
+    snapshot.totalAmount !== 0 ||
+    snapshot.contributingIndicationCount !== 0
+  ) unavailable();
+  return deepFreeze({ ...snapshot, currency });
+}
+
+function decodeAggregateRecordInStoredCurrency(
+  record: StorageRecord,
+): StoredInvestmentAggregateSnapshot {
   if (storageKeyString(record.key) !== storageKeyString(CURRENT_AGGREGATE_KEY)) {
     unavailable();
   }
@@ -1018,9 +1062,22 @@ function decodeAggregateRecord(
   ) {
     unavailable();
   }
-  const snapshot = decodeSnapshot(source.snapshot, currency);
+  const snapshotSource = objectRecord(source.snapshot);
+  if (snapshotSource === null) unavailable();
+  const snapshot = decodeSnapshot(
+    source.snapshot,
+    requiredStoredCurrency(snapshotSource.currency),
+  );
   if (record.revision !== snapshot.revision || record.revision < 1) unavailable();
   return snapshot;
+}
+
+function requiredStoredCurrency(value: unknown): CurrencyCode {
+  try {
+    return requiredCurrency(value);
+  } catch {
+    unavailable();
+  }
 }
 
 function decodeContributionRecord(

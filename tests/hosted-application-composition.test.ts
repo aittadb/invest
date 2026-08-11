@@ -2317,6 +2317,139 @@ test("hosted investment interests persist their full lifecycle across workers an
   );
 });
 
+test("hosted HTML and JSON create in current currency after historical contributions reach zero", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedInvestmentFixture(service);
+
+  const initial = await investmentResource(hostedPackageWorker(service), env);
+  const oldCreateAction = requiredAction(
+    initial.document,
+    "create-personal-investment-interest",
+  );
+  const oldCreateBody = actionBody(oldCreateAction, {
+    "operation-id": "investment-operation:hosted-rollover-old-create",
+    "residence-country": "FI",
+    amount: 25_000,
+    "availability-period": "Within twelve months.",
+    note: "Historical rollover note.",
+  });
+  const createdResponse = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    initial,
+    oldCreateAction,
+    oldCreateBody,
+  );
+  assert.equal(createdResponse.status, 201);
+  const created = await createdResponse.json() as InvestmentInterestItemDocument;
+  assert.equal(created.data.fields.currency, "SEK");
+
+  await configureHostedInvestmentCurrency(service, "EUR");
+  const oldItemPath = investmentItemPath(
+    "investment-operation:hosted-rollover-old-create",
+  );
+  const withdrawalProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    oldItemPath,
+  );
+  const withdrawalAction = requiredAction(
+    withdrawalProof.document,
+    "withdraw-investment-interest",
+  );
+  const withdrawalBody = actionBody(withdrawalAction, {
+    "operation-id": "investment-operation:hosted-rollover-old-withdraw",
+    "expected-revision": 1,
+    "confirm-withdrawal": true,
+  });
+  const withdrawalResponse = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    withdrawalProof,
+    withdrawalAction,
+    withdrawalBody,
+  );
+  assert.equal(withdrawalResponse.status, 200);
+  const withdrawn = await withdrawalResponse.json() as
+    InvestmentInterestItemDocument;
+  assert.equal(withdrawn.data.status, "withdrawn");
+  assert.equal(withdrawn.data.fields.currency, "SEK");
+  assert.deepEqual(actionNames(withdrawn), []);
+
+  const currentJson = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  assert.equal(currentJson.document.data.amount.currency, "EUR");
+  assert.deepEqual(actionNames(currentJson.document), [
+    "create-personal-investment-interest",
+    "create-company-investment-interest",
+  ]);
+  const currentHtml = await investmentHtmlResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  assert.deepEqual(
+    investmentHtmlActionNames(currentHtml.html),
+    actionNames(currentJson.document),
+  );
+
+  const currentCreateAction = requiredAction(
+    currentJson.document,
+    "create-company-investment-interest",
+  );
+  const currentOperation = "investment-operation:hosted-rollover-current-create";
+  const currentCreateResponse = await submitInvestmentForm(
+    hostedPackageWorker(service),
+    env,
+    currentHtml,
+    currentCreateAction,
+    actionBody(currentCreateAction, {
+      "operation-id": currentOperation,
+      "company-name": "Current Currency Company Oy",
+      "registration-country": "FI",
+      "company-identifier": "CURRENT-CURRENCY-001",
+      "representative-name": "Current Representative",
+      "representative-authority-declared": true,
+      amount: 25_000,
+      "availability-period": "Within twelve months.",
+      note: "Current rollover note.",
+    }),
+  );
+  assert.equal(currentCreateResponse.status, 201);
+  assert.match(await currentCreateResponse.text(), /Current Currency Company Oy/u);
+
+  const reopened = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    investmentItemPath(currentOperation),
+  );
+  assert.equal(reopened.document.data.status, "active");
+  assert.equal(reopened.document.data.fields.currency, "EUR");
+  const aggregate = recordsIn(service, "investment-aggregate-states");
+  assert.equal(aggregate.length, 1);
+  assert.deepEqual(aggregate[0]?.value.snapshot, {
+    revision: 3,
+    totalAmount: 25_000,
+    currency: "EUR",
+    contributingIndicationCount: 1,
+  });
+
+  const historicalReplay = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    currentJson,
+    withdrawalAction,
+    withdrawalBody,
+  );
+  assert.equal(historicalReplay.status, 200);
+  const replayedWithdrawal = await historicalReplay.json() as
+    InvestmentInterestItemDocument;
+  assert.equal(replayedWithdrawal.data.fields.currency, "SEK");
+  assert.equal(recordsIn(service, "audit-events").length, 3);
+});
+
 test("hosted investment creation and reactivation recheck phase and package policy", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });

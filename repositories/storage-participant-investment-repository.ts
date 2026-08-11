@@ -45,9 +45,10 @@ import {
   type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
 import {
-  DevelopmentInMemoryAggregateRepository,
   prepareAtomicAggregateContribution,
+  readAtomicAggregateContributionHead,
   readAtomicAggregateContributionReplay,
+  type AtomicAggregateCurrencyMode,
 } from "./in-memory-aggregate-repository.ts";
 import {
   prepareAuditAppend,
@@ -273,17 +274,22 @@ export class StorageParticipantInvestmentInterestRepository
       operationCurrency !== this.#amount.currency
     ) precondition();
 
-    const aggregateBefore = await new DevelopmentInMemoryAggregateRepository(
+    const aggregateCurrencyMode: AtomicAggregateCurrencyMode =
+      prepared.command.kind === "withdraw"
+        ? "strict"
+        : "allow-empty-rollover";
+    const aggregateBefore = await readAtomicAggregateContributionHead(
       staged,
       operationCurrency,
-    ).readStored();
+      aggregateCurrencyMode,
+    );
     const aggregate = await prepareAtomicAggregateContribution(staged, {
       operationId,
       expectedStoredRevision: aggregateBefore.revision,
       contribution: projectInvestmentIndicationForAggregation(
         indication.snapshot,
       ),
-    }, operationCurrency);
+    }, operationCurrency, aggregateCurrencyMode);
     await staged.stage(aggregate.mutations);
 
     if (prepared.command.kind === "create") {

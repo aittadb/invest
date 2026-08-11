@@ -259,6 +259,177 @@ test("historical currency preserves withdrawal and exact retries after policy ev
   assert.equal(withdrawn.snapshot.fields.currency, AMOUNT.currency);
   assertAggregate(state, 2, 0, 0);
 
+  const rolloverInput = Object.freeze({
+    operationId: "investment-operation:storage-currency-rollover-create",
+    fields: companyFields({
+      companyIdentifier: "CURRENT-CURRENCY-COMPANY",
+      amount: 5_000,
+    }),
+  });
+  const createCurrent = () => serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      evolvedAmount,
+    ),
+    ALICE,
+    context,
+    () => new Date("2026-08-12T12:00:00.000Z"),
+    evolvedAmount,
+  ).create(rolloverInput);
+  const rollovers = await Promise.all([createCurrent(), createCurrent()]);
+  assert.deepEqual(
+    rollovers.map(({ replayed }) => replayed).sort(),
+    [false, true],
+  );
+  assert.equal(rollovers[0]?.snapshot.fields.currency, evolvedAmount.currency);
+  assertAggregate(state, 3, 5_000, 1, evolvedAmount.currency);
+
+  const restarted = serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      evolvedAmount,
+    ),
+    ALICE,
+    context,
+    () => new Date("2026-08-12T13:00:00.000Z"),
+    evolvedAmount,
+  );
+  const currentCreateReplay = await restarted.create(rolloverInput);
+  assert.equal(currentCreateReplay.replayed, true);
+  assert.deepEqual(currentCreateReplay.snapshot, rollovers[0]?.snapshot);
+  const withdrawalReplay = await restarted.withdraw(withdrawalInput);
+  assert.equal(withdrawalReplay.replayed, true);
+  assert.deepEqual(withdrawalReplay.snapshot, withdrawn.snapshot);
+  assertAggregate(state, 3, 5_000, 1, evolvedAmount.currency);
+
+  const blockedReactivation = await captureStorageFailure(() =>
+    restarted.reactivate({
+      operationId:
+        "investment-operation:storage-currency-evolution-reactivate",
+      indicationId: original.snapshot.id,
+      expectedRevision: 2,
+    })
+  );
+  assert.equal(blockedReactivation.code, "PRECONDITION_FAILED");
+  assert.equal(recordsIn(state, "audit-events").length, 3);
+  assert.equal(recordsIn(state, "participant-investment-operations").length, 3);
+  assert.equal(state.operations.size, 3);
+});
+
+test("currency rollover rejects every non-empty aggregate shape without writes", async () => {
+  const cases = [
+    { name: "nonzero amount and count", totalAmount: 1_250, count: 1 },
+    { name: "zero amount with nonzero count", totalAmount: 0, count: 1 },
+    { name: "nonzero amount with zero count", totalAmount: 1_250, count: 0 },
+  ] as const;
+
+  for (const candidate of cases) {
+    const state = new MemoryStorageState();
+    const context = await currentContext(
+      ALICE,
+      `storage-currency-rollover-${candidate.name.replaceAll(" ", "-")}`,
+    );
+    await serviceFor(
+      new StorageParticipantInvestmentInterestRepository(
+        new MemoryStorageAdapter(state),
+        ALICE,
+        AMOUNT,
+      ),
+      ALICE,
+      context,
+      () => new Date("2026-08-12T10:00:00.000Z"),
+    ).create({
+      operationId:
+        `investment-operation:storage-currency-rollover-seed-${candidate.count}`,
+      fields: personalFields(),
+    });
+    replaceAggregateSnapshot(state, {
+      totalAmount: candidate.totalAmount,
+      contributingIndicationCount: candidate.count,
+    });
+    const recordsBefore = [...state.records.entries()];
+    const operationsBefore = [...state.operations.entries()];
+    const evolvedAmount = amountConfiguration({ currency: "usd" });
+    const evolved = serviceFor(
+      new StorageParticipantInvestmentInterestRepository(
+        new MemoryStorageAdapter(state),
+        ALICE,
+        evolvedAmount,
+      ),
+      ALICE,
+      context,
+      () => new Date("2026-08-12T11:00:00.000Z"),
+      evolvedAmount,
+    );
+
+    const failure = await captureStorageFailure(() => evolved.create({
+      operationId:
+        `investment-operation:storage-currency-rollover-blocked-${candidate.count}`,
+      fields: companyFields({
+        companyIdentifier: `BLOCKED-${candidate.count}`,
+      }),
+    }));
+    assert.equal(failure.code, "UNAVAILABLE", candidate.name);
+    assert.deepEqual([...state.records.entries()], recordsBefore, candidate.name);
+    assert.deepEqual(
+      [...state.operations.entries()],
+      operationsBefore,
+      candidate.name,
+    );
+  }
+});
+
+test("malformed rollover transaction evidence fails closed and exact restart retry recovers", async () => {
+  const state = new MemoryStorageState();
+  const context = await currentContext(ALICE, "storage-currency-rollover-result");
+  const original = serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      AMOUNT,
+    ),
+    ALICE,
+    context,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  const created = await original.create({
+    operationId: "investment-operation:storage-rollover-result-seed",
+    fields: personalFields(),
+  });
+  await original.withdraw({
+    operationId: "investment-operation:storage-rollover-result-withdraw",
+    indicationId: created.snapshot.id,
+    expectedRevision: 1,
+  });
+
+  const evolvedAmount = amountConfiguration({ currency: "usd" });
+  const input = Object.freeze({
+    operationId: "investment-operation:storage-rollover-result-create",
+    fields: companyFields({
+      companyIdentifier: "ROLLOVER-RESULT",
+    }),
+  });
+  const malformed = serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      new ResultTransformStorageAdapter(
+        new MemoryStorageAdapter(state),
+        replaceReturnedAggregateCurrency,
+      ),
+      ALICE,
+      evolvedAmount,
+    ),
+    ALICE,
+    context,
+    () => new Date("2026-08-12T11:00:00.000Z"),
+    evolvedAmount,
+  );
+  const failure = await captureStorageFailure(() => malformed.create(input));
+  assert.equal(failure.code, "UNAVAILABLE");
+  assertAggregate(state, 3, 2_000, 1, evolvedAmount.currency);
+  assert.equal(recordsIn(state, "audit-events").length, 3);
+
   const restarted = serviceFor(
     new StorageParticipantInvestmentInterestRepository(
       new MemoryStorageAdapter(state),
@@ -270,21 +441,12 @@ test("historical currency preserves withdrawal and exact retries after policy ev
     () => new Date("2026-08-12T12:00:00.000Z"),
     evolvedAmount,
   );
-  const withdrawalReplay = await restarted.withdraw(withdrawalInput);
-  assert.equal(withdrawalReplay.replayed, true);
-  assert.deepEqual(withdrawalReplay.snapshot, withdrawn.snapshot);
-
-  const blockedReactivation = await captureStorageFailure(() =>
-    restarted.reactivate({
-      operationId:
-        "investment-operation:storage-currency-evolution-reactivate",
-      indicationId: original.snapshot.id,
-      expectedRevision: 2,
-    })
-  );
-  assert.equal(blockedReactivation.code, "PRECONDITION_FAILED");
-  assert.equal(recordsIn(state, "audit-events").length, 2);
-  assert.equal(recordsIn(state, "participant-investment-operations").length, 2);
+  const replay = await restarted.create(input);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.snapshot.fields.currency, evolvedAmount.currency);
+  assertAggregate(state, 3, 2_000, 1, evolvedAmount.currency);
+  assert.equal(recordsIn(state, "audit-events").length, 3);
+  assert.equal(recordsIn(state, "participant-investment-operations").length, 3);
 });
 
 test("atomic exact retries survive normalizer evolution without semantic substitution", async () => {
@@ -868,6 +1030,7 @@ function assertAggregate(
   revision: number,
   totalAmount: number,
   count: number,
+  expectedCurrency: string = AMOUNT.currency,
 ): void {
   const records = recordsIn(state, "investment-aggregate-states");
   assert.equal(records.length, 1);
@@ -876,7 +1039,54 @@ function assertAggregate(
     | undefined;
   assert.equal(snapshot?.revision, revision);
   assert.equal(snapshot?.totalAmount, totalAmount);
+  assert.equal(snapshot?.currency, expectedCurrency);
   assert.equal(snapshot?.contributingIndicationCount, count);
+}
+
+function replaceAggregateSnapshot(
+  state: MemoryStorageState,
+  overrides: Readonly<Record<string, unknown>>,
+): void {
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "investment-aggregate-states"
+  );
+  assert(entry);
+  const [identity, record] = entry;
+  const value = JSON.parse(JSON.stringify(record.value)) as Record<
+    string,
+    unknown
+  >;
+  value.snapshot = {
+    ...(value.snapshot as Record<string, unknown>),
+    ...overrides,
+  };
+  state.records.set(identity, Object.freeze({
+    key: record.key,
+    revision: record.revision,
+    value: value as StorageDocument,
+  }));
+}
+
+function replaceReturnedAggregateCurrency(
+  result: StorageTransactionResult,
+): unknown {
+  return {
+    ...result,
+    records: result.records.map((record) => {
+      if (
+        record === null ||
+        record.key.collection !== "investment-aggregate-states"
+      ) return record;
+      const snapshot = record.value.snapshot as Record<string, unknown>;
+      return {
+        ...record,
+        value: {
+          ...record.value,
+          snapshot: { ...snapshot, currency: AMOUNT.currency },
+        },
+      };
+    }),
+  };
 }
 
 function replaceAggregateOperationTotal(
