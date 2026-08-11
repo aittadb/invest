@@ -71,6 +71,7 @@ const AMOUNT = amountConfiguration();
 test("owner resolves one opaque indication detail across restart without listing", async () => {
   const state = new MemoryStorageState();
   const indication = await seedEditedIndication(state);
+  downgradeCurrentIndicationToSchema4(state, indication.id);
   const key = await ownerIndicationCurrentStorageKey(indication.id);
   const reviewId = await REVIEW_IDS.reviewIdForCurrentKey(key, OWNER);
   assert.equal(reviewId.includes(PARTICIPANT), false);
@@ -756,6 +757,26 @@ function rewriteEveryNotificationRecord(
       }),
     }));
   }
+}
+
+function downgradeCurrentIndicationToSchema4(
+  state: MemoryStorageState,
+  id: InvestmentIndicationId,
+): void {
+  const current = [...state.records.entries()].find(([, stored]) =>
+    stored.key.collection === "investment-indications" &&
+    stored.value.indicationId === id
+  );
+  assert(current);
+  const [identity, stored] = current;
+  assert.equal(stored.value.schemaVersion, 5);
+  const value = { ...stored.value, schemaVersion: 4 };
+  Reflect.deleteProperty(value, "participantSummary");
+  state.records.set(identity, Object.freeze({
+    key: stored.key,
+    revision: stored.revision,
+    value: Object.freeze(value),
+  }));
 }
 
 function requiredDocument(value: unknown): StorageDocument {

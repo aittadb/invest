@@ -62,6 +62,21 @@ const RETRY_TIME = timestamp("2026-08-12T13:00:00.000Z");
 test("owner rejection persists every effect once and replays across restart", async () => {
   const state = new MemoryStorageState();
   const seeded = await seedActiveIndication(state);
+  downgradeCurrentIndicationToSchema4(state, seeded.indication.id);
+  const legacyParticipant = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    PARTICIPANT,
+    AMOUNT,
+  );
+  assert.equal(
+    (await captureFailure(() => legacyParticipant.listOwned())).code,
+    "UNAVAILABLE",
+  );
+  assert.equal((await new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    PARTICIPANT,
+    AMOUNT,
+  ).listOwned()).length, 1);
   const repository = rejectionRepository(new MemoryStorageAdapter(state));
   const request = await rejectionRequest(seeded.indication);
 
@@ -84,6 +99,16 @@ test("owner rejection persists every effect once and replays across restart", as
     PARTICIPANT,
   );
   assert.equal(rejected.auditEvent.detail.kind, "resource-transition");
+  const [, rejectedCurrent] = matchingStoredRecord(
+    state,
+    "investment-indications",
+    (value) => value.indicationId === seeded.indication.id,
+  );
+  assert.equal(rejectedCurrent.value.schemaVersion, 5);
+  assert.equal(
+    rejectedCurrent.revision,
+    (rejectedCurrent.value.revision as number) + 1,
+  );
 
   const reopenedParticipant = new StorageParticipantInvestmentInterestRepository(
     new MemoryStorageAdapter(state),
@@ -719,6 +744,23 @@ function recordsIn(state: MemoryStorageState, collection: string): number {
   return [...state.records.values()].filter(
     (record) => record.key.collection === collection,
   ).length;
+}
+
+function downgradeCurrentIndicationToSchema4(
+  state: MemoryStorageState,
+  id: InvestmentIndicationId,
+): void {
+  replaceStoredValue(
+    state,
+    "investment-indications",
+    (value) => value.indicationId === id,
+    (value) => {
+      assert.equal(value.schemaVersion, 5);
+      const legacy = { ...value, schemaVersion: 4 };
+      Reflect.deleteProperty(legacy, "participantSummary");
+      return legacy;
+    },
+  );
 }
 
 function replaceStoredValue(

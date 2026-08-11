@@ -59,8 +59,10 @@ import {
 } from "./in-memory-audit-notification-repositories.ts";
 import {
   DevelopmentInMemoryIndicationRepository,
+  MAX_INDICATION_FIELDS_CHUNKS,
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
+  MAX_LEGACY_PARTICIPANT_SUMMARY_UPGRADES_PER_READ,
   MAX_PARTICIPANT_INDICATION_SUMMARY_READS,
   prepareParticipantIndicationMutation,
   prepareParticipantIndicationReplay,
@@ -111,6 +113,11 @@ export const MAX_PARTICIPANT_INVESTMENT_COLLECTION_STORAGE_READS =
   1 +
   MAX_PARTICIPANT_INVESTMENT_INTERESTS *
     MAX_PARTICIPANT_INDICATION_SUMMARY_READS;
+export const MAX_PARTICIPANT_LEGACY_COLLECTION_UPGRADE_STORAGE_READS =
+  1 +
+  MAX_PARTICIPANT_INVESTMENT_INTERESTS +
+  MAX_LEGACY_PARTICIPANT_SUMMARY_UPGRADES_PER_READ *
+    (2 + 2 * MAX_INDICATION_FIELDS_CHUNKS + 1 + 1);
 
 export type InvestmentPolicyAssertionProvider =
   () => readonly StorageCheckMutation[];
@@ -197,20 +204,22 @@ export class StorageParticipantInvestmentInterestRepository
   async listOwned(): Promise<readonly ParticipantInvestmentIndicationSummary[]> {
     try {
       const index = await readParticipantIndex(this.#storage, this.#subject);
-      const indications: ParticipantInvestmentIndicationSummary[] = [];
-      for (const id of index.ids) {
-        const indication = await this.#indications
-          .readCurrentParticipantSummary(id);
+      const indications = await this.#indications
+        .readCurrentParticipantSummaries(index.ids);
+      if (indications.length !== index.ids.length) unavailable();
+      for (let indexPosition = 0; indexPosition < index.ids.length; indexPosition += 1) {
+        const id = index.ids[indexPosition];
+        const indication = indications[indexPosition];
         if (
-          indication === null ||
+          id === undefined ||
+          indication === undefined ||
           indication.id !== id ||
           indication.participantSubject !== this.#subject
         ) {
           unavailable();
         }
-        indications.push(indication);
       }
-      return Object.freeze(indications);
+      return indications;
     } catch (error) {
       return mapRepositoryError(error);
     }

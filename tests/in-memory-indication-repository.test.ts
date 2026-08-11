@@ -931,6 +931,17 @@ test("compact indication records reject current, transition, reference, and chun
       ),
     },
     {
+      name: "current storage revision exceeds migration offset",
+      apply: (state) => {
+        const record = requiredRecordIn(state, "investment-indications");
+        state.records.set(storageKeyString(record.key), freezeRecord({
+          key: record.key,
+          revision: record.revision + 2,
+          value: record.value,
+        }));
+      },
+    },
+    {
       name: "transition kind",
       apply: (state) => mutateStoredDocument(
         state,

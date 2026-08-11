@@ -277,6 +277,8 @@ not present.
 
 `/participant/investment-interests` is the authenticated participant's collection. `/participant/investment-interests/{id}` is one participant-owned indication. Both URIs negotiate native HTML and versioned hypermedia JSON from the same capability models, authorization decision, validation, and repository services. Collection data includes every owned bounded current summary, independent of immutable history depth; item data includes the current personal or company fields and immutable revision history without participant subjects, owner identity, acknowledgment hashes, or storage keys.
 
+An exact pre-summary schema-4 current indication remains compatible. Item reads and lifecycle actions retain complete immutable-history validation. A collection request that encounters legacy heads verifies and upgrades a fixed-size batch to the current summary shape, returns the same generic unavailable resource in HTML or JSON, and resumes from durable progress on retry or after restart. It never returns a partial collection, exposes a migration marker, or advertises actions from mixed old and new state. Once the bounded upgrade completes, both representations expose the same collection links, summaries, and actions as a natively written schema-5 collection.
+
 The collection may expose:
 
 - `create-personal-investment-interest` with `POST` when personal creation is permitted, no personal indication is currently active, the current package acknowledgment is valid, and the private aggregate can accept the configured currency; and

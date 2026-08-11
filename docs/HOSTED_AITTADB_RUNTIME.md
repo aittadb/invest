@@ -313,9 +313,10 @@ cached-head read and acknowledgment GET uses at most four. The investment
 collection reads its participant index once and each of at most 100 current
 summaries in at most four records, independent of the indication's 16-revision
 history; current fields, terminal lifecycle, creation time, and any active lease
-must agree. Its one-record aggregate compatibility projection and policy reads
+must agree. One hundred active maximum-history records therefore consume
+exactly 401 repository reads. Its one-record aggregate compatibility projection and policy reads
 therefore remain inside the unchanged route ceiling even at the valid count and
-history maxima. Route read 513 or total
+history maxima and maximum valid campaign-policy storage. Route read 513 or total
 read 1,064 fails
 before adapter access. General public campaign reads and storage transactions
 are outside this participant read counter. Investment policy opens its private
@@ -323,6 +324,17 @@ campaign-head reader inside the participant scope, so those reads and all
 profile, package, gate, acceptance-head, acceptance-record,
 founder-application, investment-indication, and participant-route reads are
 inside it.
+
+Legacy schema-4 indication heads have no embedded collection summary. A
+collection request scans no more than its 100 indexed heads, verifies and
+upgrades at most eight legacy heads, then returns the fixed unavailable response.
+One worst-case progress request uses at most 261 indication-repository reads:
+the index and current heads, plus terminal, creation, eight current-field
+chunks, eight creation-field chunks, an active lease, and at most one race-resolution read for each upgraded head. Upgrade writes are
+deterministic compare-and-set operations, so a retry or fresh Worker resumes
+from durable schema-5 heads. Once no legacy head remains, HTML and JSON return
+the same collection and actions under the ordinary 401-read maximum. Corrupt
+legacy evidence is never rewritten and remains fixed unavailable.
 
 After the investment route obtains a stable campaign, participant, package, and
 acknowledgment sample, the scope supplies exactly four non-mutating revision

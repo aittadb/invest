@@ -101,6 +101,7 @@ export const MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE = 25;
 export const MAX_OWNER_INDICATION_REVIEW_ITEM_READS =
   2 + MAX_INDICATION_FIELDS_CHUNKS;
 export const MAX_PARTICIPANT_INDICATION_SUMMARY_READS = 4;
+export const MAX_LEGACY_PARTICIPANT_SUMMARY_UPGRADES_PER_READ = 8;
 export const MAX_OWNER_INDICATION_REVIEW_PAGE_RECORD_READS =
   MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE *
   MAX_OWNER_INDICATION_REVIEW_ITEM_READS;
@@ -111,7 +112,7 @@ export type OwnerIndicationCurrentProjection = Readonly<{
   terminalOperationId: StorageOperationId;
 }>;
 
-const CURRENT_DOCUMENT_KEYS = new Set([
+const LEGACY_CURRENT_DOCUMENT_KEYS = new Set([
   "kind",
   "schemaVersion",
   "operationId",
@@ -121,6 +122,9 @@ const CURRENT_DOCUMENT_KEYS = new Set([
   "participantSubject",
   "revision",
   "fields",
+]);
+const CURRENT_DOCUMENT_KEYS = new Set([
+  ...LEGACY_CURRENT_DOCUMENT_KEYS,
   "participantSummary",
 ]);
 const PARTICIPANT_SUMMARY_DOCUMENT_KEYS = new Set([
@@ -424,14 +428,18 @@ type StoredTransition = Readonly<{
 }>;
 
 type StoredCurrent = Readonly<{
+  schemaVersion:
+    | typeof INDICATION_SCHEMA_VERSION
+    | typeof CURRENT_INDICATION_SCHEMA_VERSION;
   operationId: StorageOperationId;
   operationFingerprint: string;
   requestFingerprint: string;
   indicationId: InvestmentIndicationId;
   participantSubject: ActorSubject;
   revision: number;
+  storageRevisionOffset: 0 | 1;
   fields: StoredFieldsReference;
-  participantSummary: StorageDocument;
+  participantSummary: StorageDocument | null;
   document: StorageDocument;
   record: StorageRecord;
 }>;
@@ -440,6 +448,7 @@ type MaterializedIndication = Readonly<{
   indication: InvestmentIndication;
   terminal: StoredTransition;
   fieldsByRevision: ReadonlyMap<number, StoredFields>;
+  current: StoredCurrent | null;
 }>;
 
 type PreparedSnapshotMutation = Readonly<{
@@ -558,8 +567,8 @@ export class DevelopmentInMemoryIndicationRepository
     const key = requiredCurrentIndicationStorageKey(value);
     const record = await this.#storage.read(key);
     if (record === null) return null;
-    const source = exactRecord(record.value, CURRENT_DOCUMENT_KEYS);
-    const id = storedIndicationId(source.indicationId);
+    const coordinates = storedIndicationCoordinates(record.value);
+    const id = coordinates.id;
     const expectedKey = await currentIndicationKey(id);
     if (
       key.collection !== expectedKey.collection ||
@@ -622,56 +631,122 @@ export class DevelopmentInMemoryIndicationRepository
     return mutationResult(materialized.indication, true);
   }
 
-  /** Read one current collection row without traversing immutable ancestry. */
-  async readCurrentParticipantSummary(
-    id: InvestmentIndicationId,
-  ): Promise<ParticipantInvestmentIndicationSummary | null> {
+  /** Read a bounded participant collection, upgrading verified schema-4 heads. */
+  async readCurrentParticipantSummaries(
+    ids: readonly InvestmentIndicationId[],
+  ): Promise<readonly ParticipantInvestmentIndicationSummary[]> {
     const subject = this.#authenticatedSubject;
-    if (subject === null || subject === this.#configuredOwnerSubject) return null;
-    const indicationId = requiredIndicationId(id);
-    const currentKey = await currentIndicationKey(indicationId);
-    const currentRecord = await this.#storage.read(currentKey);
-    if (currentRecord === null) return null;
-    if (peekParticipantSubject(currentRecord) !== subject) return null;
-    const current = decodeStoredCurrent(
-      currentRecord,
-      currentKey,
-      indicationId,
-      subject,
+    if (subject === null || subject === this.#configuredOwnerSubject) {
+      return Object.freeze([]);
+    }
+    if (!Array.isArray(ids)) unavailable();
+
+    const currents: StoredCurrent[] = [];
+    const seen = new Set<InvestmentIndicationId>();
+    for (const candidate of ids) {
+      const indicationId = requiredIndicationId(candidate);
+      if (seen.has(indicationId)) unavailable();
+      seen.add(indicationId);
+      const currentKey = await currentIndicationKey(indicationId);
+      const currentRecord = await this.#storage.read(currentKey);
+      if (
+        currentRecord === null ||
+        peekParticipantSubject(currentRecord) !== subject
+      ) unavailable();
+      currents.push(decodeStoredCurrent(
+        currentRecord,
+        currentKey,
+        indicationId,
+        subject,
+      ));
+    }
+
+    const legacy = currents.filter((current) =>
+      current.schemaVersion === INDICATION_SCHEMA_VERSION
     );
-    const terminalKey = await indicationHistoryKey(indicationId, current.revision);
-    const createdKey = await indicationHistoryKey(indicationId, 1);
-    const [terminalRecord, createdRecord] = await Promise.all([
-      this.#storage.read(terminalKey),
-      current.revision === 1
-        ? Promise.resolve(null)
-        : this.#storage.read(createdKey),
-    ]);
-    if (terminalRecord === null) unavailable();
-    const terminal = decodeStoredTransition(
-      terminalRecord,
-      terminalKey,
-      subject,
-      indicationId,
-      current.revision,
-    );
-    const created = current.revision === 1
-      ? terminal
-      : createdRecord === null
-      ? unavailable()
-      : decodeStoredTransition(
-          createdRecord,
-          createdKey,
-          subject,
-          indicationId,
-          1,
+    if (legacy.length > 0) {
+      for (
+        let index = 0;
+        index < Math.min(
+          legacy.length,
+          MAX_LEGACY_PARTICIPANT_SUMMARY_UPGRADES_PER_READ,
         );
-    return decodeParticipantIndicationSummary(
+        index += 1
+      ) {
+        const current = legacy[index];
+        if (current === undefined) unavailable();
+        await this.#upgradeLegacyCurrentParticipantSummary(current);
+      }
+      unavailable();
+    }
+
+    const summaries: ParticipantInvestmentIndicationSummary[] = [];
+    for (const current of currents) {
+      summaries.push(await readCurrentParticipantSummary(
+        this.#storage,
+        current,
+      ));
+    }
+    return Object.freeze(summaries);
+  }
+
+  async #upgradeLegacyCurrentParticipantSummary(
+    current: StoredCurrent,
+  ): Promise<void> {
+    if (
+      current.schemaVersion !== INDICATION_SCHEMA_VERSION ||
+      current.storageRevisionOffset !== 0 ||
+      current.participantSummary !== null
+    ) unavailable();
+    const summary = await readLegacyCurrentParticipantSummary(
       this.#storage,
       current,
-      terminal,
-      created,
     );
+    const upgradedDocument = currentIndicationDocumentFromSummary(
+      current,
+      summary,
+    );
+    if (jsonByteLength(upgradedDocument) > MAX_INDICATION_STORAGE_RECORD_BYTES) {
+      unavailable();
+    }
+    const operationId = requiredStorageOperationId(
+      `indication-summary-upgrade:${await sha256Hex(
+        canonicalJson(current.document),
+      )}`,
+    );
+    const mutation = Object.freeze({
+      type: "put" as const,
+      key: current.record.key,
+      expectedRevision: current.record.revision,
+      value: upgradedDocument,
+    });
+    try {
+      const result = await this.#storage.transact(Object.freeze({
+        operationId,
+        mutations: Object.freeze([mutation]),
+      }));
+      verifyMutationResult(result, Object.freeze([mutation]));
+    } catch (error) {
+      if (
+        !(error instanceof StorageFailure) ||
+        (error.code !== "CONFLICT" &&
+          error.code !== "PRECONDITION_FAILED")
+      ) unavailable();
+      const raced = await this.#storage.read(current.record.key);
+      if (raced === null) unavailable();
+      const decoded = decodeStoredCurrent(
+        raced,
+        current.record.key,
+        current.indicationId,
+        current.participantSubject,
+      );
+      if (
+        decoded.schemaVersion === INDICATION_SCHEMA_VERSION ||
+        decoded.revision < current.revision ||
+        (decoded.revision === current.revision &&
+          canonicalJson(decoded.document) !== canonicalJson(upgradedDocument))
+      ) unavailable();
+    }
   }
 
   async edit(
@@ -962,7 +1037,8 @@ export class DevelopmentInMemoryIndicationRepository
       null,
     );
     if (
-      canonicalJson(currentIndicationDocument(
+      canonicalJson(storedCurrentIndicationDocument(
+        current.schemaVersion,
         materialized.indication,
         materialized.terminal.operationId,
         materialized.terminal.operationFingerprint,
@@ -973,7 +1049,7 @@ export class DevelopmentInMemoryIndicationRepository
       unavailable();
     }
     await this.#verifyActiveLease(materialized.indication);
-    return materialized;
+    return Object.freeze({ ...materialized, current });
   }
 
   async #verifyActiveLease(indication: InvestmentIndication): Promise<void> {
@@ -1082,11 +1158,14 @@ export class DevelopmentInMemoryIndicationRepository
       previous?.indication ?? null,
       indication,
     );
+    const expectedCurrentRevision = request.expectedRevision === null
+      ? null
+      : previous?.current?.record.revision ?? unavailable();
     const mutations: readonly StorageMutation[] = Object.freeze([
       Object.freeze({
         type: "put" as const,
         key: currentKey,
-        expectedRevision: request.expectedRevision,
+        expectedRevision: expectedCurrentRevision,
         value: prepared.currentDocument,
       }),
       Object.freeze({
@@ -1349,7 +1428,14 @@ function storedIndicationCoordinates(value: unknown): Readonly<{
   subject: ActorSubject;
   id: InvestmentIndicationId;
 }> {
-  const source = exactRecord(value, CURRENT_DOCUMENT_KEYS);
+  const candidate = objectRecord(value);
+  if (candidate === null) unavailable();
+  const source = candidate.schemaVersion === INDICATION_SCHEMA_VERSION
+    ? exactRecord(candidate, LEGACY_CURRENT_DOCUMENT_KEYS)
+    : candidate.schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION
+    ? exactRecord(candidate, CURRENT_DOCUMENT_KEYS)
+    : unavailable();
+  if (source.kind !== "investment-indication-current") unavailable();
   return Object.freeze({
     subject: storedActorSubject(source.participantSubject),
     id: storedIndicationId(source.indicationId),
@@ -1379,12 +1465,147 @@ type VerifiedTerminalLifecycle = Readonly<{
   rejectionReason: string | null;
 }>;
 
+async function readCurrentParticipantSummary(
+  storage: Pick<StorageAdapter, "read">,
+  current: StoredCurrent,
+): Promise<ParticipantInvestmentIndicationSummary> {
+  if (
+    current.schemaVersion !== CURRENT_INDICATION_SCHEMA_VERSION ||
+    current.participantSummary === null
+  ) unavailable();
+  const terminalKey = await indicationHistoryKey(
+    current.indicationId,
+    current.revision,
+  );
+  const createdKey = await indicationHistoryKey(current.indicationId, 1);
+  const [terminalRecord, createdRecord] = await Promise.all([
+    storage.read(terminalKey),
+    current.revision === 1
+      ? Promise.resolve(null)
+      : storage.read(createdKey),
+  ]);
+  if (terminalRecord === null) unavailable();
+  const terminal = decodeStoredTransition(
+    terminalRecord,
+    terminalKey,
+    current.participantSubject,
+    current.indicationId,
+    current.revision,
+  );
+  const created = current.revision === 1
+    ? terminal
+    : createdRecord === null
+    ? unavailable()
+    : decodeStoredTransition(
+        createdRecord,
+        createdKey,
+        current.participantSubject,
+        current.indicationId,
+        1,
+      );
+  return decodeParticipantIndicationSummary(
+    storage,
+    current,
+    terminal,
+    created,
+  );
+}
+
+async function readLegacyCurrentParticipantSummary(
+  storage: Pick<StorageAdapter, "read">,
+  current: StoredCurrent,
+): Promise<ParticipantInvestmentIndicationSummary> {
+  if (
+    current.schemaVersion !== INDICATION_SCHEMA_VERSION ||
+    current.participantSummary !== null
+  ) unavailable();
+  const terminalKey = await indicationHistoryKey(
+    current.indicationId,
+    current.revision,
+  );
+  const createdKey = await indicationHistoryKey(current.indicationId, 1);
+  const [terminalRecord, createdRecord, storedFields] = await Promise.all([
+    storage.read(terminalKey),
+    current.revision === 1
+      ? Promise.resolve(null)
+      : storage.read(createdKey),
+    readStoredFields(
+      storage,
+      current.participantSubject,
+      current.indicationId,
+      current.fields,
+    ),
+  ]);
+  if (terminalRecord === null) unavailable();
+  const terminal = decodeStoredTransition(
+    terminalRecord,
+    terminalKey,
+    current.participantSubject,
+    current.indicationId,
+    current.revision,
+  );
+  const created = current.revision === 1
+    ? terminal
+    : createdRecord === null
+    ? unavailable()
+    : decodeStoredTransition(
+        createdRecord,
+        createdKey,
+        current.participantSubject,
+        current.indicationId,
+        1,
+      );
+  requireCurrentMatchesTerminal(current, terminal);
+  const createdFields = current.revision === 1
+    ? storedFields
+    : await readStoredFields(
+        storage,
+        current.participantSubject,
+        current.indicationId,
+        created.fields,
+      );
+  verifyParticipantCreatedTransition(created);
+  const createdLifecycle = await verifyOwnerReviewTerminal(
+    created,
+    createdFields.fields,
+  );
+  if (
+    createdLifecycle.status !== "active" ||
+    createdLifecycle.rejectionReason !== null
+  ) unavailable();
+  const lifecycle = await verifyOwnerReviewTerminal(
+    terminal,
+    storedFields.fields,
+  );
+  if (created.occurredAt > terminal.occurredAt) unavailable();
+  await verifyOwnerReviewActiveLease(
+    storage,
+    current,
+    storedFields.fields,
+    lifecycle.status,
+  );
+  return Object.freeze({
+    id: current.indicationId,
+    participantSubject: current.participantSubject,
+    kind: storedFields.fields.kind,
+    fields: storedFields.fields,
+    lifecycle: Object.freeze(lifecycle),
+    createdAt: created.occurredAt,
+    updatedAt: terminal.occurredAt,
+    revision: current.revision,
+  });
+}
+
 async function decodeParticipantIndicationSummary(
   storage: Pick<StorageAdapter, "read">,
   current: StoredCurrent,
   terminal: StoredTransition,
   created: StoredTransition,
 ): Promise<ParticipantInvestmentIndicationSummary> {
+  if (
+    current.schemaVersion !== CURRENT_INDICATION_SCHEMA_VERSION ||
+    current.participantSummary === null
+  ) unavailable();
   requireCurrentMatchesTerminal(current, terminal);
   const source = exactRecord(
     current.participantSummary,
@@ -1913,12 +2134,21 @@ function decodeStoredCurrent(
   expectedId: InvestmentIndicationId,
   expectedSubject: ActorSubject | null,
 ): StoredCurrent {
+  const candidate = objectRecord(record.value);
+  if (candidate === null) unavailable();
+  const schemaVersion = candidate.schemaVersion === INDICATION_SCHEMA_VERSION
+    ? INDICATION_SCHEMA_VERSION
+    : candidate.schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION
+    ? CURRENT_INDICATION_SCHEMA_VERSION
+    : unavailable();
   const source = exactStoredDocument(
     record,
     expectedKey,
-    CURRENT_DOCUMENT_KEYS,
+    schemaVersion === INDICATION_SCHEMA_VERSION
+      ? LEGACY_CURRENT_DOCUMENT_KEYS
+      : CURRENT_DOCUMENT_KEYS,
     "investment-indication-current",
-    CURRENT_INDICATION_SCHEMA_VERSION,
+    schemaVersion,
   );
   const operationId = storedOperationId(source.operationId);
   const operationFingerprint = storedFingerprint(source.operationFingerprint);
@@ -1927,22 +2157,31 @@ function decodeStoredCurrent(
   const participantSubject = storedActorSubject(source.participantSubject);
   const revision = storedRevision(source.revision);
   const fields = storedFieldsReference(source.fields);
-  const participantSummary = exactRecord(
-    source.participantSummary,
-    PARTICIPANT_SUMMARY_DOCUMENT_KEYS,
-  ) as StorageDocument;
+  const participantSummary = schemaVersion === INDICATION_SCHEMA_VERSION
+    ? null
+    : exactRecord(
+        source.participantSummary,
+        PARTICIPANT_SUMMARY_DOCUMENT_KEYS,
+      ) as StorageDocument;
+  const storageRevisionOffset = record.revision === revision
+    ? 0
+    : schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION &&
+        record.revision === revision + 1
+    ? 1
+    : unavailable();
   if (
     indicationId !== expectedId ||
-    (expectedSubject !== null && participantSubject !== expectedSubject) ||
-    record.revision !== revision
+    (expectedSubject !== null && participantSubject !== expectedSubject)
   ) unavailable();
   return Object.freeze({
+    schemaVersion,
     operationId,
     operationFingerprint,
     requestFingerprint,
     indicationId,
     participantSubject,
     revision,
+    storageRevisionOffset,
     fields,
     participantSummary,
     document: record.value,
@@ -2138,7 +2377,12 @@ async function materializeIndication(
   if (indication === null) unavailable();
   const terminal = transitions.at(-1);
   if (terminal === undefined) unavailable();
-  return Object.freeze({ indication, terminal, fieldsByRevision });
+  return Object.freeze({
+    indication,
+    terminal,
+    fieldsByRevision,
+    current: null,
+  });
 }
 
 function exactStoredDocument(
@@ -2164,6 +2408,12 @@ function exactStoredDocument(
 }
 
 function storedOperationId(value: unknown): StorageOperationId {
+  const parsed = parseStorageOperationId(value);
+  if (!parsed.ok) unavailable();
+  return parsed.value;
+}
+
+function requiredStorageOperationId(value: unknown): StorageOperationId {
   const parsed = parseStorageOperationId(value);
   if (!parsed.ok) unavailable();
   return parsed.value;
@@ -2589,10 +2839,73 @@ function currentIndicationDocument(
   });
 }
 
+function storedCurrentIndicationDocument(
+  schemaVersion:
+    | typeof INDICATION_SCHEMA_VERSION
+    | typeof CURRENT_INDICATION_SCHEMA_VERSION,
+  indication: InvestmentIndication,
+  operationId: StorageOperationId,
+  fingerprint: string,
+  requestFingerprint: string,
+  fields: StoredFieldsReference,
+): StorageDocument {
+  if (schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION) {
+    return currentIndicationDocument(
+      indication,
+      operationId,
+      fingerprint,
+      requestFingerprint,
+      fields,
+    );
+  }
+  return Object.freeze({
+    kind: "investment-indication-current",
+    schemaVersion: INDICATION_SCHEMA_VERSION,
+    operationId,
+    operationFingerprint: fingerprint,
+    requestFingerprint,
+    indicationId: indication.id,
+    participantSubject: indication.participantSubject,
+    revision: indication.revision,
+    fields: fieldsReferenceDocument(fields),
+  });
+}
+
+function currentIndicationDocumentFromSummary(
+  current: StoredCurrent,
+  summary: ParticipantInvestmentIndicationSummary,
+): StorageDocument {
+  if (
+    current.schemaVersion !== INDICATION_SCHEMA_VERSION ||
+    summary.id !== current.indicationId ||
+    summary.participantSubject !== current.participantSubject ||
+    summary.revision !== current.revision
+  ) unavailable();
+  return Object.freeze({
+    kind: "investment-indication-current",
+    schemaVersion: CURRENT_INDICATION_SCHEMA_VERSION,
+    operationId: current.operationId,
+    operationFingerprint: current.operationFingerprint,
+    requestFingerprint: current.requestFingerprint,
+    indicationId: current.indicationId,
+    participantSubject: current.participantSubject,
+    revision: current.revision,
+    fields: fieldsReferenceDocument(current.fields),
+    participantSummary: participantSummaryStorageDocument(summary),
+  });
+}
+
 function participantSummaryDocument(
   indication: InvestmentIndication,
 ): StorageDocument {
-  const summary = participantInvestmentIndicationSummary(indication);
+  return participantSummaryStorageDocument(
+    participantInvestmentIndicationSummary(indication),
+  );
+}
+
+function participantSummaryStorageDocument(
+  summary: ParticipantInvestmentIndicationSummary,
+): StorageDocument {
   return Object.freeze({
     kind: summary.kind,
     status: summary.lifecycle.status,

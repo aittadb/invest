@@ -77,7 +77,10 @@ import {
   PARTICIPANT_REQUEST_STORAGE_READ_LIMIT,
   StorageApplicationRepositoryFactory,
 } from "../repositories/storage-application-repository-factory.ts";
-import { StorageParticipantInvestmentInterestRepository } from "../repositories/storage-participant-investment-repository.ts";
+import {
+  MAX_PARTICIPANT_INVESTMENT_COLLECTION_STORAGE_READS,
+  StorageParticipantInvestmentInterestRepository,
+} from "../repositories/storage-participant-investment-repository.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
 import { createParticipantInvestmentInterestService } from "../worker/investment-interest-service.ts";
 import type {
@@ -2777,10 +2780,79 @@ for (
   );
 }
 
-test("hosted maximum-history investment collection stays inside the shared request budget", async () => {
+test("hosted schema-4 collection upgrade preserves JSON, HTML, and item resources across workers", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
   await configureHostedInvestmentFixture(service);
+  const initial = await investmentResource(hostedPackageWorker(service), env);
+  const createAction = requiredAction(
+    initial.document,
+    "create-company-investment-interest",
+  );
+  const operationId = "investment-operation:hosted-schema-4";
+  const createdResponse = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    initial,
+    createAction,
+    actionBody(createAction, {
+      "operation-id": operationId,
+      "company-name": "Schema 4 hosted company",
+      "registration-country": "FI",
+      "company-identifier": "HOSTED-SCHEMA-4",
+      "representative-name": "Schema 4 representative",
+      "representative-authority-declared": "true",
+      amount: 25_000,
+      "availability-period": "Within twelve months.",
+    }),
+  );
+  assert.equal(createdResponse.status, 201);
+  downgradeHostedCurrentIndicationToSchema4(service, operationId);
+
+  const upgrading = await hostedPackageWorker(service).fetch(
+    participantRequest(INVESTMENT_INTEREST_PATH),
+    env,
+    executionContext,
+  );
+  assert.equal(upgrading.status, 503);
+  assert.doesNotMatch(await upgrading.text(), /schema|history|summary/iu);
+
+  const restarted = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  assert.equal(restarted.document.data.indications.length, 1);
+  const summary = restarted.document.data.indications[0];
+  assert(summary);
+  assert.equal(summary.id, operationId);
+  assert.equal(summary.status, "active");
+  const html = await hostedPackageWorker(service).fetch(
+    participantHtmlRequest(INVESTMENT_INTEREST_PATH),
+    env,
+    executionContext,
+  );
+  assert.equal(html.status, 200);
+  assert.deepEqual(
+    investmentHtmlActionNames(await html.text()),
+    actionNames(restarted.document),
+  );
+  const item = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    investmentItemPath(operationId),
+  );
+  assert.equal(item.document.data.history.length, 1);
+  assert.deepEqual(actionNames(item.document), [
+    "edit-investment-interest",
+    "withdraw-investment-interest",
+  ]);
+});
+
+test("hosted maximum-history investment collection stays inside the shared request budget", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedInvestmentFixture(service, true);
+  assert.equal(recordsIn(service, "campaign-setup-chunks").length, 4);
   await seedHostedMaximumInvestmentCollection(service);
 
   const readsBefore = service.readRequests;
@@ -2796,11 +2868,13 @@ test("hosted maximum-history investment collection stays inside the shared reque
     MAX_PARTICIPANT_INVESTMENT_INTERESTS,
   );
   assert.deepEqual(actionNames(document), []);
+  assert.equal(MAX_PARTICIPANT_INVESTMENT_COLLECTION_STORAGE_READS, 401);
   assert.ok(
     service.readRequests - readsBefore <=
-      PARTICIPANT_REQUEST_STORAGE_READ_LIMIT,
+      PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT,
   );
 
+  const htmlReadsBefore = service.readRequests;
   const htmlResponse = await hostedPackageWorker(service).fetch(
     participantHtmlRequest(INVESTMENT_INTEREST_PATH),
     env,
@@ -2808,6 +2882,10 @@ test("hosted maximum-history investment collection stays inside the shared reque
   );
   assert.equal(htmlResponse.status, 200);
   assert.deepEqual(investmentHtmlActionNames(await htmlResponse.text()), []);
+  assert.ok(
+    service.readRequests - htmlReadsBefore <=
+      PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT,
+  );
 
   const first = document.data.indications[0];
   assert(first);
@@ -5606,8 +5684,13 @@ async function updateHostedParticipantInterest(
 
 async function configureHostedInvestmentFixture(
   service: SyntheticAittaDBService,
+  maximumPolicyStorage = false,
 ): Promise<StableId<"package-version">> {
-  await configureHostedInvestmentCampaign(service, "open");
+  await configureHostedInvestmentCampaign(
+    service,
+    "open",
+    maximumPolicyStorage,
+  );
   const packageVersion = await appendHostedPackageVersion(service, 1, 0);
   await registerHostedAcceptedInvestor(
     service,
@@ -5706,14 +5789,6 @@ async function seedHostedMaximumInvestmentCollection(
         },
       });
     }
-    if (index % 2 === 1) {
-      await interestService.withdraw({
-        operationId:
-          `investment-operation:maximum-collection-${suffix}-withdraw`,
-        indicationId: created.snapshot.id,
-        expectedRevision: MAX_INVESTMENT_INDICATION_REVISIONS - 1,
-      });
-    }
   }
 }
 
@@ -5746,6 +5821,7 @@ async function registerHostedAcceptedInvestor(
 async function configureHostedInvestmentCampaign(
   service: SyntheticAittaDBService,
   phaseState: "closed" | "open",
+  maximumPolicyStorage = false,
 ): Promise<void> {
   const repository = new StorageCampaignRepository(hostedStorageAdapter(service));
   const current = await repository.readSetup();
@@ -5756,9 +5832,56 @@ async function configureHostedInvestmentCampaign(
     }`,
     expectedRevision,
     recordedAt: "2026-08-10T10:30:00.000Z",
-    setup: explicitCampaignSetup({ phaseState }),
+    setup: maximumPolicyStorage
+      ? maximumCampaignPolicySetup(phaseState)
+      : explicitCampaignSetup({ phaseState }),
   });
   assert.equal(result.setup.phases[0]?.state, phaseState);
+}
+
+function maximumCampaignPolicySetup(phaseState: "closed" | "open") {
+  const base = explicitCampaignSetup({ phaseState });
+  const countries = Array.from(
+    { length: 26 * 26 },
+    (_, index) =>
+      `${String.fromCharCode(65 + Math.floor(index / 26))}${
+        String.fromCharCode(65 + index % 26)
+      }`,
+  );
+  return {
+    ...base,
+    phases: Array.from({ length: 32 }, (_, index) => ({
+      id: `phase:maximum-policy-${String(index).padStart(2, "0")}`,
+      state: phaseState,
+      enabledParticipationPaths: ["investor", "founder"],
+      countryEligibility: { mode: "allow", countries },
+    })),
+    campaignPolicy: {
+      founderContributionChoices: Array.from({ length: 64 }, (_, index) => ({
+        id: `area:maximum-policy-${String(index).padStart(2, "0")}`,
+        label: `Contribution ${String(index).padStart(2, "0")} `.padEnd(
+          120,
+          "x",
+        ),
+      })),
+      notices: {
+        legalBoundary: "Legal boundary ".padEnd(4_000, "L"),
+        nonBindingInterest: "Non-binding interest ".padEnd(4_000, "N"),
+        processEmail: "Process email ".padEnd(4_000, "P"),
+        marketingConsent: "Marketing consent ".padEnd(4_000, "M"),
+        privacyContact: {
+          label: "Privacy contact ".padEnd(160, "C"),
+          href: "https://privacy.example.test/".padEnd(2_048, "p"),
+        },
+        retention: "Retention notice ".padEnd(4_000, "R"),
+      },
+      publicationReadiness: {
+        publicPresentationReviewed: true,
+        legalNoticesReviewed: true,
+        privacyAndRetentionReviewed: true,
+      },
+    },
+  };
 }
 
 async function configureHostedInvestmentCurrency(
@@ -6764,6 +6887,26 @@ function bumpHostedRecordRevision(
     key: record.key,
     revision: record.revision + 1,
     value: structuredClone(record.value),
+  }));
+}
+
+function downgradeHostedCurrentIndicationToSchema4(
+  service: SyntheticAittaDBService,
+  indicationId: string,
+): void {
+  const record = recordsIn(service, "investment-indications").find(
+    (candidate) => candidate.value.indicationId === indicationId,
+  );
+  assert(record);
+  assert.equal(record.value.schemaVersion, 5);
+  assert.equal(record.revision, record.value.revision);
+  const value = { ...record.value, schemaVersion: 4 };
+  Reflect.deleteProperty(value, "participantSummary");
+  const identity = `${record.key.collection}/${record.key.id}`;
+  service.records.set(identity, Object.freeze({
+    key: record.key,
+    revision: record.revision,
+    value: Object.freeze(value),
   }));
 }
 

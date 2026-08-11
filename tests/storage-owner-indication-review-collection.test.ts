@@ -70,6 +70,7 @@ test("owner indication reviews page opaque bounded summaries across restart", as
   const storage = new MemoryStorageAdapter(state);
   const alice = await seedIndication(storage, ALICE, "alice", personalFields());
   const bob = await seedIndication(storage, BOB, "bob", companyFields());
+  downgradeCurrentIndicationsToSchema4(state, [alice.id, bob.id]);
   const operationCount = state.operations.size;
   const observed = new ObservedStorageAdapter(storage);
 
@@ -675,6 +676,30 @@ function ownerRepository(
     OWNER,
     tokens,
   );
+}
+
+function downgradeCurrentIndicationsToSchema4(
+  state: MemoryStorageState,
+  ids: readonly InvestmentIndicationId[],
+): void {
+  const selected = new Set(ids);
+  let changed = 0;
+  for (const [identity, record] of state.records) {
+    if (
+      record.key.collection !== "investment-indications" ||
+      !selected.has(record.value.indicationId as InvestmentIndicationId)
+    ) continue;
+    assert.equal(record.value.schemaVersion, 5);
+    const value = { ...record.value, schemaVersion: 4 };
+    Reflect.deleteProperty(value, "participantSummary");
+    state.records.set(identity, Object.freeze({
+      key: record.key,
+      revision: record.revision,
+      value: Object.freeze(value),
+    }));
+    changed += 1;
+  }
+  assert.equal(changed, selected.size);
 }
 
 function tokenBoundary(

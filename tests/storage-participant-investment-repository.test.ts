@@ -35,9 +35,11 @@ import {
 import {
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
+  MAX_LEGACY_PARTICIPANT_SUMMARY_UPGRADES_PER_READ,
 } from "../repositories/in-memory-indication-repository.ts";
 import {
   MAX_PARTICIPANT_INVESTMENT_COLLECTION_STORAGE_READS,
+  MAX_PARTICIPANT_LEGACY_COLLECTION_UPGRADE_STORAGE_READS,
   StorageParticipantInvestmentInterestRepository,
 } from "../repositories/storage-participant-investment-repository.ts";
 import {
@@ -163,6 +165,408 @@ test("storage participant investment repository commits one persistent atomic li
   );
   assert.equal(await foreign.get(created.snapshot.id), null);
   assert.deepEqual(await foreign.listOwned(), []);
+});
+
+test("persisted schema-4 heads survive restart, lifecycle mutations, and bounded collection upgrade", async () => {
+  const state = new MemoryStorageState();
+  const context = await currentContext(ALICE, "schema-4-lifecycle");
+  let minute = 0;
+  const original = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  const originalService = serviceFor(original, ALICE, context, () =>
+    new Date(`2026-08-12T10:${String(minute++).padStart(2, "0")}:00.000Z`)
+  );
+  const editTarget = await originalService.create({
+    operationId: "investment-operation:schema-4-edit-target",
+    fields: personalFields(),
+  });
+  const withdrawTarget = await originalService.create({
+    operationId: "investment-operation:schema-4-withdraw-target",
+    fields: companyFields({ companyIdentifier: "SCHEMA-4-WITHDRAW" }),
+  });
+  const reactivateTarget = await originalService.create({
+    operationId: "investment-operation:schema-4-reactivate-target",
+    fields: companyFields({ companyIdentifier: "SCHEMA-4-REACTIVATE" }),
+  });
+  await originalService.withdraw({
+    operationId: "investment-operation:schema-4-reactivate-prepare",
+    indicationId: reactivateTarget.snapshot.id,
+    expectedRevision: 1,
+  });
+  const collectionTarget = await originalService.create({
+    operationId: "investment-operation:schema-4-collection-target",
+    fields: companyFields({ companyIdentifier: "SCHEMA-4-COLLECTION" }),
+  });
+  downgradeCurrentIndicationsToSchema4(state, [
+    editTarget.snapshot.id,
+    withdrawTarget.snapshot.id,
+    reactivateTarget.snapshot.id,
+    collectionTarget.snapshot.id,
+  ]);
+
+  const restarted = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  const restartedService = serviceFor(restarted, ALICE, context, () =>
+    new Date(`2026-08-12T10:${String(minute++).padStart(2, "0")}:00.000Z`)
+  );
+  assert.equal(
+    (await restarted.get(editTarget.snapshot.id))?.history.length,
+    1,
+  );
+  const edited = await restartedService.edit({
+    operationId: "investment-operation:schema-4-edit",
+    indicationId: editTarget.snapshot.id,
+    expectedRevision: 1,
+    fields: personalFields({ note: "Edited from a schema-4 head." }),
+  });
+  const withdrawn = await restartedService.withdraw({
+    operationId: "investment-operation:schema-4-withdraw",
+    indicationId: withdrawTarget.snapshot.id,
+    expectedRevision: 1,
+  });
+  const reactivated = await restartedService.reactivate({
+    operationId: "investment-operation:schema-4-reactivate",
+    indicationId: reactivateTarget.snapshot.id,
+    expectedRevision: 2,
+  });
+  assert.equal(edited.snapshot.revision, 2);
+  assert.equal(withdrawn.snapshot.lifecycle.status, "withdrawn");
+  assert.equal(reactivated.snapshot.lifecycle.status, "active");
+  for (const id of [
+    editTarget.snapshot.id,
+    withdrawTarget.snapshot.id,
+    reactivateTarget.snapshot.id,
+  ]) {
+    const current = currentIndicationRecord(state, id);
+    assert.equal(current.value.schemaVersion, 5);
+    assert.equal(current.revision, current.value.revision);
+  }
+
+  const firstCollectionFailure = await captureStorageFailure(() =>
+    restarted.listOwned()
+  );
+  assert.equal(firstCollectionFailure.code, "UNAVAILABLE");
+  const upgraded = currentIndicationRecord(
+    state,
+    collectionTarget.snapshot.id,
+  );
+  assert.equal(upgraded.value.schemaVersion, 5);
+  assert.equal(
+    upgraded.revision,
+    (upgraded.value.revision as number) + 1,
+  );
+
+  const reopened = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  const summaries = await reopened.listOwned();
+  assert.equal(summaries.length, 4);
+  assert.equal(
+    summaries.find((item) => item.id === collectionTarget.snapshot.id)?.revision,
+    1,
+  );
+  const reopenedService = serviceFor(reopened, ALICE, context, () =>
+    new Date(`2026-08-12T10:${String(minute++).padStart(2, "0")}:00.000Z`)
+  );
+  const editedUpgraded = await reopenedService.edit({
+    operationId: "investment-operation:schema-4-upgraded-edit",
+    indicationId: collectionTarget.snapshot.id,
+    expectedRevision: 1,
+    fields: companyFields({
+      companyIdentifier: "SCHEMA-4-COLLECTION",
+      note: "Edited after the in-place compatibility upgrade.",
+    }),
+  });
+  assert.equal(editedUpgraded.snapshot.revision, 2);
+  const persisted = currentIndicationRecord(
+    state,
+    collectionTarget.snapshot.id,
+  );
+  assert.equal(persisted.revision, 3);
+  assert.equal(persisted.value.revision, 2);
+  assert.equal((await reopened.get(collectionTarget.snapshot.id))?.history.length, 2);
+});
+
+test("schema-4 collection upgrades make bounded durable progress across restarts", async () => {
+  const state = new MemoryStorageState();
+  const context = await currentContext(ALICE, "schema-4-bounded-upgrade");
+  const original = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  const service = serviceFor(
+    original,
+    ALICE,
+    context,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  const ids: InvestmentIndicationId[] = [];
+  for (
+    let index = 0;
+    index < MAX_LEGACY_PARTICIPANT_SUMMARY_UPGRADES_PER_READ + 1;
+    index += 1
+  ) {
+    const created = await service.create({
+      operationId: `investment-operation:schema-4-batch-${index}`,
+      fields: companyFields({
+        companyName: `Schema 4 company ${index}`,
+        companyIdentifier: `SCHEMA-4-BATCH-${index}`,
+      }),
+    });
+    ids.push(created.snapshot.id);
+  }
+  downgradeCurrentIndicationsToSchema4(state, ids);
+  const operationsBefore = state.operations.size;
+
+  const counted = new CountingStorageAdapter(new MemoryStorageAdapter(state));
+  const first = new StorageParticipantInvestmentInterestRepository(
+    counted,
+    ALICE,
+    AMOUNT,
+  );
+  assert.equal(
+    (await captureStorageFailure(() => first.listOwned())).code,
+    "UNAVAILABLE",
+  );
+  assert.equal(
+    schemaVersionCount(state, 5),
+    MAX_LEGACY_PARTICIPANT_SUMMARY_UPGRADES_PER_READ,
+  );
+  assert.equal(schemaVersionCount(state, 4), 1);
+  assert.equal(
+    state.operations.size,
+    operationsBefore + MAX_LEGACY_PARTICIPANT_SUMMARY_UPGRADES_PER_READ,
+  );
+  assert.equal(
+    MAX_PARTICIPANT_LEGACY_COLLECTION_UPGRADE_STORAGE_READS,
+    261,
+  );
+  assert.ok(
+    counted.readCalls <=
+      MAX_PARTICIPANT_LEGACY_COLLECTION_UPGRADE_STORAGE_READS,
+  );
+
+  const second = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  assert.equal(
+    (await captureStorageFailure(() => second.listOwned())).code,
+    "UNAVAILABLE",
+  );
+  assert.equal(schemaVersionCount(state, 4), 0);
+
+  const third = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  assert.equal((await third.listOwned()).length, ids.length);
+});
+
+test("schema-4 collection upgrade recovers after its committed response is lost", async () => {
+  const state = new MemoryStorageState();
+  const context = await currentContext(ALICE, "schema-4-response-loss");
+  const original = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  const service = serviceFor(
+    original,
+    ALICE,
+    context,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  const created = await service.create({
+    operationId: "investment-operation:schema-4-response-loss",
+    fields: personalFields(),
+  });
+  downgradeCurrentIndicationsToSchema4(state, [created.snapshot.id]);
+  const operationsBefore = state.operations.size;
+  const interrupted = new StorageParticipantInvestmentInterestRepository(
+    new CommitThenThrowOnceStorageAdapter(new MemoryStorageAdapter(state)),
+    ALICE,
+    AMOUNT,
+  );
+
+  assert.equal(
+    (await captureStorageFailure(() => interrupted.listOwned())).code,
+    "UNAVAILABLE",
+  );
+  assert.equal(
+    currentIndicationRecord(state, created.snapshot.id).value.schemaVersion,
+    5,
+  );
+  assert.equal(state.operations.size, operationsBefore + 1);
+
+  const restarted = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  assert.equal((await restarted.listOwned())[0]?.id, created.snapshot.id);
+});
+
+test("schema-4 detail reads retain full immutable-history validation", async () => {
+  const state = new MemoryStorageState();
+  const context = await currentContext(ALICE, "schema-4-detail-history");
+  const original = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  const service = serviceFor(
+    original,
+    ALICE,
+    context,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  const created = await service.create({
+    operationId: "investment-operation:schema-4-history",
+    fields: personalFields(),
+  });
+  await service.edit({
+    operationId: "investment-operation:schema-4-history-edit-1",
+    indicationId: created.snapshot.id,
+    expectedRevision: 1,
+    fields: personalFields({ note: "Second immutable revision." }),
+  });
+  await service.edit({
+    operationId: "investment-operation:schema-4-history-edit-2",
+    indicationId: created.snapshot.id,
+    expectedRevision: 2,
+    fields: personalFields({ note: "Current immutable revision." }),
+  });
+  downgradeCurrentIndicationsToSchema4(state, [created.snapshot.id]);
+  deleteIndicationHistoryRevision(state, created.snapshot.id, 2);
+
+  const restarted = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  assert.equal(
+    (await captureStorageFailure(() => restarted.get(created.snapshot.id))).code,
+    "UNAVAILABLE",
+  );
+  assert.equal(
+    (await captureStorageFailure(() => restarted.listOwned())).code,
+    "UNAVAILABLE",
+  );
+  const reopened = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  assert.equal((await reopened.listOwned()).length, 1);
+  assert.equal(
+    (await captureStorageFailure(() => reopened.get(created.snapshot.id))).code,
+    "UNAVAILABLE",
+  );
+});
+
+test("schema-4 summary upgrades fail closed before writing on source corruption", async (context) => {
+  const cases = [
+    {
+      name: "missing creation transition",
+      remove(state: MemoryStorageState, id: InvestmentIndicationId) {
+        deleteIndicationHistoryRevision(state, id, 1);
+      },
+    },
+    {
+      name: "missing current fields chunk",
+      remove(state: MemoryStorageState, id: InvestmentIndicationId) {
+        deleteRecordWhere(state, (record) =>
+          record.key.collection === "investment-indication-fields" &&
+          record.value.indicationId === id &&
+          record.value.fieldsRevision === 2
+        );
+      },
+    },
+    {
+      name: "missing creation fields chunk",
+      remove(state: MemoryStorageState, id: InvestmentIndicationId) {
+        deleteRecordWhere(state, (record) =>
+          record.key.collection === "investment-indication-fields" &&
+          record.value.indicationId === id &&
+          record.value.fieldsRevision === 1
+        );
+      },
+    },
+    {
+      name: "missing active uniqueness lease",
+      remove(state: MemoryStorageState) {
+        deleteRecordWhere(state, (record) =>
+          record.key.collection === "investment-indication-active-keys"
+        );
+      },
+    },
+    {
+      name: "schema-4 storage revision offset",
+      remove(state: MemoryStorageState, id: InvestmentIndicationId) {
+        const record = currentIndicationRecord(state, id);
+        replaceRecordRevision(state, record, record.revision + 1);
+      },
+    },
+  ] as const;
+
+  for (const [index, candidate] of cases.entries()) {
+    await context.test(candidate.name, async () => {
+      const state = new MemoryStorageState();
+      const currentContextValue = await currentContext(
+        ALICE,
+        `schema-4-corruption-${index}`,
+      );
+      const original = new StorageParticipantInvestmentInterestRepository(
+        new MemoryStorageAdapter(state),
+        ALICE,
+        AMOUNT,
+      );
+      const service = serviceFor(
+        original,
+        ALICE,
+        currentContextValue,
+        () => new Date("2026-08-12T10:00:00.000Z"),
+      );
+      const created = await service.create({
+        operationId: `investment-operation:schema-4-corruption-${index}`,
+        fields: personalFields(),
+      });
+      await service.edit({
+        operationId: `investment-operation:schema-4-corruption-${index}-edit`,
+        indicationId: created.snapshot.id,
+        expectedRevision: 1,
+        fields: personalFields({ note: "Current schema-4 fields." }),
+      });
+      downgradeCurrentIndicationsToSchema4(state, [created.snapshot.id]);
+      candidate.remove(state, created.snapshot.id);
+      const operationsBefore = state.operations.size;
+
+      const restarted = new StorageParticipantInvestmentInterestRepository(
+        new MemoryStorageAdapter(state),
+        ALICE,
+        AMOUNT,
+      );
+      const failure = await captureStorageFailure(() => restarted.listOwned());
+      assert.equal(failure.code, "UNAVAILABLE");
+      assert.equal(
+        currentIndicationRecord(state, created.snapshot.id).value.schemaVersion,
+        4,
+      );
+      assert.equal(state.operations.size, operationsBefore);
+    });
+  }
 });
 
 test("atomic exact retries survive amount-policy evolution before current validation", async () => {
@@ -723,11 +1127,6 @@ test("maximum collection and history stay within the bounded summary read ceilin
         }),
       });
     }
-    await service.withdraw({
-      operationId: `investment-operation:index-ceiling-${index}-withdraw`,
-      indicationId: `investment-operation:index-ceiling-${index}`,
-      expectedRevision: MAX_INVESTMENT_INDICATION_REVISIONS - 1,
-    });
   }
 
   const counted = new CountingStorageAdapter(
@@ -743,13 +1142,14 @@ test("maximum collection and history stay within the bounded summary read ceilin
   assert.equal(listed.length, 100);
   assert.equal(
     listed.filter((indication) =>
-      indication.revision === MAX_INVESTMENT_INDICATION_REVISIONS
+      indication.revision === MAX_INVESTMENT_INDICATION_REVISIONS - 1 &&
+      indication.lifecycle.status === "active"
     ).length,
     100,
   );
   assert.equal(listed.every((indication) => indication.fields.note === maximumNote), true);
   assert.equal(counted.listCalls, 0);
-  assert.equal(counted.readCalls, 301);
+  assert.equal(counted.readCalls, 401);
   assert.ok(
     counted.readCalls <= MAX_PARTICIPANT_INVESTMENT_COLLECTION_STORAGE_READS,
   );
@@ -766,7 +1166,7 @@ test("maximum collection and history stay within the bounded summary read ceilin
   assert.equal(failure.code, "CONFLICT");
   assert.equal(state.records.size, recordsBefore);
   assert.equal(state.operations.size, operationsBefore);
-  assertAggregate(state, 1_600, 0, 0);
+  assertAggregate(state, 1_500, 200_000, 100);
 });
 
 test("participant collection summaries fail closed at corruption boundaries", async (context) => {
@@ -1225,6 +1625,93 @@ function recordsIn(state: MemoryStorageState, collection: string) {
   );
 }
 
+function downgradeCurrentIndicationsToSchema4(
+  state: MemoryStorageState,
+  ids: readonly InvestmentIndicationId[],
+): void {
+  const selected = new Set(ids);
+  let changed = 0;
+  for (const [identity, record] of state.records) {
+    if (
+      record.key.collection !== "investment-indications" ||
+      !selected.has(record.value.indicationId as InvestmentIndicationId)
+    ) continue;
+    assert.equal(record.value.schemaVersion, 5);
+    assert.equal(Object.hasOwn(record.value, "participantSummary"), true);
+    assert.equal(record.revision, record.value.revision);
+    const value = { ...record.value, schemaVersion: 4 };
+    Reflect.deleteProperty(value, "participantSummary");
+    state.records.set(identity, Object.freeze({
+      key: record.key,
+      revision: record.revision,
+      value: Object.freeze(value),
+    }));
+    changed += 1;
+  }
+  assert.equal(changed, selected.size);
+}
+
+function currentIndicationRecord(
+  state: MemoryStorageState,
+  id: InvestmentIndicationId,
+): StorageRecord {
+  const record = recordsIn(state, "investment-indications").find(
+    (candidate) => candidate.value.indicationId === id,
+  );
+  assert(record);
+  return record;
+}
+
+function schemaVersionCount(
+  state: MemoryStorageState,
+  schemaVersion: number,
+): number {
+  return recordsIn(state, "investment-indications").filter(
+    (record) => record.value.schemaVersion === schemaVersion,
+  ).length;
+}
+
+function deleteIndicationHistoryRevision(
+  state: MemoryStorageState,
+  id: InvestmentIndicationId,
+  revision: number,
+): void {
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "investment-indication-history" &&
+    record.value.indicationId === id &&
+    record.value.revision === revision
+  );
+  assert(entry);
+  state.records.delete(entry[0]);
+}
+
+function deleteRecordWhere(
+  state: MemoryStorageState,
+  predicate: (record: StorageRecord) => boolean,
+): void {
+  const entry = [...state.records.entries()].find(([, record]) =>
+    predicate(record)
+  );
+  assert(entry);
+  state.records.delete(entry[0]);
+}
+
+function replaceRecordRevision(
+  state: MemoryStorageState,
+  record: StorageRecord,
+  revision: number,
+): void {
+  const entry = [...state.records.entries()].find(([, candidate]) =>
+    candidate === record
+  );
+  assert(entry);
+  state.records.set(entry[0], Object.freeze({
+    key: record.key,
+    revision,
+    value: record.value,
+  }));
+}
+
 function mapParticipantSummary(
   record: StorageRecord,
   transform: (
@@ -1464,6 +1951,29 @@ class FailOnceStorageAdapter implements StorageAdapter {
       throw new StorageFailure("UNAVAILABLE");
     }
     return this.#delegate.transact(request);
+  }
+}
+
+class CommitThenThrowOnceStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  #fail = true;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+  }
+
+  read: StorageAdapter["read"] = (key) => this.#delegate.read(key);
+  list: StorageAdapter["list"] = (request) => this.#delegate.list(request);
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    const result = await this.#delegate.transact(request);
+    if (this.#fail) {
+      this.#fail = false;
+      throw new StorageFailure("UNAVAILABLE");
+    }
+    return result;
   }
 }
 
