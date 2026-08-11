@@ -93,6 +93,7 @@ import {
   createOwnerAggregateReconciliationRouteHandler,
   isExactOwnerAggregateReconciliationMutation,
   MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_BYTES,
+  ownerAggregateCorrectionReplayScopeFor,
   ownerAggregateReconciliationMutationFieldLimit,
   type OwnerAggregateReconciliationRouteOptions,
 } from "./routes/owner-aggregate-reconciliation.ts";
@@ -1221,10 +1222,18 @@ async function runtimeOwnerAggregateReconciliation(
             repeatedFormFields: [],
             validateBeforeReplayClaim:
               isExactOwnerAggregateReconciliationMutation,
+            exactReplayScopeFor: ownerAggregateCorrectionReplayScopeFor,
           },
         ),
-      csrfToken: (request: Request) =>
-        runtime.mutationSession.issue(request, identity, appOrigin),
+      csrfToken: (request: Request, exactReplayScope: string | null) =>
+        exactReplayScope === null
+          ? runtime.mutationSession.issue(request, identity, appOrigin)
+          : runtime.mutationSession.issueExactReplay(
+              request,
+              identity,
+              appOrigin,
+              exactReplayScope,
+            ),
       issueOperationId: () => randomOperationId("aggregate-correction"),
       now: runtime.now,
     });

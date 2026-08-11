@@ -348,6 +348,18 @@ test("audited corrections commit one retry-stable aggregate and audit transactio
     transition: "reconciled",
   });
 
+  const restartedState = await new DevelopmentInMemoryAggregateRepository(
+    adapter,
+    currency,
+    revisionAssertion(campaignKey, 1),
+  ).previewReconciliationState();
+  assert.equal(restartedState.preview.status, "match");
+  assert.deepEqual(restartedState.terminalReplay, {
+    operationId: request.operationId,
+    expectedCampaignRevision: request.expectedCampaignRevision,
+    confirmation: request.confirmation,
+  });
+
   const events = await new DevelopmentInMemoryAuditRepository(adapter).list({
     limit: 10,
   });
@@ -373,6 +385,18 @@ test("audited corrections commit one retry-stable aggregate and audit transactio
     }),
     "CONFLICT",
   );
+
+  await repository.applyContribution(applyRequest(
+    "aggregate-operation:after-terminal-correction",
+    2,
+    contribution("indication:after-terminal-correction", 1, "active", 5_000),
+  ));
+  const advanced = await new DevelopmentInMemoryAggregateRepository(
+    adapter,
+    currency,
+  ).previewReconciliationState();
+  assert.equal(advanced.preview.status, "match");
+  assert.equal(advanced.terminalReplay, null);
 });
 
 test("overlapping exact audited corrections boundedly recover the winning receipt", async () => {
@@ -562,6 +586,29 @@ test("delayed exact correction retry survives campaign and currency evolution", 
     adapter,
     evolvedCurrency,
     revisionAssertion(campaignKey, 2),
+  );
+  const terminalState = await revisionTwoRepository.previewReconciliationState();
+  assert.equal(terminalState.preview.status, "match");
+  assert.equal(terminalState.preview.stored.currency, currency);
+  assert.deepEqual(terminalState.terminalReplay, {
+    operationId: request.operationId,
+    expectedCampaignRevision: request.expectedCampaignRevision,
+    confirmation: request.confirmation,
+  });
+  const uncorruptedAggregate = mutateAggregateTerminalReplay(
+    state,
+    (terminalReplay) => {
+      const confirmation = mutableRecord(terminalReplay.confirmation);
+      confirmation.expectedCalculatedAmount = 25_001;
+    },
+  );
+  await rejectsStorage(
+    () => revisionTwoRepository.previewReconciliationState(),
+    "UNAVAILABLE",
+  );
+  state.records.set(
+    storageKeyString(uncorruptedAggregate.key),
+    uncorruptedAggregate,
   );
   const transactionsBeforeRetries = state.transactionCalls;
   const delayed = await revisionTwoRepository.applyConfirmedCorrectionWithAudit({
@@ -1174,6 +1221,27 @@ function mutateAggregateRecord(
     revision: storageRevision ?? record.revision,
     value: document as StorageDocument,
   }));
+}
+
+function mutateAggregateTerminalReplay(
+  state: MemoryStorageState,
+  mutation: (terminalReplay: MutableRecord) => void,
+): StorageRecord {
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.value.kind === "investment-aggregate-state"
+  );
+  assert.notEqual(entry, undefined);
+  if (entry === undefined) assert.fail("Aggregate record expected.");
+  const [key, record] = entry;
+  const document = cloneDocument(record.value) as MutableRecord;
+  const terminalReplay = mutableRecord(document.terminalCorrectionReplay);
+  mutation(terminalReplay);
+  state.records.set(key, freezeRecord({
+    key: record.key,
+    revision: record.revision,
+    value: document as StorageDocument,
+  }));
+  return record;
 }
 
 function mutableRecord(value: unknown): MutableRecord {

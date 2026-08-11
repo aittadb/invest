@@ -467,6 +467,104 @@ test("exact-replay proofs are bounded, route-scoped, actor-bound, and one-use", 
   );
 });
 
+test("aggregate exact-replay proofs bind a bounded route command and one claim", async () => {
+  const harness = await configuredHarness();
+  const body = {
+    "operation-id": "aggregate-correction:terminal-replay",
+    "expected-campaign-revision": 7,
+    confirmation: "apply-calculated-aggregate",
+    "expected-stored-revision": 1,
+    "expected-stored-amount": 8_000,
+    "expected-stored-count": 1,
+    "expected-calculated-amount": 10_000,
+    "expected-calculated-count": 1,
+  };
+  const scopeFor = (request: Readonly<{
+    method: string;
+    body: Readonly<Record<string, unknown>>;
+  }>) => request.method === "POST"
+    ? JSON.stringify([
+        "owner-aggregate-correction-replay:v1",
+        "POST",
+        "/owner/aggregate-reconciliation",
+        ...Object.values(request.body),
+      ])
+    : null;
+  const scope = scopeFor({ method: "POST", body });
+  assert(scope);
+  const proof = await harness.session.issueExactReplay(
+    new Request(`${APP_ORIGIN}/owner/aggregate-reconciliation`),
+    PARTICIPANT,
+    APP_ORIGIN,
+    scope,
+  );
+  assert.doesNotMatch(
+    proof.setCookie,
+    /aggregate-correction|reconciliation|terminal-replay/u,
+  );
+
+  for (const request of [
+    jsonRequest(proof, { ...body, "expected-stored-revision": 2 }),
+    jsonRequest(proof, body, "PATCH"),
+  ]) {
+    assert.equal(
+      (await captureFailure(() =>
+        harness.session.verifyMutation(
+          request,
+          PARTICIPANT,
+          APP_ORIGIN,
+          { exactReplayScopeFor: scopeFor },
+        )
+      )).code,
+      "INVALID_REQUEST",
+    );
+  }
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.verifyMutation(
+        jsonRequest(proof, body),
+        FOREIGN_PARTICIPANT,
+        APP_ORIGIN,
+        { exactReplayScopeFor: scopeFor },
+      )
+    )).code,
+    "REQUEST_REJECTED",
+  );
+  assert.equal(harness.claims.calls.length, 0);
+
+  const exact = await harness.session.verifyMutation(
+    jsonRequest(proof, body),
+    PARTICIPANT,
+    APP_ORIGIN,
+    { exactReplayScopeFor: scopeFor },
+  );
+  assert.deepEqual(exact.body, body);
+  assert.equal(harness.claims.calls.length, 1);
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.verifyMutation(
+        jsonRequest(proof, body),
+        PARTICIPANT,
+        APP_ORIGIN,
+        { exactReplayScopeFor: scopeFor },
+      )
+    )).code,
+    "REQUEST_REJECTED",
+  );
+
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.issueExactReplay(
+        new Request(`${APP_ORIGIN}/owner/aggregate-reconciliation`),
+        PARTICIPANT,
+        APP_ORIGIN,
+        "x".repeat(513),
+      )
+    )).code,
+    "REQUEST_REJECTED",
+  );
+});
+
 test("concurrent refreshes use independent cookies and remain independently usable", async () => {
   const harness = await configuredHarness();
   const [first, second] = await Promise.all([

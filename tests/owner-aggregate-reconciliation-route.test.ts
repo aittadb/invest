@@ -3,8 +3,10 @@ import test from "node:test";
 
 import {
   APPLY_CALCULATED_AGGREGATE_CONFIRMATION,
+  type InvestmentAggregateCorrectionTerminalReplay,
   type InvestmentAggregateReconciliationPreview,
 } from "../domain/investment-aggregate.ts";
+import { OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION } from "../domain/owner-aggregate-reconciliation-resource.ts";
 import { INVESTOR_APP_MEDIA_TYPE } from "../domain/public-campaign-resource.ts";
 import { StorageFailure } from "../domain/storage-adapter.ts";
 import {
@@ -66,7 +68,11 @@ test("owner reconciliation renders one equivalent HTML form and JSON action", as
     actions: Array<{
       name: string;
       method: string;
-      fields: Array<{ name: string; value?: string | number }>;
+      fields: Array<{
+        name: string;
+        presentation?: string;
+        value?: string | number;
+      }>;
     }>;
   };
   assert.equal(document.type, "owner-aggregate-reconciliation");
@@ -89,6 +95,16 @@ test("owner reconciliation renders one equivalent HTML form and JSON action", as
       ?.value,
     OPERATION_ID,
   );
+  assert.deepEqual(
+    document.actions[0]?.fields.map((field) => [
+      field.name,
+      field.presentation,
+    ]),
+    correctionFieldNames().map((name) => [
+      name,
+      name === "confirmation" ? "control" : "hidden",
+    ]),
+  );
 
   const html = await requiredResponse(await handler(context(new Request(
     `${ORIGIN}${PATH}`,
@@ -105,6 +121,14 @@ test("owner reconciliation renders one equivalent HTML form and JSON action", as
   assert.match(body, new RegExp(`name="${MUTATION_CSRF_FIELD}"`));
   assert.match(body, /Apply the calculated totals shown above/);
   assert.match(body, /<button type="submit">Apply calculated totals<\/button>/);
+  for (const name of correctionFieldNames().filter((name) =>
+    name !== "confirmation"
+  )) {
+    assert.match(
+      body,
+      new RegExp(`<input type="hidden" name="${name}"`, "u"),
+    );
+  }
 
   const ownerHome = await requiredResponse(await handler(context(new Request(
     `${ORIGIN}/owner`,
@@ -126,11 +150,15 @@ test("JSON and form mutations enforce the guard and bind the exact preview", asy
     "application/x-www-form-urlencoded",
   ] as const) {
     const repository = new FakeAtomicReconciliationRepository(mismatchPreview());
+    let operationIdCalls = 0;
     const handler = createOwnerAggregateReconciliationRouteHandler({
       repository,
       guardMutation: await mutationGuard(),
       csrfToken: async () => CSRF_TOKEN,
-      issueOperationId: () => "aggregate-correction:next-operation",
+      issueOperationId: () => {
+        operationIdCalls += 1;
+        return "aggregate-correction:next-operation";
+      },
       now: () => new Date(OCCURRED_AT),
     });
     const fields = correctionFields();
@@ -166,7 +194,9 @@ test("JSON and form mutations enforce the guard and bind the exact preview", asy
     assert.match(responseBody, mediaType === "application/json"
       ? /"status":"match"/
       : /Stored and calculated totals match/);
-    assert.equal(responseBody.includes("apply-calculated-aggregate"), false);
+    assert.match(responseBody, mediaType === "application/json"
+      ? new RegExp(OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION, "u")
+      : /Retry recorded correction/u);
     assert.match(
       responseBody,
       mediaType === "application/json"
@@ -175,6 +205,7 @@ test("JSON and form mutations enforce the guard and bind the exact preview", asy
     );
     assert.equal(repository.applyCalls.length, 1);
     assert.equal(repository.previewCalls, 0);
+    assert.equal(operationIdCalls, 0);
     assert.deepEqual(repository.applyCalls[0], {
       operationId: OPERATION_ID,
       expectedCampaignRevision: CAMPAIGN_REVISION,
@@ -195,6 +226,7 @@ test("JSON and form mutations enforce the guard and bind the exact preview", asy
 test("maximum stored revision omits correction actions and proof in HTML and JSON", async () => {
   const repository = new FakeAtomicReconciliationRepository(overflowPreview());
   let proofCalls = 0;
+  let operationIdCalls = 0;
   const handler = createOwnerAggregateReconciliationRouteHandler({
     repository,
     guardMutation: await mutationGuard(),
@@ -202,7 +234,10 @@ test("maximum stored revision omits correction actions and proof in HTML and JSO
       proofCalls += 1;
       return CSRF_TOKEN;
     },
-    issueOperationId: () => OPERATION_ID,
+    issueOperationId: () => {
+      operationIdCalls += 1;
+      return OPERATION_ID;
+    },
   });
 
   const json = await requiredResponse(await handler(context(new Request(
@@ -238,9 +273,122 @@ test("maximum stored revision omits correction actions and proof in HTML and JSO
   assert.equal(html.headers.get(MUTATION_CSRF_HEADER), null);
   assert.equal(html.headers.get("set-cookie"), null);
   assert.equal(proofCalls, 0);
+  assert.equal(operationIdCalls, 0);
 });
 
-test("hosted proof cookies are issued and consumed without surviving correction", async () => {
+test("matching state without a terminal receipt issues no operation or proof", async () => {
+  const repository = new FakeAtomicReconciliationRepository(matchingPreview());
+  let operationIdCalls = 0;
+  let proofCalls = 0;
+  const handler = createOwnerAggregateReconciliationRouteHandler({
+    repository,
+    guardMutation: await mutationGuard(),
+    csrfToken: async () => {
+      proofCalls += 1;
+      return CSRF_TOKEN;
+    },
+    issueOperationId: () => {
+      operationIdCalls += 1;
+      return OPERATION_ID;
+    },
+  });
+
+  for (const accept of ["application/json", "text/html"]) {
+    const response = await requiredResponse(await handler(context(new Request(
+      `${ORIGIN}${PATH}`,
+      { headers: { Accept: accept } },
+    ))));
+    const body = await response.text();
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get(MUTATION_CSRF_HEADER), null);
+    assert.equal(response.headers.get("set-cookie"), null);
+    assert.doesNotMatch(body, /<form|"actions":\[(?!\])/u);
+  }
+  assert.equal(operationIdCalls, 0);
+  assert.equal(proofCalls, 0);
+});
+
+test("terminal retry has equivalent hidden HTML and hypermedia fields without a new operation", async () => {
+  const replay = terminalReplay();
+  const repository = new FakeAtomicReconciliationRepository(
+    matchingPreview(),
+    replay,
+  );
+  const scopes: Array<string | null> = [];
+  let operationIdCalls = 0;
+  const handler = createOwnerAggregateReconciliationRouteHandler({
+    repository,
+    guardMutation: await mutationGuard(),
+    csrfToken: async (_request, exactReplayScope) => {
+      scopes.push(exactReplayScope);
+      return CSRF_TOKEN;
+    },
+    issueOperationId: () => {
+      operationIdCalls += 1;
+      return "aggregate-correction:must-not-be-issued";
+    },
+  });
+
+  const json = await requiredResponse(await handler(context(new Request(
+    `${ORIGIN}${PATH}`,
+    { headers: { Accept: "application/json" } },
+  ))));
+  const document = await json.json() as {
+    data: { correction_available: boolean };
+    actions: Array<{
+      name: string;
+      fields: Array<{
+        name: string;
+        presentation?: string;
+        value?: string | number;
+      }>;
+    }>;
+  };
+  assert.equal(document.data.correction_available, false);
+  assert.deepEqual(document.actions.map(({ name }) => name), [
+    OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  ]);
+  const action = document.actions[0];
+  assert(action);
+  assert.deepEqual(
+    Object.fromEntries(action.fields.map((field) => [field.name, field.value])),
+    correctionFields(),
+  );
+  assert.deepEqual(
+    action.fields.map((field) => field.presentation),
+    correctionFieldNames().map((name) =>
+      name === "confirmation" ? "control" : "hidden"
+    ),
+  );
+
+  const html = await requiredResponse(await handler(context(new Request(
+    `${ORIGIN}${PATH}`,
+    { headers: { Accept: "text/html" } },
+  ))));
+  const body = await html.text();
+  assert.match(
+    body,
+    new RegExp(`data-action-name="${OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION}"`, "u"),
+  );
+  assert.match(body, /<button type="submit">Retry recorded correction<\/button>/u);
+  for (const field of action.fields.filter((candidate) =>
+    candidate.presentation === "hidden"
+  )) {
+    assert.match(
+      body,
+      new RegExp(
+        `<input type="hidden" name="${field.name}" value="${String(field.value)}">`,
+        "u",
+      ),
+    );
+  }
+  assert.equal(operationIdCalls, 0);
+  assert.equal(scopes.length, 2);
+  assert.equal(typeof scopes[0], "string");
+  assert.equal(scopes[0], scopes[1]);
+});
+
+test("hosted proof cookies clear the spent proof and issue terminal replay proof", async () => {
   const repository = new FakeAtomicReconciliationRepository(mismatchPreview());
   const guard = await mutationGuard();
   const handler = createOwnerAggregateReconciliationRouteHandler({
@@ -279,8 +427,9 @@ test("hosted proof cookies are issued and consumed without surviving correction"
     },
   ))));
   assert.equal(response.status, 200);
-  assert.equal(response.headers.get(MUTATION_CSRF_HEADER), null);
-  assert.equal(response.headers.get("set-cookie"), CLEAR_PROOF_COOKIE);
+  assert.equal(response.headers.get(MUTATION_CSRF_HEADER), CSRF_TOKEN);
+  assert.match(response.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+  assert.match(response.headers.get("set-cookie") ?? "", /encrypted/u);
 });
 
 test("authentication, ownership, and mutation proofs fail without repository writes", async () => {
@@ -378,6 +527,7 @@ test("an invalid consumed-proof cookie fails closed before correction", async ()
 
 test("correction is absent and POST fails closed without atomic consistency", async () => {
   let guardCalls = 0;
+  let operationIdCalls = 0;
   const repository = {
     correctionConsistency: "unavailable" as const,
     previewReconciliation: async () => mismatchPreview(),
@@ -391,7 +541,10 @@ test("correction is absent and POST fails closed without atomic consistency", as
     csrfToken: async () => {
       throw new Error("csrf token must not be requested");
     },
-    issueOperationId: () => OPERATION_ID,
+    issueOperationId: () => {
+      operationIdCalls += 1;
+      return OPERATION_ID;
+    },
   });
 
   const get = await requiredResponse(await handler(context(new Request(
@@ -416,6 +569,7 @@ test("correction is absent and POST fails closed without atomic consistency", as
   ))));
   assert.equal(post.status, 503);
   assert.equal(guardCalls, 0);
+  assert.equal(operationIdCalls, 0);
 });
 
 test("stale correction previews return a fixed precondition failure", async () => {
@@ -454,15 +608,28 @@ implements CampaignRevisionBoundAggregateCorrectionRepository {
   previewCalls = 0;
   applyCalls: ApplyAuditedAggregateCorrectionRequest[] = [];
   failure: StorageFailure | null = null;
+  terminalReplay: InvestmentAggregateCorrectionTerminalReplay | null;
   #preview: InvestmentAggregateReconciliationPreview;
 
-  constructor(preview: InvestmentAggregateReconciliationPreview) {
+  constructor(
+    preview: InvestmentAggregateReconciliationPreview,
+    terminalReplay: InvestmentAggregateCorrectionTerminalReplay | null = null,
+  ) {
     this.#preview = preview;
+    this.terminalReplay = terminalReplay;
   }
 
   async previewReconciliation(): Promise<InvestmentAggregateReconciliationPreview> {
     this.previewCalls += 1;
     return this.#preview;
+  }
+
+  async previewReconciliationState() {
+    this.previewCalls += 1;
+    return Object.freeze({
+      preview: this.#preview,
+      terminalReplay: this.terminalReplay,
+    });
   }
 
   async applyConfirmedCorrectionWithAudit(
@@ -472,6 +639,7 @@ implements CampaignRevisionBoundAggregateCorrectionRepository {
     this.applyCalls.push(request);
     const previous = this.#preview;
     this.#preview = matchingPreview();
+    this.terminalReplay = terminalReplay();
     return {
       preview: previous,
       stored: this.#preview.stored,
@@ -520,6 +688,21 @@ function correctionFields(): Record<string, string | number> {
     "expected-stored-count": 1,
     "expected-calculated-amount": 10_000,
     "expected-calculated-count": 1,
+  };
+}
+
+function terminalReplay(): InvestmentAggregateCorrectionTerminalReplay {
+  return {
+    operationId: OPERATION_ID,
+    expectedCampaignRevision: CAMPAIGN_REVISION,
+    confirmation: {
+      confirmation: APPLY_CALCULATED_AGGREGATE_CONFIRMATION,
+      expectedStoredRevision: 1,
+      expectedStoredAmount: 8_000 as never,
+      expectedStoredContributingIndicationCount: 1,
+      expectedCalculatedAmount: 10_000 as never,
+      expectedCalculatedContributingIndicationCount: 1,
+    },
   };
 }
 

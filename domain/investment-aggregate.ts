@@ -81,6 +81,13 @@ export type InvestmentAggregateCorrectionConfirmation = Readonly<{
   expectedCalculatedContributingIndicationCount: number;
 }>;
 
+/** Exact completed correction command recoverable only from private storage. */
+export type InvestmentAggregateCorrectionTerminalReplay = Readonly<{
+  operationId: string;
+  expectedCampaignRevision: number;
+  confirmation: InvestmentAggregateCorrectionConfirmation;
+}>;
+
 /** Retry-stable correction intent; persistence still performs compare-and-set. */
 export type ConfirmedInvestmentAggregateCorrection = Readonly<{
   confirmed: true;

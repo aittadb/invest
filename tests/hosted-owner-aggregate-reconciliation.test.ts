@@ -5,7 +5,10 @@ import {
   parseMinorUnits,
   parseStableId,
 } from "../domain/foundation.ts";
-import type { OwnerAggregateReconciliationDocument } from "../domain/owner-aggregate-reconciliation-resource.ts";
+import {
+  OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  type OwnerAggregateReconciliationDocument,
+} from "../domain/owner-aggregate-reconciliation-resource.ts";
 import type { OwnerHomeDocument } from "../domain/owner-home-resource.ts";
 import {
   parseStorageKey,
@@ -126,12 +129,14 @@ test("hosted owner reconciles a persistent AittaDB aggregate and audit atomicall
   assert.equal(correctedResponse.status, 200);
   assert.equal(service.listRequests, listRequestsBeforeCorrection + 1);
   assert.match(correctedResponse.headers.get("set-cookie") ?? "", /Max-Age=0/u);
-  assert.equal(correctedResponse.headers.get(MUTATION_CSRF_HEADER), null);
+  assert(correctedResponse.headers.get(MUTATION_CSRF_HEADER));
   const corrected = await correctedResponse.json() as
     OwnerAggregateReconciliationDocument;
   assert.equal(corrected.data.status, "match");
   assert.equal(corrected.data.stored.amount, 50_000);
-  assert.deepEqual(corrected.actions, []);
+  assert.deepEqual(corrected.actions.map(({ name }) => name), [
+    OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  ]);
 
   const restarted = hostedWorker(service);
   const persistedResponse = await restarted.fetch(
@@ -142,9 +147,11 @@ test("hosted owner reconciles a persistent AittaDB aggregate and audit atomicall
   const persisted = await persistedResponse.json() as
     OwnerAggregateReconciliationDocument;
   assert.equal(persisted.data.status, "match");
-  assert.deepEqual(persisted.actions, []);
-  assert.equal(persistedResponse.headers.get(MUTATION_CSRF_HEADER), null);
-  assert.equal(persistedResponse.headers.get("set-cookie"), null);
+  assert.deepEqual(persisted.actions.map(({ name }) => name), [
+    OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  ]);
+  assert(persistedResponse.headers.get(MUTATION_CSRF_HEADER));
+  assert(persistedResponse.headers.get("set-cookie"));
 
   const preview = await seeded.aggregate.previewReconciliation();
   assert.equal(preview.status, "match");
@@ -163,6 +170,152 @@ test("hosted owner reconciles a persistent AittaDB aggregate and audit atomicall
     },
     transition: "reconciled",
   });
+});
+
+test("hosted terminal exact retry recovers a lost correction response after restart", async () => {
+  const service = storageService();
+  const seeded = await seedMismatch(service);
+  const worker = hostedWorker(service);
+  const env = environment();
+  const initialResponse = await worker.fetch(
+    ownerRequest(PATH),
+    env,
+    executionContext,
+  );
+  const initialProof = mutationProof(initialResponse);
+  const initial = await initialResponse.json() as
+    OwnerAggregateReconciliationDocument;
+  const originalBody = actionBody(initial);
+
+  const lost = await worker.fetch(
+    ownerMutation(originalBody, initialProof),
+    env,
+    executionContext,
+  );
+  assert.equal(lost.status, 200);
+  await lost.body?.cancel();
+
+  const spentOriginal = await worker.fetch(
+    ownerMutation(originalBody, initialProof),
+    env,
+    executionContext,
+  );
+  assert.equal(spentOriginal.status, 403);
+
+  const restarted = hostedWorker(service, service.fetch, 41);
+  const terminalResponse = await restarted.fetch(
+    ownerRequest(PATH),
+    env,
+    executionContext,
+  );
+  const terminalProof = mutationProof(terminalResponse);
+  const terminal = await terminalResponse.json() as
+    OwnerAggregateReconciliationDocument;
+  assert.equal(terminal.data.status, "match");
+  assert.deepEqual(terminal.actions.map(({ name }) => name), [
+    OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  ]);
+  const replayBody = actionBody(
+    terminal,
+    OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  );
+  assert.deepEqual(replayBody, originalBody);
+  assert.doesNotMatch(
+    terminalProof.cookie,
+    /aggregate-correction|reconciliation|configured-owner/u,
+  );
+
+  const terminalHtmlResponse = await restarted.fetch(
+    ownerRequest(PATH, "text/html"),
+    env,
+    executionContext,
+  );
+  const terminalHtml = await terminalHtmlResponse.text();
+  assert.match(
+    terminalHtml,
+    new RegExp(
+      `data-action-name="${OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION}"`,
+      "u",
+    ),
+  );
+  for (const field of requiredAction(
+    terminal,
+    OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  ).fields.filter((candidate) => candidate.presentation === "hidden")) {
+    assert.match(
+      terminalHtml,
+      new RegExp(`<input type="hidden" name="${field.name}"`, "u"),
+    );
+  }
+
+  const claimsBeforeRejected = browserReplayClaimCount(service);
+  for (const changedBody of [
+    {
+      ...replayBody,
+      "operation-id": "aggregate-correction:changed-terminal-retry",
+    },
+    { ...replayBody, "expected-campaign-revision": 2 },
+    { ...replayBody, "expected-stored-revision": 3 },
+    { ...replayBody, "expected-calculated-amount": 10_001 },
+  ]) {
+    const changed = await restarted.fetch(
+      ownerMutation(changedBody, terminalProof),
+      env,
+      executionContext,
+    );
+    assert.equal(changed.status, 400, JSON.stringify(changedBody));
+  }
+  const foreign = await restarted.fetch(
+    foreignOwnerMutation(replayBody, terminalProof),
+    env,
+    executionContext,
+  );
+  assert.equal(foreign.status, 404);
+  assert.doesNotMatch(
+    await foreign.text(),
+    /aggregate-correction|configured-owner|investment-aggregate/iu,
+  );
+  assert.equal(browserReplayClaimCount(service), claimsBeforeRejected);
+
+  const correctionTransactionsBeforeExact = service.transactionOperationIds
+    .filter((operationId) => operationId === originalBody["operation-id"])
+    .length;
+  const listRequestsBeforeExact = service.listRequests;
+  const exact = await restarted.fetch(
+    ownerMutation(replayBody, terminalProof),
+    env,
+    executionContext,
+  );
+  assert.equal(exact.status, 200);
+  const exactResource = await exact.json() as
+    OwnerAggregateReconciliationDocument;
+  assert.equal(exactResource.data.status, "match");
+  assert.deepEqual(actionBody(
+    exactResource,
+    OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  ), originalBody);
+  assert.equal(service.listRequests, listRequestsBeforeExact);
+  assert.equal(
+    service.transactionOperationIds.filter((operationId) =>
+      operationId === originalBody["operation-id"]
+    ).length,
+    correctionTransactionsBeforeExact,
+  );
+  assert.equal(browserReplayClaimCount(service), claimsBeforeRejected + 1);
+  assert.equal((await seeded.aggregate.previewReconciliation()).status, "match");
+  assert.equal(
+    (await new DevelopmentInMemoryAuditRepository(seeded.adapter).list({
+      limit: 10,
+    })).items.length,
+    1,
+  );
+
+  const reused = await restarted.fetch(
+    ownerMutation(replayBody, terminalProof),
+    env,
+    executionContext,
+  );
+  assert.equal(reused.status, 403);
 });
 
 test("hosted exact retry survives campaign currency evolution and restart", async () => {
@@ -212,11 +365,23 @@ test("hosted exact retry survives campaign currency evolution and restart", asyn
   });
 
   const restarted = hostedWorker(service, service.fetch, 41);
+  const terminalResponse = await restarted.fetch(
+    ownerRequest(PATH),
+    env,
+    executionContext,
+  );
+  const terminalProof = mutationProof(terminalResponse);
+  const terminal = await terminalResponse.json() as
+    OwnerAggregateReconciliationDocument;
+  assert.equal(terminal.data.campaign_revision, 2);
+  assert.equal(terminal.data.stored.currency, originalCurrency);
+  assert.deepEqual(actionBody(
+    terminal,
+    OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  ), originalBody);
   const listRequestsBeforeRetries = service.listRequests;
-  const exactAttempt = attempts[1];
-  assert(exactAttempt);
   const exact = await restarted.fetch(
-    ownerMutation(originalBody, exactAttempt.proof),
+    ownerMutation(originalBody, terminalProof),
     env,
     executionContext,
   );
@@ -227,7 +392,9 @@ test("hosted exact retry survives campaign currency evolution and restart", asyn
   assert.equal(exactResource.data.status, "match");
   assert.equal(exactResource.data.stored.currency, originalCurrency);
   assert.equal(exactResource.data.calculated.currency, originalCurrency);
-  assert.deepEqual(exactResource.actions, []);
+  assert.deepEqual(exactResource.actions.map(({ name }) => name), [
+    OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  ]);
 
   const changedAttempt = attempts[2];
   assert(changedAttempt);
@@ -320,7 +487,7 @@ test("hosted native form applies the same bounded correction action", async () =
   const html = await response.text();
   assert.equal(response.status, 200);
   assert.match(html, /Stored and calculated totals match/u);
-  assert.doesNotMatch(html, /<form/u);
+  assert.match(html, new RegExp(OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION, "u"));
   assert.match(response.headers.get("set-cookie") ?? "", /Max-Age=0/u);
 });
 
@@ -593,7 +760,9 @@ test("hosted correction rolls back on a concurrent campaign change and succeeds 
   const verifiedResource = await verified.json() as
     OwnerAggregateReconciliationDocument;
   assert.equal(verifiedResource.data.status, "match");
-  assert.deepEqual(verifiedResource.actions, []);
+  assert.deepEqual(verifiedResource.actions.map(({ name }) => name), [
+    OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  ]);
 });
 
 test("hosted reconciliation rejects unauthorized callers and storage failure without disclosure", async () => {
@@ -827,6 +996,20 @@ function ownerMutation(
   });
 }
 
+function foreignOwnerMutation(
+  body: Readonly<Record<string, unknown>>,
+  proof: Readonly<{ token: string; cookie: string }>,
+): Request {
+  const request = ownerMutation(body, proof);
+  const headers = new Headers(request.headers);
+  headers.set("oai-authenticated-user-id", "oidc:foreign-terminal-retry");
+  headers.set(
+    "oai-authenticated-user-email",
+    "foreign-terminal-retry@example.test",
+  );
+  return new Request(request, { headers });
+}
+
 function ownerFormMutation(
   body: Readonly<Record<string, unknown>>,
   proof: Readonly<{ token: string; cookie: string }>,
@@ -862,9 +1045,20 @@ function mutationProof(
   return Object.freeze({ token, cookie });
 }
 
-function requiredAction(document: OwnerAggregateReconciliationDocument) {
+function browserReplayClaimCount(
+  service: SyntheticAittaDBStorageService,
+): number {
+  return service.recordKeys().filter((key) =>
+    key.startsWith("browser-mutation-replays/")
+  ).length;
+}
+
+function requiredAction(
+  document: OwnerAggregateReconciliationDocument,
+  name = "apply-calculated-aggregate",
+) {
   const action = document.actions.find((candidate) =>
-    candidate.name === "apply-calculated-aggregate"
+    candidate.name === name
   );
   assert(action);
   return action;
@@ -872,9 +1066,10 @@ function requiredAction(document: OwnerAggregateReconciliationDocument) {
 
 function actionBody(
   document: OwnerAggregateReconciliationDocument,
+  actionName = "apply-calculated-aggregate",
 ): Readonly<Record<string, unknown>> {
   return Object.freeze(Object.fromEntries(
-    requiredAction(document).fields.map((field) => {
+    requiredAction(document, actionName).fields.map((field) => {
       assert.notEqual(field.value, undefined);
       return [field.name, field.value] as const;
     }),

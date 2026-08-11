@@ -1,6 +1,8 @@
 import { chatGPTSignInPath } from "../../domain/auth-navigation.ts";
+import { parseMinorUnits } from "../../domain/foundation.ts";
 import {
   createOwnerAggregateReconciliationResource,
+  ownerAggregateCorrectionAvailable,
   type AggregateCorrectionConsistency,
   type OwnerAggregateReconciliationResource,
 } from "../../domain/owner-aggregate-reconciliation-resource.ts";
@@ -9,9 +11,16 @@ import {
 } from "../../domain/public-campaign-resource.ts";
 import {
   previewInvestmentAggregateReconciliation,
+  APPLY_CALCULATED_AGGREGATE_CONFIRMATION,
+  type InvestmentAggregateCorrectionConfirmation,
+  type InvestmentAggregateCorrectionTerminalReplay,
   type InvestmentAggregateReconciliationPreview,
 } from "../../domain/investment-aggregate.ts";
-import { parseStorageOperationId, StorageFailure } from "../../domain/storage-adapter.ts";
+import {
+  parseStorageOperationId,
+  StorageFailure,
+  type StorageOperationId,
+} from "../../domain/storage-adapter.ts";
 import { negotiateRepresentation } from "../../http/content-negotiation.ts";
 import type {
   BrowserMutationProof,
@@ -35,6 +44,8 @@ import {
 } from "./responses.ts";
 
 const RECONCILIATION_PATH = "/owner/aggregate-reconciliation";
+const CORRECTION_REPLAY_SCOPE_PREFIX =
+  "owner-aggregate-correction-replay:v1";
 const MUTATION_KEYS = new Set([
   "operation-id",
   "expected-campaign-revision",
@@ -71,6 +82,46 @@ export function isExactOwnerAggregateReconciliationMutation(
     keys.every((key) => MUTATION_KEYS.has(key));
 }
 
+export function ownerAggregateCorrectionReplayScopeFor(
+  request: VerifiedMutationRequest,
+): string | null {
+  try {
+    if (request.method !== "POST") return null;
+    return ownerAggregateCorrectionReplayScope(parseCorrectionMutation(
+      request.body,
+      request.mediaType,
+    ));
+  } catch {
+    return null;
+  }
+}
+
+export function ownerAggregateCorrectionReplayScope(
+  replay: InvestmentAggregateCorrectionTerminalReplay,
+): string {
+  try {
+    const parsed = parseCorrectionMutation(
+      terminalReplayBody(replay),
+      "application/json",
+    );
+    return JSON.stringify([
+      CORRECTION_REPLAY_SCOPE_PREFIX,
+      "POST",
+      RECONCILIATION_PATH,
+      parsed.operationId,
+      parsed.expectedCampaignRevision,
+      parsed.confirmation.confirmation,
+      parsed.confirmation.expectedStoredRevision,
+      parsed.confirmation.expectedStoredAmount,
+      parsed.confirmation.expectedStoredContributingIndicationCount,
+      parsed.confirmation.expectedCalculatedAmount,
+      parsed.confirmation.expectedCalculatedContributingIndicationCount,
+    ]);
+  } catch {
+    throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+  }
+}
+
 type OwnerAggregateReconciliationMutationVerifier = (
   request: Request,
 ) => Promise<
@@ -91,6 +142,7 @@ export type OwnerAggregateReconciliationRouteOptions = Readonly<{
   guardMutation: OwnerAggregateReconciliationMutationVerifier;
   csrfToken: (
     request: Request,
+    exactReplayScope: string | null,
   ) => Promise<string | BrowserMutationProof | null>;
   issueOperationId?: () => string;
   now?: () => Date;
@@ -137,6 +189,8 @@ export function createOwnerAggregateReconciliationRouteHandler(
 
     let clearCookie: string | null = null;
     let preview: InvestmentAggregateReconciliationPreview | null = null;
+    let terminalReplay: InvestmentAggregateCorrectionTerminalReplay | null =
+      null;
     try {
       if (context.request.method === "POST") {
         if (options.repository.correctionConsistency !==
@@ -189,26 +243,48 @@ export function createOwnerAggregateReconciliationRouteHandler(
         if (preview.correctionRequired) {
           throw new StorageFailure("UNAVAILABLE");
         }
+        terminalReplay = terminalReplayFromMutation(mutation);
       }
 
-      preview ??= await options.repository.previewReconciliation();
-      const operationId = requiredOperationId(issueOperationId());
       const consistency = options.repository.correctionConsistency satisfies
         AggregateCorrectionConsistency;
       const campaignRevision =
         options.repository.correctionConsistency === "atomic-aggregate-audit"
           ? options.repository.campaignRevision
           : null;
+      if (preview === null) {
+        if (options.repository.correctionConsistency ===
+          "atomic-aggregate-audit") {
+          const state = await options.repository.previewReconciliationState();
+          preview = state.preview;
+          terminalReplay = state.terminalReplay;
+        } else {
+          preview = await options.repository.previewReconciliation();
+        }
+      }
+      const operationId = ownerAggregateCorrectionAvailable(
+          preview,
+          consistency,
+          campaignRevision,
+        )
+        ? requiredOperationId(issueOperationId())
+        : null;
       const resource = createOwnerAggregateReconciliationResource(
         context.resourceUrl,
         preview,
         consistency,
         campaignRevision,
         operationId,
+        terminalReplay,
       );
       const csrf = resource.correctionForm === null
         ? null
-        : requiredCsrfProof(await options.csrfToken(context.request));
+        : requiredCsrfProof(await options.csrfToken(
+            context.request,
+            terminalReplay === null
+              ? null
+              : ownerAggregateCorrectionReplayScope(terminalReplay),
+          ));
       const response = representation.kind === "hypermedia-json"
         ? hypermediaResponse(resource.document)
         : htmlResponse(renderResource(resource, csrf?.token ?? null));
@@ -240,16 +316,9 @@ export function createOwnerAggregateReconciliationRouteHandler(
 }
 
 type ParsedCorrectionMutation = Readonly<{
-  operationId: string;
+  operationId: StorageOperationId;
   expectedCampaignRevision: number;
-  confirmation: Readonly<{
-    confirmation: string;
-    expectedStoredRevision: number;
-    expectedStoredAmount: number;
-    expectedStoredContributingIndicationCount: number;
-    expectedCalculatedAmount: number;
-    expectedCalculatedContributingIndicationCount: number;
-  }>;
+  confirmation: InvestmentAggregateCorrectionConfirmation;
 }>;
 
 function parseCorrectionMutation(
@@ -263,17 +332,17 @@ function parseCorrectionMutation(
   }
   return Object.freeze({
     operationId: requiredOperationId(body["operation-id"]),
-    expectedCampaignRevision: requiredInteger(
+    expectedCampaignRevision: requiredPositiveInteger(
       body["expected-campaign-revision"],
       mediaType,
     ),
     confirmation: Object.freeze({
-      confirmation: requiredString(body.confirmation),
+      confirmation: requiredConfirmation(body.confirmation),
       expectedStoredRevision: requiredInteger(
         body["expected-stored-revision"],
         mediaType,
       ),
-      expectedStoredAmount: requiredInteger(
+      expectedStoredAmount: requiredMinorUnits(
         body["expected-stored-amount"],
         mediaType,
       ),
@@ -281,7 +350,7 @@ function parseCorrectionMutation(
         body["expected-stored-count"],
         mediaType,
       ),
-      expectedCalculatedAmount: requiredInteger(
+      expectedCalculatedAmount: requiredMinorUnits(
         body["expected-calculated-amount"],
         mediaType,
       ),
@@ -291,6 +360,33 @@ function parseCorrectionMutation(
       ),
     }),
   });
+}
+
+function terminalReplayFromMutation(
+  mutation: ParsedCorrectionMutation,
+): InvestmentAggregateCorrectionTerminalReplay {
+  return Object.freeze({
+    operationId: mutation.operationId,
+    expectedCampaignRevision: mutation.expectedCampaignRevision,
+    confirmation: mutation.confirmation,
+  });
+}
+
+function terminalReplayBody(
+  replay: InvestmentAggregateCorrectionTerminalReplay,
+): Readonly<Record<string, unknown>> {
+  return {
+    "operation-id": replay.operationId,
+    "expected-campaign-revision": replay.expectedCampaignRevision,
+    confirmation: replay.confirmation.confirmation,
+    "expected-stored-revision": replay.confirmation.expectedStoredRevision,
+    "expected-stored-amount": replay.confirmation.expectedStoredAmount,
+    "expected-stored-count":
+      replay.confirmation.expectedStoredContributingIndicationCount,
+    "expected-calculated-amount": replay.confirmation.expectedCalculatedAmount,
+    "expected-calculated-count":
+      replay.confirmation.expectedCalculatedContributingIndicationCount,
+  };
 }
 
 function requiredInteger(value: unknown, mediaType: MutationMediaType): number {
@@ -305,14 +401,34 @@ function requiredInteger(value: unknown, mediaType: MutationMediaType): number {
   return parsed as number;
 }
 
-function requiredString(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > 128) {
+function requiredPositiveInteger(
+  value: unknown,
+  mediaType: MutationMediaType,
+): number {
+  const parsed = requiredInteger(value, mediaType);
+  if (parsed < 1) throw new StorageFailure("INVALID_REQUEST");
+  return parsed;
+}
+
+function requiredMinorUnits(
+  value: unknown,
+  mediaType: MutationMediaType,
+) {
+  const parsed = parseMinorUnits(requiredInteger(value, mediaType));
+  if (!parsed.ok) throw new StorageFailure("INVALID_REQUEST");
+  return parsed.value;
+}
+
+function requiredConfirmation(
+  value: unknown,
+): typeof APPLY_CALCULATED_AGGREGATE_CONFIRMATION {
+  if (value !== APPLY_CALCULATED_AGGREGATE_CONFIRMATION) {
     throw new StorageFailure("INVALID_REQUEST");
   }
   return value;
 }
 
-function requiredOperationId(value: unknown): string {
+function requiredOperationId(value: unknown): StorageOperationId {
   const parsed = parseStorageOperationId(value);
   if (!parsed.ok) throw new StorageFailure("INVALID_REQUEST");
   return parsed.value;
@@ -389,13 +505,24 @@ function renderCorrectionForm(
   form: NonNullable<OwnerAggregateReconciliationResource["correctionForm"]>,
   csrf: string,
 ): string {
-  const values = new Map(form.fields.map((field) => [field.name, field.value]));
-  const hidden = [...values.entries()]
-    .filter(([name]) => name !== "confirmation")
-    .map(([name, value]) =>
-      `<input type="hidden" name="${escapeAttribute(name)}" value="${escapeAttribute(String(value ?? ""))}">`
+  const hidden = form.fields
+    .filter((field) => field.presentation === "hidden")
+    .map((field) =>
+      `<input type="hidden" name="${escapeAttribute(field.name)}" value="${escapeAttribute(String(field.value ?? ""))}">`
     ).join("");
-  return `<form action="${escapeAttribute(form.action)}" method="post"><input type="hidden" name="${MUTATION_CSRF_FIELD}" value="${escapeAttribute(csrf)}">${hidden}<label><input type="checkbox" name="confirmation" value="apply-calculated-aggregate" required> Apply the calculated totals shown above</label><button type="submit">Apply calculated totals</button></form>`;
+  const confirmation = form.fields.find((field) =>
+    field.name === "confirmation" && field.presentation !== "hidden"
+  );
+  if (confirmation?.value !== APPLY_CALCULATED_AGGREGATE_CONFIRMATION) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  const confirmationLabel = confirmation.choices?.find((choice) =>
+    choice.value === APPLY_CALCULATED_AGGREGATE_CONFIRMATION
+  )?.label;
+  if (confirmationLabel === undefined) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return `<form action="${escapeAttribute(form.action)}" method="post" data-action-name="${escapeAttribute(form.name)}"><input type="hidden" name="${MUTATION_CSRF_FIELD}" value="${escapeAttribute(csrf)}">${hidden}<label><input type="checkbox" name="confirmation" value="${APPLY_CALCULATED_AGGREGATE_CONFIRMATION}" required> ${escapeHtml(confirmationLabel)}</label><button type="submit">${escapeHtml(form.title)}</button></form>`;
 }
 
 function authenticationRequiredResponse(

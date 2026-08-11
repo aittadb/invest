@@ -15,11 +15,14 @@ import {
 } from "../domain/foundation.ts";
 import type { AuditEvent } from "../domain/audit-notification.ts";
 import {
+  APPLY_CALCULATED_AGGREGATE_CONFIRMATION,
   calculateInvestmentAggregateSummary,
   confirmInvestmentAggregateCorrection,
   createSanitizedPublicInvestmentAggregate,
   previewInvestmentAggregateReconciliation,
   type InvestmentAggregateContribution,
+  type InvestmentAggregateCorrectionConfirmation,
+  type InvestmentAggregateCorrectionTerminalReplay,
   type InvestmentAggregateReconciliationPreview,
   type InvestmentAggregateSummary,
   type SanitizedPublicInvestmentAggregate,
@@ -76,6 +79,15 @@ const AGGREGATE_DOCUMENT_KEYS = new Set([
   "kind",
   "schemaVersion",
   "snapshot",
+]);
+const AGGREGATE_DOCUMENT_WITH_REPLAY_KEYS = new Set([
+  ...AGGREGATE_DOCUMENT_KEYS,
+  "terminalCorrectionReplay",
+]);
+const TERMINAL_CORRECTION_REPLAY_KEYS = new Set([
+  "operationId",
+  "expectedCampaignRevision",
+  "confirmation",
 ]);
 const CONTRIBUTION_DOCUMENT_KEYS = new Set([
   "kind",
@@ -180,6 +192,14 @@ export type ApplyAuditedAggregateCorrectionResult = Readonly<{
   replayed: boolean;
 }>;
 
+export type AggregateCorrectionTerminalReplay =
+  InvestmentAggregateCorrectionTerminalReplay;
+
+export type InvestmentAggregateReconciliationState = Readonly<{
+  preview: InvestmentAggregateReconciliationPreview;
+  terminalReplay: AggregateCorrectionTerminalReplay | null;
+}>;
+
 export type AggregateCorrectionRevisionAssertion = StorageCheckMutation &
   Readonly<{ expectedRevision: number }>;
 
@@ -213,11 +233,13 @@ export interface AtomicInvestmentAggregateCorrectionRepository {
 export interface CampaignRevisionBoundAggregateCorrectionRepository
   extends AtomicInvestmentAggregateCorrectionRepository {
   readonly campaignRevision: number;
+  previewReconciliationState(): Promise<InvestmentAggregateReconciliationState>;
 }
 
 type StoredAggregateRecord = Readonly<{
   record: StorageRecord;
   snapshot: StoredInvestmentAggregateSnapshot;
+  terminalReplay: AggregateCorrectionTerminalReplay | null;
 }>;
 
 type OperationKind = "contribution" | "correction" | "audited-correction";
@@ -550,7 +572,43 @@ export class DevelopmentInMemoryAggregateRepository
   }
 
   async previewReconciliation(): Promise<InvestmentAggregateReconciliationPreview> {
-    return preview(await this.readStored(), await this.calculate());
+    return (await this.previewReconciliationState()).preview;
+  }
+
+  async previewReconciliationState(): Promise<InvestmentAggregateReconciliationState> {
+    const record = await this.#storage.read(CURRENT_AGGREGATE_KEY);
+    let aggregate: StoredAggregateRecord | null = null;
+    if (record !== null) {
+      try {
+        const decoded = decodeAggregateDocument(record, this.#currency);
+        aggregate = Object.freeze({ record, ...decoded });
+      } catch (error) {
+        if (!(error instanceof StorageFailure) || error.code !== "UNAVAILABLE") {
+          throw error;
+        }
+        const immutableCurrency = immutableAggregateCurrency(record);
+        if (immutableCurrency === this.#currency) throw error;
+        const decoded = decodeAggregateDocument(record, immutableCurrency);
+        if (decoded.terminalReplay === null) throw error;
+        aggregate = Object.freeze({ record, ...decoded });
+      }
+    }
+    const stored = aggregate?.snapshot ?? zeroStoredSnapshot(this.#currency);
+    const calculated = calculatePersistedSummary(
+      await this.#listContributions(stored.currency),
+      stored.currency,
+    );
+    const reconciliation = preview(stored, calculated);
+    if (
+      stored.currency !== this.#currency &&
+      (aggregate?.terminalReplay === null || reconciliation.status !== "match")
+    ) unavailable();
+    return deepFreeze({
+      preview: reconciliation,
+      terminalReplay: reconciliation.status === "match"
+        ? aggregate?.terminalReplay ?? null
+        : null,
+    });
   }
 
   async applyConfirmedCorrection(
@@ -670,12 +728,17 @@ export class DevelopmentInMemoryAggregateRepository
       stored: confirmed.replacement,
       auditEvent,
     });
+    const terminalReplay = deepFreeze({
+      operationId,
+      expectedCampaignRevision,
+      confirmation: correctionConfirmation(reconciliation),
+    });
     const mutations = Object.freeze([
       {
         type: "put" as const,
         key: CURRENT_AGGREGATE_KEY,
         expectedRevision: aggregate?.record.revision ?? null,
-        value: aggregateDocument(confirmed.replacement),
+        value: aggregateDocument(confirmed.replacement, terminalReplay),
       },
       {
         type: "put" as const,
@@ -766,13 +829,17 @@ export class DevelopmentInMemoryAggregateRepository
   async #readStoredRecord(): Promise<StoredAggregateRecord | null> {
     const record = await this.#storage.read(CURRENT_AGGREGATE_KEY);
     if (record === null) return null;
+    const decoded = decodeAggregateDocument(record, this.#currency);
     return Object.freeze({
       record,
-      snapshot: decodeAggregateRecord(record, this.#currency),
+      snapshot: decoded.snapshot,
+      terminalReplay: decoded.terminalReplay,
     });
   }
 
-  async #listContributions(): Promise<readonly InvestmentAggregateContribution[]> {
+  async #listContributions(
+    currency: CurrencyCode = this.#currency,
+  ): Promise<readonly InvestmentAggregateContribution[]> {
     const contributions: InvestmentAggregateContribution[] = [];
     const indicationIds = new Set<string>();
     const cursors = new Set<string>();
@@ -797,7 +864,7 @@ export class DevelopmentInMemoryAggregateRepository
           MAX_AGGREGATE_CONTRIBUTION_RECORDS
       ) unavailable();
       for (const record of page.items) {
-        const contribution = decodeContributionRecord(record, this.#currency);
+        const contribution = decodeContributionRecord(record, currency);
         if (indicationIds.has(contribution.indicationId)) unavailable();
         indicationIds.add(contribution.indicationId);
         contributions.push(contribution);
@@ -932,6 +999,10 @@ export class OwnerBoundInvestmentAggregateCorrectionRepository
     return this.#repository.previewReconciliation();
   }
 
+  previewReconciliationState(): Promise<InvestmentAggregateReconciliationState> {
+    return this.#repository.previewReconciliationState();
+  }
+
   applyConfirmedCorrectionWithAudit(
     request: ApplyAuditedAggregateCorrectionRequest,
   ): Promise<ApplyAuditedAggregateCorrectionResult> {
@@ -1058,12 +1129,35 @@ function requiredContribution(
 
 function aggregateDocument(
   snapshot: StoredInvestmentAggregateSnapshot,
+  terminalReplay: AggregateCorrectionTerminalReplay | null = null,
 ): StorageDocument {
   return deepFreeze({
     kind: "investment-aggregate-state",
     schemaVersion: AGGREGATE_SCHEMA_VERSION,
     snapshot: snapshotDocument(snapshot),
+    ...(terminalReplay === null
+      ? {}
+      : { terminalCorrectionReplay: terminalReplayDocument(terminalReplay) }),
   });
+}
+
+function terminalReplayDocument(
+  replay: AggregateCorrectionTerminalReplay,
+): StorageDocument {
+  return {
+    operationId: replay.operationId,
+    expectedCampaignRevision: replay.expectedCampaignRevision,
+    confirmation: {
+      confirmation: replay.confirmation.confirmation,
+      expectedStoredRevision: replay.confirmation.expectedStoredRevision,
+      expectedStoredAmount: replay.confirmation.expectedStoredAmount,
+      expectedStoredContributingIndicationCount:
+        replay.confirmation.expectedStoredContributingIndicationCount,
+      expectedCalculatedAmount: replay.confirmation.expectedCalculatedAmount,
+      expectedCalculatedContributingIndicationCount:
+        replay.confirmation.expectedCalculatedContributingIndicationCount,
+    },
+  };
 }
 
 function contributionDocument(
@@ -1167,13 +1261,24 @@ function decodeAggregateRecord(
   record: StorageRecord,
   currency: CurrencyCode,
 ): StoredInvestmentAggregateSnapshot {
+  return decodeAggregateDocument(record, currency).snapshot;
+}
+
+function decodeAggregateDocument(
+  record: StorageRecord,
+  currency: CurrencyCode,
+): Readonly<{
+  snapshot: StoredInvestmentAggregateSnapshot;
+  terminalReplay: AggregateCorrectionTerminalReplay | null;
+}> {
   if (storageKeyString(record.key) !== storageKeyString(CURRENT_AGGREGATE_KEY)) {
     unavailable();
   }
   const source = objectRecord(record.value);
   if (
     source === null ||
-    !hasExactKeys(source, AGGREGATE_DOCUMENT_KEYS) ||
+    (!hasExactKeys(source, AGGREGATE_DOCUMENT_KEYS) &&
+      !hasExactKeys(source, AGGREGATE_DOCUMENT_WITH_REPLAY_KEYS)) ||
     source.kind !== "investment-aggregate-state" ||
     source.schemaVersion !== AGGREGATE_SCHEMA_VERSION
   ) {
@@ -1181,7 +1286,99 @@ function decodeAggregateRecord(
   }
   const snapshot = decodeSnapshot(source.snapshot, currency);
   if (record.revision !== snapshot.revision || record.revision < 1) unavailable();
-  return snapshot;
+  const terminalReplay = Object.hasOwn(source, "terminalCorrectionReplay")
+    ? decodeTerminalCorrectionReplay(
+        source.terminalCorrectionReplay,
+        snapshot,
+        currency,
+      )
+    : null;
+  return deepFreeze({ snapshot, terminalReplay });
+}
+
+function immutableAggregateCurrency(record: StorageRecord): CurrencyCode {
+  try {
+    if (storageKeyString(record.key) !== storageKeyString(CURRENT_AGGREGATE_KEY)) {
+      unavailable();
+    }
+    const source = objectRecord(record.value);
+    const snapshot = source === null ? null : objectRecord(source.snapshot);
+    if (
+      source === null ||
+      snapshot === null ||
+      (!hasExactKeys(source, AGGREGATE_DOCUMENT_KEYS) &&
+        !hasExactKeys(source, AGGREGATE_DOCUMENT_WITH_REPLAY_KEYS)) ||
+      source.kind !== "investment-aggregate-state" ||
+      source.schemaVersion !== AGGREGATE_SCHEMA_VERSION ||
+      !hasExactKeys(snapshot, SNAPSHOT_KEYS) ||
+      typeof snapshot.currency !== "string" ||
+      !/^[A-Z]{3}$/.test(snapshot.currency)
+    ) unavailable();
+    return snapshot.currency as CurrencyCode;
+  } catch (error) {
+    if (error instanceof StorageFailure) throw error;
+    unavailable();
+  }
+}
+
+function decodeTerminalCorrectionReplay(
+  value: unknown,
+  replacement: StoredInvestmentAggregateSnapshot,
+  currency: CurrencyCode,
+): AggregateCorrectionTerminalReplay {
+  try {
+    const source = objectRecord(value);
+    if (
+      source === null ||
+      !hasExactKeys(source, TERMINAL_CORRECTION_REPLAY_KEYS)
+    ) unavailable();
+    const operationId = requiredOperationId(source.operationId);
+    const expectedCampaignRevision = requiredCampaignRevision(
+      source.expectedCampaignRevision,
+    );
+    const confirmationSource = objectRecord(source.confirmation);
+    if (confirmationSource === null) unavailable();
+    const storedRevision = requiredStoredRevision(
+      confirmationSource.expectedStoredRevision,
+    );
+    const storedAmount = requiredMinorUnits(
+      confirmationSource.expectedStoredAmount,
+    );
+    const storedCount = requiredStoredRevision(
+      confirmationSource.expectedStoredContributingIndicationCount,
+    );
+    const calculatedAmount = requiredMinorUnits(
+      confirmationSource.expectedCalculatedAmount,
+    );
+    const calculatedCount = requiredStoredRevision(
+      confirmationSource.expectedCalculatedContributingIndicationCount,
+    );
+    const reconciliation = preview(
+      deepFreeze({
+        revision: storedRevision,
+        totalAmount: storedAmount,
+        currency,
+        contributingIndicationCount: storedCount,
+      }),
+      deepFreeze({
+        totalAmount: calculatedAmount,
+        currency,
+        contributingIndicationCount: calculatedCount,
+      }),
+    );
+    const confirmed = confirmCorrection(reconciliation, confirmationSource);
+    if (!sameSnapshot(confirmed.replacement, replacement)) unavailable();
+    return deepFreeze({
+      operationId,
+      expectedCampaignRevision,
+      confirmation: correctionConfirmation(reconciliation),
+    });
+  } catch (error) {
+    if (error instanceof StorageFailure && error.code === "UNAVAILABLE") {
+      throw error;
+    }
+    unavailable();
+  }
 }
 
 function decodeContributionRecord(
@@ -1533,6 +1730,21 @@ function confirmCorrection(
     if (error instanceof StorageFailure) throw error;
     unavailable();
   }
+}
+
+function correctionConfirmation(
+  reconciliation: InvestmentAggregateReconciliationPreview,
+): InvestmentAggregateCorrectionConfirmation {
+  return deepFreeze({
+    confirmation: APPLY_CALCULATED_AGGREGATE_CONFIRMATION,
+    expectedStoredRevision: reconciliation.stored.revision,
+    expectedStoredAmount: reconciliation.stored.totalAmount,
+    expectedStoredContributingIndicationCount:
+      reconciliation.stored.contributingIndicationCount,
+    expectedCalculatedAmount: reconciliation.calculated.totalAmount,
+    expectedCalculatedContributingIndicationCount:
+      reconciliation.calculated.contributingIndicationCount,
+  });
 }
 
 function contributionResult(
@@ -2037,6 +2249,12 @@ function requiredOccurredAt(value: unknown): Timestamp {
 function requiredStoredRevision(value: unknown): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) invalidRequest();
   return value as number;
+}
+
+function requiredMinorUnits(value: unknown): MinorUnits {
+  const parsed = parseMinorUnits(value);
+  if (!parsed.ok) invalidRequest();
+  return parsed.value;
 }
 
 function requiredCurrency(value: unknown): CurrencyCode {

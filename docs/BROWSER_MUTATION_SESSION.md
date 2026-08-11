@@ -41,9 +41,12 @@ equals the configured application origin. It returns:
 The cookie has a random `__Host-` name and is `Secure`, `HttpOnly`,
 `SameSite=Strict`, host-only, and scoped to `/`. Its AES-GCM ciphertext contains
 only the capability ID, actor type and subject, exact origin, issue and expiry
-times, and the token hash. Authenticated additional data binds the exact cookie
-name, path, origin, and protocol version. Neither the hosted key nor plaintext
-state is serialized.
+times, and the token hash. An `issueExactReplay()` cookie additionally contains
+only the SHA-256 digest of a 1-512 byte route-defined terminal replay scope.
+Authenticated additional data binds the exact cookie name, path, origin, and
+protocol version. Neither the hosted key, replay command, nor plaintext state is
+serialized. The version-2 reader remains compatible with ordinary version-1
+cookies.
 
 Issuing again is the refresh operation. Every issuance uses a different cookie
 name, so concurrent resource renders do not overwrite each other's proof.
@@ -72,6 +75,17 @@ before replay authority is consumed. A throw or any result other than `true`
 becomes the same fixed `INVALID_REQUEST` failure and does not call the durable
 claimer. Feature parsing still repeats the check before persistence.
 
+A route that can reconstruct one immutable completed command may issue a proof
+with `issueExactReplay()` and provide `exactReplayScopeFor` during verification.
+The resolver rebuilds the canonical route, method, operation, revision, and
+command values from the already bounded request. Its SHA-256 digest must match
+the encrypted digest before durable replay authority is claimed. Missing
+resolvers, changed commands, foreign actors, unrelated methods, and oversized
+scopes fail closed without a claim. The exact proof still has the same short
+lifetime and one-use durable claim as an ordinary proof; it authorizes receipt
+recovery only, while the repository independently verifies the immutable
+operation receipt.
+
 Only after identity, origin, ciphertext, expiry, request body, CSRF proof, and
 any route predicate validation succeed does the module call `claimReplay()`.
 The claim contains an
@@ -98,10 +112,12 @@ memory, browser storage, D1, or best-effort read-then-write is not authority.
 Tests may use a deterministic in-memory claimer solely as an adapter fixture.
 See `docs/HOSTED_AITTADB_RUNTIME.md`.
 
-Because a proof is one-time, a response retry needs a newly rendered proof.
-Business mutations still require their own operation ID, compare-and-set rules,
-and idempotent repository behavior; the CSRF capability does not replace those
-domain controls.
+Because a proof is one-time, a response retry needs a newly rendered proof. A
+terminal resource may render the same completed command with a newly scoped
+exact-replay proof, but it must not issue a new business operation ID or reopen
+other mutation actions. Business mutations still require their own operation
+ID, compare-and-set rules, and idempotent repository behavior; the CSRF
+capability does not replace those domain controls.
 
 ## Failure behavior
 
