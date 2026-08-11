@@ -810,6 +810,37 @@ test("participant request scope enforces exact maximum route and retry read budg
   const subject = parseActorSubject(PARTICIPANT_SUBJECT);
   assert(account.ok);
   assert(subject.ok);
+
+  const routeOnlyReads = observeStorageReads(
+    hostedStorageAdapter(new SyntheticAittaDBService()),
+  );
+  const routeOnlyRequest = new StorageApplicationRepositoryFactory(
+    routeOnlyReads.storage,
+    () => NOW,
+  ).participantRequest(account.value);
+  const routeOnlyPackages = routeOnlyRequest.participantPackageReader(
+    subject.value,
+  );
+  for (
+    let index = 0;
+    index < PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT;
+    index += 1
+  ) {
+    assert.equal(await routeOnlyPackages.current(), null);
+  }
+  assert.equal(
+    routeOnlyReads.count(),
+    PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT,
+  );
+  await assert.rejects(
+    routeOnlyPackages.current(),
+    (error) => error instanceof StorageFailure && error.code === "UNAVAILABLE",
+  );
+  assert.equal(
+    routeOnlyReads.count(),
+    PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT,
+  );
+
   await recordHostedAcceptance(
     service,
     subject.value,

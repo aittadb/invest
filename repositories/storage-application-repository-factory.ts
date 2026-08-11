@@ -247,6 +247,8 @@ export class StorageApplicationRepositoryFactory {
 
 type ParticipantRequestReadBudget = {
   remainingReads: number;
+  remainingRouteReads: number;
+  routeReadsActive: boolean;
 };
 
 function createParticipantRequestRepositoryScope(
@@ -256,6 +258,8 @@ function createParticipantRequestRepositoryScope(
   const account = requiredParticipantAccount(input);
   const budget: ParticipantRequestReadBudget = {
     remainingReads: PARTICIPANT_REQUEST_STORAGE_READ_LIMIT,
+    remainingRouteReads: PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT,
+    routeReadsActive: false,
   };
   const readStorage = participantRequestStorage(storage, budget, false);
   const mutationStorage = participantRequestStorage(storage, budget, true);
@@ -314,40 +318,54 @@ function createParticipantRequestRepositoryScope(
   const requireSubject = (value: ActorSubject): void => {
     if (requiredActorSubject(value) !== account.subject) unavailable();
   };
+  const beginRouteReads = (): void => {
+    budget.routeReadsActive = true;
+  };
   return Object.freeze({
     participantAccessReader: () => accessReader,
-    participantProfileRepository: () => participantProfile,
+    participantProfileRepository: () => {
+      beginRouteReads();
+      return participantProfile;
+    },
     participantPackageReader: (participantSubject: ActorSubject) => {
       requireSubject(participantSubject);
+      beginRouteReads();
       return packageReader;
     },
     participantPackageAcknowledgments: (
       participantSubject: ActorSubject,
     ) => {
       requireSubject(participantSubject);
+      beginRouteReads();
       return packageAcknowledgments;
     },
     participantFounderApplications: (
       contributionAreaChoices: readonly ContributionAreaChoice[],
-    ) => Object.freeze({
-      participant: Object.freeze({
-        current: () => participant.current(),
-      }),
-      applications: new StorageFounderApplicationRepository(
-        mutationStorage,
-        account.subject,
-        contributionAreaChoices,
-      ),
-    }),
+    ) => {
+      beginRouteReads();
+      return Object.freeze({
+        participant: Object.freeze({
+          current: () => participant.current(),
+        }),
+        applications: new StorageFounderApplicationRepository(
+          mutationStorage,
+          account.subject,
+          contributionAreaChoices,
+        ),
+      });
+    },
     participantInvestmentInterests: (
       amountConfiguration: AmountConfiguration,
       parsingOptions: InvestmentIndicationParsingOptions = {},
-    ) => new StorageParticipantInvestmentInterestRepository(
-      mutationStorage,
-      account.subject,
-      amountConfiguration,
-      parsingOptions,
-    ),
+    ) => {
+      beginRouteReads();
+      return new StorageParticipantInvestmentInterestRepository(
+        mutationStorage,
+        account.subject,
+        amountConfiguration,
+        parsingOptions,
+      );
+    },
   });
 }
 
@@ -358,8 +376,12 @@ function participantRequestStorage(
 ): StorageAdapter {
   return Object.freeze({
     async read(key: StorageKey) {
-      if (budget.remainingReads <= 0) unavailable();
+      if (
+        budget.remainingReads <= 0 ||
+        (budget.routeReadsActive && budget.remainingRouteReads <= 0)
+      ) unavailable();
       budget.remainingReads -= 1;
+      if (budget.routeReadsActive) budget.remainingRouteReads -= 1;
       return await storage.read(key);
     },
     async list() {

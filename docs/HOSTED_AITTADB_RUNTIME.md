@@ -298,17 +298,21 @@ package, acknowledgment, founder, or investment route receive the same subject-b
 route repository factories cannot reopen the underlying uncapped adapter. A
 second HTTP request receives a new scope.
 
-That scope admits at most 1,063 participant-private storage-record reads. The
+That scope admits at most 1,063 participant-private storage-record reads and
+enforces a separate 512-read route ceiling. The
 maximum valid authorization envelope is 551: 511 unique immutable package
 records plus two outer attempts, each containing six profile reads, two package
 head reads, and three four-read accepted gate attempts. The profile reads cover
 current, matching latest history, and immutable registration revision 1 for
-each sample. The selected route owns the remaining 512 reads. This covers a
+each sample. Activating any profile, package, acknowledgment, founder, or
+investment repository starts the route counter, and every later read spends
+from both counters; unused authorization capacity cannot widen route work. This covers a
 profile mutation's current state, two historical samples, failed first attempt,
 recovery state and history, retry, and final projection. Package GET uses one
 cached-head read, acknowledgment GET uses at most four, and an ordinary
 maximum-count investment collection remains bounded; unusually deep combined
-indication histories fail closed at the same ceiling. The next read fails
+indication histories fail closed at the same ceiling. Route read 513 or total
+read 1,064 fails
 before adapter access. Public campaign reads and storage transactions are
 outside this participant read counter, while all profile, package, gate,
 acceptance-head, acceptance-record, founder-application, investment-indication,
