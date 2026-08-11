@@ -81,6 +81,20 @@ npm run validate
 
 `npm run build` works from a clean checkout with the inert hosting example. Before packaging or publishing, create an ignored `.openai/hosting.json` containing the exact Sites project identifier for that deployment; `npm run sites:package` refuses to proceed without it.
 
+Legacy schema-4 indication heads are upgraded only by the backend operator
+command documented in
+[`docs/HOSTED_AITTADB_RUNTIME.md`](docs/HOSTED_AITTADB_RUNTIME.md). Put the
+reviewed authoritative inventory under the ignored `migration-inventories/`
+directory and run the command with a separate namespace-bound read/write
+credential:
+
+```sh
+npm run migrate:legacy-indication-summaries -- migration-inventories/indications.json
+```
+
+The command does not use the Sites runtime credential, and ordinary browser
+requests never perform this migration.
+
 ## Planning Workflow
 
 Before repository-affecting implementation, add or amend one unchecked `PLAN.md` task. Keep tasks small: one primitive, route group, security control, UI flow, storage contract, or narrowly bounded proof per task. Record only direct dependencies. Ready tasks may proceed concurrently in isolated branches and Git worktrees, with one focused task per worktree. Completed tasks move to `CHANGELOG.md` with evidence and are removed from `PLAN.md`; zero open tasks is the valid completed state.

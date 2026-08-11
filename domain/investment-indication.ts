@@ -263,6 +263,21 @@ export type ParticipantVisibleIndicationLifecycle = Readonly<{
   transitions: readonly ParticipantVisibleIndicationTransition[];
 }>;
 
+/** Current participant-owned fields needed by the collection representation. */
+export type ParticipantInvestmentIndicationSummary = Readonly<{
+  id: InvestmentIndicationId;
+  participantSubject: ParticipantIndicationActor["subject"];
+  kind: InvestmentIndication["kind"];
+  fields: InvestmentIndicationFields;
+  lifecycle: Readonly<{
+    status: InvestmentIndicationStatus;
+    rejectionReason: string | null;
+  }>;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  revision: number;
+}>;
+
 export type CompanyIdentifierNormalizer = (
   value: string,
   country: CountryCode,
@@ -817,6 +832,26 @@ export function participantVisibleIndicationLifecycle(
     status: "rejected",
     rejectionReason: indication.lifecycle.rejection.reason,
     transitions: NO_PARTICIPANT_TRANSITIONS,
+  });
+}
+
+/** Project one indication without its acknowledgment or immutable history. */
+export function participantInvestmentIndicationSummary(
+  indication: InvestmentIndication,
+): ParticipantInvestmentIndicationSummary {
+  const lifecycle = participantVisibleIndicationLifecycle(indication);
+  return Object.freeze({
+    id: indication.id,
+    participantSubject: indication.participantSubject,
+    kind: indication.kind,
+    fields: indication.fields,
+    lifecycle: Object.freeze({
+      status: lifecycle.status,
+      rejectionReason: lifecycle.rejectionReason,
+    }),
+    createdAt: indication.createdAt,
+    updatedAt: indication.updatedAt,
+    revision: indication.revision,
   });
 }
 

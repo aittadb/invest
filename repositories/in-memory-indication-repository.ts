@@ -17,6 +17,7 @@ import {
   editInvestmentIndication,
   MAX_INVESTMENT_INDICATION_REVISIONS,
   parseInvestmentIndicationFields,
+  participantInvestmentIndicationSummary,
   reactivateInvestmentIndication,
   rejectInvestmentIndication,
   withdrawInvestmentIndication,
@@ -31,6 +32,7 @@ import {
   type InvestmentIndicationParsingOptions,
   type OwnerIndicationActor,
   type ParticipantIndicationActor,
+  type ParticipantInvestmentIndicationSummary,
   type RejectedInvestmentIndication,
   type TrustedPackageAcknowledgmentContext,
   type WithdrawnInvestmentIndication,
@@ -71,7 +73,9 @@ export {
   MAX_OWNER_INDICATION_REVIEW_CURSOR_LENGTH,
 } from "../services/owner-indication-review-tokens.ts";
 
+const LEGACY_INDICATION_SCHEMA_VERSION = 4;
 const INDICATION_SCHEMA_VERSION = 5;
+const CURRENT_INDICATION_SCHEMA_VERSION = 6;
 const CURRENT_INDICATIONS = storageCollection("investment-indications");
 const INDICATION_HISTORY = storageCollection("investment-indication-history");
 const INDICATION_FIELDS = storageCollection("investment-indication-fields");
@@ -112,7 +116,7 @@ export type OwnerIndicationCurrentProjection = Readonly<{
   terminalOperationId: StorageOperationId;
 }>;
 
-const CURRENT_DOCUMENT_KEYS = new Set([
+const LEGACY_CURRENT_DOCUMENT_KEYS = new Set([
   "kind",
   "schemaVersion",
   "operationId",
@@ -122,6 +126,18 @@ const CURRENT_DOCUMENT_KEYS = new Set([
   "participantSubject",
   "revision",
   "fields",
+]);
+const CURRENT_DOCUMENT_KEYS = new Set([
+  ...LEGACY_CURRENT_DOCUMENT_KEYS,
+  "participantSummary",
+]);
+const PARTICIPANT_SUMMARY_DOCUMENT_KEYS = new Set([
+  "kind",
+  "status",
+  "createdAt",
+  "updatedAt",
+  "fields",
+  "rejectionReason",
 ]);
 const TRANSITION_DOCUMENT_KEYS = new Set([
   "kind",
@@ -444,13 +460,18 @@ type StoredTransition = Readonly<{
 }>;
 
 type StoredCurrent = Readonly<{
+  schemaVersion:
+    | typeof INDICATION_SCHEMA_VERSION
+    | typeof CURRENT_INDICATION_SCHEMA_VERSION;
   operationId: StorageOperationId;
   operationFingerprint: string;
   requestFingerprint: string;
   indicationId: InvestmentIndicationId;
   participantSubject: ActorSubject;
   revision: number;
+  storageRevisionOffset: 0 | 1;
   fields: StoredFieldsReference;
+  participantSummary: StorageDocument | null;
   document: StorageDocument;
   record: StorageRecord;
 }>;
@@ -459,7 +480,12 @@ type MaterializedIndication = Readonly<{
   indication: InvestmentIndication;
   terminal: StoredTransition;
   fieldsByRevision: ReadonlyMap<number, StoredFields>;
+  current: StoredCurrent | null;
 }>;
+
+export type LegacyIndicationSummaryMigrationStatus =
+  | "migrated"
+  | "already-current";
 
 type PreparedSnapshotMutation = Readonly<{
   indication: InvestmentIndication;
@@ -697,8 +723,8 @@ export class DevelopmentInMemoryIndicationRepository
     const key = requiredCurrentIndicationStorageKey(value);
     const record = await this.#storage.read(key);
     if (record === null) return null;
-    const source = exactRecord(record.value, CURRENT_DOCUMENT_KEYS);
-    const id = storedIndicationId(source.indicationId);
+    const coordinates = storedIndicationCoordinates(record.value);
+    const id = coordinates.id;
     const expectedKey = await currentIndicationKey(id);
     if (
       key.collection !== expectedKey.collection ||
@@ -1063,7 +1089,8 @@ export class DevelopmentInMemoryIndicationRepository
       null,
     );
     if (
-      canonicalJson(currentIndicationDocument(
+      canonicalJson(storedCurrentIndicationDocument(
+        current.schemaVersion,
         materialized.indication,
         materialized.terminal.operationId,
         materialized.terminal.operationFingerprint,
@@ -1074,7 +1101,7 @@ export class DevelopmentInMemoryIndicationRepository
       unavailable();
     }
     await this.#verifyActiveLease(materialized.indication);
-    return materialized;
+    return Object.freeze({ ...materialized, current });
   }
 
   async #verifyActiveLease(indication: InvestmentIndication): Promise<void> {
@@ -1193,11 +1220,14 @@ export class DevelopmentInMemoryIndicationRepository
       previous?.indication ?? null,
       indication,
     );
+    const expectedCurrentRevision = request.expectedRevision === null
+      ? null
+      : previous?.current?.record.revision ?? unavailable();
     const mutations: readonly StorageMutation[] = Object.freeze([
       Object.freeze({
         type: "put" as const,
         key: currentKey,
-        expectedRevision: request.expectedRevision,
+        expectedRevision: expectedCurrentRevision,
         value: prepared.currentDocument,
       }),
       Object.freeze({
@@ -1229,6 +1259,96 @@ export class DevelopmentInMemoryIndicationRepository
     const result = await this.#storage.transact(transaction);
     verifyMutationResult(result, mutations);
     return mutationResult(prepared.indication, result.replayed);
+  }
+}
+
+/**
+ * Verify one explicitly inventoried current indication and migrate only its
+ * schema-4 head. This capability is intentionally not part of browser routes.
+ */
+export async function migrateLegacyIndicationCurrentSummary(
+  storage: StorageAdapter,
+  participantSubject: ActorSubject,
+  indicationId: InvestmentIndicationId,
+): Promise<LegacyIndicationSummaryMigrationStatus> {
+  const subject = requiredActorSubject(participantSubject);
+  const id = requiredIndicationId(indicationId);
+  const key = await currentIndicationKey(id);
+  const record = await storage.read(key);
+  if (record === null) unavailable();
+  const current = decodeStoredCurrent(record, key, id, subject);
+  const materialized = await materializeIndication(
+    storage,
+    subject,
+    id,
+    current.revision,
+    null,
+  );
+  const expectedStoredDocument = storedCurrentIndicationDocument(
+    current.schemaVersion,
+    materialized.indication,
+    materialized.terminal.operationId,
+    materialized.terminal.operationFingerprint,
+    materialized.terminal.requestFingerprint,
+    materialized.terminal.fields,
+  );
+  if (canonicalJson(expectedStoredDocument) !== canonicalJson(current.document)) {
+    unavailable();
+  }
+  const lease = await activeLease(materialized.indication);
+  if (lease !== null) {
+    const leaseRecord = await storage.read(lease.key);
+    if (leaseRecord === null) unavailable();
+    verifyLeaseRecord(leaseRecord, lease, id);
+  }
+
+  if (current.schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION) {
+    return "already-current";
+  }
+  if (current.storageRevisionOffset !== 0) unavailable();
+
+  const migratedDocument = currentIndicationDocument(
+    materialized.indication,
+    materialized.terminal.operationId,
+    materialized.terminal.operationFingerprint,
+    materialized.terminal.requestFingerprint,
+    materialized.terminal.fields,
+  );
+  if (jsonByteLength(migratedDocument) > MAX_INDICATION_STORAGE_RECORD_BYTES) {
+    unavailable();
+  }
+  const operationId = requiredStorageOperationId(
+    `indication-summary-migration:${await sha256Hex(
+      canonicalJson(current.document),
+    )}`,
+  );
+  const mutation = Object.freeze({
+    type: "put" as const,
+    key,
+    expectedRevision: current.record.revision,
+    value: migratedDocument,
+  });
+  try {
+    const result = await storage.transact(Object.freeze({
+      operationId,
+      mutations: Object.freeze([mutation]),
+    }));
+    verifyMutationResult(result, Object.freeze([mutation]));
+    return "migrated";
+  } catch {
+    const recovered = await storage.read(key).catch(() => null);
+    if (
+      recovered !== null &&
+      recovered.revision === current.record.revision + 1 &&
+      canonicalJson(recovered.value) === canonicalJson(migratedDocument)
+    ) {
+      const decoded = decodeStoredCurrent(recovered, key, id, subject);
+      if (
+        decoded.schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION &&
+        decoded.revision === current.revision
+      ) return "already-current";
+    }
+    unavailable();
   }
 }
 
@@ -1456,7 +1576,14 @@ function storedIndicationCoordinates(value: unknown): Readonly<{
   subject: ActorSubject;
   id: InvestmentIndicationId;
 }> {
-  const source = exactRecord(value, CURRENT_DOCUMENT_KEYS);
+  const candidate = objectRecord(value);
+  if (candidate === null) unavailable();
+  const source = candidate.schemaVersion === INDICATION_SCHEMA_VERSION
+    ? exactRecord(candidate, LEGACY_CURRENT_DOCUMENT_KEYS)
+    : candidate.schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION
+    ? exactRecord(candidate, CURRENT_DOCUMENT_KEYS)
+    : unavailable();
+  if (source.kind !== "investment-indication-current") unavailable();
   return Object.freeze({
     subject: storedActorSubject(source.participantSubject),
     id: storedIndicationId(source.indicationId),
@@ -1925,11 +2052,21 @@ function decodeStoredCurrent(
   expectedId: InvestmentIndicationId,
   expectedSubject: ActorSubject | null,
 ): StoredCurrent {
+  const candidate = objectRecord(record.value);
+  if (candidate === null) unavailable();
+  const schemaVersion = candidate.schemaVersion === INDICATION_SCHEMA_VERSION
+    ? INDICATION_SCHEMA_VERSION
+    : candidate.schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION
+    ? CURRENT_INDICATION_SCHEMA_VERSION
+    : unavailable();
   const source = exactStoredDocument(
     record,
     expectedKey,
-    CURRENT_DOCUMENT_KEYS,
+    schemaVersion === INDICATION_SCHEMA_VERSION
+      ? LEGACY_CURRENT_DOCUMENT_KEYS
+      : CURRENT_DOCUMENT_KEYS,
     "investment-indication-current",
+    schemaVersion,
   );
   const operationId = storedOperationId(source.operationId);
   const operationFingerprint = storedFingerprint(source.operationFingerprint);
@@ -1938,19 +2075,33 @@ function decodeStoredCurrent(
   const participantSubject = storedActorSubject(source.participantSubject);
   const revision = storedRevision(source.revision);
   const fields = storedFieldsReference(source.fields);
+  const participantSummary = schemaVersion === INDICATION_SCHEMA_VERSION
+    ? null
+    : exactRecord(
+        source.participantSummary,
+        PARTICIPANT_SUMMARY_DOCUMENT_KEYS,
+      ) as StorageDocument;
+  const storageRevisionOffset = record.revision === revision
+    ? 0
+    : schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION &&
+        record.revision === revision + 1
+    ? 1
+    : unavailable();
   if (
     indicationId !== expectedId ||
-    (expectedSubject !== null && participantSubject !== expectedSubject) ||
-    record.revision !== revision
+    (expectedSubject !== null && participantSubject !== expectedSubject)
   ) unavailable();
   return Object.freeze({
+    schemaVersion,
     operationId,
     operationFingerprint,
     requestFingerprint,
     indicationId,
     participantSubject,
     revision,
+    storageRevisionOffset,
     fields,
+    participantSummary,
     document: record.value,
     record,
   });
@@ -2144,7 +2295,7 @@ async function materializeIndication(
   if (indication === null) unavailable();
   const terminal = transitions.at(-1);
   if (terminal === undefined) unavailable();
-  return Object.freeze({ indication, terminal, fieldsByRevision });
+  return Object.freeze({ indication, terminal, fieldsByRevision, current: null });
 }
 
 function exactStoredDocument(
@@ -2170,6 +2321,12 @@ function exactStoredDocument(
 }
 
 function storedOperationId(value: unknown): StorageOperationId {
+  const parsed = parseStorageOperationId(value);
+  if (!parsed.ok) unavailable();
+  return parsed.value;
+}
+
+function requiredStorageOperationId(value: unknown): StorageOperationId {
   const parsed = parseStorageOperationId(value);
   if (!parsed.ok) unavailable();
   return parsed.value;
@@ -2594,6 +2751,39 @@ function currentIndicationDocument(
 ): StorageDocument {
   return Object.freeze({
     kind: "investment-indication-current",
+    schemaVersion: CURRENT_INDICATION_SCHEMA_VERSION,
+    operationId,
+    operationFingerprint: fingerprint,
+    requestFingerprint,
+    indicationId: indication.id,
+    participantSubject: indication.participantSubject,
+    revision: indication.revision,
+    fields: fieldsReferenceDocument(fields),
+    participantSummary: participantSummaryDocument(indication),
+  });
+}
+
+function storedCurrentIndicationDocument(
+  schemaVersion:
+    | typeof INDICATION_SCHEMA_VERSION
+    | typeof CURRENT_INDICATION_SCHEMA_VERSION,
+  indication: InvestmentIndication,
+  operationId: StorageOperationId,
+  fingerprint: string,
+  requestFingerprint: string,
+  fields: StoredFieldsReference,
+): StorageDocument {
+  if (schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION) {
+    return currentIndicationDocument(
+      indication,
+      operationId,
+      fingerprint,
+      requestFingerprint,
+      fields,
+    );
+  }
+  return Object.freeze({
+    kind: "investment-indication-current",
     schemaVersion: INDICATION_SCHEMA_VERSION,
     operationId,
     operationFingerprint: fingerprint,
@@ -2602,6 +2792,27 @@ function currentIndicationDocument(
     participantSubject: indication.participantSubject,
     revision: indication.revision,
     fields: fieldsReferenceDocument(fields),
+  });
+}
+
+function participantSummaryDocument(
+  indication: InvestmentIndication,
+): StorageDocument {
+  return participantSummaryStorageDocument(
+    participantInvestmentIndicationSummary(indication),
+  );
+}
+
+function participantSummaryStorageDocument(
+  summary: ParticipantInvestmentIndicationSummary,
+): StorageDocument {
+  return Object.freeze({
+    kind: summary.kind,
+    status: summary.lifecycle.status,
+    createdAt: summary.createdAt,
+    updatedAt: summary.updatedAt,
+    fields: fieldsDocument(summary.fields),
+    rejectionReason: summary.lifecycle.rejectionReason,
   });
 }
 

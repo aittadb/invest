@@ -41,6 +41,7 @@ yarn-error.log*
 /.wrangler/
 /outputs/
 /work/
+/migration-inventories/
 
 # ChatGPT Sites instance bindings are local deployment state.
 /.openai/hosting.json

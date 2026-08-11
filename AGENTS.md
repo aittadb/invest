@@ -125,6 +125,7 @@ README must state experimental status, FSL-1.1-MIT source availability with two-
 - Plan dependency graph: `npm run plan:check`
 - Local validation: `npm run validate`
 - Sites package build: `npm run sites:package`
+- Legacy indication summary operator migration: `npm run migrate:legacy-indication-summaries -- migration-inventories/<reviewed-file>.json`
 
 Keep commands synchronized with `package.json`, CI, README, and contributor docs.
 

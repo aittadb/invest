@@ -8,4 +8,9 @@ Before implementation, create a complete unchecked PLAN task using the next stab
 
 Run `npm run validate` before requesting review. It includes the `AGENTS.md` size guard. Keep root `AGENTS.md` under 32,000 bytes so Codex can load the complete instruction set by default.
 
+Treat `migration-inventories/` as private operator input. Keep every inventory
+ignored, use only the documented backend command and its separate least-
+privilege credential, and never paste subjects, indication IDs, credentials,
+or command failures into commits, issues, or logs.
+
 Use feature branches. Do not push directly to `main`, merge without review, deploy, publish, save a production checkpoint, rotate secrets, or change Sites access settings without explicit approval.

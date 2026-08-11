@@ -417,6 +417,62 @@ transact and shares the same read counter and cached immutable binding, but it
 does not grant mutation authority to the cache. No adapter, counter, cache, or
 subject-bound repository survives the HTTP request.
 
+## Legacy Indication Summary Migration
+
+Schema-4 indication current records do not contain the bounded participant
+collection summary used by schema 5. They are never upgraded by a browser GET,
+page render, route composition, or ordinary Sites startup. Before activating a
+runtime that consumes schema-5 summaries, an operator must prepare an exact
+authoritative inventory in this closed form:
+
+```json
+{
+  "schemaVersion": 1,
+  "indications": [
+    {
+      "participantSubject": "issuer.example/subject:example",
+      "indicationId": "indication:example"
+    }
+  ]
+}
+```
+
+The array is sorted by subject and indication ID, contains no duplicates, and
+is capped at 100 entries per command run. Empty inventories are valid. Store
+the file only under ignored `migration-inventories/`; it is private operator
+input and must not be committed, logged, attached to issues, or placed in Sites
+configuration.
+
+Configure `AITTADB_MIGRATION_ISSUER`, optional
+`AITTADB_MIGRATION_TRANSPORT_ORIGIN`, `AITTADB_MIGRATION_ENTRY_HREF`,
+`AITTADB_MIGRATION_CLIENT_ID`, and `AITTADB_MIGRATION_CLIENT_SECRET` in the
+operator environment. The client must be temporary or otherwise dedicated,
+bound by AittaDB to only the intended deployment namespace, have no browser
+origin or redirect, and carry only `storage.read storage.write`. The command
+rejects reuse of an application-runtime client value visible in the same
+environment. Do not install these values as hosted Sites settings.
+
+Run:
+
+```sh
+npm run migrate:legacy-indication-summaries -- migration-inventories/indications.json
+```
+
+For every item, the command reads the exact current key and fully reconstructs
+all immutable transitions and referenced field chunks. It validates identities,
+revisions, lifecycle, raw-request and normalized operation fingerprints,
+current metadata, and any active uniqueness lease before one compare-and-set
+write. Migration changes only the current envelope from schema 4 to schema 5;
+the domain revision and immutable records do not change. Missing, crossed,
+corrupt, or concurrently changed state stops the run through one fixed failure
+surface. Output contains only scanned, migrated, and already-current counts.
+
+The operation is item-idempotent. After interruption, process restart, an exact
+concurrent upgrade, or a lost response, rerun the same complete inventory. A
+previously migrated exact head is fully reverified and counted as already
+current; untouched later items continue normally. Do not remove an item from
+the authoritative inventory merely because its prior response was unknown.
+
 ## Browser-Mutation Replay
 
 The factory supplies the first production repository capability: an atomic
@@ -596,3 +652,10 @@ synthetic hosted services implement and enforce the discovered AittaDB
 read/list/transaction controls rather than bypassing the adapter. Source
 and built-artifact scans complement `npm run instances:check`, which rejects
 tracked runtime env files and active Sites bindings.
+
+Legacy indication-summary coverage separately proves empty and maximum-history
+inventories, closed manifest parsing, complete ancestry and lease validation,
+missing/crossed/corrupt rejection, exact retries, concurrent exact migration,
+concurrent domain change, response-loss recovery, restart/resume, content-free
+results, dedicated credential closure, and the absence of migration writes or
+imports from browser GET paths.
