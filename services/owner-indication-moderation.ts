@@ -65,6 +65,11 @@ export type OwnerIndicationModerationPage = Readonly<{
   nextCursor: StorageCursor | null;
 }>;
 
+/** Owner-bound read contract for one opaque indication review resource. */
+export interface OwnerIndicationReviewDetailRepository {
+  get(reviewId: unknown): Promise<OwnerIndicationModerationItem | null>;
+}
+
 export type RejectIndicationWithEffectsRequest = Readonly<{
   reviewId: string;
   operationId: StorageOperationId;
@@ -90,13 +95,13 @@ export type RejectIndicationWithEffectsResult = Readonly<{
  * Strong owner-moderation port. An implementation may advertise reject only
  * when all four effects share one atomic, idempotent commit boundary.
  */
-export interface AtomicOwnerIndicationModerationRepository {
+export interface AtomicOwnerIndicationModerationRepository
+  extends OwnerIndicationReviewDetailRepository {
   readonly moderationConsistency:
     "atomic-indication-aggregate-audit-notification";
   list(
     request: OwnerIndicationModerationListRequest,
   ): Promise<OwnerIndicationModerationPage>;
-  get(reviewId: unknown): Promise<OwnerIndicationModerationItem | null>;
   rejectWithEffects(
     request: RejectIndicationWithEffectsRequest,
   ): Promise<RejectIndicationWithEffectsResult>;

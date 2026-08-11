@@ -102,6 +102,11 @@ export const MAX_OWNER_INDICATION_REVIEW_PAGE_RECORD_READS =
   MAX_OWNER_INDICATION_REVIEW_ITEM_READS;
 const MAX_OWNER_INDICATION_REVIEW_BACKEND_CURSOR_LENGTH = 2_048;
 
+export type OwnerIndicationCurrentProjection = Readonly<{
+  indication: InvestmentIndication;
+  terminalOperationId: StorageOperationId;
+}>;
+
 const CURRENT_DOCUMENT_KEYS = new Set([
   "kind",
   "schemaVersion",
@@ -531,6 +536,34 @@ export class DevelopmentInMemoryIndicationRepository
     ).then((stored) => stored?.indication ?? null);
   }
 
+  /** Resolve one owner-authenticated current-record key without listing. */
+  async getOwnerProjectionByCurrentKey(
+    value: unknown,
+  ): Promise<OwnerIndicationCurrentProjection | null> {
+    const actor = this.#requiredOwnerActor();
+    const key = requiredCurrentIndicationStorageKey(value);
+    const record = await this.#storage.read(key);
+    if (record === null) return null;
+    const source = exactRecord(record.value, CURRENT_DOCUMENT_KEYS);
+    const id = storedIndicationId(source.indicationId);
+    const expectedKey = await currentIndicationKey(id);
+    if (
+      key.collection !== expectedKey.collection ||
+      key.id !== expectedKey.id
+    ) unavailable();
+    const materialized = await this.#materializeCurrent(
+      record,
+      key,
+      id,
+      null,
+      actor.subject,
+    );
+    return Object.freeze({
+      indication: materialized.indication,
+      terminalOperationId: materialized.terminal.operationId,
+    });
+  }
+
   /** Reopen one immutable operation result without projecting a later head. */
   async readPreparedParticipantMutation(
     prepared: PreparedParticipantIndicationReplay,
@@ -843,11 +876,31 @@ export class DevelopmentInMemoryIndicationRepository
       return null;
     }
 
-    const current = decodeStoredCurrent(
+    return this.#materializeCurrent(
       record,
       key,
       id,
       access === "participant" ? subject : null,
+      subject,
+    );
+  }
+
+  async #materializeCurrent(
+    record: StorageRecord,
+    key: StorageKey,
+    id: InvestmentIndicationId,
+    expectedParticipantSubject: ActorSubject | null,
+    authorizedSubject: ActorSubject,
+  ): Promise<MaterializedIndication> {
+    if (
+      expectedParticipantSubject === null &&
+      authorizedSubject !== this.#configuredOwnerSubject
+    ) unavailable();
+    const current = decodeStoredCurrent(
+      record,
+      key,
+      id,
+      expectedParticipantSubject,
     );
     const materialized = await materializeIndication(
       this.#storage,
@@ -2736,6 +2789,24 @@ async function currentIndicationKey(
     CURRENT_INDICATIONS,
     await hashedStorageId("indication-current", id),
   );
+}
+
+/** Internal current key used by owner-only opaque review resources. */
+export async function ownerIndicationCurrentStorageKey(
+  id: unknown,
+): Promise<StorageKey> {
+  return currentIndicationKey(requiredIndicationId(id));
+}
+
+function requiredCurrentIndicationStorageKey(value: unknown): StorageKey {
+  const source = exactRecord(value, new Set(["collection", "id"]));
+  const parsed = parseStorageKey(source.collection, source.id);
+  if (
+    !parsed.ok ||
+    parsed.value.collection !== CURRENT_INDICATIONS ||
+    !/^indication-current:[0-9a-f]{64}$/u.test(parsed.value.id)
+  ) invalidRequest();
+  return parsed.value;
 }
 
 async function indicationHistoryKey(

@@ -33,6 +33,12 @@ sign-out while withholding founder and investment actions. Indication,
 aggregate, moderation, export, and coordinated deletion persistence still
 require their own named capabilities.
 
+The persistent owner indication-detail primitive can resolve one deployment-key
+opaque review ID to a bounded verified current record and notification without a
+list scan. It is not installed as a hosted owner route until the separate owner
+moderation composition supplies the shared token boundary, collection, detail,
+atomic rejection, and mutation-session capabilities together.
+
 This source composition and its deterministic protocol services are not hosted
 acceptance evidence. Activation remains blocked until the configured AittaDB
 deployment passes the required storage, authorization, quota, retention, and
