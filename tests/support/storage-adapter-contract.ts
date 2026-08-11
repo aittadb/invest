@@ -38,6 +38,7 @@ export async function verifyStorageAdapterContract(
   await verifyDuplicateProtection(createFixture());
   await verifyCompareAndSet(createFixture());
   await verifyChecks(createFixture());
+  await verifyConcurrentCheckLinearizability(createFixture());
   await verifyAtomicity(createFixture());
   await verifyTransactionBoundaries(createFixture());
   await verifyAuthorizationAndDisclosure(createFixture());
@@ -75,6 +76,29 @@ async function verifyChecks(fixture: StorageAdapterContractFixture) {
   requireInvariant(
     JSON.stringify(await fixture.owner.read(existing)) === JSON.stringify(before),
     "check.non-mutating",
+  );
+
+  await expectFailure(
+    () => fixture.owner.transact({
+      ...request,
+      mutations: [
+        check(existing, 2),
+        ...request.mutations.slice(1),
+      ],
+    }),
+    "CONFLICT",
+    "check.idempotency-revision",
+  );
+  await expectFailure(
+    () => fixture.owner.transact({
+      ...request,
+      mutations: [
+        check(privateKey("check-changed-key"), 1),
+        ...request.mutations.slice(1),
+      ],
+    }),
+    "CONFLICT",
+    "check.idempotency-key",
   );
 
   await fixture.owner.transact(
@@ -130,6 +154,78 @@ async function verifyChecks(fixture: StorageAdapterContractFixture) {
     "PRECONDITION_FAILED",
     "check.failed-absence",
   );
+}
+
+async function verifyConcurrentCheckLinearizability(
+  fixture: StorageAdapterContractFixture,
+) {
+  const guard = privateKey("check-concurrent-guard");
+  const candidate = privateKey("check-concurrent-candidate");
+  await fixture.owner.transact(
+    createRequest("operation:check-concurrent-seed", guard, { value: "before" }),
+  );
+  const guardedWrite: StorageTransactionRequest = {
+    operationId: operationId("operation:check-concurrent-guarded-write"),
+    mutations: [
+      check(guard, 1),
+      { type: "put", key: candidate, expectedRevision: null, value: { value: "guarded" } },
+    ],
+  };
+  const competingWrite: StorageTransactionRequest = {
+    operationId: operationId("operation:check-concurrent-competing-write"),
+    mutations: [
+      check(candidate, null),
+      { type: "put", key: guard, expectedRevision: 1, value: { value: "after" } },
+    ],
+  };
+
+  let releaseStart!: () => void;
+  const start = new Promise<void>((resolve) => {
+    releaseStart = resolve;
+  });
+  const run = async (request: StorageTransactionRequest) => {
+    await start;
+    return fixture.owner.transact(request);
+  };
+  const guarded = run(guardedWrite);
+  const competing = run(competingWrite);
+  releaseStart();
+  const [guardedResult, competingResult] = await Promise.allSettled([
+    guarded,
+    competing,
+  ]);
+
+  const guardedSucceeded = guardedResult.status === "fulfilled";
+  const competingSucceeded = competingResult.status === "fulfilled";
+  requireInvariant(
+    guardedSucceeded !== competingSucceeded,
+    "check.concurrent-one-winner",
+  );
+  const rejection = guardedResult.status === "rejected"
+    ? guardedResult.reason
+    : competingResult.status === "rejected"
+    ? competingResult.reason
+    : undefined;
+  requireInvariant(
+    rejection instanceof StorageFailure &&
+      rejection.code === "PRECONDITION_FAILED",
+    "check.concurrent-loser-precondition",
+  );
+
+  const storedGuard = await fixture.owner.read(guard);
+  const storedCandidate = await fixture.owner.read(candidate);
+  requireInvariant(storedGuard !== null, "check.concurrent-guard-present");
+  if (guardedSucceeded) {
+    requireInvariant(
+      storedGuard.revision === 1 && storedCandidate?.revision === 1,
+      "check.concurrent-guarded-state",
+    );
+  } else {
+    requireInvariant(
+      storedGuard.revision === 2 && storedCandidate === null,
+      "check.concurrent-competing-state",
+    );
+  }
 }
 
 async function verifyIdempotency(fixture: StorageAdapterContractFixture) {
@@ -307,6 +403,30 @@ async function verifyAuthorizationAndDisclosure(
   requireInvariant(
     deniedCheck.code === "NOT_FOUND" && absentCheck.code === "NOT_FOUND",
     "authorization.check-equivalence",
+  );
+
+  const deniedAbsenceCheck = await captureStorageFailure(
+    () => fixture.outsider.transact(checkRequest(
+      "operation:foreign-absence-check-existing",
+      existing,
+      null,
+    )),
+    "authorization.foreign-absence-check",
+  );
+  const absentAbsenceCheck = await captureStorageFailure(
+    () => fixture.outsider.transact(checkRequest(
+      "operation:foreign-absence-check-missing",
+      missing,
+      null,
+    )),
+    "authorization.missing-absence-check",
+  );
+  requireInvariant(
+    deniedAbsenceCheck.code === "NOT_FOUND" &&
+      absentAbsenceCheck.code === "NOT_FOUND" &&
+      JSON.stringify(toPublicStorageFailure(deniedAbsenceCheck)) ===
+        JSON.stringify(toPublicStorageFailure(absentAbsenceCheck)),
+    "authorization.absence-check-equivalence",
   );
 
   const deniedPublic = JSON.stringify(toPublicStorageFailure(denied));

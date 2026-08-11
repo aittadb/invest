@@ -26,6 +26,9 @@ type Fault =
   | "duplicate"
   | "drift"
   | "check"
+  | "atomic-check"
+  | "check-fingerprint"
+  | "absence-disclosure"
   | "disclosure"
   | null;
 
@@ -38,6 +41,9 @@ for (const [fault, invariant] of [
   ["duplicate", "duplicate.create"],
   ["drift", "compare-and-set.stale-write"],
   ["check", "check.stale-positive"],
+  ["atomic-check", "check.concurrent-one-winner"],
+  ["check-fingerprint", "check.idempotency-revision"],
+  ["absence-disclosure", "authorization.absence-check-equivalence"],
   ["disclosure", "authorization.read-shape"],
 ] as const) {
   test(`the shared harness detects ${fault} contract failures`, async () => {
@@ -65,9 +71,28 @@ class FakeStorageState {
     Readonly<{ fingerprint: string; result: StorageTransactionResult }>
   >();
   readonly fault: Fault;
+  readonly #concurrentCheckGate: Promise<void>;
+  #concurrentCheckArrivals = 0;
+  #releaseConcurrentChecks: (() => void) | undefined;
 
   constructor(fault: Fault) {
     this.fault = fault;
+    this.#concurrentCheckGate = new Promise<void>((resolve) => {
+      this.#releaseConcurrentChecks = resolve;
+    });
+  }
+
+  async pauseFaultyConcurrentCheck(operationId: string): Promise<void> {
+    if (
+      this.fault !== "atomic-check" ||
+      !operationId.startsWith("operation:check-concurrent-") ||
+      operationId.endsWith("-seed")
+    ) return;
+    this.#concurrentCheckArrivals += 1;
+    if (this.#concurrentCheckArrivals === 2) {
+      this.#releaseConcurrentChecks?.();
+    }
+    await this.#concurrentCheckGate;
   }
 }
 
@@ -117,10 +142,32 @@ class MinimalFakeStorageAdapter implements StorageAdapter {
     request: StorageTransactionRequest,
   ): Promise<StorageTransactionResult> {
     const snapshot = normalizeStorageTransactionRequest(request);
-    if (!this.permitted) throw new StorageFailure("NOT_FOUND");
+    if (!this.permitted) {
+      if (
+        this.state.fault === "absence-disclosure" &&
+        snapshot.mutations.length === 1 &&
+        snapshot.mutations[0]?.type === "check" &&
+        snapshot.mutations[0].expectedRevision === null
+      ) {
+        const current = this.state.records.get(
+          storageKeyString(snapshot.mutations[0].key),
+        );
+        throw new StorageFailure(
+          current === undefined ? "NOT_FOUND" : "PRECONDITION_FAILED",
+        );
+      }
+      throw new StorageFailure("NOT_FOUND");
+    }
 
     const operationKey = snapshot.operationId as string;
-    const fingerprint = JSON.stringify(snapshot);
+    const fingerprint = this.state.fault === "check-fingerprint"
+      ? JSON.stringify({
+          ...snapshot,
+          mutations: snapshot.mutations.map((mutation) =>
+            mutation.type === "check" ? { type: mutation.type } : mutation
+          ),
+        })
+      : JSON.stringify(snapshot);
     const prior = this.state.operations.get(operationKey);
     if (prior) {
       if (prior.fingerprint !== fingerprint) throw new StorageFailure("CONFLICT");
@@ -148,6 +195,10 @@ class MinimalFakeStorageAdapter implements StorageAdapter {
       ) {
         throw new StorageFailure("PRECONDITION_FAILED");
       }
+    }
+
+    if (this.state.fault === "atomic-check") {
+      await this.state.pauseFaultyConcurrentCheck(operationKey);
     }
 
     const nextRecords = new Map(this.state.records);

@@ -106,9 +106,10 @@ at the storage protocol boundary.
 
 `tests/aittadb-storage-protocol.test.ts` now runs the unchanged shared
 `StorageAdapter` contract against this production adapter and a deterministic
-protocol service. The same suite proves authorization equivalence, duplicate
-protection, compare-and-set and non-mutating check behavior, atomic rollback,
-ordered unchanged evidence, pagination, idempotency,
+protocol service. The same suite proves positive and absence-check authorization
+equivalence, duplicate protection, compare-and-set and non-mutating check
+behavior, concurrent cyclic check/write linearizability, atomic rollback,
+ordered unchanged evidence, pagination, and check-field-bound idempotency,
 quota rollback, and non-disclosure. Adapter-specific tests cover logical and
 transport origins, exact headers, redirects, media types, declared and streamed
 sizes, fragmented and stalled streams, UTF-8 and JSON failures, discovery retry

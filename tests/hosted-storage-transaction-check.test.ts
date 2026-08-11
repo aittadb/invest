@@ -70,6 +70,58 @@ test("hosted synthetic transport keeps revision checks atomic with writes", asyn
   );
   assert.equal(await adapter.read(rolledBack), null);
   assert.equal(service.operationCount(), 3);
+
+  const cycleGuard = storageKey("guard-records", "cycle-guard");
+  const cycleCandidate = storageKey("write-records", "cycle-candidate");
+  await adapter.transact(request("operation:hosted-check-cycle-seed", [
+    put(cycleGuard, null, { state: "before" }),
+  ]));
+  const guardedCycle = request("operation:hosted-check-cycle-guarded", [
+    check(cycleGuard, 1),
+    put(cycleCandidate, null, { state: "guarded" }),
+  ]);
+  const competingCycle = request("operation:hosted-check-cycle-competing", [
+    check(cycleCandidate, null),
+    put(cycleGuard, 1, { state: "after" }),
+  ]);
+  let releaseStart!: () => void;
+  const start = new Promise<void>((resolve) => {
+    releaseStart = resolve;
+  });
+  const run = async (candidate: StorageTransactionRequest) => {
+    await start;
+    return adapter.transact(candidate);
+  };
+  const guardedResult = run(guardedCycle);
+  const competingResult = run(competingCycle);
+  releaseStart();
+  const [guardedOutcome, competingOutcome] = await Promise.allSettled([
+    guardedResult,
+    competingResult,
+  ]);
+  assert.notEqual(
+    guardedOutcome.status === "fulfilled",
+    competingOutcome.status === "fulfilled",
+  );
+  const rejected = guardedOutcome.status === "rejected"
+    ? guardedOutcome.reason
+    : competingOutcome.status === "rejected"
+    ? competingOutcome.reason
+    : undefined;
+  assert(
+    rejected instanceof StorageFailure &&
+      rejected.code === "PRECONDITION_FAILED",
+  );
+  const storedCycleGuard = await adapter.read(cycleGuard);
+  const storedCycleCandidate = await adapter.read(cycleCandidate);
+  if (guardedOutcome.status === "fulfilled") {
+    assert.equal(storedCycleGuard?.revision, 1);
+    assert.equal(storedCycleCandidate?.revision, 1);
+  } else {
+    assert.equal(storedCycleGuard?.revision, 2);
+    assert.equal(storedCycleCandidate, null);
+  }
+  assert.equal(service.operationCount(), 5);
 });
 
 function request(
