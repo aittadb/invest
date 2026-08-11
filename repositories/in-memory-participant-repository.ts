@@ -210,6 +210,69 @@ export interface ParticipantRegistrationRepository
   ): Promise<ParticipantProfileMutationResult>;
 }
 
+/** Authenticate one persisted account-deletion revision without writing it again. */
+export async function verifyParticipantAccountDeletionRevision(
+  storage: StorageAdapter,
+  authenticatedAccount: ParticipantAccount | null,
+  request: RequestParticipantDeletionRequest,
+): Promise<ParticipantProfileMutationResult> {
+  const account = authenticatedAccount === null
+    ? null
+    : requiredParticipantAccount(authenticatedAccount);
+  if (account === null) notFound();
+  const operationId = requiredOperationId(request.operationId);
+  const expectedRevision = requiredRevision(request.expectedRevision);
+  const requestedAt = requiredTimestamp(request.requestedAt);
+  const repository = new StorageParticipantRepository(storage, account);
+  const base = await repository.revision(expectedRevision);
+  if (base === null) unavailable();
+  requireNondecreasingTime(base.snapshot.updatedAt, requestedAt);
+
+  const transition = requestParticipantAccountDeletion(
+    base.snapshot,
+    requestedAt,
+  );
+  const requestHash = await hashMutationRequest({
+    action: "request-account-deletion",
+    requestedAt,
+  });
+  const revision = nextProfileRevision(expectedRevision);
+  const key = await participantProfileRevisionKey(account.subject, revision);
+  const record = await storageRead(storage, key);
+  if (record === null) unavailable();
+  const snapshot = decodeHistoricalParticipantRecord(
+    record,
+    key,
+    account.subject,
+    revision,
+  );
+  if (snapshot === null) unavailable();
+  const evidence = participantMutationEvidence(
+    snapshotStorageRecord(record).value,
+  );
+  const expectedValue = boundedParticipantProfileDocument(
+    transition.profile,
+    revision,
+    "request-account-deletion",
+    operationId,
+    requestHash,
+  );
+  if (
+    evidence.operationId !== operationId ||
+    evidence.action !== "request-account-deletion" ||
+    evidence.requestHash !== requestHash ||
+    !equalData(snapshotStorageRecord(record).value, expectedValue)
+  ) {
+    unavailable();
+  }
+  return mutationResult(
+    snapshot.revision,
+    snapshot.snapshot,
+    true,
+    transition.intents,
+  );
+}
+
 /** Subject-bound participant persistence over a credential-bound StorageAdapter. */
 export class StorageParticipantRepository
   implements ParticipantRegistrationRepository {

@@ -1514,7 +1514,7 @@ test("adapter failures preserve only fixed failure codes and discard causes", as
   assert.equal(JSON.stringify(writeFailure).includes("private adapter value"), false);
 });
 
-test("participant module exports only repositories and profile checks, and writes only participant records", async () => {
+test("participant module exports only repositories and profile verifiers, and writes only participant records", async () => {
   const participantModule = await import(
     "../repositories/in-memory-participant-repository.ts"
   );
@@ -1522,6 +1522,7 @@ test("participant module exports only repositories and profile checks, and write
     "DevelopmentInMemoryParticipantRepository",
     "StorageParticipantRepository",
     "participantProfileRevisionCheck",
+    "verifyParticipantAccountDeletionRevision",
     "verifyParticipantProfileRevisionCheckRecord",
   ]);
 
