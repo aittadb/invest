@@ -110,7 +110,7 @@ test("owner founder review exposes equivalent collection resources", async () =>
 
 test("founder review collection remains independent from detail composition", async () => {
   const item = reviewItem();
-  const repository = new FakeFounderReviewRepository(item);
+  const repository = new FakeFounderReviewRepository(item, [10, 25]);
   const collection = createOwnerFounderReviewCollectionRouteHandler(repository);
   const detailUrl =
     `https://invest.example/owner/founder-applications/${encodeURIComponent(item.reviewId)}`;
@@ -142,6 +142,7 @@ test("founder review collection remains independent from detail composition", as
       note: string;
       history: Array<{ transition: string }>;
     };
+    links: Array<{ rel: string[]; href: string }>;
   };
   assert.equal(detailDocument.type, "owner-founder-application");
   assert.equal(detailDocument.id, item.reviewId);
@@ -152,6 +153,19 @@ test("founder review collection remains independent from detail composition", as
     ["created"],
   );
   assert.equal(JSON.stringify(detailDocument).includes(item.application.applicantSubject), false);
+  const collectionLink = detailDocument.links.find((link) =>
+    link.rel.includes("collection")
+  );
+  assert(collectionLink);
+  const followedCollection = await requiredResponse(await handler(context(
+    collectionLink.href,
+    { accept: "application/json" },
+  )));
+  assert.equal(followedCollection.status, 200);
+  assert.equal(
+    ((await followedCollection.json()) as { type: string }).type,
+    "owner-founder-application-collection",
+  );
 
   const htmlDetail = await requiredResponse(await handler(context(detailUrl, {
     accept: "text/html",
@@ -349,7 +363,29 @@ test("detail-only routing exposes no collection or unauthorized lookup", async (
     accept: "application/json",
   })));
   assert.equal(detail.status, 200);
+  const detailDocument = await detail.json() as OwnerFounderReviewDetailDocument;
+  assert.equal(
+    detailDocument.links.some((link) => link.rel.includes("collection")),
+    false,
+  );
+  assert.equal(
+    detailDocument.links.some((link) => link.rel.includes("owner")),
+    true,
+  );
   assert.equal(repository.getCalls, 1);
+
+  const htmlDetail = await requiredResponse(await handler(context(detailUrl, {
+    accept: "text/html",
+  })));
+  const detailHtml = await htmlDetail.text();
+  assert.equal(htmlDetail.status, 200);
+  assert.doesNotMatch(detailHtml, /Back to founder applications/u);
+  assert.doesNotMatch(
+    detailHtml,
+    /href="https:\/\/invest\.example\/owner\/founder-applications"/u,
+  );
+  assert.match(detailHtml, /Back to campaign workspace/u);
+  assert.equal(repository.getCalls, 2);
 
   const queried = await requiredResponse(await handler(context(
     `${detailUrl}?private=${encodeURIComponent(PRIVATE_NOTE)}`,
@@ -357,7 +393,7 @@ test("detail-only routing exposes no collection or unauthorized lookup", async (
   )));
   assert.equal(queried.status, 400);
   assert.equal((await queried.text()).includes(PRIVATE_NOTE), false);
-  assert.equal(repository.getCalls, 1);
+  assert.equal(repository.getCalls, 2);
 
   const privateSubject = "issuer.invalid/subject:must-not-be-reflected";
   const malformed = await requiredResponse(await handler(context(
@@ -370,7 +406,7 @@ test("detail-only routing exposes no collection or unauthorized lookup", async (
   assert.equal(malformed.status, 400);
   assert.equal(malformedBody.includes(privateSubject), false);
   assert.match(malformedBody, /owner\/founder-applications\/invalid/u);
-  assert.equal(repository.getCalls, 1);
+  assert.equal(repository.getCalls, 2);
 
   for (const options of [
     { actor: null, isOwner: false },
@@ -383,7 +419,7 @@ test("detail-only routing exposes no collection or unauthorized lookup", async (
     assert.equal(denied.status, options.actor === null ? 401 : 404);
     assert.equal((await denied.text()).includes(PRIVATE_NOTE), false);
   }
-  assert.equal(repository.getCalls, 1);
+  assert.equal(repository.getCalls, 2);
 });
 
 test("malformed detail paths are canonical, private, and bypass reads and rendering", async () => {
@@ -434,16 +470,21 @@ implements FounderApplicationReviewRepository {
   listCalls = 0;
   getCalls = 0;
   private readonly item: FounderApplicationReviewItem;
+  private readonly acceptedPageSizes: readonly number[];
 
-  constructor(item: FounderApplicationReviewItem) {
+  constructor(
+    item: FounderApplicationReviewItem,
+    acceptedPageSizes: readonly number[] = [10],
+  ) {
     this.item = item;
+    this.acceptedPageSizes = acceptedPageSizes;
   }
 
   async list(
     request: FounderApplicationReviewListRequest,
   ): Promise<FounderApplicationReviewPage> {
     this.listCalls += 1;
-    assert.equal(request.limit, 10);
+    assert.ok(this.acceptedPageSizes.includes(request.limit));
     const item: FounderApplicationReviewCollectionItem = Object.freeze({
       reviewId: this.item.reviewId,
       status: this.item.application.status,

@@ -112,6 +112,7 @@ export function createOwnerFounderReviewCollectionDocument(
 export function createOwnerFounderReviewDetailDocument(
   requestUrl: string,
   item: OwnerFounderReviewItem,
+  collectionAvailable: boolean,
 ): OwnerFounderReviewDetailDocument {
   const self = new URL(requestUrl);
   const application = item.application;
@@ -149,10 +150,12 @@ export function createOwnerFounderReviewDetailDocument(
     },
     links: [
       { rel: ["self"], href: self.href },
-      {
-        rel: ["collection"],
-        href: new URL("/owner/founder-applications", self).href,
-      },
+      ...(collectionAvailable
+        ? [{
+            rel: ["collection"],
+            href: new URL("/owner/founder-applications", self).href,
+          }]
+        : []),
       { rel: ["owner"], href: new URL("/owner", self).href },
     ],
     actions: [],

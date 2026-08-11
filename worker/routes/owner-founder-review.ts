@@ -131,6 +131,7 @@ function createFounderReviewHandler(
       const document = createOwnerFounderReviewDetailDocument(
         safeResourceUrl,
         item,
+        collection !== null,
       );
       return representation.kind === "hypermedia-json"
         ? privateResponse(hypermediaResponse(document))

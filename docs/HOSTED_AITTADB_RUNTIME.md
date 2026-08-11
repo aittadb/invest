@@ -226,7 +226,8 @@ to one current-record key without listing, then reconstructs and verifies the
 bounded immutable application ancestry within a fixed 210-record-read ceiling.
 Malformed identifiers read nothing and missing identifiers read only the
 derived current key. Hosted routing composes the two ports so a collection item
-links to its available detail while either port remains independently testable.
+links to its available detail and that detail links back to the collection.
+Independently composed ports omit links to the unavailable sibling resource.
 Anonymous and non-owner callers are rejected before either founder-review port
 is invoked.
 
