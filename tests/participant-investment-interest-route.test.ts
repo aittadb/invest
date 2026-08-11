@@ -71,6 +71,7 @@ const ISSUED_COOKIE =
   "__Host-investor_mutation_investment=encrypted; Path=/; Max-Age=300; Secure; HttpOnly; SameSite=Strict";
 const CLEAR_COOKIE =
   "__Host-investor_mutation_investment=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict";
+const FORM_PREFLIGHT_DEADLINE_MS = 1_000;
 const ALICE = subject("issuer.invalid/participant:alice-route-investment");
 const BOB = subject("issuer.invalid/participant:bob-route-investment");
 const PARTICIPANT_IDENTITY = Object.freeze({
@@ -735,6 +736,51 @@ test("investment route owns finite per-method mutation limits", () => {
     () => investmentInterestMutationLimits("PUT"),
     MutationSecurityFailure,
   );
+});
+
+test("above-POST-cap override preflight completes without consuming its proof", async () => {
+  const hosted = await createHostedMutationSession();
+  const proof = await issueHostedInvestmentProof(
+    hosted.session,
+    PARTICIPANT_IDENTITY,
+  );
+  let verificationCalls = 0;
+  const harness = await createHarness({
+    verifyMutation(request, limits) {
+      verificationCalls += 1;
+      return hosted.session.verifyMutation(
+        request,
+        PARTICIPANT_IDENTITY,
+        CANONICAL_ORIGIN,
+        limits,
+      );
+    },
+    csrfTokenFor: () => proof,
+  });
+  const response = await completesWithin(
+    harness.dispatch(
+      hostedInvestmentFormMutation(
+        proof,
+        investmentInterestItemPath(
+          "investment-operation:hosted-post-cap-target",
+        ),
+        [
+          [MUTATION_METHOD_FIELD, "DELETE"],
+          ["operation-id", "investment-operation:hosted-post-cap"],
+          ["expected-revision", "1"],
+          ["confirm-withdrawal", "x".repeat(70 * 1_024)],
+        ],
+      ),
+      ALICE,
+    ),
+    FORM_PREFLIGHT_DEADLINE_MS,
+  );
+
+  assert.equal(response.status, 413);
+  assert.equal(verificationCalls, 0);
+  assert.deepEqual(hosted.claims.calls, []);
+  assert.equal(harness.serviceCalls(), 0);
+  assert.equal(harness.state.indications.size, 0);
 });
 
 test("real hosted investment verification applies method limits before replay or persistence", async () => {
@@ -1474,6 +1520,24 @@ async function aesKey(seed: number): Promise<CryptoKey> {
     false,
     ["encrypt", "decrypt"],
   );
+}
+
+async function completesWithin<T>(
+  operation: Promise<T>,
+  milliseconds: number,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<never>((_, reject) => {
+    timeout = setTimeout(
+      () => reject(new Error(`Operation exceeded ${milliseconds}ms deadline.`)),
+      milliseconds,
+    );
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    if (timeout !== null) clearTimeout(timeout);
+  }
 }
 
 function investmentVerifierFor(

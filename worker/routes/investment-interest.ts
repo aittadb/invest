@@ -432,7 +432,8 @@ async function readBoundedPreflightBody(
       if (result.done) break;
       length += result.value.byteLength;
       if (length > maximum) {
-        await reader.cancel();
+        // A cloned stream's cancellation may wait for its unread tee sibling.
+        void reader.cancel().catch(() => undefined);
         throw new MutationSecurityFailure("PAYLOAD_TOO_LARGE");
       }
       chunks.push(result.value);
