@@ -451,6 +451,131 @@ test("availability reports alternate media, size, body, document, and internal f
   }
 });
 
+test("availability fetch and streamed bodies stay time, chunk, and cancellation bounded", async (t) => {
+  await t.test("stalled fetch", async () => {
+    const harness = await createHarness({
+      requestTimeoutMs: 10,
+      stallAt: "discovery",
+    });
+    assert.equal(await settlesWithin(harness.service.availability()), false);
+    assert.deepEqual(harness.availabilityFailures, ["fetch"]);
+    assert.equal(harness.signals.length, 1);
+    assert.equal(harness.signals[0]?.aborted, true);
+  });
+
+  await t.test("stalled response stream", async () => {
+    let cancelled = false;
+    const harness = await createHarness({
+      requestTimeoutMs: 10,
+      discoveryResponse: new Response(new ReadableStream<Uint8Array>({
+        pull: () => new Promise<void>(() => undefined),
+        cancel() {
+          cancelled = true;
+        },
+      }), {
+        headers: { "content-type": "application/json" },
+      }),
+    });
+    assert.equal(await settlesWithin(harness.service.availability()), false);
+    assert.deepEqual(harness.availabilityFailures, ["body"]);
+    assert.equal(cancelled, true);
+  });
+
+  await t.test("non-settling oversized-body cancellation", async () => {
+    let cancelled = false;
+    const harness = await createHarness({
+      requestTimeoutMs: 1_000,
+      discoveryResponse: new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(16_385));
+        },
+        cancel() {
+          cancelled = true;
+          return new Promise<void>(() => undefined);
+        },
+      }), {
+        headers: { "content-type": "application/json" },
+      }),
+    });
+    assert.equal(await settlesWithin(harness.service.availability()), false);
+    assert.deepEqual(harness.availabilityFailures, ["body_size"]);
+    assert.equal(cancelled, true);
+  });
+
+  await t.test("fragmented zero-byte response stream", async () => {
+    let chunks = 0;
+    let cancelled = false;
+    const harness = await createHarness({
+      requestTimeoutMs: 1_000,
+      discoveryResponse: new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          chunks += 1;
+          controller.enqueue(new Uint8Array());
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }), {
+        headers: { "content-type": "application/json" },
+      }),
+    });
+    assert.equal(
+      await settlesWithin(harness.service.availability(), 2_000),
+      false,
+    );
+    assert.deepEqual(harness.availabilityFailures, ["body_size"]);
+    assert.equal(chunks >= 4_097 && chunks <= 4_098, true);
+    assert.equal(cancelled, true);
+  });
+});
+
+test("availability cancels rejected response bodies without awaiting their sources", async (t) => {
+  const cases = [
+    [
+      "status",
+      "status_redirect",
+      { status: 302, headers: { location: `${ISSUER}/private?token=${ACCESS_TOKEN}` } },
+    ],
+    [
+      "media",
+      "content_type",
+      { status: 200, headers: { "content-type": "text/plain" } },
+    ],
+    [
+      "declared size",
+      "declared_size",
+      {
+        status: 200,
+        headers: {
+          "content-length": "16385",
+          "content-type": "application/json",
+        },
+      },
+    ],
+  ] as const;
+
+  for (const [name, phase, responseInit] of cases) {
+    await t.test(name, async () => {
+      let cancelled = false;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(CLIENT_SECRET));
+        },
+        cancel() {
+          cancelled = true;
+          return new Promise<void>(() => undefined);
+        },
+      });
+      const harness = await createHarness({
+        discoveryResponse: new Response(body, responseInit),
+      });
+      assert.equal(await settlesWithin(harness.service.availability()), false);
+      assert.deepEqual(harness.availabilityFailures, [phase]);
+      assert.equal(cancelled, true);
+    });
+  }
+});
+
 test("provider redirects are returned manually and rejected without following", async () => {
   const harness = await createHarness({
     discoveryResponse: new Response(null, {
@@ -465,6 +590,28 @@ test("provider redirects are returned manually and rejected without following", 
   assert.equal(harness.requests[0]?.redirect, "manual");
   assert.equal(harness.requests[0]?.authorization, null);
   assert.equal(harness.requests[0]?.cookie, null);
+});
+
+test("a followed or mismatched final discovery URL is rejected as a redirect", async (t) => {
+  for (const [name, property, value] of [
+    ["redirected response", "redirected", true],
+    [
+      "mismatched final URL",
+      "url",
+      `${ISSUER}/private?token=${ACCESS_TOKEN}`,
+    ],
+  ] as const) {
+    await t.test(name, async () => {
+      const response = jsonResponse(discoveryDocument());
+      Object.defineProperty(response, property, { value });
+      const harness = await createHarness({ discoveryResponse: response });
+      assert.equal(await harness.service.availability(), false);
+      assert.deepEqual(harness.availabilityFailures, ["status_redirect"]);
+      const evidence = JSON.stringify(harness.availabilityFailures);
+      assert.equal(evidence.includes(ACCESS_TOKEN), false);
+      assert.equal(evidence.includes(ISSUER), false);
+    });
+  }
 });
 
 test("discovery, token, and introspection require exact HTTP 200", async (t) => {
@@ -776,11 +923,19 @@ test("credential-bearing failures expose no causes or credential values", async 
   }
 });
 
-test("configuration rejects an extractable transaction cookie key", async () => {
+test("configuration rejects unsafe cookie keys and request deadlines", async (t) => {
   await assert.rejects(
     createHarness({ cookieKeyExtractable: true }),
     publicFailure("service_unavailable"),
   );
+  for (const requestTimeoutMs of [9, 60_001, 1.5, Number.NaN]) {
+    await t.test(String(requestTimeoutMs), async () => {
+      await assert.rejects(
+        createHarness({ requestTimeoutMs }),
+        publicFailure("service_unavailable"),
+      );
+    });
+  }
 });
 
 type ObservedRequest = Readonly<{
@@ -806,6 +961,8 @@ async function createHarness(
     cookieKeyExtractable?: boolean;
     issuer?: string;
     transportOrigin?: string;
+    requestTimeoutMs?: number;
+    stallAt?: "discovery";
     availabilityFailureObserver?: OAuthAvailabilityFailureObserver;
   }> = {},
 ) {
@@ -821,6 +978,7 @@ async function createHarness(
   const claimed = new Set<string>();
   const proofs: AittaDBOAuthProofMetadata[] = [];
   const availabilityFailures: string[] = [];
+  const signals: AbortSignal[] = [];
   let randomCall = 0;
   const fetch = async (
     input: string,
@@ -837,12 +995,16 @@ async function createHarness(
       redirect: request.redirect,
       body,
     });
+    if (init.signal instanceof AbortSignal) signals.push(init.signal);
     const kind = request.url.endsWith("/.well-known/openid-configuration")
       ? "discovery"
       : request.url.endsWith("/oauth/token")
         ? "token"
         : "introspection";
     if (options.failAt === kind) throw options.fetchFailure ?? new Error("private");
+    if (options.stallAt === kind) {
+      return new Promise<Response>(() => undefined);
+    }
     if (kind === "discovery") {
       return options.discoveryResponse ?? jsonResponse(
         options.discovery ?? discoveryDocument(),
@@ -869,6 +1031,7 @@ async function createHarness(
     requestedStorageScopes: REQUESTED_SCOPES,
     transactionCookieKey: key,
     transactionTtlSeconds: 300,
+    requestTimeoutMs: options.requestTimeoutMs,
     transactionClaimStore: {
       async claim(claim) {
         claims.push(claim);
@@ -902,7 +1065,23 @@ async function createHarness(
     claims,
     proofs,
     availabilityFailures,
+    signals,
   };
+}
+
+async function settlesWithin<Value>(
+  operation: Promise<Value>,
+  timeoutMs = 2_000,
+): Promise<Value> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => reject(new Error("test deadline exceeded")), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function startedCallback(harness: Harness) {

@@ -5,6 +5,10 @@ const DISCOVERY_MAX_BYTES = 16_384;
 const TOKEN_MAX_BYTES = 16_384;
 const INTROSPECTION_MAX_BYTES = 16_384;
 const CONTENT_TYPE_MAX_LENGTH = 1_024;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const MIN_REQUEST_TIMEOUT_MS = 10;
+const MAX_REQUEST_TIMEOUT_MS = 60_000;
+const MAX_RESPONSE_CHUNKS = 4_096;
 const CALLBACK_MAX_LENGTH = 8_192;
 const COOKIE_HEADER_MAX_LENGTH = 8_192;
 const COOKIE_VALUE_MAX_LENGTH = 4_096;
@@ -89,6 +93,8 @@ export type AittaDBOAuthProofDependencies = Readonly<{
   now: () => Date;
   randomBytes: OAuthRandomBytes;
   transactionTtlSeconds: number;
+  /** Independent finite bounds for fetch and streamed-response waits. */
+  requestTimeoutMs?: number;
   transactionCookieName?: string;
   availabilityFailureObserver?: OAuthAvailabilityFailureObserver;
 }>;
@@ -149,6 +155,7 @@ type ValidatedConfiguration = Readonly<{
   now: () => Date;
   randomBytes: OAuthRandomBytes;
   transactionTtlSeconds: number;
+  requestTimeoutMs: number;
   transactionCookieName: string;
   availabilityFailureObserver?: OAuthAvailabilityFailureObserver;
 }>;
@@ -336,6 +343,7 @@ function validateConfiguration(
   }
   const cookieName = input.transactionCookieName ??
     DEFAULT_OAUTH_TRANSACTION_COOKIE;
+  const requestTimeoutMs = input.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   if (!/^__Host-[A-Za-z0-9_]+$/.test(cookieName)) invalidConfiguration();
   if (
     !(input.transactionCookieKey instanceof CryptoKey) ||
@@ -348,6 +356,9 @@ function validateConfiguration(
     typeof input.randomBytes !== "function" ||
     typeof input.transactionClaimStore?.claim !== "function" ||
     typeof input.resultSink?.recordVerifiedProof !== "function" ||
+    !Number.isSafeInteger(requestTimeoutMs) ||
+    requestTimeoutMs < MIN_REQUEST_TIMEOUT_MS ||
+    requestTimeoutMs > MAX_REQUEST_TIMEOUT_MS ||
     (input.availabilityFailureObserver !== undefined &&
       typeof input.availabilityFailureObserver !== "function")
   ) {
@@ -373,6 +384,7 @@ function validateConfiguration(
     now: input.now,
     randomBytes: input.randomBytes,
     transactionTtlSeconds: input.transactionTtlSeconds,
+    requestTimeoutMs,
     transactionCookieName: cookieName,
     availabilityFailureObserver: input.availabilityFailureObserver,
   });
@@ -567,23 +579,26 @@ async function fetchJson(
   maxBytes: number,
   report?: OAuthAvailabilityFailureObserver,
 ): Promise<Record<string, unknown>> {
-  let response: Response;
-  try {
-    response = await config.fetch(request.url, request.init);
-  } catch {
-    report?.("fetch");
-    unavailable();
+  const response = await fetchBeforeDeadline(config, request, report);
+  if (
+    response.redirected ||
+    response.url !== "" && response.url !== request.url
+  ) {
+    rejectOAuthResponse(response, report, "status_redirect");
   }
   const status = response.status;
   if (status !== 200) {
-    report?.(availabilityStatusPhase(status));
-    unavailable();
+    rejectOAuthResponse(response, report, availabilityStatusPhase(status));
   }
   if (!isJsonMediaType(response.headers.get("content-type"))) {
-    report?.("content_type");
-    unavailable();
+    rejectOAuthResponse(response, report, "content_type");
   }
-  const text = await readBoundedText(response, maxBytes, report);
+  const text = await readBoundedText(
+    response,
+    maxBytes,
+    config.requestTimeoutMs,
+    report,
+  );
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -596,6 +611,43 @@ async function fetchJson(
     unavailable();
   }
   return parsed;
+}
+
+async function fetchBeforeDeadline(
+  config: ValidatedConfiguration,
+  request: OAuthHttpRequest,
+  report?: OAuthAvailabilityFailureObserver,
+): Promise<Response> {
+  const controller = new AbortController();
+  let rejectDeadline: (() => void) | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = () => reject(new OAuthProofFailure("service_unavailable"));
+  });
+  const timeout = setTimeout(() => {
+    controller.abort();
+    rejectDeadline?.();
+  }, config.requestTimeoutMs);
+  let response: unknown;
+  try {
+    response = await Promise.race([
+      config.fetch(request.url, {
+        ...request.init,
+        signal: controller.signal,
+      }),
+      deadline,
+    ]);
+  } catch {
+    report?.("fetch");
+    unavailable();
+  } finally {
+    clearTimeout(timeout);
+    rejectDeadline = undefined;
+  }
+  if (!(response instanceof Response)) {
+    report?.("internal");
+    unavailable();
+  }
+  return response;
 }
 
 function isJsonMediaType(value: string | null): boolean {
@@ -725,35 +777,61 @@ function availabilityStatusPhase(
 async function readBoundedText(
   response: Response,
   maxBytes: number,
+  timeoutMs: number,
   report?: OAuthAvailabilityFailureObserver,
 ): Promise<string> {
   const declared = response.headers.get("content-length");
   if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > maxBytes)) {
-    report?.("declared_size");
-    unavailable();
+    rejectOAuthResponse(response, report, "declared_size");
   }
   if (response.body === null) {
     report?.("body");
     unavailable();
   }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
   try {
-    while (true) {
-      const next = await reader.read();
-      if (next.done) break;
-      total += next.value.byteLength;
-      if (total > maxBytes) {
-        await reader.cancel();
-        report?.("body_size");
-        unavailable();
-      }
-      chunks.push(next.value);
-    }
+    reader = response.body.getReader();
   } catch {
+    cancelResponseBody(response);
     report?.("body");
     unavailable();
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let chunkCount = 0;
+  let failurePhase: OAuthAvailabilityFailurePhase = "body";
+  let rejectDeadline: (() => void) | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = () => reject(new OAuthProofFailure("service_unavailable"));
+  });
+  const timeout = setTimeout(() => {
+    rejectDeadline?.();
+    cancelReader(reader);
+  }, timeoutMs);
+  try {
+    while (true) {
+      const next = await Promise.race([reader.read(), deadline]);
+      if (next.done) break;
+      chunkCount += 1;
+      total += next.value.byteLength;
+      if (
+        chunkCount > MAX_RESPONSE_CHUNKS ||
+        !Number.isSafeInteger(total) ||
+        total > maxBytes
+      ) {
+        failurePhase = "body_size";
+        cancelReader(reader);
+        unavailable();
+      }
+      if (next.value.byteLength > 0) chunks.push(next.value);
+    }
+  } catch {
+    cancelReader(reader);
+    report?.(failurePhase);
+    unavailable();
+  } finally {
+    clearTimeout(timeout);
+    rejectDeadline = undefined;
   }
   const bytes = new Uint8Array(total);
   let offset = 0;
@@ -766,6 +844,32 @@ async function readBoundedText(
   } catch {
     report?.("encoding");
     unavailable();
+  }
+}
+
+function rejectOAuthResponse(
+  response: Response,
+  report: OAuthAvailabilityFailureObserver | undefined,
+  phase: OAuthAvailabilityFailurePhase,
+): never {
+  cancelResponseBody(response);
+  report?.(phase);
+  unavailable();
+}
+
+function cancelResponseBody(response: Response): void {
+  try {
+    void response.body?.cancel().catch(() => undefined);
+  } catch {
+    // The caller emits only its fixed availability phase.
+  }
+}
+
+function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    void reader.cancel().catch(() => undefined);
+  } catch {
+    // The caller emits only its fixed availability phase.
   }
 }
 
