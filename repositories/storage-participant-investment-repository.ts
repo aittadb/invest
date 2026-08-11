@@ -174,6 +174,17 @@ const ACCOUNT_DELETION_WITHDRAWAL_SET_REQUEST_KEYS = new Set([
   "operationId",
   "requestedAt",
 ]);
+const ACCOUNT_DELETION_WITHDRAWAL_REPLAY_REQUEST_KEYS = new Set([
+  "operationId",
+  "requestedAt",
+  "withdrawals",
+  "aggregate",
+]);
+const ACCOUNT_DELETION_WITHDRAWAL_REPLAY_KEYS = new Set([
+  "indicationId",
+  "indicationRevision",
+  "historyEntryId",
+]);
 
 type ParticipantIndex = Readonly<{
   record: StorageRecord | null;
@@ -213,6 +224,14 @@ export type ParticipantAccountDeletionInvestmentWithdrawalSetRequest = Readonly<
   operationId: unknown;
   requestedAt: unknown;
 }>;
+
+export type ParticipantAccountDeletionInvestmentWithdrawalReplayRequest =
+  Readonly<{
+    operationId: unknown;
+    requestedAt: unknown;
+    withdrawals: unknown;
+    aggregate: unknown;
+  }>;
 
 export type PreparedParticipantAccountDeletionInvestmentWithdrawal = Readonly<{
   operationId: StorageOperationId;
@@ -303,6 +322,19 @@ type ParsedOwnershipInitialization = Readonly<{
 type ParsedAccountDeletionWithdrawalSetRequest = Readonly<{
   operationId: StorageOperationId;
   requestedAt: Timestamp;
+}>;
+
+type ParsedAccountDeletionWithdrawalReplay = Readonly<{
+  indicationId: InvestmentIndicationId;
+  indicationRevision: number;
+  historyEntryId: InvestmentIndicationHistoryEntryId;
+}>;
+
+type ParsedAccountDeletionWithdrawalReplayRequest = Readonly<{
+  operationId: StorageOperationId;
+  requestedAt: Timestamp;
+  withdrawals: readonly ParsedAccountDeletionWithdrawalReplay[];
+  aggregate: StoredInvestmentAggregateSnapshot;
 }>;
 
 type AccountDeletionWithdrawalIdentity = Readonly<{
@@ -548,6 +580,92 @@ export async function stageParticipantAccountDeletionInvestmentWithdrawalSet(
       withdrawals: Object.freeze(withdrawals),
       aggregate: aggregate.stored,
       mutationCount: mutations.length,
+    });
+  } catch (error) {
+    return mapRepositoryError(error);
+  }
+}
+
+/**
+ * Verify a completed deletion withdrawal set from compact ownership evidence.
+ * Only the at-most-four receipt withdrawals need full indication materialization.
+ */
+export async function verifyParticipantAccountDeletionInvestmentWithdrawalSet(
+  storage: StorageAdapter,
+  participantSubject: unknown,
+  amountConfiguration: AmountConfiguration,
+  request: ParticipantAccountDeletionInvestmentWithdrawalReplayRequest,
+  parsingOptions: InvestmentIndicationParsingOptions = {},
+): Promise<PreparedParticipantAccountDeletionInvestmentWithdrawalSet> {
+  try {
+    const adapter = requiredStorageAdapter(storage);
+    const subject = requiredSubject(participantSubject);
+    const amount = requiredAmountConfiguration(amountConfiguration);
+    const parsed = parseAccountDeletionWithdrawalReplayRequest(request, amount);
+    const complete = await readCompleteParticipantIndex(adapter, subject);
+    if (
+      complete.witness.indications.some((entry) =>
+        entry.lifecycleStatus === "active"
+      )
+    ) unavailable();
+
+    const indications = new DevelopmentInMemoryIndicationRepository(
+      adapter,
+      subject,
+      null,
+      amount,
+      parsingOptions,
+    );
+    const withdrawals: PreparedParticipantAccountDeletionInvestmentWithdrawal[] = [];
+    for (const expected of parsed.withdrawals) {
+      const ownership = complete.witness.indications.find((entry) =>
+        entry.indicationId === expected.indicationId
+      );
+      if (
+        ownership === undefined ||
+        ownership.indicationRevision !== expected.indicationRevision ||
+        ownership.lifecycleStatus !== "withdrawn"
+      ) unavailable();
+      const identity = await accountDeletionWithdrawalIdentity(
+        parsed.operationId,
+        subject,
+        expected.indicationId,
+      );
+      if (identity.historyEntryId !== expected.historyEntryId) unavailable();
+      const current = await indications.readCurrentParticipantProjection(
+        expected.indicationId,
+      );
+      if (
+        current === null ||
+        current.participantSubject !== subject ||
+        current.id !== expected.indicationId ||
+        current.revision !== expected.indicationRevision ||
+        current.lifecycle.status !== "withdrawn"
+      ) unavailable();
+      const terminal = current.history.at(-1);
+      if (
+        current.lifecycle.withdrawnAt !== parsed.requestedAt ||
+        terminal?.transition !== "withdrawn" ||
+        terminal.id !== expected.historyEntryId ||
+        terminal.occurredAt !== parsed.requestedAt ||
+        terminal.actor.type !== "participant" ||
+        terminal.actor.subject !== subject
+      ) unavailable();
+      withdrawals.push(Object.freeze({
+        operationId: identity.operationId,
+        historyEntryId: identity.historyEntryId,
+        indication: current as WithdrawnInvestmentIndication,
+      }));
+    }
+    return Object.freeze({
+      participantSubject: subject,
+      operationId: parsed.operationId,
+      requestedAt: parsed.requestedAt,
+      withdrawals: Object.freeze(withdrawals),
+      aggregate: parsed.aggregate,
+      mutationCount: withdrawals.length === 0
+        ? 0
+        : 4 * withdrawals.length + 3,
     });
   } catch (error) {
     return mapRepositoryError(error);
@@ -1159,6 +1277,73 @@ function parseAccountDeletionWithdrawalSetRequest(
   return Object.freeze({
     operationId: operationId.value,
     requestedAt: requestedAt.value,
+  });
+}
+
+function parseAccountDeletionWithdrawalReplayRequest(
+  request: ParticipantAccountDeletionInvestmentWithdrawalReplayRequest,
+  amount: AmountConfiguration,
+): ParsedAccountDeletionWithdrawalReplayRequest {
+  const source = exactRecord(
+    request,
+    ACCOUNT_DELETION_WITHDRAWAL_REPLAY_REQUEST_KEYS,
+  );
+  const operationId = parseStorageOperationId(source.operationId);
+  const requestedAt = parseTimestamp(source.requestedAt);
+  if (!operationId.ok || !requestedAt.ok) invalid();
+  const withdrawals = exactDenseArray(
+    source.withdrawals,
+    MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS,
+  ).map((candidate) => {
+    const entry = exactRecord(
+      candidate,
+      ACCOUNT_DELETION_WITHDRAWAL_REPLAY_KEYS,
+    );
+    const indicationId = parseStableId<"investment-indication">(
+      entry.indicationId,
+    );
+    const historyEntryId =
+      parseStableId<"investment-indication-history-entry">(
+        entry.historyEntryId,
+      );
+    if (
+      !indicationId.ok ||
+      !historyEntryId.ok ||
+      !Number.isSafeInteger(entry.indicationRevision) ||
+      (entry.indicationRevision as number) < 1
+    ) invalid();
+    return Object.freeze({
+      indicationId: indicationId.value,
+      indicationRevision: entry.indicationRevision as number,
+      historyEntryId: historyEntryId.value,
+    });
+  });
+  for (let index = 0; index < withdrawals.length; index += 1) {
+    const previous = withdrawals[index - 1];
+    const current = withdrawals[index];
+    if (
+      current === undefined ||
+      (previous !== undefined && previous.indicationId >= current.indicationId)
+    ) invalid();
+  }
+  const aggregate = exactRecord(source.aggregate, AGGREGATE_KEYS);
+  const totalAmount = parseMinorUnits(aggregate.totalAmount);
+  if (
+    !nonNegativeInteger(aggregate.revision) ||
+    !totalAmount.ok ||
+    aggregate.currency !== amount.currency ||
+    !nonNegativeInteger(aggregate.contributingIndicationCount)
+  ) invalid();
+  return Object.freeze({
+    operationId: operationId.value,
+    requestedAt: requestedAt.value,
+    withdrawals: Object.freeze(withdrawals),
+    aggregate: Object.freeze({
+      revision: aggregate.revision,
+      totalAmount: totalAmount.value,
+      currency: amount.currency,
+      contributingIndicationCount: aggregate.contributingIndicationCount,
+    }),
   });
 }
 

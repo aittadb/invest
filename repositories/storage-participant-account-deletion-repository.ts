@@ -17,7 +17,6 @@ import {
 } from "../domain/foundation.ts";
 import type { StoredInvestmentAggregateSnapshot } from "../domain/investment-aggregate.ts";
 import type {
-  InvestmentIndication,
   InvestmentIndicationId,
   InvestmentIndicationParsingOptions,
   WithdrawnInvestmentIndication,
@@ -42,6 +41,8 @@ import {
   type StorageOperationId,
 } from "../domain/storage-adapter.ts";
 import {
+  MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS,
+  MAX_FOUNDER_APPLICATION_STORAGE_READS,
   StorageFounderApplicationRepository,
 } from "./in-memory-founder-application-repository.ts";
 import {
@@ -57,8 +58,9 @@ import {
 } from "./in-memory-participant-repository.ts";
 import { StagedStorageTransaction } from "./staged-storage-transaction.ts";
 import {
-  StorageParticipantInvestmentInterestRepository,
+  MAX_PARTICIPANT_ACCOUNT_DELETION_WITHDRAWAL_SET_READS,
   stageParticipantAccountDeletionInvestmentWithdrawalSet,
+  verifyParticipantAccountDeletionInvestmentWithdrawalSet,
   type PreparedParticipantAccountDeletionInvestmentWithdrawalSet,
 } from "./storage-participant-investment-repository.ts";
 
@@ -97,6 +99,25 @@ const STORAGE_RECORD_KEYS = new Set(["key", "revision", "value"]);
 const STORAGE_KEY_KEYS = new Set(["collection", "id"]);
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const MAX_ACCOUNT_DELETION_INVESTMENT_WITHDRAWALS = 4;
+const MAX_PROFILE_DELETION_COMMIT_READS = 6;
+const MAX_PROFILE_DELETION_REPLAY_READS = 5;
+const MAX_ACCOUNT_DELETION_AUDIT_AND_RECEIPT_READS = 2;
+const MAX_ACCOUNT_DELETION_COMMIT_READS =
+  1 +
+  MAX_PROFILE_DELETION_COMMIT_READS +
+  MAX_FOUNDER_APPLICATION_STORAGE_READS +
+  MAX_PARTICIPANT_ACCOUNT_DELETION_WITHDRAWAL_SET_READS +
+  MAX_ACCOUNT_DELETION_AUDIT_AND_RECEIPT_READS;
+const MAX_ACCOUNT_DELETION_REPLAY_READS =
+  1 +
+  MAX_PROFILE_DELETION_REPLAY_READS +
+  MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS +
+  MAX_PARTICIPANT_ACCOUNT_DELETION_WITHDRAWAL_SET_READS +
+  1;
+
+/** Read ceiling including a lost final response followed by receipt recovery. */
+export const MAX_PARTICIPANT_ACCOUNT_DELETION_OPERATION_READS =
+  MAX_ACCOUNT_DELETION_COMMIT_READS + MAX_ACCOUNT_DELETION_REPLAY_READS;
 
 type ParsedAccountDeletionRequest = Readonly<{
   operationId: StorageOperationId;
@@ -493,48 +514,18 @@ async function verifyInvestmentReplay(
   request: ParsedAccountDeletionRequest,
   receipt: StoredAccountDeletionReceipt,
 ): Promise<PreparedParticipantAccountDeletionInvestmentWithdrawalSet> {
-  const current = await new StorageParticipantInvestmentInterestRepository(
+  return verifyParticipantAccountDeletionInvestmentWithdrawalSet(
     storage,
     subject,
     amount,
-    parsingOptions,
-  ).listOwned();
-  if (current.some(({ lifecycle }) => lifecycle.status === "active")) {
-    unavailable();
-  }
-  const withdrawals: Array<
-    PreparedParticipantAccountDeletionInvestmentWithdrawalSet["withdrawals"][number]
-  > = [];
-  for (const expected of receipt.investmentWithdrawals) {
-    const candidate = current.find(({ id }) => id === expected.indicationId);
-    if (candidate === undefined) unavailable();
-    const indication = requiredWithdrawnIndication(candidate);
-    const terminal = indication.history.at(-1);
-    if (
-      indication.lifecycle.withdrawnAt !== request.requestedAt ||
-      indication.revision !== expected.indicationRevision ||
-      terminal?.transition !== "withdrawn" ||
-      terminal.id !== expected.historyEntryId ||
-      terminal.occurredAt !== request.requestedAt ||
-      terminal.actor.type !== "participant" ||
-      terminal.actor.subject !== subject
-    ) unavailable();
-    withdrawals.push(Object.freeze({
+    Object.freeze({
       operationId: request.operationId,
-      historyEntryId: expected.historyEntryId,
-      indication,
-    }));
-  }
-  return Object.freeze({
-    participantSubject: subject,
-    operationId: request.operationId,
-    requestedAt: request.requestedAt,
-    withdrawals: Object.freeze(withdrawals),
-    aggregate: receipt.aggregate,
-    mutationCount: withdrawals.length === 0
-      ? 0
-      : 4 * withdrawals.length + 3,
-  });
+      requestedAt: request.requestedAt,
+      withdrawals: receipt.investmentWithdrawals,
+      aggregate: receipt.aggregate,
+    }),
+    parsingOptions,
+  );
 }
 
 async function preparedAudit(
@@ -843,13 +834,6 @@ function aggregateDocument(
 
 function sameProfile(left: ParticipantProfile, right: ParticipantProfile): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function requiredWithdrawnIndication(
-  value: InvestmentIndication,
-): WithdrawnInvestmentIndication {
-  if (value.lifecycle.status !== "withdrawn") unavailable();
-  return value as WithdrawnInvestmentIndication;
 }
 
 function exactInputRecord(
