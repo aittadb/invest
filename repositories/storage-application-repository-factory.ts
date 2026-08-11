@@ -49,6 +49,7 @@ import {
   StorageFounderApplicationRepository,
   type FounderApplicationRepository,
 } from "./in-memory-founder-application-repository.ts";
+import { StorageOwnerIndicationReviewCollectionRepository } from "./in-memory-indication-repository.ts";
 import {
   StorageParticipantRepository,
   type ParticipantRegistrationRepository,
@@ -198,6 +199,17 @@ export class StorageApplicationRepositoryFactory {
 
   ownerAuditEvents(): AuditEventReader {
     return this.#ownerAuditEvents;
+  }
+
+  ownerIndicationReviews(
+    authenticatedSubject: ActorSubject | null,
+    configuredOwnerSubject: ActorSubject,
+  ): StorageOwnerIndicationReviewCollectionRepository {
+    return new StorageOwnerIndicationReviewCollectionRepository(
+      this.#storage,
+      authenticatedSubject,
+      configuredOwnerSubject,
+    );
   }
 
   participantRequest(

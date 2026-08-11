@@ -118,7 +118,8 @@ redirect and carry the bearer value only to the validated transport target.
 `StorageApplicationRepositoryFactory` closes over the single credential-bound
 adapter and exposes only named, narrow capability methods for browser-mutation
 replay, the atomic campaign/audit repository, the public campaign projection
-reader, the owner package workspace, a participant package reader,
+reader, the owner package workspace, the owner-bound indication-review
+collection, a participant package reader,
 subject-bound package acknowledgment, one participant-access state reader, and
 one participant-bound founder-application pair.
 That reader creates fresh profile and acknowledgment repositories for each
@@ -141,6 +142,14 @@ from a hostname, owner, campaign, D1, R2, browser store, file, or process-memory
 map. `StoragePackageVersionRepository` and
 `StorageAcknowledgmentRepository` retain no local authority; their historical
 `InMemory*` names remain compatibility exports for deterministic fixtures.
+
+`ownerIndicationReviews(authenticatedSubject, configuredOwnerSubject)` creates a
+fresh read-only repository bound to that exact owner authorization decision.
+The repository lists only the bounded current indication collection and returns
+an allowlisted opaque summary page; it exposes no generic storage, detail, or
+mutation method. The application runtime type does not install this capability
+into a route yet. Hosted moderation composition remains separate so collection,
+detail, and rejection contracts can be validated independently.
 
 `StorageCampaignRepository` is production-neutral and retains no state outside
 its supplied adapter. `StorageFounderApplicationRepository` follows the same

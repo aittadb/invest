@@ -188,6 +188,10 @@ test("factory exposes only named application repository capabilities", async () 
   assert(account.ok);
   assert(foreignSubject.ok);
   assert(foreignAccount.ok);
+  const ownerIndicationReviews = factory.ownerIndicationReviews(
+    subject.value,
+    subject.value,
+  );
 
   assert.deepEqual(Object.getOwnPropertyNames(
     Object.getPrototypeOf(factory) as object,
@@ -199,6 +203,7 @@ test("factory exposes only named application repository capabilities", async () 
     "publicCampaignStateReader",
     "ownerPackageWorkspace",
     "ownerAuditEvents",
+    "ownerIndicationReviews",
     "participantRequest",
     "participantInvestmentRepository",
     "participantRepository",
@@ -226,6 +231,7 @@ test("factory exposes only named application repository capabilities", async () 
   assert.deepEqual(Reflect.ownKeys(publicCampaignReader), []);
   assert.deepEqual(Reflect.ownKeys(ownerAuditEvents), []);
   assert.deepEqual(Reflect.ownKeys(publicCampaignStateReader), []);
+  assert.deepEqual(Reflect.ownKeys(ownerIndicationReviews), []);
   assert.deepEqual(Object.values(campaignRepository), [
     "atomic-campaign-audit",
   ]);
@@ -240,6 +246,12 @@ test("factory exposes only named application repository capabilities", async () 
   }
   assert.equal(Object.values(ownerAuditEvents).includes(storage), false);
   assertNoGenericStorageSurface(publicCampaignStateReader, storage);
+  assert.equal(typeof ownerIndicationReviews.list, "function");
+  assert.equal(Object.isFrozen(ownerIndicationReviews), true);
+  for (const property of ["adapter", "storage", "read", "transact", "get"]) {
+    assert.equal(property in ownerIndicationReviews, false, property);
+  }
+  assert.equal(Object.values(ownerIndicationReviews).includes(storage), false);
   assert.equal("storage" in factory, false);
   assert.equal("create" in factory, false);
   const participantRequest = factory.participantRequest(account.value);

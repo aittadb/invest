@@ -32,6 +32,28 @@ export type OwnerIndicationModerationListRequest = Readonly<{
   cursor?: StorageCursor;
 }>;
 
+export type OwnerIndicationReviewSummary = Readonly<{
+  reviewId: string;
+  kind: InvestmentIndication["kind"];
+  status: InvestmentIndication["lifecycle"]["status"];
+  amount: number;
+  currency: string;
+  updatedAt: Timestamp;
+  revision: number;
+}>;
+
+export type OwnerIndicationReviewPage = Readonly<{
+  items: readonly OwnerIndicationReviewSummary[];
+  nextCursor: StorageCursor | null;
+}>;
+
+/** Owner-bound, read-only collection contract over current indications. */
+export interface OwnerIndicationReviewCollectionRepository {
+  list(
+    request: OwnerIndicationModerationListRequest,
+  ): Promise<OwnerIndicationReviewPage>;
+}
+
 export type OwnerIndicationModerationPage = Readonly<{
   items: readonly OwnerIndicationModerationItem[];
   nextCursor: StorageCursor | null;

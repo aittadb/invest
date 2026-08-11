@@ -41,6 +41,7 @@ import type {
   PackageVersion,
 } from "../domain/package-content.ts";
 import {
+  assertStorageListBoundary,
   MAX_STORAGE_TRANSACTION_MUTATIONS,
   StorageFailure,
   parseStorageCollection,
@@ -48,12 +49,19 @@ import {
   parseStorageOperationId,
   type StorageAdapter,
   type StorageCollection,
+  type StorageCursor,
   type StorageDocument,
   type StorageKey,
   type StorageMutation,
   type StorageOperationId,
   type StorageRecord,
 } from "../domain/storage-adapter.ts";
+import type {
+  OwnerIndicationModerationListRequest,
+  OwnerIndicationReviewCollectionRepository,
+  OwnerIndicationReviewPage,
+  OwnerIndicationReviewSummary,
+} from "../services/owner-indication-moderation.ts";
 
 const INDICATION_SCHEMA_VERSION = 4;
 const CURRENT_INDICATIONS = storageCollection("investment-indications");
@@ -78,6 +86,13 @@ export const MAX_INDICATION_STORAGE_READS =
   1 + 2 * MAX_INDICATION_MATERIALIZATION_READS;
 export const MAX_INDICATION_STORAGE_MUTATIONS =
   4 + MAX_INDICATION_FIELDS_CHUNKS;
+export const MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE = 25;
+export const MAX_OWNER_INDICATION_REVIEW_CURSOR_LENGTH = 2_048;
+export const MAX_OWNER_INDICATION_REVIEW_ITEM_READS =
+  2 + MAX_INDICATION_FIELDS_CHUNKS;
+export const MAX_OWNER_INDICATION_REVIEW_PAGE_RECORD_READS =
+  MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE *
+  MAX_OWNER_INDICATION_REVIEW_ITEM_READS;
 
 const CURRENT_DOCUMENT_KEYS = new Set([
   "kind",
@@ -154,6 +169,9 @@ const LEASE_DOCUMENT_KEYS = new Set([
   "indicationId",
   "uniquenessFingerprint",
 ]);
+const OWNER_REVIEW_LIST_REQUEST_KEYS = new Set(["limit"]);
+const OWNER_REVIEW_CURSOR_REQUEST_KEYS = new Set(["limit", "cursor"]);
+const OWNER_REVIEW_PAGE_KEYS = new Set(["items", "nextCursor"]);
 
 export type IndicationMutationResult<
   Indication extends InvestmentIndication = InvestmentIndication,
@@ -989,6 +1007,397 @@ export class DevelopmentInMemoryIndicationRepository
   }
 }
 
+type OwnerIndicationReviewStorage = Pick<StorageAdapter, "list" | "read">;
+
+/** Persistent owner-only summary projection over current indication records. */
+export class StorageOwnerIndicationReviewCollectionRepository
+  implements OwnerIndicationReviewCollectionRepository
+{
+  readonly #storage: OwnerIndicationReviewStorage;
+  readonly #configuredOwnerSubject: ActorSubject;
+  readonly #permitted: boolean;
+
+  constructor(
+    storage: OwnerIndicationReviewStorage,
+    authenticatedSubject: ActorSubject | null,
+    configuredOwnerSubject: ActorSubject,
+  ) {
+    this.#storage = requiredOwnerIndicationReviewStorage(storage);
+    this.#configuredOwnerSubject = requiredActorSubject(configuredOwnerSubject);
+    const actorSubject = authenticatedSubject === null
+      ? null
+      : requiredActorSubject(authenticatedSubject);
+    this.#permitted = actorSubject === this.#configuredOwnerSubject;
+    Object.freeze(this);
+  }
+
+  async list(
+    request: OwnerIndicationModerationListRequest,
+  ): Promise<OwnerIndicationReviewPage> {
+    if (!this.#permitted) notFound();
+
+    try {
+      const parsed = parseOwnerIndicationReviewListRequest(request);
+      const storageRequest = Object.freeze({
+        collection: CURRENT_INDICATIONS,
+        limit: parsed.limit,
+        ...(parsed.cursor === undefined ? {} : { cursor: parsed.cursor }),
+      });
+      assertStorageListBoundary(storageRequest);
+      const page = exactOwnerIndicationReviewStoragePage(
+        await this.#storage.list(storageRequest),
+        parsed,
+      );
+      const items = await Promise.all(page.items.map((record) =>
+        decodeOwnerIndicationReviewSummary(
+          this.#storage,
+          record,
+        )
+      ));
+      return Object.freeze({
+        items: Object.freeze(items),
+        nextCursor: page.nextCursor,
+      });
+    } catch (error) {
+      if (
+        error instanceof StorageFailure &&
+        error.code === "INVALID_REQUEST"
+      ) {
+        throw new StorageFailure("INVALID_REQUEST");
+      }
+      throw new StorageFailure("UNAVAILABLE");
+    }
+  }
+}
+
+function parseOwnerIndicationReviewListRequest(
+  value: unknown,
+): OwnerIndicationModerationListRequest {
+  const source = objectRecord(value);
+  const hasCursor = source !== null && Object.hasOwn(source, "cursor");
+  if (
+    source === null ||
+    !hasExactKeys(
+      source,
+      hasCursor
+        ? OWNER_REVIEW_CURSOR_REQUEST_KEYS
+        : OWNER_REVIEW_LIST_REQUEST_KEYS,
+    ) ||
+    !Number.isSafeInteger(source.limit) ||
+    (source.limit as number) < 1 ||
+    (source.limit as number) > MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE
+  ) {
+    invalidRequest();
+  }
+  const cursor = hasCursor
+    ? requiredOwnerIndicationReviewCursor(source.cursor, invalidRequest)
+    : undefined;
+  return Object.freeze({
+    limit: source.limit as number,
+    ...(cursor === undefined ? {} : { cursor }),
+  });
+}
+
+function exactOwnerIndicationReviewStoragePage(
+  value: unknown,
+  request: OwnerIndicationModerationListRequest,
+): Readonly<{
+  items: readonly StorageRecord[];
+  nextCursor: StorageCursor | null;
+}> {
+  const source = exactRecord(value, OWNER_REVIEW_PAGE_KEYS);
+  const candidates = exactDenseArray(source.items, request.limit);
+  const items = candidates.map(exactOwnerIndicationReviewStorageRecord);
+  let priorId: string | null = null;
+  for (const item of items) {
+    if (
+      item.key.collection !== CURRENT_INDICATIONS ||
+      (priorId !== null && priorId >= item.key.id)
+    ) {
+      unavailable();
+    }
+    priorId = item.key.id;
+  }
+
+  const nextCursor = source.nextCursor === null
+    ? null
+    : requiredOwnerIndicationReviewCursor(source.nextCursor, unavailable);
+  if (
+    nextCursor !== null &&
+    (items.length === 0 || nextCursor === request.cursor)
+  ) {
+    unavailable();
+  }
+  return Object.freeze({ items: Object.freeze(items), nextCursor });
+}
+
+function exactOwnerIndicationReviewStorageRecord(value: unknown): StorageRecord {
+  const source = exactRecord(value, STORAGE_RECORD_KEYS);
+  const keySource = exactRecord(source.key, STORAGE_KEY_KEYS);
+  const parsedKey = parseStorageKey(keySource.collection, keySource.id);
+  if (
+    !parsedKey.ok ||
+    !Number.isSafeInteger(source.revision) ||
+    (source.revision as number) < 1 ||
+    objectRecord(source.value) === null
+  ) {
+    unavailable();
+  }
+  return Object.freeze({
+    key: Object.freeze({ ...parsedKey.value }),
+    revision: source.revision as number,
+    value: source.value as StorageDocument,
+  });
+}
+
+async function decodeOwnerIndicationReviewSummary(
+  storage: OwnerIndicationReviewStorage,
+  record: StorageRecord,
+): Promise<OwnerIndicationReviewSummary> {
+  const coordinates = storedIndicationCoordinates(record.value);
+  const currentKey = await currentIndicationKey(coordinates.id);
+  const current = decodeStoredCurrent(
+    record,
+    currentKey,
+    coordinates.id,
+    coordinates.subject,
+  );
+  const terminalKey = await indicationHistoryKey(
+    coordinates.id,
+    current.revision,
+  );
+  const terminalRecord = await storage.read(terminalKey);
+  if (terminalRecord === null) unavailable();
+  const terminal = decodeStoredTransition(
+    terminalRecord,
+    terminalKey,
+    coordinates.subject,
+    coordinates.id,
+    current.revision,
+  );
+  requireCurrentMatchesTerminal(current, terminal);
+  const fields = await readStoredFields(
+    storage,
+    coordinates.subject,
+    coordinates.id,
+    current.fields,
+  );
+  const status = await verifyOwnerReviewTerminal(
+    terminal,
+    fields.fields,
+  );
+  await verifyOwnerReviewActiveLease(storage, current, fields.fields, status);
+  return Object.freeze({
+    reviewId: await ownerIndicationReviewId(
+      coordinates.subject,
+      coordinates.id,
+    ),
+    kind: fields.fields.kind,
+    status,
+    amount: fields.fields.amount,
+    currency: fields.fields.currency,
+    updatedAt: terminal.occurredAt,
+    revision: current.revision,
+  });
+}
+
+function storedIndicationCoordinates(value: unknown): Readonly<{
+  subject: ActorSubject;
+  id: InvestmentIndicationId;
+}> {
+  const source = exactRecord(value, CURRENT_DOCUMENT_KEYS);
+  return Object.freeze({
+    subject: storedActorSubject(source.participantSubject),
+    id: storedIndicationId(source.indicationId),
+  });
+}
+
+function requireCurrentMatchesTerminal(
+  current: StoredCurrent,
+  terminal: StoredTransition,
+): void {
+  if (
+    current.operationId !== terminal.operationId ||
+    current.operationFingerprint !== terminal.operationFingerprint ||
+    current.requestFingerprint !== terminal.requestFingerprint ||
+    current.indicationId !== terminal.indicationId ||
+    current.participantSubject !== terminal.participantSubject ||
+    current.revision !== terminal.revision ||
+    canonicalJson(fieldsReferenceDocument(current.fields)) !==
+      canonicalJson(fieldsReferenceDocument(terminal.fields))
+  ) {
+    unavailable();
+  }
+}
+
+async function verifyOwnerReviewTerminal(
+  terminal: StoredTransition,
+  fields: InvestmentIndicationFields,
+): Promise<InvestmentIndication["lifecycle"]["status"]> {
+  const source = exactRecord(terminal.document, TRANSITION_DOCUMENT_KEYS);
+  const acknowledgment = storedAcknowledgment(source.acknowledgment);
+  if (
+    acknowledgment.participantSubject !== terminal.participantSubject ||
+    canonicalJson(acknowledgmentDocument(acknowledgment)) !==
+      canonicalJson(source.acknowledgment)
+  ) {
+    unavailable();
+  }
+
+  let actor: ParticipantIndicationActor | OwnerIndicationActor;
+  let status: InvestmentIndication["lifecycle"]["status"];
+  let reason: string | undefined;
+  if (terminal.transitionKind === "rejected") {
+    actor = storedOwnerActor(source.actor);
+    const rejection = exactRecord(
+      source.rejection,
+      new Set(["reason", "rejectedAt", "rejectedBy"]),
+    );
+    const rejectedAt = storedTimestamp(rejection.rejectedAt);
+    const rejectedBy = storedOwnerActor(rejection.rejectedBy);
+    reason = parseRejectionReason(rejection.reason) ?? unavailable();
+    if (
+      rejectedAt !== terminal.occurredAt ||
+      rejectedBy.subject !== actor.subject ||
+      canonicalJson(actorDocument(actor)) !== canonicalJson(source.actor) ||
+      canonicalJson({
+        reason,
+        rejectedAt,
+        rejectedBy: actorDocument(rejectedBy),
+      }) !== canonicalJson(source.rejection)
+    ) {
+      unavailable();
+    }
+    status = "rejected";
+  } else {
+    actor = storedParticipantActor(source.actor);
+    if (
+      actor.subject !== terminal.participantSubject ||
+      source.rejection !== null ||
+      canonicalJson(actorDocument(actor)) !== canonicalJson(source.actor)
+    ) {
+      unavailable();
+    }
+    status = terminal.transitionKind === "withdrawn" ? "withdrawn" : "active";
+  }
+
+  if (
+    terminal.transitionKind === "created"
+      ? terminal.revision !== 1 || terminal.fields.revision !== 1
+      : terminal.revision <= 1 ||
+        (terminal.transitionKind === "edited"
+          ? terminal.fields.revision !== terminal.revision
+          : terminal.fields.revision >= terminal.revision)
+  ) {
+    unavailable();
+  }
+  const request = Object.freeze({
+    operationId: terminal.operationId,
+    id: terminal.indicationId,
+    occurredAt: terminal.occurredAt,
+    historyEntryId: terminal.historyEntryId,
+    expectedRevision: terminal.revision === 1 ? null : terminal.revision - 1,
+    ...(terminal.transitionKind === "created" ||
+        terminal.transitionKind === "edited"
+      ? { fields }
+      : {}),
+    ...(reason === undefined ? {} : { reason }),
+  }) satisfies ParsedMutationRequest;
+  if (
+    terminal.operationFingerprint !== await operationFingerprint(
+      mutationKindForTransition(terminal.transitionKind),
+      actor,
+      request,
+      terminal.requestFingerprint,
+    )
+  ) {
+    unavailable();
+  }
+
+  return status;
+}
+
+async function verifyOwnerReviewActiveLease(
+  storage: Pick<StorageAdapter, "read">,
+  current: StoredCurrent,
+  fields: InvestmentIndicationFields,
+  status: InvestmentIndication["lifecycle"]["status"],
+): Promise<void> {
+  if (status !== "active") return;
+  const uniquenessKey = (fields.kind === "personal"
+    ? JSON.stringify(["personal", current.participantSubject])
+    : JSON.stringify([
+        "company",
+        fields.registrationCountry,
+        fields.companyIdentifier,
+      ])) as ActiveIndicationUniquenessKey;
+  const hexadecimal = await sha256Hex(
+    `active-indication-uniqueness\u0000${uniquenessKey}`,
+  );
+  const fingerprint = `sha256:${hexadecimal}`;
+  const key = requiredStorageKey(
+    ACTIVE_UNIQUENESS_KEYS,
+    `active-key:${hexadecimal}`,
+  );
+  const lease = Object.freeze({
+    uniquenessKey,
+    key,
+    fingerprint,
+    document: Object.freeze({
+      kind: "active-indication-lease",
+      schemaVersion: INDICATION_SCHEMA_VERSION,
+      indicationId: current.indicationId,
+      uniquenessFingerprint: fingerprint,
+    }),
+  });
+  const record = await storage.read(key);
+  if (record === null) unavailable();
+  verifyLeaseRecord(record, lease, current.indicationId);
+}
+
+function requiredOwnerIndicationReviewCursor(
+  value: unknown,
+  fail: () => never,
+): StorageCursor {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > MAX_OWNER_INDICATION_REVIEW_CURSOR_LENGTH
+  ) {
+    return fail();
+  }
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint !== undefined && (codePoint <= 31 || codePoint === 127)) {
+      return fail();
+    }
+  }
+  return value as StorageCursor;
+}
+
+function requiredOwnerIndicationReviewStorage(
+  value: OwnerIndicationReviewStorage,
+): OwnerIndicationReviewStorage {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    typeof value.list !== "function" ||
+    typeof value.read !== "function"
+  ) {
+    invalidRequest();
+  }
+  return value;
+}
+
+async function ownerIndicationReviewId(
+  subject: ActorSubject,
+  id: InvestmentIndicationId,
+): Promise<string> {
+  return `indication-review:${
+    await sha256Hex(`owner-indication-review\u0000${subject}\u0000${id}`)
+  }`;
+}
+
 function parseCreateRequest(
   request: CreateIndicationRequest,
   amountConfiguration: AmountConfiguration,
@@ -1757,7 +2166,7 @@ async function prepareStoredFields(
 }
 
 async function readStoredFields(
-  storage: StorageAdapter,
+  storage: Pick<StorageAdapter, "read">,
   subject: ActorSubject,
   id: InvestmentIndicationId,
   reference: StoredFieldsReference,

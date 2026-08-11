@@ -262,6 +262,33 @@ Participants can edit or withdraw active indications and reactivate withdrawn in
 
 Reads reconstruct the bounded transition ancestry from exact data-only records, verify every field reference, chunk topology, byte count, content hash, normalized operation fingerprint, storage revision, and required active lease, then compare the reconstruction with current metadata. A separate immutable fingerprint binds the exact authoritative request fields before deployment policy or normalizers are applied, and every normalized transition fingerprint commits that raw-request fingerprint, so exact retries return their original revision after policy evolution while changed or corrupted request evidence cannot adopt the operation. Stored values with accessors, unexpected own keys, or non-data prototypes fail closed; canonical comparisons have explicit depth and node ceilings, and participant-index plus operation-receipt reads validate their complete outer record and key envelopes before field access. Current owner configuration authorizes access, while immutable historical owner attribution survives an authorized owner rotation. Exported record, transaction, mutation, materialization-read, and delayed-replay-read ceilings are enforced and observed in the reusable repository contract.
 
+`StorageOwnerIndicationReviewCollectionRepository` is the narrow persistent
+collection projection over those current indication records. Construction binds
+one authenticated subject to the configured owner; anonymous and different
+authenticated subjects receive the same fixed not-found failure before any
+storage request. The repository exposes only `list`, with no detail lookup,
+mutation, adapter, key-read, transaction, or credential surface.
+
+Each page contains at most 25 allowlisted summaries. One adapter list and at
+most 25 terminal-transition reads, active-lease checks, and bounded current-field
+chunks produce the page, for a maximum of 250 record reads. Current metadata, terminal
+transition, acknowledgment, actor, operation fingerprint, field reference,
+chunk envelope, byte count, payload hash, and parsed fields must agree before a
+summary is returned. The projection includes only a one-way review ID, kind,
+lifecycle, minor-unit amount, currency, update timestamp, and revision. It
+omits participant subject, indication ID, company identity, representative,
+availability, note, rejection reason, and notification state.
+
+Continuation state is the bounded opaque cursor returned by the validated
+AittaDB storage protocol. Investor App neither decodes nor logs that cursor;
+the protocol excludes principals, namespaces, physical keys, and authorization
+detail from cursor state. A new repository instance can continue the same
+cursor after a Worker restart. Invalid requests, malformed or non-progressing
+pages, corrupt records, and backend causes collapse to fixed failures without
+private values. Only the one-way review ID is suitable for a later owner detail
+URL. Persistent detail lookup, rejection, notification composition, and hosted
+route wiring remain separate capabilities.
+
 Owner moderation is a separate application capability over the strong `AtomicOwnerIndicationModerationRepository` port. The owner collection uses opaque review identifiers, while each authorized detail projects permitted private indication fields, immutable transition history, current notification state, and only the action valid for that lifecycle. The same resource model drives native HTML and versioned hypermedia JSON at `/owner/investment-indications` and `/owner/investment-indications/{review-id}`.
 
 A rejection action is advertised only when the injected repository explicitly guarantees `atomic-indication-aggregate-audit-notification`. One retry-stable operation must reject the active indication, replace its aggregate contribution with the rejected revision, update the aggregate snapshot, append closed owner audit evidence, and create the bounded participant notification template in one transaction. The route cross-checks all returned effects against the rejected indication and trusted owner before responding. Missing guarantees, stale revisions, invalid results, or transaction failure fail closed; no weaker adapter may expose the action.
