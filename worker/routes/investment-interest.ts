@@ -34,7 +34,9 @@ import {
 } from "../../domain/storage-adapter.ts";
 import { negotiateRepresentation } from "../../http/content-negotiation.ts";
 import {
+  MUTATION_CSRF_FIELD,
   MUTATION_CSRF_HEADER,
+  MUTATION_METHOD_FIELD,
   MutationSecurityFailure,
   createBrowserMutationGuard,
   hashCsrfToken,
@@ -66,6 +68,8 @@ const EXPECTED_REVISION_FIELD = "expected-revision";
 const KIND_FIELD = "kind";
 const CONFIRM_WITHDRAWAL_FIELD = "confirm-withdrawal";
 const CONFIRM_REACTIVATION_FIELD = "confirm-reactivation";
+const FORM_MUTATION_MEDIA_TYPE = "application/x-www-form-urlencoded";
+const FORM_TRANSPORT_FIELD_COUNT = 2;
 
 const PERSONAL_FIELD_NAMES = Object.freeze([
   KIND_FIELD,
@@ -113,10 +117,16 @@ const INVESTMENT_MUTATION_LIMITS = Object.freeze({
   Record<"POST" | "PATCH" | "DELETE", BrowserMutationVerificationLimits>
 >);
 
+type InvestmentInterestVerificationLimits = Readonly<{
+  maxBodyBytes: number;
+  maxFields: number;
+  repeatedFormFields: readonly string[];
+}>;
+
 /** Route-owned limits selected before hosted or compatibility verification. */
 export function investmentInterestMutationLimits(
   requestMethod: string,
-): BrowserMutationVerificationLimits {
+): InvestmentInterestVerificationLimits {
   if (
     requestMethod !== "POST" &&
     requestMethod !== "PATCH" &&
@@ -138,6 +148,7 @@ export type InvestmentInterestCsrfTokenProvider = (
 
 export type InvestmentInterestMutationVerifier = (
   request: Request,
+  limits: BrowserMutationVerificationLimits,
 ) => Promise<VerifiedMutationRequest & Readonly<{ clearCookie: string }>>;
 
 export type InvestmentInterestRouteDependencies = Readonly<{
@@ -171,8 +182,9 @@ export function createInvestmentInterestRouteHandler(
 
   const createOperationId = dependencies.createOperationId ?? randomOperationId;
   const hostedMutationVerifier = dependencies.verifyMutation;
-  const mutationGuard: (
+  const verifier: (
     request: Request,
+    limits: BrowserMutationVerificationLimits,
   ) => Promise<VerifiedMutationRequest & Readonly<{ clearCookie?: string }>> =
     hostedMutationVerifier ?? createLegacyMutationVerifier(
       dependencies.mutationSecurity as BrowserMutationGuardOptions,
@@ -247,7 +259,10 @@ export function createInvestmentInterestRouteHandler(
 
     let clearCookie: string | null = null;
     try {
-      const verified = await mutationGuard(context.request);
+      const verificationLimits = await investmentInterestVerificationLimits(
+        context.request,
+      );
+      const verified = await verifier(context.request, verificationLimits);
       if (hostedMutationVerifier !== undefined) {
         if (!validSetCookie(verified.clearCookie)) {
           throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
@@ -311,25 +326,131 @@ export function createInvestmentInterestRouteHandler(
 
 function createLegacyMutationVerifier(
   options: BrowserMutationGuardOptions,
-): (request: Request) => Promise<VerifiedMutationRequest> {
-  const guards = Object.freeze({
-    POST: createBrowserMutationGuard(
-      legacyGuardOptions(options, INVESTMENT_MUTATION_LIMITS.POST),
-    ),
-    PATCH: createBrowserMutationGuard(
-      legacyGuardOptions(options, INVESTMENT_MUTATION_LIMITS.PATCH),
-    ),
-    DELETE: createBrowserMutationGuard(
-      legacyGuardOptions(options, INVESTMENT_MUTATION_LIMITS.DELETE),
-    ),
-  });
-  return (request) => {
-    const method = request.method;
-    if (method !== "POST" && method !== "PATCH" && method !== "DELETE") {
+): (
+  request: Request,
+  limits: BrowserMutationVerificationLimits,
+) => Promise<VerifiedMutationRequest> {
+  return (request, limits) =>
+    createBrowserMutationGuard(legacyGuardOptions(options, limits))(request);
+}
+
+async function investmentInterestVerificationLimits(
+  request: Request,
+): Promise<InvestmentInterestVerificationLimits> {
+  const requestMethod = request.method;
+  const direct = investmentInterestMutationLimits(requestMethod);
+  if (
+    requestMethod !== "POST" ||
+    mutationMediaType(request.headers.get("content-type")) !==
+      FORM_MUTATION_MEDIA_TYPE
+  ) {
+    return direct;
+  }
+
+  const bytes = await readBoundedPreflightBody(
+    request,
+    INVESTMENT_MUTATION_LIMITS.POST.maxBodyBytes,
+  );
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (error) {
+    throw new MutationSecurityFailure("INVALID_REQUEST", { cause: error });
+  }
+
+  const entries = [...new URLSearchParams(text).entries()];
+  const names = new Set<string>();
+  let override: string | undefined;
+  let businessFields = 0;
+  for (const [name, value] of entries) {
+    if (names.has(name)) {
       throw new MutationSecurityFailure("INVALID_REQUEST");
     }
-    return guards[method](request);
-  };
+    names.add(name);
+    if (name === MUTATION_METHOD_FIELD) {
+      override = value;
+    } else if (name !== MUTATION_CSRF_FIELD) {
+      businessFields += 1;
+    }
+  }
+
+  if (override === undefined) return direct;
+  if (override !== "PATCH" && override !== "DELETE") {
+    throw new MutationSecurityFailure("INVALID_REQUEST");
+  }
+
+  const effective = investmentInterestMutationLimits(override);
+  if (bytes.byteLength > effective.maxBodyBytes) {
+    throw new MutationSecurityFailure("PAYLOAD_TOO_LARGE");
+  }
+  if (businessFields > effective.maxFields) {
+    throw new MutationSecurityFailure("INVALID_REQUEST");
+  }
+
+  return Object.freeze({
+    ...effective,
+    maxFields: effective.maxFields + FORM_TRANSPORT_FIELD_COUNT,
+  });
+}
+
+function mutationMediaType(value: string | null): string | null {
+  return value?.split(";", 1)[0]?.trim().toLowerCase() ?? null;
+}
+
+async function readBoundedPreflightBody(
+  request: Request,
+  maximum: number,
+): Promise<Uint8Array> {
+  let copy: Request;
+  try {
+    copy = request.clone();
+  } catch (error) {
+    throw new MutationSecurityFailure("INVALID_REQUEST", { cause: error });
+  }
+
+  const declaredLength = copy.headers.get("content-length");
+  if (declaredLength !== null) {
+    if (!/^(?:0|[1-9]\d*)$/u.test(declaredLength)) {
+      throw new MutationSecurityFailure("INVALID_REQUEST");
+    }
+    const length = Number(declaredLength);
+    if (!Number.isSafeInteger(length)) {
+      throw new MutationSecurityFailure("INVALID_REQUEST");
+    }
+    if (length > maximum) {
+      throw new MutationSecurityFailure("PAYLOAD_TOO_LARGE");
+    }
+  }
+
+  if (copy.body === null) return new Uint8Array();
+  const reader = copy.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      length += result.value.byteLength;
+      if (length > maximum) {
+        await reader.cancel();
+        throw new MutationSecurityFailure("PAYLOAD_TOO_LARGE");
+      }
+      chunks.push(result.value);
+    }
+  } catch (error) {
+    if (error instanceof MutationSecurityFailure) throw error;
+    throw new MutationSecurityFailure("INVALID_REQUEST", { cause: error });
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 function legacyGuardOptions(

@@ -39,6 +39,7 @@ import {
   type BrowserMutationProof,
   type BrowserMutationReplayClaim,
   type BrowserMutationSession,
+  type BrowserMutationVerificationLimits,
   type TrustedSitesMutationIdentity,
 } from "../http/browser-mutation-session.ts";
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
@@ -690,7 +691,10 @@ test("hosted investment verification requires a valid clear cookie", async () =>
       "POST",
       body,
       CLEAR_COOKIE,
-    )(jsonMutation(INVESTMENT_INTEREST_PATH, ALICE, "POST", body));
+    )(
+      jsonMutation(INVESTMENT_INTEREST_PATH, ALICE, "POST", body),
+      investmentInterestMutationLimits("POST"),
+    );
     const harness = await createHarness({
       verifyMutation: (async () => clearCookie === undefined
         ? {
@@ -739,13 +743,17 @@ test("real hosted investment verification applies method limits before replay or
     hosted.session,
     PARTICIPANT_IDENTITY,
   );
+  let verificationCalls = 0;
   const harness = await createHarness({
-    verifyMutation: (request) => hosted.session.verifyMutation(
-      request,
-      PARTICIPANT_IDENTITY,
-      CANONICAL_ORIGIN,
-      investmentInterestMutationLimits(request.method),
-    ),
+    verifyMutation: (request, limits) => {
+      verificationCalls += 1;
+      return hosted.session.verifyMutation(
+        request,
+        PARTICIPANT_IDENTITY,
+        CANONICAL_ORIGIN,
+        limits,
+      );
+    },
     csrfTokenFor: () => proof,
   });
   const itemPath = investmentInterestItemPath(
@@ -833,9 +841,147 @@ test("real hosted investment verification applies method limits before replay or
   );
   assert.equal(repeated.status, 400);
 
+  const callsBeforeOverrides = verificationCalls;
+  const oversizedOverride = await harness.dispatch(
+    hostedInvestmentFormMutation(proof, itemPath, [
+      [MUTATION_METHOD_FIELD, "DELETE"],
+      ["operation-id", "investment-operation:hosted-override-size"],
+      ["expected-revision", "1"],
+      [
+        "confirm-withdrawal",
+        "x".repeat(MAX_INVESTMENT_DELETE_MUTATION_BYTES),
+      ],
+    ]),
+    ALICE,
+  );
+  assert.equal(oversizedOverride.status, 413);
+
+  const excessDeleteOverride = await harness.dispatch(
+    hostedInvestmentFormMutation(proof, itemPath, [
+      [MUTATION_METHOD_FIELD, "DELETE"],
+      ["operation-id", "investment-operation:hosted-override-fields"],
+      ["expected-revision", "1"],
+      ["confirm-withdrawal", "true"],
+      ["unexpected", "private"],
+    ]),
+    ALICE,
+  );
+  assert.equal(excessDeleteOverride.status, 400);
+
+  const excessPatchOverride = await harness.dispatch(
+    hostedInvestmentFormMutation(proof, itemPath, [
+      [MUTATION_METHOD_FIELD, "PATCH"],
+      ["operation-id", "investment-operation:hosted-patch-fields"],
+      ["expected-revision", "1"],
+      ["kind", "company"],
+      ["company-name", "Synthetic company"],
+      ["registration-country", "FI"],
+      ["company-identifier", "SYNTHETIC-123"],
+      ["representative-name", "Synthetic representative"],
+      ["representative-authority-declared", "true"],
+      ["amount", "2000"],
+      ["availability-period", "Within twelve months."],
+      ["note", "Private"],
+      ["unexpected", "private"],
+    ]),
+    ALICE,
+  );
+  assert.equal(excessPatchOverride.status, 400);
+
   assert.equal(harness.serviceCalls(), 0);
   assert.equal(harness.state.indications.size, 0);
   assert.deepEqual(hosted.claims.calls, []);
+  assert.equal(verificationCalls, callsBeforeOverrides);
+});
+
+test("real hosted PATCH and DELETE override forms use effective limits and remain usable", async () => {
+  const hosted = await createHostedMutationSession();
+  const proof = await issueHostedInvestmentProof(
+    hosted.session,
+    PARTICIPANT_IDENTITY,
+  );
+  const replacements: BrowserMutationProof[] = [];
+  const limitsSeen: BrowserMutationVerificationLimits[] = [];
+  const harness = await createHarness({
+    verifyMutation(request, limits) {
+      limitsSeen.push(limits);
+      return hosted.session.verifyMutation(
+        request,
+        PARTICIPANT_IDENTITY,
+        CANONICAL_ORIGIN,
+        limits,
+      );
+    },
+    async csrfTokenFor(request) {
+      const replacement = await hosted.session.issue(
+        request,
+        PARTICIPANT_IDENTITY,
+        CANONICAL_ORIGIN,
+      );
+      replacements.push(replacement);
+      return replacement;
+    },
+  });
+  const indicationId = "investment-operation:hosted-override-lifecycle";
+  const itemPath = investmentInterestItemPath(indicationId);
+
+  const created = await harness.dispatch(
+    hostedInvestmentJsonMutation(
+      proof,
+      INVESTMENT_INTEREST_PATH,
+      "POST",
+      personalBody(indicationId),
+    ),
+    ALICE,
+  );
+  assert.equal(created.status, 201);
+  const editProof = replacements[0];
+  assert(editProof);
+
+  const edited = await harness.dispatch(
+    hostedInvestmentFormMutation(editProof, itemPath, [
+      [MUTATION_METHOD_FIELD, "PATCH"],
+      ["operation-id", "investment-operation:hosted-override-edit"],
+      ["expected-revision", "1"],
+      ["kind", "personal"],
+      ["residence-country", "FI"],
+      ["amount", "1500"],
+      ["availability-period", "Within six months."],
+      ["note", "Updated through the HTML form."],
+    ]),
+    ALICE,
+  );
+  assert.equal(edited.status, 200);
+  const withdrawProof = replacements[1];
+  assert(withdrawProof);
+
+  const withdrawn = await harness.dispatch(
+    hostedInvestmentFormMutation(withdrawProof, itemPath, [
+      [MUTATION_METHOD_FIELD, "DELETE"],
+      ["operation-id", "investment-operation:hosted-override-withdraw"],
+      ["expected-revision", "2"],
+      ["confirm-withdrawal", "true"],
+    ]),
+    ALICE,
+  );
+  assert.equal(withdrawn.status, 200);
+  assert.deepEqual(limitsSeen, [
+    investmentInterestMutationLimits("POST"),
+    {
+      ...investmentInterestMutationLimits("PATCH"),
+      maxFields: MAX_INVESTMENT_PATCH_MUTATION_FIELDS + 2,
+    },
+    {
+      ...investmentInterestMutationLimits("DELETE"),
+      maxFields: MAX_INVESTMENT_DELETE_MUTATION_FIELDS + 2,
+    },
+  ]);
+  assert.equal(hosted.claims.calls.length, 3);
+  assert.equal(harness.serviceCalls(), 3);
+  assert.equal(harness.state.indications.size, 1);
+  const persisted = [...harness.state.indications.values()][0];
+  assert(persisted);
+  assert.equal(persisted.lifecycle.status, "withdrawn");
 });
 
 test("real hosted investment proofs are participant-bound, one-time, and replaced after use", async () => {
@@ -846,11 +992,11 @@ test("real hosted investment proofs are participant-bound, one-time, and replace
   );
   const replacements: BrowserMutationProof[] = [];
   const harness = await createHarness({
-    verifyMutation: (request) => hosted.session.verifyMutation(
+    verifyMutation: (request, limits) => hosted.session.verifyMutation(
       request,
       PARTICIPANT_IDENTITY,
       CANONICAL_ORIGIN,
-      investmentInterestMutationLimits(request.method),
+      limits,
     ),
     async csrfTokenFor(request, actorSubject) {
       assert.equal(actorSubject, ALICE);
@@ -937,6 +1083,52 @@ test("real hosted investment proofs are participant-bound, one-time, and replace
   assert.equal(harness.serviceCalls(), 1);
   assert.equal(harness.state.indications.size, 1);
   assert.equal(hosted.claims.calls.length, 2);
+});
+
+test("a correctly verified owner proof reaches fixed participant-only denial", async () => {
+  const hosted = await createHostedMutationSession();
+  const ownerProof = await issueHostedInvestmentProof(
+    hosted.session,
+    OWNER_IDENTITY,
+  );
+  const harness = await createHarness({
+    verifyMutation: (request, limits) => hosted.session.verifyMutation(
+      request,
+      OWNER_IDENTITY,
+      CANONICAL_ORIGIN,
+      limits,
+    ),
+    csrfTokenFor() {
+      assert.fail("Owner denial must not issue a participant replacement proof.");
+    },
+  });
+  const ownerAttempt = await harness.dispatch(
+    hostedInvestmentJsonMutation(
+      ownerProof,
+      INVESTMENT_INTEREST_PATH,
+      "POST",
+      personalBody("investment-operation:hosted-owner-proof"),
+    ),
+    ALICE,
+  );
+
+  assert.equal(ownerAttempt.status, 404);
+  assert.deepEqual(ownerAttempt.headers.getSetCookie(), [
+    expiredProofCookie(ownerProof),
+  ]);
+  const document = await jsonDocument(ownerAttempt);
+  assert.deepEqual(resourceData(document), {
+    code: "not_found",
+    message: "The requested resource was not found.",
+  });
+  assert.deepEqual(actionNames(document), []);
+  assert.doesNotMatch(
+    JSON.stringify(document),
+    /owner|alice-route-investment|hosted-owner-proof/iu,
+  );
+  assert.equal(hosted.claims.calls.length, 1);
+  assert.equal(harness.serviceCalls(), 0);
+  assert.equal(harness.state.indications.size, 0);
 });
 
 type Harness = Readonly<{
