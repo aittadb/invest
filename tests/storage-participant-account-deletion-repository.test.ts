@@ -55,6 +55,7 @@ import {
   StorageParticipantRepository,
 } from "../repositories/in-memory-participant-repository.ts";
 import {
+  MAX_PARTICIPANT_ACCOUNT_DELETION_OPERATION_READS,
   StorageParticipantAccountDeletionRepository,
 } from "../repositories/storage-participant-account-deletion-repository.ts";
 import {
@@ -411,6 +412,19 @@ test("maximum 100-record ownership inventory stays inside the atomic boundary", 
     current.every(({ lifecycle }) => lifecycle.status !== "active"),
     true,
   );
+
+  const counted = new CountingStorageAdapter(storage);
+  const replay = await coordinator(counted, ALICE).requestAccountDeletion(
+    deletionRequest("participant-operation:deletion-100", 1),
+  );
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.investmentWithdrawals.length, 4);
+  assert.equal(counted.listCalls, 0);
+  assert.equal(counted.transactCalls, 0);
+  assert.ok(
+    counted.readCalls <= MAX_PARTICIPANT_ACCOUNT_DELETION_OPERATION_READS,
+    `${counted.readCalls} account-deletion replay reads exceeded the operation ceiling`,
+  );
 });
 
 type SeedOptions = Readonly<{
@@ -758,5 +772,33 @@ class CommitEvidenceAdapter implements StorageAdapter {
     this.#first = false;
     if (this.#mode === "throw") throw new Error("PRIVATE_PROVIDER_BODY");
     return Object.freeze({ replayed: false, records: Object.freeze([]) });
+  }
+}
+
+class CountingStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readCalls = 0;
+  listCalls = 0;
+  transactCalls = 0;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+  }
+
+  read(key: Parameters<StorageAdapter["read"]>[0]) {
+    this.readCalls += 1;
+    return this.#delegate.read(key);
+  }
+
+  list(request: StorageListRequest): Promise<StoragePage> {
+    this.listCalls += 1;
+    return this.#delegate.list(request);
+  }
+
+  transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    this.transactCalls += 1;
+    return this.#delegate.transact(request);
   }
 }

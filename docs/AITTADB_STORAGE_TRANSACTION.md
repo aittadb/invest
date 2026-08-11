@@ -122,7 +122,10 @@ two profile records, at most two founder records, one closed audit event, and
 one immutable operation receipt before the shared boundary's single commit.
 The maximum shape is exactly 25 mutations. A missing or malformed effect makes
 receipt replay unavailable; changed operation reuse conflicts, and
-response-loss recovery reads the receipt without repeating a write.
+response-loss recovery reads the receipt without repeating a write. Replay
+authenticates every compact ownership head and reconstructs only the receipt's
+at-most-four withdrawn indications, keeping a 100-record account finite without
+reloading every complete historical indication.
 
 The machine-readable `transaction_shape` declares:
 
