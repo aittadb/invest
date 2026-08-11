@@ -93,6 +93,14 @@ test("persistent audit-only route keeps HTML and hypermedia equivalent", async (
     document.links.some((link) => link.rel.includes("manual-notifications")),
     false,
   );
+  assert.equal(
+    document.links.find((link) => link.rel.includes("owner"))?.href,
+    `${APP_ORIGIN}/owner`,
+  );
+  assert.equal(
+    document.links.find((link) => link.rel.includes("campaign"))?.href,
+    `${APP_ORIGIN}/`,
+  );
   assert.equal(document.actions.length, 0);
 
   const htmlResponse = await request(
@@ -104,6 +112,8 @@ test("persistent audit-only route keeps HTML and hypermedia equivalent", async (
   assert.match(html, /audit:event-persistent/u);
   assert.match(html, new RegExp(OWNER_SUBJECT, "u"));
   assert.match(html, /resource:campaign/u);
+  assert.match(html, /href="\/owner">Campaign workspace<\/a>/u);
+  assert.match(html, /href="\/">View campaign<\/a>/u);
   assert.doesNotMatch(html, /Manual notifications/u);
   assert.equal(htmlResponse.headers.get("cache-control"), "no-store");
 

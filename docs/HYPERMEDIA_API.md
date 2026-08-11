@@ -196,15 +196,17 @@ records at revision one whose key matches the parsed event identifier. Unknown
 event kinds, extra private fields, hostile accessors, malformed records,
 oversized pages, duplicate events, and unusable continuation cursors all fail
 through one fixed non-disclosing unavailable response; none is interpreted as
-trusted evidence. A fresh Worker continues from the opaque next-page link.
+trusted evidence. Adapter failure codes retain their fixed meaning while
+backend causes are discarded. A fresh Worker continues from the opaque
+next-page link.
 
 Audit history is composed independently from manual-notification history. Until
 the latter has its own persistent capability, neither the audit document nor
 its HTML navigation advertises `/owner/manual-notifications`. The configured
-owner receives the same event identifiers, times, actors, and closed detail in
-HTML and version `0.1` hypermedia JSON; anonymous callers receive the sign-in
-transition and other authenticated callers receive the non-disclosing missing
-surface.
+owner receives the same event identifiers, times, actors, closed detail, owner
+navigation, campaign navigation, and continuation in HTML and version `0.1`
+hypermedia JSON; anonymous callers receive the sign-in transition and other
+authenticated callers receive the non-disclosing missing surface.
 
 `GET /owner/manual-notifications` pages bounded private notification summaries.
 `GET /owner/manual-notifications/{notification-id}` exposes the selected

@@ -356,6 +356,7 @@ function collectionLinks(
   const links: HypermediaLink[] = [
     { rel: ["self"], href: self.href },
     { rel: ["owner"], href: new URL("/owner", self).href },
+    { rel: ["campaign"], href: new URL("/", self).href },
     ...additional,
   ];
   if (nextCursor !== null) {

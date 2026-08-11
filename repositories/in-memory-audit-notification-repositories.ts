@@ -633,7 +633,9 @@ async function listAuditEvents(
   try {
     storedPage = await storage.list(storageRequest);
   } catch (error) {
-    if (error instanceof StorageFailure) throw error;
+    if (error instanceof StorageFailure) {
+      throw new StorageFailure(error.code);
+    }
     unavailable();
   }
   const page = exactAuditStoragePage(storedPage, normalized);
@@ -1188,8 +1190,7 @@ function exactDenseArray(
       result.push(descriptor.value);
     }
     return Object.freeze(result);
-  } catch (error) {
-    if (error instanceof StorageFailure) throw error;
+  } catch {
     unavailable();
   }
 }

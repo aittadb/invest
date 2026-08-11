@@ -116,6 +116,43 @@ test("audit reader rejects unknown and private stored evidence without evaluatin
     JSON.stringify(dependencyFailure),
     new RegExp(PRIVATE_SENTINEL, "u"),
   );
+
+  const privateStorageFailure = await expectFailure(
+    () => new StorageAuditEventReader(pageAdapter(() => {
+      throw new StorageFailure("UNAVAILABLE", {
+        cause: new Error(PRIVATE_SENTINEL),
+      });
+    })).list({ limit: 1 }),
+    "UNAVAILABLE",
+  );
+  assert.equal(privateStorageFailure.cause, undefined);
+  assert.doesNotMatch(
+    String(privateStorageFailure),
+    new RegExp(PRIVATE_SENTINEL, "u"),
+  );
+
+  const hostileItems = new Proxy([auditRecord({
+    kind: "export-created",
+    exportType: "review-csv",
+  })], {
+    ownKeys() {
+      throw new StorageFailure("UNAVAILABLE", {
+        cause: new Error(PRIVATE_SENTINEL),
+      });
+    },
+  });
+  const hostilePageFailure = await expectFailure(
+    () => new StorageAuditEventReader(pageAdapter(() => ({
+      items: hostileItems,
+      nextCursor: null,
+    }))).list({ limit: 1 }),
+    "UNAVAILABLE",
+  );
+  assert.equal(hostilePageFailure.cause, undefined);
+  assert.doesNotMatch(
+    String(hostilePageFailure),
+    new RegExp(PRIVATE_SENTINEL, "u"),
+  );
 });
 
 test("audit reader fails closed on corrupt records and non-finite pages", async () => {

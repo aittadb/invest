@@ -59,6 +59,14 @@ test("hosted owner pages persistent AittaDB audit history across Workers", async
     first.links.some((link) => link.rel.includes("manual-notifications")),
     false,
   );
+  assert.equal(
+    first.links.find((link) => link.rel.includes("owner"))?.href,
+    `${APP_ORIGIN}/owner`,
+  );
+  assert.equal(
+    first.links.find((link) => link.rel.includes("campaign"))?.href,
+    `${APP_ORIGIN}/`,
+  );
   const next = first.links.find((link) => link.rel.includes("next"));
   assert.ok(next);
   assert.match(next.href, /^https:\/\/invest\.example\.test\//u);
