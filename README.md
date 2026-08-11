@@ -81,6 +81,16 @@ npm run validate
 
 `npm run build` works from a clean checkout with the inert hosting example. Before packaging or publishing, create an ignored `.openai/hosting.json` containing the exact Sites project identifier for that deployment; `npm run sites:package` refuses to proceed without it.
 
+### Legacy ownership migration
+
+Pre-existing participant investment records require one explicit backend migration before hosted investment routes can use them. Prepare a private, complete, sorted manifest under ignored `migration-inventories/`, configure the five `AITTADB_MIGRATION_*` values only in the operator environment with a dedicated namespace-bound `storage.read storage.write` client, and run:
+
+```sh
+npm run migrate:legacy-investment-ownership -- --apply --manifest migration-inventories/ownership.json
+```
+
+The manifest contains `schemaVersion: 1` and at most 100 sorted `participants`. Each participant supplies its subject, one unique retry-stable operation ID, and the complete sorted set of at most 100 indication IDs with current revision and `active`, `withdrawn`, or `rejected` status. At most four may be active. The command never lists participants, has no browser route, does not use the Sites runtime credential, and prints only counters. Exact reruns resume safely; changed, incomplete, crossed, corrupt, oversized, or over-capacity input fails closed. See [docs/HOSTED_AITTADB_RUNTIME.md](docs/HOSTED_AITTADB_RUNTIME.md#legacy-investment-ownership-migration) for the operator contract. Do not run it against a live namespace without explicit approval and an independently reviewed authoritative inventory.
+
 ## Planning Workflow
 
 Before repository-affecting implementation, add or amend one unchecked `PLAN.md` task. Keep tasks small: one primitive, route group, security control, UI flow, storage contract, or narrowly bounded proof per task. Record only direct dependencies. Ready tasks may proceed concurrently in isolated branches and Git worktrees, with one focused task per worktree. Completed tasks move to `CHANGELOG.md` with evidence and are removed from `PLAN.md`; zero open tasks is the valid completed state.

@@ -247,19 +247,64 @@ must never call this function as an absence fallback. Existing-root corruption
 is unavailable and requires operator investigation rather than automatic
 reinitialization.
 
-This primitive does not yet make hosted participant investment persistence
-ready. `TASK-158` must atomically provision empty ownership metadata with first
-registration, and `TASK-159` must provide the credential-closed complete
-inventory migration for legacy participants. Ordinary hosted investment routes
-must remain unavailable for a subject until the applicable prerequisite has
-completed. Exact initialization retries use immutable root evidence and return
-their original counts after later valid lifecycle activity, but every retry
-still validates the current root, index, summary, and compact ownership heads.
+This primitive and its migration command do not yet make hosted participant
+investment persistence ready. `TASK-158` must atomically provision empty
+ownership metadata with first registration. Ordinary hosted investment routes
+must remain unavailable for a subject until first-registration provisioning or
+the reviewed legacy migration has completed. Exact initialization retries use
+immutable root evidence and return their original counts after later valid
+lifecycle activity, but every retry still validates the current root, index,
+summary, and compact ownership heads.
 Each head recomputes the terminal operation fingerprint, including the
 normalized field-reference commitment for create and edit, before its lifecycle
 status can affect capacity. Each active head then verifies its one-to-eight
 current field chunks, derives its normalized uniqueness scope, and validates the
 exact active lease. Non-active heads read neither fields nor leases.
+
+### Legacy Investment Ownership Migration
+
+`npm run migrate:legacy-investment-ownership -- --apply --manifest <path>` is
+the only operator command for pre-existing ownership initialization. It is a
+Node-only backend tool and is not imported by the Worker, route composition, or
+ordinary repositories. It never lists a storage collection or treats missing
+metadata as an empty participant. Do not run it against any live namespace
+without explicit approval.
+
+The ignored JSON manifest is the authority for scope and completeness. It has
+exact `schemaVersion: 1` and a `participants` array sorted by subject. The array
+contains at most 100 unique subjects. Each entry has exactly
+`participantSubject`, one globally unique stable `operationId`, and a complete
+`indications` array sorted by indication ID. That array contains at most 100
+unique IDs with exact current revision and `active`, `withdrawn`, or `rejected`
+status; at most four may be active. Unknown fields, duplicates, sparse arrays,
+non-canonical order, excess capacity, and an over-limit or growing file are
+rejected before storage access. The command does not generate, infer, list, or
+repair an inventory. Prepare it from a separately reviewed authoritative source
+and keep it only under ignored `migration-inventories/`.
+
+Configure `AITTADB_MIGRATION_ISSUER`, optional
+`AITTADB_MIGRATION_TRANSPORT_ORIGIN`, `AITTADB_MIGRATION_ENTRY_HREF`,
+`AITTADB_MIGRATION_CLIENT_ID`, and `AITTADB_MIGRATION_CLIENT_SECRET` only in the
+operator environment. The client must be temporary or otherwise dedicated,
+namespace-bound, have no browser origin or redirect, and have exactly
+`storage.read storage.write`. Its ID and secret must differ from one another and
+from every application service, OAuth, browser-mutation, owner-review, and proof
+value visible in the same environment. Never configure migration values as
+Sites settings.
+
+Each subject is processed sequentially through
+`initializeParticipantInvestmentOwnership`. The primitive verifies any legacy
+index or witness against the manifest, authenticates every current and immutable
+terminal head, validates active field chunks and uniqueness leases, and creates
+the root, index, and current witness in one three-record transaction. It stops
+at the first fixed failure and stores no separate checkpoint. Rerun the exact
+unchanged manifest to resume: completed subjects replay from their immutable
+root and operation receipt, while later subjects continue. A changed operation
+ID or inventory conflicts, and incomplete, crossed, missing, corrupt, or
+continuously changing evidence remains unavailable for operator investigation.
+Standard output contains only scanned, initialized, already-initialized, and
+indication counters; command and adapter failures contain no subject, record ID,
+credential, backend response, or transport exception.
 
 The malformed-input-safe adapter-read ceilings are 240 for capacity, 239 for
 first initialization, 241 for an initialized restart, and 479 for a maximum-size

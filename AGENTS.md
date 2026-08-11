@@ -25,6 +25,8 @@ Keep real Sites project identifiers in ignored `.openai/hosting.json` files, one
 
 Production persistence must use AittaDB. Browser storage, process memory, local files, direct Sites D1 tables, and temporary hosted storage are not production substitutes. Development may use a deterministic in-memory/test adapter, and the production AittaDB adapter must pass the same contract tests.
 
+Backend migration inventories are private operator input. Keep them under ignored `migration-inventories/`, use only a dedicated credential-closed command, and never run a live migration without explicit approval.
+
 ## Architecture Rules
 
 - Keep domain logic framework-independent and behind narrow repository interfaces.
@@ -123,6 +125,7 @@ README must state experimental status, FSL-1.1-MIT source availability with two-
 - Lint: `npm run lint`
 - Agent instruction budget: `npm run agents:check`
 - Plan dependency graph: `npm run plan:check`
+- Legacy ownership migration: `npm run migrate:legacy-investment-ownership -- --apply --manifest <ignored-path>`
 - Local validation: `npm run validate`
 - Sites package build: `npm run sites:package`
 
