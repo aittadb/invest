@@ -1,3 +1,4 @@
+import { constants as fsConstants } from "node:fs";
 import { open } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
@@ -135,6 +136,7 @@ function parseCommandConfigurationUnchecked(
     512,
     true,
   );
+  const ownerReviewKey = environment.OWNER_INDICATION_REVIEW_KEY;
   const reservedCredentials = [
     environment.AITTADB_STORAGE_CLIENT_ID,
     environment.AITTADB_STORAGE_CLIENT_SECRET,
@@ -143,12 +145,15 @@ function parseCommandConfigurationUnchecked(
     environment.BROWSER_MUTATION_SESSION_KEY,
     environment.AITTADB_OAUTH_TRANSACTION_KEY,
     environment.AITTADB_OAUTH_CSRF_KEY,
+    ownerReviewKey,
   ];
   if (
     clientId === clientSecret ||
     reservedCredentials.some((value) =>
       value !== undefined && (clientId === value || clientSecret === value)
-    )
+    ) ||
+    (ownerReviewKey !== undefined &&
+      environment.AITTADB_MIGRATION_OPERATOR_KEY === ownerReviewKey)
   ) invalid();
 
   return Object.freeze({
@@ -176,7 +181,10 @@ function parseCommandConfigurationUnchecked(
 async function openManifest(
   path: string,
 ): Promise<LegacyIndicationSummaryMigrationManifestFile> {
-  const file = await open(path, "r");
+  const file = await open(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+  );
   return Object.freeze({
     stat: async () => {
       const metadata = await file.stat({ bigint: true });

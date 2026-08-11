@@ -301,7 +301,7 @@ mutation, adapter, key-read, transaction, credential, or token-codec surface.
 
 Each page contains at most 25 allowlisted summaries. One adapter list and at
 most 25 terminal-transition reads, active-lease checks, and bounded current-field
-chunks produce the page, for a maximum of 250 record reads. Current metadata, terminal
+chunks produce the page, for a maximum of 475 record reads. Current metadata, terminal
 transition, acknowledgment, actor, operation fingerprint, field reference,
 chunk envelope, byte count, payload hash, and parsed fields must agree before a
 summary is returned. The projection includes only an authenticated opaque review ID, kind,

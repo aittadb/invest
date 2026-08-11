@@ -1,8 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { execFile as execFileCallback } from "node:child_process";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import {
   parseAmountAggregateConfiguration,
@@ -58,6 +68,8 @@ import {
   MemoryStorageState,
 } from "./support/memory-storage-adapter.ts";
 import { SyntheticAittaDBStorageService } from "./support/synthetic-aittadb-storage-service.ts";
+
+const execFile = promisify(execFileCallback);
 
 const ALICE = actorSubject("issuer.invalid/subject:alice-migration");
 const BOB = actorSubject("issuer.invalid/subject:bob-migration");
@@ -713,6 +725,7 @@ test("operator command requires separate credentials before touching a manifest"
     "BROWSER_MUTATION_SESSION_KEY",
     "AITTADB_OAUTH_TRANSACTION_KEY",
     "AITTADB_OAUTH_CSRF_KEY",
+    "OWNER_INDICATION_REVIEW_KEY",
   ] as const;
   for (const migrationKey of migrationKeys) {
     for (const reusedKey of separationKeys) {
@@ -743,6 +756,39 @@ test("operator command requires separate credentials before touching a manifest"
       );
       assert.equal(touched, false);
     }
+  }
+
+  for (const migrationKey of [
+    "AITTADB_MIGRATION_CLIENT_SECRET",
+    "AITTADB_MIGRATION_OPERATOR_KEY",
+  ] as const) {
+    let touched = false;
+    await assert.rejects(
+      () => executeLegacyIndicationSummaryMigrationCommand(
+        ["--apply", "--manifest", "private.json"],
+        {
+          ...environment,
+          [migrationKey]: environment.OWNER_INDICATION_REVIEW_KEY,
+        },
+        {
+          readManifest: async () => {
+            touched = true;
+            return manifest([]);
+          },
+          fetch: async () => {
+            touched = true;
+            throw new Error("Unexpected fetch.");
+          },
+        },
+      ),
+      (error: unknown) =>
+        error instanceof Error &&
+        error.message ===
+          "Legacy indication summary migration configuration is invalid." &&
+        !error.message.includes(environment.OWNER_INDICATION_REVIEW_KEY),
+      `${migrationKey} must not reuse OWNER_INDICATION_REVIEW_KEY`,
+    );
+    assert.equal(touched, false);
   }
 
   const service = new SyntheticAittaDBStorageService({
@@ -977,6 +1023,63 @@ test("operator command rejects same-size in-place manifest replacement", async (
   assert.equal(reads, 2);
   assert.equal(closes, 1);
   assert.equal(fetches, 0);
+});
+
+test("operator command rejects symlink and directory manifests before reading", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "invest-migration-paths-"));
+  const target = join(directory, "target.json");
+  const link = join(directory, "link.json");
+  const nestedDirectory = join(directory, "nested");
+  try {
+    await writeFile(target, JSON.stringify(manifest([])), "utf8");
+    await symlink(target, link);
+    await mkdir(nestedDirectory);
+
+    for (const path of [link, nestedDirectory]) {
+      await assert.rejects(
+        () => executeLegacyIndicationSummaryMigrationCommand(
+          ["--apply", "--manifest", path],
+          migrationEnvironment(),
+          {
+            fetch: async () => {
+              throw new Error("Unexpected fetch.");
+            },
+          },
+        ),
+        (error: unknown) =>
+          error instanceof Error &&
+          error.message ===
+            "Legacy indication summary migration configuration is invalid.",
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("operator command rejects a FIFO without waiting for a writer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "invest-migration-fifo-"));
+  const fifo = join(directory, "manifest.fifo");
+  try {
+    await execFile("mkfifo", [fifo]);
+    const outcome = await Promise.race([
+      executeLegacyIndicationSummaryMigrationCommand(
+        ["--apply", "--manifest", fifo],
+        migrationEnvironment(),
+        {
+          fetch: async () => {
+            throw new Error("Unexpected fetch.");
+          },
+        },
+      ).then(() => "completed", () => "rejected"),
+      new Promise<"timed-out">((resolve) => {
+        setTimeout(() => resolve("timed-out"), 1_000);
+      }),
+    ]);
+    assert.equal(outcome, "rejected");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 async function editedInactiveCompany(
@@ -1464,6 +1567,7 @@ function migrationEnvironment(): Record<string, string> {
     BROWSER_MUTATION_SESSION_KEY: "browser-mutation-session-key",
     AITTADB_OAUTH_TRANSACTION_KEY: "oauth-transaction-proof-key",
     AITTADB_OAUTH_CSRF_KEY: "oauth-csrf-proof-key-material",
+    OWNER_INDICATION_REVIEW_KEY: "owner-review-key-material",
   };
 }
 
