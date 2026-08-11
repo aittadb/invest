@@ -479,11 +479,7 @@ test("audited correction atomically asserts its advertised campaign revision", a
     "campaign-setup-current",
     "configured-campaign",
   );
-  state.records.set(storageKeyString(campaignKey), freezeRecord({
-    key: campaignKey,
-    revision: 1,
-    value: { kind: "campaign-revision-fixture" },
-  }));
+  setCampaignRevision(state, campaignKey, 1);
   const request = {
     operationId: "aggregate-operation:campaign-race-correction",
     expectedCampaignRevision: 1,
@@ -787,6 +783,25 @@ test("audited corrections reject a closed malformed transaction result matrix", 
         result,
         3,
         (record) => ({ ...record, revision: record.revision + 1 }),
+      ),
+    },
+    {
+      name: "malformed campaign check value",
+      apply: (result) => replaceTransactionResultRecord(
+        result,
+        3,
+        (record) => ({ ...record, value: { kind: "campaign-setup-revision" } }),
+      ),
+    },
+    {
+      name: "changed campaign check value revision",
+      apply: (result) => replaceTransactionResultRecord(
+        result,
+        3,
+        (record) => ({
+          ...record,
+          value: { ...record.value, revision: record.revision + 1 },
+        }),
       ),
     },
   ];
@@ -1272,8 +1287,21 @@ function setCampaignRevision(
   state.records.set(storageKeyString(key), freezeRecord({
     key,
     revision,
-    value: { kind: "campaign-revision-fixture" },
+    value: campaignRevisionDocument(revision),
   }));
+}
+
+function campaignRevisionDocument(revision: number): StorageDocument {
+  return Object.freeze({
+    kind: "campaign-setup-revision",
+    schemaVersion: 4,
+    revision,
+    recordedAt: "2026-08-09T00:00:00.000Z",
+    operationId: `campaign-operation:aggregate-fixture-${revision}`,
+    setupHash: `sha256:${"0".repeat(64)}`,
+    setupBytes: 1,
+    setupChunks: 1,
+  });
 }
 
 function hasStoredOperation(
@@ -1412,7 +1440,7 @@ class CampaignRevisionRaceAdapter implements StorageAdapter {
       this.#state.records.set(key, freezeRecord({
         key: current.key,
         revision: current.revision + 1,
-        value: { kind: "campaign-revision-raced" },
+        value: campaignRevisionDocument(current.revision + 1),
       }));
       this.raced = true;
     }

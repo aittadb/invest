@@ -294,7 +294,7 @@ test("hosted terminal exact retry recovers a lost correction response after rest
     exactResource,
     OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
   ), originalBody);
-  assert.equal(service.listRequests, listRequestsBeforeExact);
+  assert.equal(service.listRequests, listRequestsBeforeExact + 1);
   assert.equal(
     service.transactionOperationIds.filter((operationId) =>
       operationId === originalBody["operation-id"]
@@ -530,7 +530,7 @@ test("hosted exact retry survives campaign currency evolution and restart", asyn
     executionContext,
   );
   assert.equal(stale.status, 412);
-  assert.equal(service.listRequests, listRequestsBeforeRetries);
+  assert.equal(service.listRequests, listRequestsBeforeRetries + 1);
   assert.equal(
     (await new DevelopmentInMemoryAuditRepository(storageAdapter(service)).list({
       limit: 10,

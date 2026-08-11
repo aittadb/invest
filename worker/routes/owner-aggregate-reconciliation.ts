@@ -232,18 +232,24 @@ export function createOwnerAggregateReconciliationRouteHandler(
             ownerSubject: verified.actor.subject,
             occurredAt: currentTimestamp(now),
           });
-        try {
-          preview = previewInvestmentAggregateReconciliation(
-            correction.stored,
-            correction.preview.calculated,
-          );
-        } catch {
-          throw new StorageFailure("UNAVAILABLE");
+        if (correction.replayed) {
+          const current = await options.repository.previewReconciliationState();
+          preview = current.preview;
+          terminalReplay = current.terminalReplay;
+        } else {
+          try {
+            preview = previewInvestmentAggregateReconciliation(
+              correction.stored,
+              correction.preview.calculated,
+            );
+          } catch {
+            throw new StorageFailure("UNAVAILABLE");
+          }
+          if (preview.correctionRequired) {
+            throw new StorageFailure("UNAVAILABLE");
+          }
+          terminalReplay = terminalReplayFromMutation(mutation);
         }
-        if (preview.correctionRequired) {
-          throw new StorageFailure("UNAVAILABLE");
-        }
-        terminalReplay = terminalReplayFromMutation(mutation);
       }
 
       const consistency = options.repository.correctionConsistency satisfies

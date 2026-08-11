@@ -242,6 +242,58 @@ test("JSON and form mutations enforce the guard and bind the exact preview", asy
   }
 });
 
+test("an old exact replay projects only the bounded current state in HTML and JSON", async () => {
+  for (const accept of ["application/json", "text/html"] as const) {
+    const repository = new FakeAtomicReconciliationRepository(mismatchPreview());
+    repository.replayAgainstCurrent(advancedMatchingPreview(), null);
+    let proofCalls = 0;
+    let operationIdCalls = 0;
+    const handler = createOwnerAggregateReconciliationRouteHandler({
+      repository,
+      guardMutation: await mutationGuard(),
+      csrfToken: async () => {
+        proofCalls += 1;
+        return CSRF_TOKEN;
+      },
+      issueOperationId: () => {
+        operationIdCalls += 1;
+        return "aggregate-correction:must-not-be-issued";
+      },
+      now: () => new Date(OCCURRED_AT),
+    });
+    const response = await requiredResponse(await handler(context(new Request(
+      `${ORIGIN}${PATH}`,
+      {
+        method: "POST",
+        headers: {
+          Accept: accept,
+          "Content-Type": "application/json",
+          Origin: ORIGIN,
+          [MUTATION_CSRF_HEADER]: CSRF_TOKEN,
+        },
+        body: JSON.stringify(correctionFields()),
+      },
+    ))));
+    const body = await response.text();
+
+    assert.equal(response.status, 200);
+    assert.match(body, accept === "application/json"
+      ? /"stored":\{"revision":3,"amount":15000/u
+      : /<th scope="row">Stored<\/th><td>3<\/td><td>15000<\/td><td>XYZ<\/td>/u);
+    assert.doesNotMatch(
+      body,
+      accept === "application/json"
+        ? new RegExp(OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION, "u")
+        : /Retry recorded correction|<form/u,
+    );
+    assert.equal(response.headers.get(MUTATION_CSRF_HEADER), null);
+    assert.equal(repository.applyCalls.length, 1);
+    assert.equal(repository.previewCalls, 1);
+    assert.equal(proofCalls, 0);
+    assert.equal(operationIdCalls, 0);
+  }
+});
+
 test("maximum stored revision omits correction actions and proof in HTML and JSON", async () => {
   const repository = new FakeAtomicReconciliationRepository(overflowPreview());
   let proofCalls = 0;
@@ -629,6 +681,10 @@ implements CampaignRevisionBoundAggregateCorrectionRepository {
   failure: StorageFailure | null = null;
   terminalReplay: InvestmentAggregateCorrectionTerminalReplay | null;
   #preview: InvestmentAggregateReconciliationPreview;
+  #replayCurrentState: Readonly<{
+    preview: InvestmentAggregateReconciliationPreview;
+    terminalReplay: InvestmentAggregateCorrectionTerminalReplay | null;
+  }> | null = null;
 
   constructor(
     preview: InvestmentAggregateReconciliationPreview,
@@ -636,6 +692,13 @@ implements CampaignRevisionBoundAggregateCorrectionRepository {
   ) {
     this.#preview = preview;
     this.terminalReplay = terminalReplay;
+  }
+
+  replayAgainstCurrent(
+    preview: InvestmentAggregateReconciliationPreview,
+    terminalReplay: InvestmentAggregateCorrectionTerminalReplay | null,
+  ): void {
+    this.#replayCurrentState = Object.freeze({ preview, terminalReplay });
   }
 
   async previewReconciliation(): Promise<InvestmentAggregateReconciliationPreview> {
@@ -657,11 +720,18 @@ implements CampaignRevisionBoundAggregateCorrectionRepository {
     if (this.failure) throw this.failure;
     this.applyCalls.push(request);
     const previous = this.#preview;
-    this.#preview = matchingPreview();
-    this.terminalReplay = terminalReplay();
+    const correction = matchingPreview();
+    const replayed = this.#replayCurrentState !== null;
+    if (this.#replayCurrentState === null) {
+      this.#preview = correction;
+      this.terminalReplay = terminalReplay();
+    } else {
+      this.#preview = this.#replayCurrentState.preview;
+      this.terminalReplay = this.#replayCurrentState.terminalReplay;
+    }
     return {
       preview: previous,
-      stored: this.#preview.stored,
+      stored: correction.stored,
       auditEvent: {
         id: "aggregate-audit:test",
         operationId: request.operationId,
@@ -676,7 +746,7 @@ implements CampaignRevisionBoundAggregateCorrectionRepository {
           transition: "reconciled",
         },
       },
-      replayed: false,
+      replayed,
     } as ApplyAuditedAggregateCorrectionResult;
   }
 }
@@ -772,6 +842,24 @@ function matchingPreview(): InvestmentAggregateReconciliationPreview {
     },
     correctionRequired: false,
   } as InvestmentAggregateReconciliationPreview;
+}
+
+function advancedMatchingPreview(): InvestmentAggregateReconciliationPreview {
+  return {
+    status: "match",
+    stored: {
+      revision: 3,
+      totalAmount: 15_000 as never,
+      currency: "XYZ" as never,
+      contributingIndicationCount: 2,
+    },
+    calculated: {
+      totalAmount: 15_000 as never,
+      currency: "XYZ" as never,
+      contributingIndicationCount: 2,
+    },
+    correctionRequired: false,
+  };
 }
 
 function overflowPreview(): InvestmentAggregateReconciliationPreview {

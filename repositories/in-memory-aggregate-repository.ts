@@ -52,6 +52,10 @@ import {
   prepareAuditAppend,
   verifyPreparedAuditAppend,
 } from "./in-memory-audit-notification-repositories.ts";
+import {
+  campaignSetupRevisionCheck,
+  verifyCampaignSetupRevisionCheckRecord,
+} from "./in-memory-campaign-repository.ts";
 
 const AGGREGATE_SCHEMA_VERSION = 1;
 const AGGREGATE_STATES = storageCollection("investment-aggregate-states");
@@ -1959,11 +1963,11 @@ function requiredCorrectionRevisionAssertion(
       !Number.isSafeInteger(source.expectedRevision) ||
       (source.expectedRevision as number) < 1
     ) invalidRequest();
-    return Object.freeze({
-      type: "check" as const,
-      key: parsedKey.value,
-      expectedRevision: source.expectedRevision as number,
-    });
+    const assertion = campaignSetupRevisionCheck(source.expectedRevision);
+    if (storageKeyString(parsedKey.value) !== storageKeyString(assertion.key)) {
+      invalidRequest();
+    }
+    return assertion;
   } catch (error) {
     if (error instanceof StorageFailure) throw error;
     invalidRequest();
@@ -1986,12 +1990,7 @@ function verifyCorrectionRevisionAssertion(
   value: StorageRecord | null | undefined,
   assertion: AggregateCorrectionRevisionAssertion,
 ): void {
-  if (
-    value === null ||
-    value === undefined ||
-    storageKeyString(value.key) !== storageKeyString(assertion.key) ||
-    value.revision !== assertion.expectedRevision
-  ) unavailable();
+  verifyCampaignSetupRevisionCheckRecord(value, assertion.expectedRevision);
 }
 
 function exactStorageTransactionResult(
