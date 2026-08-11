@@ -104,6 +104,8 @@ When the owner marks a package version as material, the reader sees that renewed
 
 The registered reader can update editable profile details, change declared interest, withdraw marketing consent, review accepted acknowledgment versions, and request account deletion according to the published retention policy.
 
+Completing an account-deletion request withdraws every active founder and investment indication and removes each active investment contribution in the same atomic application operation. Already withdrawn or rejected history remains terminal. If complete bounded ownership or aggregate evidence cannot be verified, the operation changes none of those records.
+
 ## Investor Participant Use Cases
 
 ### UC-INV-001: Accept Current Acknowledgment

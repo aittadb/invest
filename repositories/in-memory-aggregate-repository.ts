@@ -71,6 +71,7 @@ const CURRENT_AGGREGATE_KEY = requiredStorageKey(
 export const MAX_AGGREGATE_CONTRIBUTION_LIST_PAGES = 20;
 export const MAX_AGGREGATE_CONTRIBUTION_LIST_READS = 20;
 export const MAX_AGGREGATE_CONTRIBUTION_RECORDS = 1_000;
+export const MAX_ATOMIC_AGGREGATE_WITHDRAWAL_CONTRIBUTIONS = 4;
 const MAX_AGGREGATE_CONTRIBUTION_CURSOR_LENGTH = 2_048;
 const MAX_AGGREGATE_TRANSACTION_RESULT_DEPTH = 32;
 const MAX_AGGREGATE_TRANSACTION_RESULT_NODES = 4_096;
@@ -167,6 +168,12 @@ export type PreparedAtomicAggregateContribution = Readonly<{
   operationFingerprint: string;
   contribution: InvestmentAggregateContribution;
   result: Omit<ApplyAggregateContributionResult, "replayed">;
+  mutations: readonly StorageMutation[];
+}>;
+
+export type PreparedAtomicAggregateWithdrawalSet = Readonly<{
+  contributions: readonly InvestmentAggregateContribution[];
+  stored: StoredInvestmentAggregateSnapshot;
   mutations: readonly StorageMutation[];
 }>;
 
@@ -352,6 +359,80 @@ export async function prepareAtomicAggregateContribution(
     result,
     mutations,
   });
+}
+
+/**
+ * Prepare one aggregate revision for a bounded set of account-deletion
+ * withdrawals. The caller owns the outer transaction and retry receipt.
+ */
+export async function prepareAtomicAggregateWithdrawalSet(
+  storage: Pick<StorageAdapter, "read">,
+  values: unknown,
+  currency: CurrencyCode,
+): Promise<PreparedAtomicAggregateWithdrawalSet> {
+  const expectedCurrency = requiredCurrency(currency);
+  const contributions = requiredAggregateWithdrawalContributions(
+    values,
+    expectedCurrency,
+  );
+  const aggregateRecord = await storage.read(CURRENT_AGGREGATE_KEY);
+  const stored = aggregateRecord === null
+    ? zeroStoredSnapshot(expectedCurrency)
+    : decodeAggregateRecord(aggregateRecord, expectedCurrency);
+  if (contributions.length === 0) {
+    return deepFreeze({ contributions, stored, mutations: [] });
+  }
+  if (stored.revision === Number.MAX_SAFE_INTEGER) preconditionFailed();
+
+  let removedAmount = 0;
+  const contributionMutations: StorageMutation[] = [];
+  for (const contribution of contributions) {
+    const contributionKey = contributionStorageKey(contribution.indicationId);
+    const currentRecord = await storage.read(contributionKey);
+    if (currentRecord === null) unavailable();
+    const current = decodeContributionRecord(currentRecord, expectedCurrency);
+    if (
+      currentRecord.revision !== current.indicationRevision ||
+      current.status !== "active" ||
+      contribution.indicationRevision !== current.indicationRevision + 1 ||
+      contribution.amount !== current.amount ||
+      contribution.currency !== current.currency
+    ) {
+      unavailable();
+    }
+    if (removedAmount > Number.MAX_SAFE_INTEGER - current.amount) unavailable();
+    removedAmount += current.amount;
+    contributionMutations.push(Object.freeze({
+      type: "put" as const,
+      key: contributionKey,
+      expectedRevision: currentRecord.revision,
+      value: contributionDocument(contribution),
+    }));
+  }
+  if (
+    stored.totalAmount < removedAmount ||
+    stored.contributingIndicationCount < contributions.length
+  ) {
+    unavailable();
+  }
+  const nextStored = deepFreeze({
+    revision: stored.revision + 1,
+    totalAmount: (stored.totalAmount - removedAmount) as MinorUnits,
+    currency: stored.currency,
+    contributingIndicationCount:
+      stored.contributingIndicationCount - contributions.length,
+  });
+  summaryFromStored(nextStored);
+  const mutations = Object.freeze([
+    Object.freeze({
+      type: "put" as const,
+      key: CURRENT_AGGREGATE_KEY,
+      expectedRevision: aggregateRecord?.revision ?? null,
+      value: aggregateDocument(nextStored),
+    }),
+    ...contributionMutations,
+  ] satisfies readonly StorageMutation[]);
+  return deepFreeze({ contributions, stored: nextStored, mutations });
 }
 
 /** Verify the immutable aggregate receipt for a completed atomic operation. */
@@ -1165,6 +1246,34 @@ function requiredContribution(
   });
   calculateRequestedSummary([contribution], currency);
   return contribution;
+}
+
+function requiredAggregateWithdrawalContributions(
+  value: unknown,
+  currency: CurrencyCode,
+): readonly InvestmentAggregateContribution[] {
+  const length = Array.isArray(value) ? exactArrayLength(value) : null;
+  const candidates = length === null ||
+      length > MAX_ATOMIC_AGGREGATE_WITHDRAWAL_CONTRIBUTIONS
+    ? null
+    : exactArrayValues(value, length);
+  if (candidates === null) invalidRequest();
+  const contributions = candidates.map((candidate) =>
+    requiredContribution(candidate, currency)
+  );
+  for (let index = 0; index < contributions.length; index += 1) {
+    const candidate = contributions[index];
+    const previous = contributions[index - 1];
+    if (
+      candidate === undefined ||
+      candidate.status !== "withdrawn" ||
+      (previous !== undefined &&
+        previous.indicationId >= candidate.indicationId)
+    ) {
+      invalidRequest();
+    }
+  }
+  return Object.freeze(contributions);
 }
 
 function aggregateDocument(

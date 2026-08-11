@@ -12,7 +12,9 @@ import {
   parseActorSubject,
   parseMinorUnits,
   parseStableId,
+  parseTimestamp,
   type ActorSubject,
+  type Timestamp,
 } from "../domain/foundation.ts";
 import {
   projectInvestmentIndicationForAggregation,
@@ -21,8 +23,10 @@ import {
 import {
   MAX_INVESTMENT_INDICATION_REVISIONS,
   type InvestmentIndication,
+  type InvestmentIndicationHistoryEntryId,
   type InvestmentIndicationId,
   type InvestmentIndicationParsingOptions,
+  type WithdrawnInvestmentIndication,
 } from "../domain/investment-indication.ts";
 import {
   MAX_STORAGE_TRANSACTION_MUTATIONS,
@@ -46,7 +50,9 @@ import {
 } from "../domain/storage-adapter.ts";
 import {
   DevelopmentInMemoryAggregateRepository,
+  MAX_ATOMIC_AGGREGATE_WITHDRAWAL_CONTRIBUTIONS,
   prepareAtomicAggregateContribution,
+  prepareAtomicAggregateWithdrawalSet,
   readAtomicAggregateContributionReplay,
 } from "./in-memory-aggregate-repository.ts";
 import {
@@ -57,6 +63,7 @@ import {
 import {
   DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_FIELDS_CHUNKS,
+  MAX_INDICATION_STORAGE_READS,
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
   MAX_OWNED_INVESTMENT_INDICATIONS,
@@ -78,6 +85,7 @@ import {
   type AtomicParticipantInvestmentInterestResult,
   type ParticipantInvestmentInterestReader,
 } from "../worker/participant-investment-mutation-port.ts";
+import { StagedStorageTransaction as SharedStagedStorageTransaction } from "./staged-storage-transaction.ts";
 
 const PARTICIPANT_INDEX_SCHEMA_VERSION = 1;
 const PARTICIPANT_OPERATION_SCHEMA_VERSION = 2;
@@ -99,7 +107,11 @@ export const MAX_PARTICIPANT_OWNERSHIP_RESTART_READS =
   1 + MAX_PARTICIPANT_CAPACITY_READS;
 export const MAX_PARTICIPANT_OWNERSHIP_CONCURRENT_REPLAY_READS =
   MAX_PARTICIPANT_OWNERSHIP_FIRST_INITIALIZATION_READS +
-  MAX_PARTICIPANT_CAPACITY_READS;
+    MAX_PARTICIPANT_CAPACITY_READS;
+export const MAX_PARTICIPANT_ACCOUNT_DELETION_WITHDRAWAL_SET_READS =
+  MAX_PARTICIPANT_CAPACITY_READS +
+  MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS *
+    (MAX_INDICATION_STORAGE_READS + 9) + 4;
 const PARTICIPANT_INDEXES = collection("participant-investment-indexes");
 const PARTICIPANT_OPERATIONS = collection("participant-investment-operations");
 const PARTICIPANT_OWNERSHIP_ROOTS = collection(
@@ -156,6 +168,10 @@ const AGGREGATE_KEYS = new Set([
 const TRANSACTION_RESULT_KEYS = new Set(["replayed", "records"]);
 const STORAGE_RECORD_KEYS = new Set(["key", "revision", "value"]);
 const STORAGE_KEY_KEYS = new Set(["collection", "id"]);
+const ACCOUNT_DELETION_WITHDRAWAL_SET_REQUEST_KEYS = new Set([
+  "operationId",
+  "requestedAt",
+]);
 
 type ParticipantIndex = Readonly<{
   record: StorageRecord | null;
@@ -191,10 +207,40 @@ export type ParticipantInvestmentOwnershipInitializationResult = Readonly<{
   activeCount: number;
 }>;
 
+export type ParticipantAccountDeletionInvestmentWithdrawalSetRequest = Readonly<{
+  operationId: unknown;
+  requestedAt: unknown;
+}>;
+
+export type PreparedParticipantAccountDeletionInvestmentWithdrawal = Readonly<{
+  operationId: StorageOperationId;
+  historyEntryId: InvestmentIndicationHistoryEntryId;
+  indication: WithdrawnInvestmentIndication;
+}>;
+
+export type PreparedParticipantAccountDeletionInvestmentWithdrawalSet = Readonly<{
+  participantSubject: ActorSubject;
+  operationId: StorageOperationId;
+  requestedAt: Timestamp;
+  withdrawals: readonly PreparedParticipantAccountDeletionInvestmentWithdrawal[];
+  aggregate: StoredInvestmentAggregateSnapshot;
+  mutationCount: number;
+}>;
+
 type ParsedOwnershipInitialization = Readonly<{
   operationId: StorageOperationId;
   indications: readonly ParticipantIndicationOwnershipEntry[];
   fingerprint: string;
+}>;
+
+type ParsedAccountDeletionWithdrawalSetRequest = Readonly<{
+  operationId: StorageOperationId;
+  requestedAt: Timestamp;
+}>;
+
+type AccountDeletionWithdrawalIdentity = Readonly<{
+  operationId: StorageOperationId;
+  historyEntryId: InvestmentIndicationHistoryEntryId;
 }>;
 
 type ParticipantMigrationWitness = Readonly<{
@@ -300,6 +346,157 @@ export async function initializeParticipantInvestmentOwnership(
       requireMatchingInitializationRoot(complete.root, parsed, "stored");
     }
     return ownershipInitializationResult(parsed.indications, result.replayed);
+  } catch (error) {
+    return mapRepositoryError(error);
+  }
+}
+
+/**
+ * Stage every active investment withdrawal needed by one account-deletion
+ * coordinator. This function never commits the supplied staging boundary.
+ */
+export async function stageParticipantAccountDeletionInvestmentWithdrawalSet(
+  staged: SharedStagedStorageTransaction,
+  participantSubject: unknown,
+  amountConfiguration: AmountConfiguration,
+  request: ParticipantAccountDeletionInvestmentWithdrawalSetRequest,
+  parsingOptions: InvestmentIndicationParsingOptions = {},
+): Promise<PreparedParticipantAccountDeletionInvestmentWithdrawalSet> {
+  try {
+    const boundary = requiredDeletionStagingBoundary(staged);
+    const subject = requiredSubject(participantSubject);
+    const amount = requiredAmountConfiguration(amountConfiguration);
+    const parsed = parseAccountDeletionWithdrawalSetRequest(request);
+    const complete = await readCompleteParticipantIndex(boundary, subject);
+    const active = complete.witness.indications.filter((entry) =>
+      entry.lifecycleStatus === "active"
+    );
+    if (
+      active.length > MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS ||
+      active.length > MAX_ATOMIC_AGGREGATE_WITHDRAWAL_CONTRIBUTIONS
+    ) {
+      unavailable();
+    }
+
+    if (active.length === 0) {
+      const aggregate = await prepareAtomicAggregateWithdrawalSet(
+        boundary,
+        Object.freeze([]),
+        amount.currency,
+      );
+      return Object.freeze({
+        participantSubject: subject,
+        operationId: parsed.operationId,
+        requestedAt: parsed.requestedAt,
+        withdrawals: Object.freeze([]),
+        aggregate: aggregate.stored,
+        mutationCount: 0,
+      });
+    }
+
+    const witnessKey = await participantOwnershipWitnessKey(subject);
+    const withdrawals: PreparedParticipantAccountDeletionInvestmentWithdrawal[] = [];
+    const indicationMutations: StorageMutation[] = [];
+    let simulatedStorage: StorageAdapter = boundary;
+    let nextOwnership = complete.witness.indications;
+    for (const entry of active) {
+      const identity = await accountDeletionWithdrawalIdentity(
+        parsed.operationId,
+        subject,
+        entry.indicationId,
+      );
+      const layer = new StagedStorageTransaction(
+        simulatedStorage,
+        identity.operationId,
+      );
+      const indications = new DevelopmentInMemoryIndicationRepository(
+        layer,
+        subject,
+        null,
+        amount,
+        parsingOptions,
+      );
+      const result = await indications.withdraw({
+        operationId: identity.operationId,
+        id: entry.indicationId,
+        occurredAt: parsed.requestedAt,
+        historyEntryId: identity.historyEntryId,
+        expectedRevision: entry.indicationRevision,
+      });
+      if (
+        result.replayed ||
+        result.snapshot.participantSubject !== subject ||
+        result.snapshot.id !== entry.indicationId ||
+        result.snapshot.revision !== entry.indicationRevision + 1 ||
+        result.snapshot.lifecycle.status !== "withdrawn"
+      ) {
+        unavailable();
+      }
+      indicationMutations.push(...preparedWithdrawalMutations(
+        layer.request(),
+        identity.operationId,
+        witnessKey,
+        entry.indicationRevision,
+      ));
+      nextOwnership = replaceOwnershipEntry(
+        nextOwnership,
+        result.snapshot,
+        false,
+      );
+      withdrawals.push(Object.freeze({
+        ...identity,
+        indication: result.snapshot,
+      }));
+      simulatedStorage = layer;
+    }
+
+    const indexMutation = await participantIndexMutation(
+      subject,
+      complete.index,
+      complete.index.ids,
+    );
+    const witnessMutation = await participantOwnershipWitnessMutation(
+      subject,
+      complete.witness.record,
+      nextOwnership,
+    );
+    const aggregate = await prepareAtomicAggregateWithdrawalSet(
+      boundary,
+      Object.freeze(withdrawals.map(({ indication }) =>
+        projectInvestmentIndicationForAggregation(indication)
+      )),
+      amount.currency,
+    );
+    const mutations = Object.freeze([
+      ...indicationMutations,
+      indexMutation,
+      witnessMutation,
+      ...aggregate.mutations,
+    ] satisfies readonly StorageMutation[]);
+    if (
+      mutations.length !== 4 * withdrawals.length + 3 ||
+      mutations.length > 19 ||
+      mutations.length > MAX_STORAGE_TRANSACTION_MUTATIONS ||
+      new Set(mutations.map(({ key }) => storageKeyString(key))).size !==
+        mutations.length
+    ) {
+      unavailable();
+    }
+    const stagedResult = await boundary.transact(Object.freeze({
+      operationId: parsed.operationId,
+      mutations,
+    }));
+    if (stagedResult.replayed || stagedResult.records.length !== mutations.length) {
+      unavailable();
+    }
+    return Object.freeze({
+      participantSubject: subject,
+      operationId: parsed.operationId,
+      requestedAt: parsed.requestedAt,
+      withdrawals: Object.freeze(withdrawals),
+      aggregate: aggregate.stored,
+      mutationCount: mutations.length,
+    });
   } catch (error) {
     return mapRepositoryError(error);
   }
@@ -893,6 +1090,82 @@ async function verifyOwnershipHeads(
       actual.lifecycleStatus !== expected.lifecycleStatus
     ) unavailable();
   }
+}
+
+function parseAccountDeletionWithdrawalSetRequest(
+  request: ParticipantAccountDeletionInvestmentWithdrawalSetRequest,
+): ParsedAccountDeletionWithdrawalSetRequest {
+  let source: Record<string, unknown>;
+  try {
+    source = exactRecord(request, ACCOUNT_DELETION_WITHDRAWAL_SET_REQUEST_KEYS);
+  } catch {
+    return invalid();
+  }
+  const operationId = parseStorageOperationId(source.operationId);
+  const requestedAt = parseTimestamp(source.requestedAt);
+  if (!operationId.ok || !requestedAt.ok) invalid();
+  return Object.freeze({
+    operationId: operationId.value,
+    requestedAt: requestedAt.value,
+  });
+}
+
+async function accountDeletionWithdrawalIdentity(
+  operationId: StorageOperationId,
+  subject: ActorSubject,
+  indicationId: InvestmentIndicationId,
+): Promise<AccountDeletionWithdrawalIdentity> {
+  const suffix = await digest(canonicalJson({
+    kind: "participant-account-deletion-investment-withdrawal",
+    operationId,
+    participantSubject: subject,
+    indicationId,
+  }));
+  const withdrawalOperationId = parseStorageOperationId(
+    `account-deletion-withdrawal:${suffix}`,
+  );
+  const historyEntryId = parseStableId<"investment-indication-history-entry">(
+    `indication-history:account-deletion-${suffix}`,
+  );
+  if (!withdrawalOperationId.ok || !historyEntryId.ok) unavailable();
+  return Object.freeze({
+    operationId: withdrawalOperationId.value,
+    historyEntryId: historyEntryId.value,
+  });
+}
+
+function preparedWithdrawalMutations(
+  request: StorageTransactionRequest,
+  operationId: StorageOperationId,
+  witnessKey: StorageKey,
+  expectedRevision: number,
+): readonly StorageMutation[] {
+  const normalized = normalizeStorageTransactionRequest(request);
+  if (
+    normalized.operationId !== operationId ||
+    normalized.mutations.length !== 4
+  ) {
+    unavailable();
+  }
+  const [current, history, lease, witness] = normalized.mutations;
+  if (
+    current?.type !== "put" ||
+    current.expectedRevision !== expectedRevision ||
+    history?.type !== "put" ||
+    history.expectedRevision !== null ||
+    lease?.type !== "delete" ||
+    lease.expectedRevision !== 1 ||
+    witness?.type !== "put" ||
+    storageKeyString(witness.key) !== storageKeyString(witnessKey) ||
+    [current, history, lease].some((mutation) =>
+      storageKeyString(mutation.key) === storageKeyString(witnessKey)
+    ) ||
+    new Set([current, history, lease].map(({ key }) => storageKeyString(key)))
+        .size !== 3
+  ) {
+    unavailable();
+  }
+  return Object.freeze([current, history, lease]);
 }
 
 async function parseOwnershipInitializationRequest(
@@ -1561,6 +1834,15 @@ function requiredStorageAdapter(value: StorageAdapter): StorageAdapter {
     typeof value.list !== "function" ||
     typeof value.transact !== "function"
   ) throw new Error("Invalid participant investment repository configuration.");
+  return value;
+}
+
+function requiredDeletionStagingBoundary(
+  value: SharedStagedStorageTransaction,
+): SharedStagedStorageTransaction {
+  if (!(value instanceof SharedStagedStorageTransaction)) {
+    throw new Error("Invalid account-deletion staging boundary.");
+  }
   return value;
 }
 
