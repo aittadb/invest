@@ -22,7 +22,6 @@ import {
 } from "./public-campaign-resource.ts";
 
 export const INVESTMENT_INTEREST_PATH = "/participant/investment-interests";
-export const MAX_PARTICIPANT_INVESTMENT_INTERESTS = 100;
 
 export type PersonalInvestmentInterestFieldsData = Readonly<{
   kind: "personal";

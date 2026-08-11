@@ -1,7 +1,4 @@
 import type { DeploymentPublicationReadinessCheck } from "../domain/campaign-publication-readiness.ts";
-import type { AmountConfiguration } from "../domain/amount-aggregate-configuration.ts";
-import type { ActorSubject } from "../domain/foundation.ts";
-import type { InvestmentIndicationParsingOptions } from "../domain/investment-indication.ts";
 import type {
   BrowserMutationReplayClaimer,
   BrowserMutationSession,
@@ -11,6 +8,9 @@ import type {
   CampaignSetupRevision,
   PublicCampaignPresentationReader,
 } from "../repositories/in-memory-campaign-repository.ts";
+import type { ActorSubject } from "../domain/foundation.ts";
+import type { AmountConfiguration } from "../domain/amount-aggregate-configuration.ts";
+import type { InvestmentIndicationParsingOptions } from "../domain/investment-indication.ts";
 import type { ParticipantAccount } from "../domain/participant-profile.ts";
 import type { ParticipantRequestRepositoryScope } from "../repositories/storage-application-repository-factory.ts";
 import type { ParticipantRegistrationRepository } from "../repositories/in-memory-participant-repository.ts";
