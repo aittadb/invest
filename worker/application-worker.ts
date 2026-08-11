@@ -56,7 +56,6 @@ import type {
   ParticipantFounderApplicationRepositories,
   ParticipantRequestRepositoryScope,
 } from "../repositories/storage-application-repository-factory.ts";
-import type { ParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
 import {
   StorageFailure,
   parseStorageOperationId,
