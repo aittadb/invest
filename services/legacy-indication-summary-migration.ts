@@ -1,4 +1,6 @@
 import {
+  MAX_ACTOR_SUBJECT_LENGTH,
+  MAX_STABLE_ID_LENGTH,
   parseActorSubject,
   parseStableId,
   type ActorSubject,
@@ -12,6 +14,22 @@ import { migrateLegacyIndicationCurrentSummary } from "../repositories/in-memory
 
 export const LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_VERSION = 1;
 export const MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_ENTRIES = 100;
+const MAX_JSON_STRING_BYTES_PER_CODE_UNIT = 6;
+const MAX_MANIFEST_ACTOR_SUBJECT_JSON_BYTES =
+  2 + MAX_ACTOR_SUBJECT_LENGTH * MAX_JSON_STRING_BYTES_PER_CODE_UNIT;
+const MAX_MANIFEST_INDICATION_ID_JSON_BYTES = 2 + MAX_STABLE_ID_LENGTH;
+const MANIFEST_PREFIX_BYTES = '{"schemaVersion":1,"indications":['.length;
+const MANIFEST_SUFFIX_BYTES = "]}".length;
+const MANIFEST_ENTRY_OVERHEAD_BYTES =
+  '{"participantSubject":'.length + ',"indicationId":'.length + "}".length;
+export const MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES =
+  MANIFEST_PREFIX_BYTES + MANIFEST_SUFFIX_BYTES +
+  MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_ENTRIES * (
+    MANIFEST_ENTRY_OVERHEAD_BYTES +
+    MAX_MANIFEST_ACTOR_SUBJECT_JSON_BYTES +
+    MAX_MANIFEST_INDICATION_ID_JSON_BYTES
+  ) +
+  (MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_ENTRIES - 1);
 
 const MANIFEST_KEYS = new Set(["schemaVersion", "indications"]);
 const ENTRY_KEYS = new Set(["participantSubject", "indicationId"]);

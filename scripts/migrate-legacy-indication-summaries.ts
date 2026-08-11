@@ -1,4 +1,4 @@
-import { readFile, stat } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
@@ -8,11 +8,11 @@ import {
   type AittaDBServiceTokenProvider,
 } from "../services/aittadb-service-token.ts";
 import {
+  MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES,
   runLegacyIndicationSummaryMigration,
   type LegacyIndicationSummaryMigrationResult,
 } from "../services/legacy-indication-summary-migration.ts";
 
-const MANIFEST_MAX_BYTES = 65_536;
 const TOKEN_REQUEST_TIMEOUT_MS = 10_000;
 const STORAGE_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -33,7 +33,23 @@ export type LegacyIndicationSummaryMigrationCommandDependencies = Readonly<{
   fetch?: AittaDBServiceTokenFetch;
   now?: () => Date;
   readManifest?: (path: string) => Promise<unknown>;
+  openManifest?: LegacyIndicationSummaryMigrationManifestOpener;
 }>;
+
+export type LegacyIndicationSummaryMigrationManifestFile = Readonly<{
+  stat(): Promise<Readonly<{ size: number; isFile(): boolean }>>;
+  read(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<Readonly<{ bytesRead: number }>>;
+  close(): Promise<void>;
+}>;
+
+export type LegacyIndicationSummaryMigrationManifestOpener = (
+  path: string,
+) => Promise<LegacyIndicationSummaryMigrationManifestFile>;
 
 /** Execute the backend-only command and return only content-free counters. */
 export async function executeLegacyIndicationSummaryMigrationCommand(
@@ -57,9 +73,12 @@ export async function executeLegacyIndicationSummaryMigrationCommand(
     fetch: providerFetch,
     requestTimeoutMs: STORAGE_REQUEST_TIMEOUT_MS,
   });
-  const inventory = await (dependencies.readManifest ?? readManifest)(
-    configuration.manifestPath,
-  );
+  const inventory = dependencies.readManifest === undefined
+    ? await readManifest(
+        configuration.manifestPath,
+        dependencies.openManifest ?? openManifest,
+      )
+    : await dependencies.readManifest(configuration.manifestPath);
   return runLegacyIndicationSummaryMigration(storage, inventory);
 }
 
@@ -106,9 +125,20 @@ function parseCommandConfigurationUnchecked(
     512,
     true,
   );
+  const reservedCredentials = [
+    environment.AITTADB_STORAGE_CLIENT_ID,
+    environment.AITTADB_STORAGE_CLIENT_SECRET,
+    environment.AITTADB_OAUTH_CLIENT_ID,
+    environment.AITTADB_OAUTH_CLIENT_SECRET,
+    environment.BROWSER_MUTATION_SESSION_KEY,
+    environment.AITTADB_OAUTH_TRANSACTION_KEY,
+    environment.AITTADB_OAUTH_CSRF_KEY,
+  ];
   if (
-    clientId === environment.AITTADB_STORAGE_CLIENT_ID ||
-    clientSecret === environment.AITTADB_STORAGE_CLIENT_SECRET
+    clientId === clientSecret ||
+    reservedCredentials.some((value) =>
+      value !== undefined && (clientId === value || clientSecret === value)
+    )
   ) invalid();
 
   return Object.freeze({
@@ -133,18 +163,56 @@ function parseCommandConfigurationUnchecked(
   });
 }
 
-async function readManifest(path: string): Promise<unknown> {
+async function openManifest(
+  path: string,
+): Promise<LegacyIndicationSummaryMigrationManifestFile> {
+  return open(path, "r");
+}
+
+async function readManifest(
+  path: string,
+  opener: LegacyIndicationSummaryMigrationManifestOpener,
+): Promise<unknown> {
+  let file: LegacyIndicationSummaryMigrationManifestFile | null = null;
   try {
-    const metadata = await stat(path);
-    if (!metadata.isFile() || metadata.size < 1 || metadata.size > MANIFEST_MAX_BYTES) {
+    file = await opener(path);
+    const metadata = await file.stat();
+    if (
+      !metadata.isFile() ||
+      !Number.isSafeInteger(metadata.size) ||
+      metadata.size < 1 ||
+      metadata.size > MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES
+    ) {
       invalid();
     }
-    const bytes = await readFile(path);
-    if (bytes.byteLength < 1 || bytes.byteLength > MANIFEST_MAX_BYTES) invalid();
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const bytes = new Uint8Array(
+      MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES + 1,
+    );
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const requested = bytes.byteLength - offset;
+      const result = await file.read(bytes, offset, requested, offset);
+      if (
+        !Number.isSafeInteger(result.bytesRead) ||
+        result.bytesRead < 0 ||
+        result.bytesRead > requested
+      ) invalid();
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    if (
+      offset < 1 ||
+      offset > MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES ||
+      offset !== metadata.size
+    ) invalid();
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(
+      bytes.subarray(0, offset),
+    );
     return JSON.parse(text) as unknown;
   } catch {
     invalid();
+  } finally {
+    if (file !== null) await file.close().catch(() => undefined);
   }
 }
 

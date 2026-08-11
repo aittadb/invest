@@ -16,6 +16,7 @@ import {
   createInvestmentIndication,
   editInvestmentIndication,
   MAX_INVESTMENT_INDICATION_REVISIONS,
+  investmentIndicationUniquenessKey,
   parseInvestmentIndicationFields,
   participantInvestmentIndicationSummary,
   reactivateInvestmentIndication,
@@ -105,7 +106,7 @@ export const MAX_INDICATION_STORAGE_MUTATIONS =
   5 + MAX_INDICATION_FIELDS_CHUNKS;
 export const MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE = 25;
 export const MAX_OWNER_INDICATION_REVIEW_ITEM_READS =
-  2 + MAX_INDICATION_FIELDS_CHUNKS;
+  3 + 2 * MAX_INDICATION_FIELDS_CHUNKS;
 export const MAX_OWNER_INDICATION_REVIEW_PAGE_RECORD_READS =
   MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE *
   MAX_OWNER_INDICATION_REVIEW_ITEM_READS;
@@ -620,6 +621,11 @@ export async function readParticipantIndicationOwnershipHead(
     lifecycleStatus,
   });
 }
+
+type OwnerVerifiedLifecycle = Readonly<{
+  status: InvestmentIndication["lifecycle"]["status"];
+  rejectionReason: string | null;
+}>;
 
 /**
  * Subject-bound storage repository with bounded metadata, immutable transitions,
@@ -1295,11 +1301,16 @@ export async function migrateLegacyIndicationCurrentSummary(
   if (canonicalJson(expectedStoredDocument) !== canonicalJson(current.document)) {
     unavailable();
   }
-  const lease = await activeLease(materialized.indication);
-  if (lease !== null) {
-    const leaseRecord = await storage.read(lease.key);
+  const lease = await indicationLease(materialized.indication);
+  const leaseRecord = await storage.read(lease.key);
+  if (materialized.indication.lifecycle.status === "active") {
     if (leaseRecord === null) unavailable();
     verifyLeaseRecord(leaseRecord, lease, id);
+  } else if (
+    leaseRecord !== null &&
+    storedLeaseIndicationId(leaseRecord, lease) === id
+  ) {
+    unavailable();
   }
 
   if (current.schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION) {
@@ -1556,15 +1567,27 @@ async function decodeOwnerIndicationReviewSummary(
     coordinates.id,
     current.fields,
   );
-  const status = await verifyOwnerReviewTerminal(
+  const lifecycle = await verifyOwnerReviewTerminal(
     terminal,
     fields.fields,
   );
-  await verifyStoredActiveLease(storage, current, fields.fields, status);
+  await verifyOwnerReviewParticipantSummary(
+    storage,
+    current,
+    terminal,
+    fields,
+    lifecycle,
+  );
+  await verifyStoredActiveLease(
+    storage,
+    current,
+    fields.fields,
+    lifecycle.status,
+  );
   return Object.freeze({
     reviewId: await tokens.reviewIdForCurrentKey(currentKey, ownerSubject),
     kind: fields.fields.kind,
-    status,
+    status: lifecycle.status,
     amount: fields.fields.amount,
     currency: fields.fields.currency,
     updatedAt: terminal.occurredAt,
@@ -1608,10 +1631,63 @@ function requireCurrentMatchesTerminal(
   }
 }
 
+async function verifyOwnerReviewParticipantSummary(
+  storage: Pick<StorageAdapter, "read">,
+  current: StoredCurrent,
+  terminal: StoredTransition,
+  currentFields: StoredFields,
+  lifecycle: OwnerVerifiedLifecycle,
+): Promise<void> {
+  if (current.schemaVersion !== CURRENT_INDICATION_SCHEMA_VERSION) return;
+  if (current.participantSummary === null) unavailable();
+  let first = terminal;
+  if (current.revision !== 1) {
+    const firstKey = await indicationHistoryKey(current.indicationId, 1);
+    const firstRecord = await storage.read(firstKey);
+    if (firstRecord === null) unavailable();
+    first = decodeStoredTransition(
+      firstRecord,
+      firstKey,
+      current.participantSubject,
+      current.indicationId,
+      1,
+    );
+  }
+  if (first.transitionKind !== "created") unavailable();
+  const firstFields = canonicalJson(fieldsReferenceDocument(first.fields)) ===
+      canonicalJson(fieldsReferenceDocument(currentFields.reference))
+    ? currentFields
+    : await readStoredFields(
+        storage,
+        current.participantSubject,
+        current.indicationId,
+        first.fields,
+      );
+  const firstLifecycle = await verifyOwnerReviewTerminal(
+    first,
+    firstFields.fields,
+  );
+  if (
+    firstLifecycle.status !== "active" ||
+    first.occurredAt > terminal.occurredAt
+  ) unavailable();
+  const expected = Object.freeze({
+    kind: currentFields.fields.kind,
+    status: lifecycle.status,
+    createdAt: first.occurredAt,
+    updatedAt: terminal.occurredAt,
+    fields: fieldsDocument(currentFields.fields),
+    rejectionReason: lifecycle.rejectionReason,
+  });
+  if (
+    canonicalJson(current.participantSummary) !== canonicalJson(expected)
+  ) unavailable();
+}
+
 async function verifyOwnerReviewTerminal(
   terminal: StoredTransition,
   fields: InvestmentIndicationFields,
-): Promise<InvestmentIndication["lifecycle"]["status"]> {
+): Promise<OwnerVerifiedLifecycle> {
   const source = exactRecord(terminal.document, TRANSITION_DOCUMENT_KEYS);
   const acknowledgment = storedAcknowledgment(source.acknowledgment);
   if (
@@ -1692,7 +1768,10 @@ async function verifyOwnerReviewTerminal(
     unavailable();
   }
 
-  return status;
+  return Object.freeze({
+    status,
+    rejectionReason: reason ?? null,
+  });
 }
 
 async function verifyStoredActiveLease(
@@ -2077,10 +2156,7 @@ function decodeStoredCurrent(
   const fields = storedFieldsReference(source.fields);
   const participantSummary = schemaVersion === INDICATION_SCHEMA_VERSION
     ? null
-    : exactRecord(
-        source.participantSummary,
-        PARTICIPANT_SUMMARY_DOCUMENT_KEYS,
-      ) as StorageDocument;
+    : storedParticipantSummary(source.participantSummary);
   const storageRevisionOffset = record.revision === revision
     ? 0
     : schemaVersion === CURRENT_INDICATION_SCHEMA_VERSION &&
@@ -2105,6 +2181,40 @@ function decodeStoredCurrent(
     document: record.value,
     record,
   });
+}
+
+function storedParticipantSummary(value: unknown): StorageDocument {
+  const source = exactRecord(value, PARTICIPANT_SUMMARY_DOCUMENT_KEYS);
+  const fieldsSource = storedFieldsDocument(source.fields);
+  const fields = parseInvestmentIndicationFields(
+    storedDomainFieldsInput(fieldsSource),
+    storedAmountConfigurationFromDocument(fieldsSource),
+    storedParsingOptions(),
+  );
+  if (!fields.ok) unavailable();
+  const createdAt = storedTimestamp(source.createdAt);
+  const updatedAt = storedTimestamp(source.updatedAt);
+  if (createdAt > updatedAt) unavailable();
+  const status = source.status === "active" ||
+      source.status === "withdrawn" ||
+      source.status === "rejected"
+    ? source.status
+    : unavailable();
+  const rejectionReason = status === "rejected"
+    ? parseRejectionReason(source.rejectionReason) ?? unavailable()
+    : source.rejectionReason === null
+    ? null
+    : unavailable();
+  const expected = Object.freeze({
+    kind: fields.value.kind,
+    status,
+    createdAt,
+    updatedAt,
+    fields: fieldsDocument(fields.value),
+    rejectionReason,
+  });
+  if (canonicalJson(source) !== canonicalJson(expected)) unavailable();
+  return expected;
 }
 
 function decodeStoredTransition(
@@ -3113,8 +3223,14 @@ async function hashDocument(value: StorageDocument): Promise<string> {
 async function activeLease(
   indication: InvestmentIndication,
 ): Promise<ActiveLease | null> {
-  const uniquenessKey = activeIndicationUniquenessKey(indication);
-  if (uniquenessKey === null) return null;
+  if (activeIndicationUniquenessKey(indication) === null) return null;
+  return indicationLease(indication);
+}
+
+async function indicationLease(
+  indication: InvestmentIndication,
+): Promise<ActiveLease> {
+  const uniquenessKey = investmentIndicationUniquenessKey(indication);
   const hexadecimal = await sha256Hex(
     `active-indication-uniqueness\u0000${uniquenessKey}`,
   );
@@ -3173,20 +3289,32 @@ function verifyLeaseRecord(
   expected: ActiveLease,
   indicationId: InvestmentIndicationId,
 ): void {
+  if (storedLeaseIndicationId(record, expected) !== indicationId) unavailable();
+}
+
+function storedLeaseIndicationId(
+  record: StorageRecord,
+  expected: ActiveLease,
+): InvestmentIndicationId {
   const source = exactStoredDocument(
     record,
     expected.key,
     LEASE_DOCUMENT_KEYS,
     "active-indication-lease",
   );
+  const indicationId = storedIndicationId(source.indicationId);
+  const expectedDocument = Object.freeze({
+    ...expected.document,
+    indicationId,
+  });
   if (
     record.revision !== 1 ||
-    source.indicationId !== indicationId ||
     source.uniquenessFingerprint !== expected.fingerprint ||
-    canonicalJson(source) !== canonicalJson(expected.document)
+    canonicalJson(source) !== canonicalJson(expectedDocument)
   ) {
     unavailable();
   }
+  return indicationId;
 }
 
 async function participantOwnershipWitnessMutation(

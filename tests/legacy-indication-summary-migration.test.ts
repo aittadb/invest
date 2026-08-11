@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { readFile, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -42,6 +43,7 @@ import {
 } from "../repositories/in-memory-indication-repository.ts";
 import { executeLegacyIndicationSummaryMigrationCommand } from "../scripts/migrate-legacy-indication-summaries.ts";
 import {
+  MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES,
   MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_ENTRIES,
   parseLegacyIndicationSummaryMigrationInventory,
   runLegacyIndicationSummaryMigration,
@@ -285,6 +287,50 @@ test("migration verifies missing, crossed, corrupt, and active-lease evidence", 
   )).code, "UNAVAILABLE");
 });
 
+test("inactive migration rejects its exact stale uniqueness lease", async (t) => {
+  for (const lifecycle of ["withdrawn", "rejected"] as const) {
+    await t.test(lifecycle, async () => {
+      const state = new MemoryStorageState();
+      const storage = new MemoryStorageAdapter(state);
+      const participant = repository(storage, ALICE);
+      await participant.create(
+        createRequest(ALICE_ID, `${lifecycle}-create`, 1),
+        await packageContext(ALICE),
+      );
+      const lease = [...state.records.values()].find((record) =>
+        record.key.collection === "investment-indication-active-keys"
+      );
+      assert(lease);
+      if (lifecycle === "withdrawn") {
+        await participant.withdraw(withdrawRequest(ALICE_ID, 2));
+      } else {
+        await repository(storage, OWNER).reject({
+          operationId: "indication-operation:migration-reject-2",
+          id: ALICE_ID,
+          occurredAt: timestamp(2),
+          historyEntryId: "indication-history:migration-reject-2",
+          expectedRevision: 1,
+          reason: "Private rejection evidence.",
+        });
+      }
+      state.records.set(storageKeyString(lease.key), lease);
+      downgradeCurrent(state, ALICE_ID);
+
+      const failure = await captureAsync(() =>
+        runLegacyIndicationSummaryMigration(
+          storage,
+          manifest([entry(ALICE, ALICE_ID)]),
+        )
+      );
+      assert.equal(failure.code, "UNAVAILABLE");
+      assert.equal(failure.cause, undefined);
+      assert.equal(String(failure).includes(ALICE), false);
+      assert.equal(String(failure).includes(ALICE_ID), false);
+      assert.equal(currentRecord(state, ALICE_ID).value.schemaVersion, 4);
+    });
+  }
+});
+
 test("maximum immutable ancestry migrates after every revision is verified", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
@@ -424,15 +470,6 @@ test("operator command requires separate credentials before touching a manifest"
       ...environment,
       AITTADB_MIGRATION_CLIENT_SECRET: undefined,
     }],
-    [["--apply", "--manifest", "private.json"], {
-      ...environment,
-      AITTADB_STORAGE_CLIENT_ID: environment.AITTADB_MIGRATION_CLIENT_ID,
-    }],
-    [["--apply", "--manifest", "private.json"], {
-      ...environment,
-      AITTADB_STORAGE_CLIENT_SECRET:
-        environment.AITTADB_MIGRATION_CLIENT_SECRET,
-    }],
   ] as const) {
     let touched = false;
     await assert.rejects(() =>
@@ -448,6 +485,51 @@ test("operator command requires separate credentials before touching a manifest"
       })
     );
     assert.equal(touched, false);
+  }
+
+  const migrationKeys = [
+    "AITTADB_MIGRATION_CLIENT_ID",
+    "AITTADB_MIGRATION_CLIENT_SECRET",
+  ] as const;
+  const separationKeys = [
+    ...migrationKeys,
+    "AITTADB_STORAGE_CLIENT_ID",
+    "AITTADB_STORAGE_CLIENT_SECRET",
+    "AITTADB_OAUTH_CLIENT_ID",
+    "AITTADB_OAUTH_CLIENT_SECRET",
+    "BROWSER_MUTATION_SESSION_KEY",
+    "AITTADB_OAUTH_TRANSACTION_KEY",
+    "AITTADB_OAUTH_CSRF_KEY",
+  ] as const;
+  for (const migrationKey of migrationKeys) {
+    for (const reusedKey of separationKeys) {
+      if (migrationKey === reusedKey) continue;
+      const reusedValue = environment[reusedKey];
+      let touched = false;
+      await assert.rejects(
+        () => executeLegacyIndicationSummaryMigrationCommand(
+          ["--apply", "--manifest", "private.json"],
+          { ...environment, [migrationKey]: reusedValue },
+          {
+            readManifest: async () => {
+              touched = true;
+              return manifest([]);
+            },
+            fetch: async () => {
+              touched = true;
+              throw new Error("Unexpected fetch.");
+            },
+          },
+        ),
+        (error: unknown) =>
+          error instanceof Error &&
+          error.message ===
+            "Legacy indication summary migration configuration is invalid." &&
+          !error.message.includes(reusedValue),
+        `${migrationKey} must not reuse ${reusedKey}`,
+      );
+      assert.equal(touched, false);
+    }
   }
 
   const service = new SyntheticAittaDBStorageService({
@@ -487,6 +569,93 @@ test("operator command requires separate credentials before touching a manifest"
         "Legacy indication summary migration configuration is invalid." &&
       !error.message.includes(privateUrl),
   );
+});
+
+test("operator command accepts a maximum canonical manifest", async () => {
+  const indications = Array.from(
+    { length: MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_ENTRIES },
+    (_, index) => entry(
+      actorSubject(
+        `${"\ud800".repeat(254)}${String.fromCharCode(0xd800 + index)}`,
+      ),
+      indicationId(
+        `m${String(index).padStart(3, "0")}${"x".repeat(124)}`,
+      ),
+    ),
+  );
+  const serialized = JSON.stringify(manifest(indications));
+  const size = new TextEncoder().encode(serialized).byteLength;
+  assert.ok(size > 65_536);
+  assert.equal(
+    size,
+    MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES,
+  );
+  const directory = await mkdtemp(join(tmpdir(), "invest-migration-manifest-"));
+  const path = join(directory, "manifest.json");
+  try {
+    await writeFile(path, serialized, "utf8");
+    let fetches = 0;
+    await assert.rejects(() =>
+      executeLegacyIndicationSummaryMigrationCommand(
+        ["--apply", "--manifest", path],
+        migrationEnvironment(),
+        {
+          fetch: async () => {
+            fetches += 1;
+            throw new Error("Stop after proving the manifest was accepted.");
+          },
+        },
+      )
+    );
+    assert.equal(fetches, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("operator command rejects manifest growth after one max-plus-one read", async () => {
+  let reads = 0;
+  let requestedBytes = 0;
+  let closes = 0;
+  let fetches = 0;
+  await assert.rejects(
+    () => executeLegacyIndicationSummaryMigrationCommand(
+      ["--apply", "--manifest", "growing-private.json"],
+      migrationEnvironment(),
+      {
+        openManifest: async () => ({
+          stat: async () => ({
+            size: MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES,
+            isFile: () => true,
+          }),
+          read: async (buffer, offset, length) => {
+            reads += 1;
+            requestedBytes += length;
+            buffer.fill(0x20, offset, offset + length);
+            return { bytesRead: length };
+          },
+          close: async () => {
+            closes += 1;
+          },
+        }),
+        fetch: async () => {
+          fetches += 1;
+          throw new Error("Unexpected fetch.");
+        },
+      },
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message ===
+        "Legacy indication summary migration configuration is invalid.",
+  );
+  assert.equal(reads, 1);
+  assert.equal(
+    requestedBytes,
+    MAX_LEGACY_INDICATION_SUMMARY_MIGRATION_MANIFEST_BYTES + 1,
+  );
+  assert.equal(closes, 1);
+  assert.equal(fetches, 0);
 });
 
 async function seededLegacy(
@@ -783,10 +952,15 @@ function migrationEnvironment(): Record<string, string> {
     AITTADB_MIGRATION_TRANSPORT_ORIGIN: "https://runtime.example.invalid",
     AITTADB_MIGRATION_ENTRY_HREF:
       "https://storage.example.invalid/storage/discovery",
-    AITTADB_MIGRATION_CLIENT_ID: "migration-client",
+    AITTADB_MIGRATION_CLIENT_ID: "migration-client-id",
     AITTADB_MIGRATION_CLIENT_SECRET: "synthetic-migration-secret",
     AITTADB_STORAGE_CLIENT_ID: "application-client",
     AITTADB_STORAGE_CLIENT_SECRET: "different-application-secret",
+    AITTADB_OAUTH_CLIENT_ID: "interactive-oauth-client",
+    AITTADB_OAUTH_CLIENT_SECRET: "interactive-oauth-secret",
+    BROWSER_MUTATION_SESSION_KEY: "browser-mutation-session-key",
+    AITTADB_OAUTH_TRANSACTION_KEY: "oauth-transaction-proof-key",
+    AITTADB_OAUTH_CSRF_KEY: "oauth-csrf-proof-key-material",
   };
 }
 

@@ -855,12 +855,10 @@ export function participantInvestmentIndicationSummary(
   });
 }
 
-/** Derive the internal uniqueness key only while an indication is active. */
-export function activeIndicationUniquenessKey(
+/** Derive the uniqueness coordinate authenticated by an indication's fields. */
+export function investmentIndicationUniquenessKey(
   indication: InvestmentIndication,
-): ActiveIndicationUniquenessKey | null {
-  if (indication.lifecycle.status !== "active") return null;
-
+): ActiveIndicationUniquenessKey {
   return (indication.kind === "personal"
     ? JSON.stringify(["personal", indication.participantSubject])
     : JSON.stringify([
@@ -868,6 +866,14 @@ export function activeIndicationUniquenessKey(
         indication.fields.registrationCountry,
         indication.fields.companyIdentifier,
       ])) as ActiveIndicationUniquenessKey;
+}
+
+/** Derive the internal uniqueness key only while an indication is active. */
+export function activeIndicationUniquenessKey(
+  indication: InvestmentIndication,
+): ActiveIndicationUniquenessKey | null {
+  if (indication.lifecycle.status !== "active") return null;
+  return investmentIndicationUniquenessKey(indication);
 }
 
 /**

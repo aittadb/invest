@@ -35,7 +35,6 @@ import {
 } from "../services/owner-indication-review-tokens.ts";
 import {
   DevelopmentInMemoryIndicationRepository,
-  MAX_INDICATION_FIELDS_CHUNKS,
   MAX_OWNER_INDICATION_REVIEW_CURSOR_LENGTH,
   MAX_OWNER_INDICATION_REVIEW_ITEM_READS,
   MAX_OWNER_INDICATION_REVIEW_PAGE_RECORD_READS,
@@ -516,6 +515,51 @@ test("owner indication review corruption fails within the item read ceiling", as
       ),
     },
     {
+      name: "participant summary timestamp type",
+      apply: (state) => mutateFirstRecord(
+        state,
+        "investment-indications",
+        (value) => {
+          const summary = value.participantSummary as Record<string, unknown>;
+          summary.createdAt = 1;
+        },
+      ),
+    },
+    {
+      name: "participant summary lifecycle drift",
+      apply: (state) => mutateFirstRecord(
+        state,
+        "investment-indications",
+        (value) => {
+          const summary = value.participantSummary as Record<string, unknown>;
+          summary.status = "withdrawn";
+        },
+      ),
+    },
+    {
+      name: "participant summary created-at drift",
+      apply: (state) => mutateFirstRecord(
+        state,
+        "investment-indications",
+        (value) => {
+          const summary = value.participantSummary as Record<string, unknown>;
+          summary.createdAt = "2026-08-10T09:30:00.000Z";
+        },
+      ),
+    },
+    {
+      name: "participant summary fields drift",
+      apply: (state) => mutateFirstRecord(
+        state,
+        "investment-indications",
+        (value) => {
+          const summary = value.participantSummary as Record<string, unknown>;
+          const fields = summary.fields as Record<string, unknown>;
+          fields.amount = 1_251;
+        },
+      ),
+    },
+    {
       name: "missing terminal transition",
       apply: (state) => deleteFirstRecord(state, "investment-indication-history"),
     },
@@ -588,7 +632,12 @@ test("owner indication review derives active withdrawn and rejected lifecycle", 
   const alice = await seedIndication(storage, ALICE, "withdrawn", personalFields());
   const bob = await seedIndication(storage, BOB, "rejected", companyFields());
   const charlie = subject("issuer.invalid/subject:review-charlie");
-  await seedIndication(storage, charlie, "active", personalFields({ amount: 1_500 }));
+  const active = await seedIndication(
+    storage,
+    charlie,
+    "active",
+    personalFields({ amount: 1_500 }),
+  );
 
   await alice.repository.withdraw({
     operationId: "indication-operation:withdrawn-withdraw",
@@ -610,6 +659,14 @@ test("owner indication review derives active withdrawn and rejected lifecycle", 
     historyEntryId: "indication-history:rejected-reject",
     reason: "Private participant-visible rejection reason.",
   });
+  await active.repository.edit({
+    operationId: "indication-operation:active-edit",
+    id: active.id,
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T11:30:00.000Z",
+    historyEntryId: "indication-history:active-edit",
+    fields: personalFields({ amount: 1_750 }),
+  }, active.context);
 
   const page = await ownerRepository(storage, OWNER).list({ limit: 3 });
   assert.deepEqual(
@@ -619,10 +676,14 @@ test("owner indication review derives active withdrawn and rejected lifecycle", 
   assert.doesNotMatch(JSON.stringify(page), /rejection reason/u);
   const withdrawn = page.items.find((item) => item.status === "withdrawn");
   const rejected = page.items.find((item) => item.status === "rejected");
+  const edited = page.items.find((item) => item.status === "active");
   assert.equal(withdrawn?.revision, 2);
   assert.equal(withdrawn?.updatedAt, "2026-08-10T11:00:00.000Z");
   assert.equal(rejected?.revision, 2);
   assert.equal(rejected?.updatedAt, "2026-08-10T12:00:00.000Z");
+  assert.equal(edited?.revision, 2);
+  assert.equal(edited?.amount, 1_750);
+  assert.equal(edited?.updatedAt, "2026-08-10T11:30:00.000Z");
 });
 
 test("maximum owner indication review page has a finite observed read budget", async () => {
@@ -648,7 +709,7 @@ test("maximum owner indication review page has a finite observed read budget", a
   assert.ok(
     observed.readCalls <=
       MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE *
-        (2 + MAX_INDICATION_FIELDS_CHUNKS),
+        MAX_OWNER_INDICATION_REVIEW_ITEM_READS,
   );
   assert.equal(observed.transactCalls, 0);
   assert.equal(state.operations.size, operationCount);

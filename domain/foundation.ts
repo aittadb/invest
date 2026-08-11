@@ -14,6 +14,7 @@ export type ActorSubject = Branded<string, "ActorSubject">;
 export type CountryCode = Branded<string, "CountryCode">;
 
 export const MAX_STABLE_ID_LENGTH = 128;
+export const MAX_ACTOR_SUBJECT_LENGTH = 255;
 
 export type Actor =
   | Readonly<{ type: "visitor" }>
@@ -144,7 +145,7 @@ export function parseActorSubject(
   }
 
   if (
-    value.length > 255 ||
+    value.length > MAX_ACTOR_SUBJECT_LENGTH ||
     value.trim() !== value ||
     hasControlCharacter(value)
   ) {

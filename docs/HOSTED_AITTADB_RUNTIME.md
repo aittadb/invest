@@ -441,16 +441,20 @@ The array is sorted by subject and indication ID, contains no duplicates, and
 is capped at 100 entries per command run. Empty inventories are valid. Store
 the file only under ignored `migration-inventories/`; it is private operator
 input and must not be committed, logged, attached to issues, or placed in Sites
-configuration.
+configuration. The command derives its byte ceiling from the maximum canonical
+100-entry document and reads at most that ceiling plus one byte through one
+opened file handle, so file growth or path replacement cannot widen the input.
 
 Configure `AITTADB_MIGRATION_ISSUER`, optional
 `AITTADB_MIGRATION_TRANSPORT_ORIGIN`, `AITTADB_MIGRATION_ENTRY_HREF`,
 `AITTADB_MIGRATION_CLIENT_ID`, and `AITTADB_MIGRATION_CLIENT_SECRET` in the
 operator environment. The client must be temporary or otherwise dedicated,
 bound by AittaDB to only the intended deployment namespace, have no browser
-origin or redirect, and carry only `storage.read storage.write`. The command
-rejects reuse of an application-runtime client value visible in the same
-environment. Do not install these values as hosted Sites settings.
+origin or redirect, and carry only `storage.read storage.write`. Its client ID
+and secret must differ from each other and from every application storage,
+interactive OAuth, browser mutation, OAuth transaction, and OAuth CSRF
+credential value visible in the same environment. Do not install these values
+as hosted Sites settings.
 
 Run:
 
@@ -461,11 +465,13 @@ npm run migrate:legacy-indication-summaries -- migration-inventories/indications
 For every item, the command reads the exact current key and fully reconstructs
 all immutable transitions and referenced field chunks. It validates identities,
 revisions, lifecycle, raw-request and normalized operation fingerprints,
-current metadata, and any active uniqueness lease before one compare-and-set
-write. Migration changes only the current envelope from schema 4 to schema 5;
-the domain revision and immutable records do not change. Missing, crossed,
-corrupt, or concurrently changed state stops the run through one fixed failure
-surface. Output contains only scanned, migrated, and already-current counts.
+current metadata, and the authenticated uniqueness coordinate before one
+compare-and-set write. Active indications require their exact lease; withdrawn
+and rejected indications reject an exact stale lease still naming them.
+Migration changes only the current envelope from schema 4 to schema 5; the
+domain revision and immutable records do not change. Missing, crossed, corrupt,
+or concurrently changed state stops the run through one fixed failure surface.
+Output contains only scanned, migrated, and already-current counts.
 
 The operation is item-idempotent. After interruption, process restart, an exact
 concurrent upgrade, or a lost response, rerun the same complete inventory. A
@@ -657,5 +663,7 @@ Legacy indication-summary coverage separately proves empty and maximum-history
 inventories, closed manifest parsing, complete ancestry and lease validation,
 missing/crossed/corrupt rejection, exact retries, concurrent exact migration,
 concurrent domain change, response-loss recovery, restart/resume, content-free
-results, dedicated credential closure, and the absence of migration writes or
-imports from browser GET paths.
+results, pairwise dedicated credential closure, maximum canonical file input,
+file-growth rejection, strict schema-5 participant summaries across participant
+and owner projections, and the absence of migration writes or imports from
+browser GET paths.
