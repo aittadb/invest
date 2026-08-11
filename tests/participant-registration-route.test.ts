@@ -459,6 +459,76 @@ test("an exact committed retry recovers its original notices after policy change
   );
 });
 
+test("closed registration hides absent records while preserving existing access and exact retries", async () => {
+  const state = new MemoryStorageState();
+  const alice = participant(ALICE, "alice@provider.example");
+  const bob = participant(BOB, "bob@provider.example");
+  const operationId = "participant-operation:registered-before-closure";
+  const body = registrationBody(operationId);
+  const openHarness = await createHarness({ state });
+  const created = await openHarness.dispatch(
+    jsonMutation(ALICE, body),
+    alice,
+  );
+  assert.equal(created.status, 201);
+
+  const closedEvidence = testParticipantRegistrationNoticeEvidence(2, {
+    processEmail: "Closed campaign process notice.",
+    marketing: "Closed campaign marketing notice.",
+  });
+  const closedHarness = await createHarness({
+    state,
+    newRegistrationAllowed: false,
+    noticeEvidence: closedEvidence,
+  });
+
+  const absent = await closedHarness.dispatch(
+    getRequest(BOB, "application/json"),
+    bob,
+  );
+  assert.equal(absent.status, 404);
+  assert.doesNotMatch(
+    await absent.text(),
+    /bob@provider|Closed campaign|registration_required/u,
+  );
+
+  const forged = await closedHarness.dispatch(
+    jsonMutation(
+      BOB,
+      registrationBody("participant-operation:forged-after-closure", {
+        "notice-evidence-version": closedEvidence.version,
+      }),
+    ),
+    bob,
+  );
+  assert.equal(forged.status, 404);
+  assert.doesNotMatch(
+    await forged.text(),
+    /bob@provider|Closed campaign|registration_required/u,
+  );
+  assert.equal(await closedHarness.profile(bob), null);
+
+  const existing = await closedHarness.dispatch(
+    getRequest(ALICE, "application/json"),
+    alice,
+  );
+  assert.equal(existing.status, 200);
+  assert.deepEqual(actionsOf(await jsonDocument(existing)), []);
+
+  const retry = await closedHarness.dispatch(
+    jsonMutation(ALICE, body),
+    alice,
+  );
+  assert.equal(retry.status, 200);
+  assert.equal(
+    resourceData(await jsonDocument(retry)).notice_evidence_version,
+    NOTICE_EVIDENCE.version,
+  );
+  assert.equal(closedHarness.nowCalls(), 0);
+  assert.equal(closedHarness.operationIdCalls(), 0);
+  assert.equal(state.operations.size, 1);
+});
+
 test("registered HTML and JSON expose the same immutable acknowledged notice state", async () => {
   const harness = await createHarness();
   const alice = participant(ALICE, "alice@provider.example");
@@ -1147,6 +1217,7 @@ async function createHarness(
       account: ParticipantAccount,
     ) => ParticipantRegistrationRepository;
     state?: MemoryStorageState;
+    newRegistrationAllowed?: boolean;
     noticeEvidence?: typeof NOTICE_EVIDENCE;
   }> = {},
 ): Promise<TestHarness> {
@@ -1164,6 +1235,7 @@ async function createHarness(
   const registrationRoute = createParticipantRegistrationRouteHandler({
     repositoryFor,
     noticeEvidence: options.noticeEvidence ?? NOTICE_EVIDENCE,
+    newRegistrationAllowed: options.newRegistrationAllowed,
     ...(options.verifyMutation === undefined
       ? {
           mutationSecurity: {

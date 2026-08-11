@@ -106,6 +106,7 @@ export type ParticipantRegistrationRouteDependencies = Readonly<{
   mutationSecurity?: BrowserMutationGuardOptions;
   verifyMutation?: ParticipantRegistrationMutationVerifier;
   csrfTokenFor: ParticipantRegistrationCsrfTokenProvider;
+  newRegistrationAllowed?: boolean;
   noticeEvidence: ParticipantRegistrationNoticeEvidence;
   now?: () => Date;
   createOperationId?: () => string;
@@ -118,6 +119,8 @@ export function createParticipantRegistrationRouteHandler(
   if (
     typeof dependencies.repositoryFor !== "function" ||
     typeof dependencies.csrfTokenFor !== "function" ||
+    (dependencies.newRegistrationAllowed !== undefined &&
+      typeof dependencies.newRegistrationAllowed !== "boolean") ||
     (dependencies.verifyMutation === undefined) ===
       (dependencies.mutationSecurity === undefined)
   ) {
@@ -126,6 +129,7 @@ export function createParticipantRegistrationRouteHandler(
   const noticeEvidence = defineParticipantRegistrationNoticeEvidence(
     dependencies.noticeEvidence,
   );
+  const newRegistrationAllowed = dependencies.newRegistrationAllowed !== false;
   const now = dependencies.now ?? (() => new Date());
   const createOperationId = dependencies.createOperationId ?? randomOperationId;
   if (typeof now !== "function" || typeof createOperationId !== "function") {
@@ -170,6 +174,7 @@ export function createParticipantRegistrationRouteHandler(
         const account = requiredParticipantAccount(context);
         const repository = requiredRepository(dependencies.repositoryFor, account);
         const current = requireOwnedSnapshot(await repository.current(), account);
+        if (current === null && !newRegistrationAllowed) notFound();
         return await resourceResponse({
           context,
           representation: representation.kind,
@@ -227,13 +232,15 @@ export function createParticipantRegistrationRouteHandler(
       const mutation = parseRegistrationMutation(verified);
       const repository = requiredRepository(dependencies.repositoryFor, account);
       const result = mutation.noticeEvidenceVersion === noticeEvidence.version
-        ? await registerWithCurrentNoticeEvidence(
-            repository,
-            account,
-            mutation,
-            noticeEvidence,
-            now,
-          )
+        ? newRegistrationAllowed
+          ? await registerWithCurrentNoticeEvidence(
+              repository,
+              account,
+              mutation,
+              noticeEvidence,
+              now,
+            )
+          : notFound()
         : await repository.recoverRegistration({
             operationId: mutation.operationId,
             registration: mutation.registration,

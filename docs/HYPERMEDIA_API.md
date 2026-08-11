@@ -98,12 +98,16 @@ marketing-consent state. Later profile revisions must retain the notice evidence
 from immutable profile revision 1. Registered HTML shows that same state, and
 neither representation exposes another registration action or CSRF proof.
 
-The signed-out campaign's sign-in and pre-registration actions all return to
-`/participant`. For an authenticated non-owner with no participant profile,
-JSON at that URI returns resource type `participant-entry`, status
-`registration_required`, and `open-participant-registration`; HTML returns a
-non-cacheable `303` to that action's target. Owners and deployments without
-usable registration configuration receive the fixed unavailable surface.
+The signed-out published open campaign's sign-in and pre-registration actions
+all return to `/participant`. For an authenticated non-owner whose trusted
+participant reader explicitly reports no profile, JSON at that URI returns
+resource type `participant-entry`, status `registration_required`, and the sole
+action `open-participant-registration`; HTML returns a non-cacheable `303` to
+that action's target. Reader failures, malformed or identity-mismatched records,
+owners, and closed, unpublished, or otherwise unusable registration
+configuration receive the fixed unavailable surface. Campaign closure blocks
+new registration while retaining existing registered reads and exact immutable
+operation recovery.
 
 `GET /participant` has resource type `participant-home`. Its `data` contains the
 authorized account label, declared interest and participation context, account
@@ -149,8 +153,9 @@ composition.
 
 These participant URIs negotiate HTML and version `0.1` hypermedia JSON. A
 signed-out JSON request receives `401 authentication_required`; an
-authenticated subject without matching participant state receives registration
-entry only when that capability is deliberately composed, and otherwise gets
+authenticated subject with an explicitly missing participant state receives
+registration entry only when that capability is deliberately composed for a
+published open campaign, and otherwise gets
 the same generic `404` shape as a missing record. Unsupported explicit versions
 return `406` before a representation is selected.
 

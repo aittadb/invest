@@ -326,11 +326,6 @@ export function createParticipantRegistrationRequiredDocument(
         "Complete registration",
         absolute(PARTICIPANT_REGISTRATION_PATH),
       ),
-      safeAction(
-        "sign-out",
-        "Sign out",
-        absolute(chatGPTSignOutPath("/")),
-      ),
     ],
   };
 }

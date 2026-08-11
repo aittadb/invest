@@ -314,7 +314,7 @@ test("participant entry negotiates registration for HTML and JSON", async () => 
   assert.equal(document.data.status, "registration_required");
   assert.deepEqual(
     document.actions.map((action: { name: string }) => action.name),
-    ["open-participant-registration", "sign-out"],
+    ["open-participant-registration"],
   );
 
   const html = requiredResponse(
@@ -326,6 +326,7 @@ test("participant entry negotiates registration for HTML and JSON", async () => 
     ),
   );
   assert.equal(html.status, 303);
+  assert.equal(document.actions.length, 1);
   assert.equal(
     html.headers.get("location"),
     document.actions[0]?.href,

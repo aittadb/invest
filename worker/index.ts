@@ -6,6 +6,11 @@ import { createApplicationWorker } from "./application-worker.ts";
 import type { ParticipantAccessStateReader } from "../domain/participant-home-resource.ts";
 import { createHostedApplicationRuntimeResolver } from "./hosted-application-composition.ts";
 import { createHostedOwnerOAuthProofResolver } from "./hosted-oauth-composition.ts";
+import type {
+  FounderInterestRouteDependencies,
+  InvestmentInterestRouteDependencies,
+  ParticipantProfileRouteDependencies,
+} from "./routes/participant.ts";
 
 // Image security config. SVG sources with .svg extension auto-skip the
 // optimization endpoint on the client side (served directly, no proxy).
@@ -16,6 +21,9 @@ import { createHostedOwnerOAuthProofResolver } from "./hosted-oauth-composition.
 export function createInvestorAppWorker(
   dependencies: Readonly<{
     participantAccessReader?: ParticipantAccessStateReader;
+    participantProfile?: ParticipantProfileRouteDependencies;
+    participantFounderInterest?: FounderInterestRouteDependencies;
+    participantInvestmentInterests?: InvestmentInterestRouteDependencies;
   }> = {},
 ) {
   return createApplicationWorker({
@@ -39,6 +47,9 @@ export function createInvestorAppWorker(
       );
     },
     participantAccessReader: dependencies.participantAccessReader,
+    participantProfile: dependencies.participantProfile,
+    participantFounderInterest: dependencies.participantFounderInterest,
+    participantInvestmentInterests: dependencies.participantInvestmentInterests,
     resolveApplicationRuntime: createHostedApplicationRuntimeResolver(),
     resolveOwnerOAuthProof: createHostedOwnerOAuthProofResolver(),
   });

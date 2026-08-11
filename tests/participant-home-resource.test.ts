@@ -252,7 +252,6 @@ test("participant entry and profile capabilities reflect registration state", ()
   assert.equal(entry.data.status, "registration_required");
   assert.deepEqual(entry.actions.map(({ name }) => name), [
     "open-participant-registration",
-    "sign-out",
   ]);
   assert.equal(
     entry.actions[0]?.href,

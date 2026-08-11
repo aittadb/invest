@@ -5,18 +5,31 @@ import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
 
 let workerPromise;
 
-async function loadWorker(participantAuthorizationState) {
+async function loadWorker(
+  participantAuthorizationState,
+  participantRouteDependencies,
+) {
   if (!workerPromise) {
     const workerUrl = new URL("../dist/server/index.js", import.meta.url);
     workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
     workerPromise = import(workerUrl.href);
   }
   const workerModule = await workerPromise;
-  if (participantAuthorizationState === undefined) return workerModule.default;
+  if (
+    participantAuthorizationState === undefined &&
+    participantRouteDependencies === undefined
+  ) {
+    return workerModule.default;
+  }
   return workerModule.createInvestorAppWorker({
-    participantAccessReader: {
-      read: async () => participantAuthorizationState,
-    },
+    ...(participantAuthorizationState === undefined
+      ? {}
+      : {
+          participantAccessReader: {
+            read: async () => participantAuthorizationState,
+          },
+        }),
+    ...participantRouteDependencies,
   });
 }
 
@@ -27,8 +40,12 @@ async function render(
   ownerEmail,
   campaignConfiguration = syntheticPublicCampaign,
   participantAuthorizationState,
+  participantRouteDependencies,
 ) {
-  const worker = await loadWorker(participantAuthorizationState);
+  const worker = await loadWorker(
+    participantAuthorizationState,
+    participantRouteDependencies,
+  );
   const serializedCampaign =
     typeof campaignConfiguration === "string"
       ? campaignConfiguration
@@ -297,6 +314,80 @@ test("participant home and package status negotiate from the same authorized sta
   assertCapabilityHrefsAppear(packageHtml, packageDocument);
 });
 
+test("real participant HTML matches active and deletion-requested hypermedia capabilities", async () => {
+  const participantHeaders = {
+    accept: "text/html",
+    "oai-authenticated-user-id": "participant-subject",
+    "oai-authenticated-user-email": "participant@example.com",
+  };
+  const participantRoutes = inertParticipantRouteDependencies();
+
+  for (const accountDeletionRequested of [false, true]) {
+    const state = participantState(
+      "participant-subject",
+      "participant@example.com",
+      accountDeletionRequested,
+    );
+    const htmlResponse = await render(
+      participantHeaders,
+      "https://campaign.example/participant",
+      undefined,
+      undefined,
+      syntheticPublicCampaign,
+      state,
+      participantRoutes,
+    );
+    assert.equal(htmlResponse.status, 200);
+    const html = await htmlResponse.text();
+
+    const jsonResponse = await render(
+      { ...participantHeaders, accept: "application/json" },
+      "https://campaign.example/participant",
+      undefined,
+      undefined,
+      syntheticPublicCampaign,
+      state,
+      participantRoutes,
+    );
+    assert.equal(jsonResponse.status, 200);
+    const document = await jsonResponse.json();
+    assert.equal(
+      document.data.account_status,
+      accountDeletionRequested ? "deletion-requested" : "active",
+    );
+    assert.deepEqual(
+      document.actions.map((action) => action.name),
+      accountDeletionRequested
+        ? [
+            "read-private-package",
+            "open-participant-profile",
+            "sign-out",
+          ]
+        : [
+            "read-private-package",
+            "open-participant-profile",
+            "open-founder-interest",
+            "open-investment-interests",
+            "sign-out",
+          ],
+    );
+    assertCapabilityHrefsAppear(html, document);
+    assert.match(
+      html,
+      accountDeletionRequested ? /View profile/u : /Manage profile/u,
+    );
+    if (accountDeletionRequested) {
+      assert.doesNotMatch(
+        html,
+        /href="\/participant\/(?:founder-interest|investment-interests)"/u,
+      );
+    } else {
+      assert.match(html, /href="\/participant\/founder-interest"/u);
+      assert.match(html, /href="\/participant\/investment-interests"/u);
+    }
+  }
+});
+
 test("signed-out, foreign, and missing participant state disclose no private capability", async () => {
   const signedOut = await render(
     { accept: "application/json" },
@@ -496,6 +587,10 @@ test("the root resource negotiates equivalent public hypermedia JSON", async () 
 
   const html = await (await render()).text();
   assert.match(html, new RegExp(document.data.product_summary));
+  assert.match(
+    html,
+    /href="\/signin-with-chatgpt\?return_to=%2Fparticipant"/u,
+  );
   for (const action of document.actions) {
     assert.match(html, new RegExp(new URL(action.href).pathname));
   }
@@ -559,7 +654,11 @@ test("absent, invalid, and unpublished campaign configuration stays generic", as
   }
 });
 
-function participantState(subject, accountEmailLabel) {
+function participantState(
+  subject,
+  accountEmailLabel,
+  accountDeletionRequested = false,
+) {
   return {
     profile: {
       subject,
@@ -567,7 +666,7 @@ function participantState(subject, accountEmailLabel) {
       displayName: "Private Participant",
       declaredInterest: "both",
       participationContext: "company",
-      accountDeletionRequested: false,
+      accountDeletionRequested,
     },
     currentPackage: {
       id: "package-version:current",
@@ -575,6 +674,33 @@ function participantState(subject, accountEmailLabel) {
       changeSummary: "Confidential package update",
       materialChange: true,
       requiresCurrentAcceptance: true,
+    },
+  };
+}
+
+function inertParticipantRouteDependencies() {
+  const unusedRepository = () => {
+    throw new Error("The renderer parity test must not access a route repository.");
+  };
+  const unusedMutation = async () => {
+    throw new Error("The renderer parity test must not verify a mutation.");
+  };
+  const shared = {
+    verifyMutation: unusedMutation,
+    csrfTokenFor: () => null,
+  };
+  return {
+    participantProfile: {
+      ...shared,
+      repositoryFor: unusedRepository,
+    },
+    participantFounderInterest: {
+      ...shared,
+      serviceFor: unusedRepository,
+    },
+    participantInvestmentInterests: {
+      ...shared,
+      serviceFor: unusedRepository,
     },
   };
 }

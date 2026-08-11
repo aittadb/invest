@@ -20,7 +20,6 @@ import {
   OWNER_PACKAGE_WORKSPACE_HEADER,
   PARTICIPANT_FOUNDER_INTEREST_HEADER,
   PARTICIPANT_PROFILE_SELF_SERVICE_HEADER,
-  hasParticipantFounderInterest,
   hasParticipantProfileSelfService,
 } from "../http/runtime-capabilities.ts";
 import {
@@ -439,6 +438,12 @@ test("hosted participant access requires the persisted provider email label", as
     "participant-operation:exact-email-binding",
   );
   await appendHostedPackageVersion(service, 1, 0);
+  await new StorageCampaignRepository(hostedStorageAdapter(service)).saveSetup({
+    operationId: "campaign-operation:exact-email-binding",
+    recordedAt: "2026-08-10T09:00:00.000Z",
+    expectedRevision: null,
+    setup: explicitCampaignSetup(),
+  });
   const worker = hostedPackageWorker(service);
 
   const valid = await worker.fetch(
@@ -493,6 +498,85 @@ test("hosted participant access requires the persisted provider email label", as
   assert.doesNotMatch(
     await changedEmailPackage.text(),
     /Exact email participant|participant@example\.test|Private package budget content/u,
+  );
+});
+
+test("hosted first sign-in requires a published open campaign before registration", async () => {
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  for (const campaign of [
+    { label: "closed", published: true, status: "closed" },
+    { label: "unpublished", published: false, status: "open" },
+  ] as const) {
+    const service = new SyntheticAittaDBService();
+    const setup = explicitCampaignSetup();
+    await new StorageCampaignRepository(hostedStorageAdapter(service)).saveSetup({
+      operationId: `campaign-operation:entry-${campaign.label}`,
+      recordedAt: "2026-08-10T09:00:00.000Z",
+      expectedRevision: null,
+      setup: {
+        ...setup,
+        publicCampaign: {
+          ...setup.publicCampaign,
+          published: campaign.published,
+          status: campaign.status,
+        },
+      },
+    });
+    const worker = hostedPackageWorker(service);
+
+    for (const path of ["/participant", PARTICIPANT_REGISTRATION_PATH]) {
+      const response = await worker.fetch(
+        participantRequest(path),
+        env,
+        executionContext,
+      );
+      assert.equal(response.status, 404, `${campaign.label} ${path}`);
+      assert.equal(response.headers.get(MUTATION_CSRF_HEADER), null);
+      assert.equal(response.headers.get("set-cookie"), null);
+      assert.doesNotMatch(
+        await response.text(),
+        /participant@example\.test|registration_required|register-participant-access|Required messages concern/u,
+      );
+    }
+  }
+});
+
+test("hosted participant projection failures do not become registration capability", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await new StorageCampaignRepository(hostedStorageAdapter(service)).saveSetup({
+    operationId: "campaign-operation:projection-failure",
+    recordedAt: "2026-08-10T09:00:00.000Z",
+    expectedRevision: null,
+    setup: explicitCampaignSetup(),
+  });
+  const worker = createApplicationWorker({
+    fetchApplication: async () => new Response("application fallback", {
+      status: 404,
+    }),
+    fetchOptimizedImage: async () => new Response("image"),
+    participantAccessReader: {
+      async read() {
+        throw new Error("synthetic private participant read failure");
+      },
+    },
+    resolveApplicationRuntime: createHostedApplicationRuntimeResolver({
+      fetch: service.fetch,
+      now: () => NOW,
+    }),
+  });
+
+  const response = await worker.fetch(
+    participantRequest("/participant"),
+    env,
+    executionContext,
+  );
+  assert.equal(response.status, 404);
+  assert.equal(response.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.equal(response.headers.get("set-cookie"), null);
+  assert.doesNotMatch(
+    await response.text(),
+    /participant@example\.test|registration_required|synthetic private/u,
   );
 });
 
@@ -2969,7 +3053,7 @@ test("hosted delayed profile replays reject impossible consent ancestry and pres
   );
 });
 
-test("hosted signed-in entry advances through equivalent registration and participant states", async () => {
+test("hosted signed-in entry advances through registration and trusted participant states", async () => {
   const service = new SyntheticAittaDBService();
   const setup = explicitCampaignSetup();
   await new StorageCampaignRepository(hostedStorageAdapter(service)).saveSetup({
@@ -2984,36 +3068,8 @@ test("hosted signed-in entry advances through equivalent registration and partic
   const createEntryWorker = () => createApplicationWorker({
     async fetchApplication(request) {
       renderedRequests.push(request);
-      const participant = participantAccessFromRuntimeHeader(
-        request.headers.get(PARTICIPANT_ACCESS_HEADER),
-      );
-      const active = participant?.accountStatus === "active";
-      const controls = [
-        ...(participant?.currentPackage
-          ? [
-              '<a data-action="read-private-package" href="/participant/package">Information package</a>',
-            ]
-          : []),
-        ...(hasParticipantProfileSelfService(
-            request.headers.get(PARTICIPANT_PROFILE_SELF_SERVICE_HEADER),
-          )
-          ? [
-              '<a data-action="open-participant-profile" href="/participant/profile">Profile</a>',
-            ]
-          : []),
-        ...(active && hasParticipantFounderInterest(
-            request.headers.get(PARTICIPANT_FOUNDER_INTEREST_HEADER),
-          )
-          ? [
-              '<a data-action="open-founder-interest" href="/participant/founder-interest">Founder interest</a>',
-            ]
-          : []),
-        '<a data-action="sign-out" href="/signout-with-chatgpt">Sign out</a>',
-      ];
       return new Response(
-        `<main><h1>${participant?.accountStatus ?? "missing"}</h1>${
-          controls.join("")
-        }</main>`,
+        "<main><h1>Participant application</h1></main>",
         { headers: { "content-type": "text/html; charset=utf-8" } },
       );
     },
@@ -3063,7 +3119,6 @@ test("hosted signed-in entry advances through equivalent registration and partic
   assert.equal(entryDocument.data.status, "registration_required");
   assert.deepEqual(actionNames(entryDocument), [
     "open-participant-registration",
-    "sign-out",
   ]);
 
   const entryHtml = await firstWorker.fetch(
@@ -3190,6 +3245,22 @@ test("hosted signed-in entry advances through equivalent registration and partic
     "sign-out",
   ]);
 
+  const activePackage = await activeWorker.fetch(
+    participantRequest(
+      new URL(requiredAction(activeDocument, "read-private-package").href)
+        .pathname,
+    ),
+    env,
+    executionContext,
+  );
+  assert.equal(activePackage.status, 200);
+  const activePackageDocument = await activePackage.json() as {
+    type: string;
+    id: string;
+  };
+  assert.equal(activePackageDocument.type, "participant-package");
+  assert.equal(activePackageDocument.id, currentPackage.snapshot.id);
+
   const activeHtml = await activeWorker.fetch(
     new Request(`${APP_ORIGIN}/participant`, {
       headers: { accept: "text/html", ...identityHeaders },
@@ -3199,11 +3270,14 @@ test("hosted signed-in entry advances through equivalent registration and partic
   );
   assert.equal(activeHtml.status, 200);
   const activeMarkup = await activeHtml.text();
-  assert.match(activeMarkup, /<h1>active<\/h1>/u);
-  for (const name of actionNames(activeDocument)) {
-    assert.match(activeMarkup, new RegExp(`data-action="${name}"`, "u"));
-  }
+  assert.match(activeMarkup, /<h1>Participant application<\/h1>/u);
   assert.equal(renderedRequests.length, 1);
+  assert.equal(
+    participantAccessFromRuntimeHeader(
+      renderedRequests[0]?.headers.get(PARTICIPANT_ACCESS_HEADER) ?? null,
+    )?.accountStatus,
+    "active",
+  );
   assert.equal(
     hasParticipantProfileSelfService(
       renderedRequests[0]?.headers.get(
@@ -3264,12 +3338,18 @@ test("hosted signed-in entry advances through equivalent registration and partic
   );
   assert.equal(deletionHtml.status, 200);
   const deletionMarkup = await deletionHtml.text();
-  assert.match(deletionMarkup, /<h1>deletion-requested<\/h1>/u);
-  for (const name of actionNames(deletedDocument)) {
-    assert.match(deletionMarkup, new RegExp(`data-action="${name}"`, "u"));
-  }
-  assert.doesNotMatch(deletionMarkup, /open-founder-interest/u);
+  assert.match(deletionMarkup, /<h1>Participant application<\/h1>/u);
   assert.equal(renderedRequests.length, 2);
+  assert.equal(
+    participantAccessFromRuntimeHeader(
+      renderedRequests[1]?.headers.get(PARTICIPANT_ACCESS_HEADER) ?? null,
+    )?.accountStatus,
+    "deletion-requested",
+  );
+  assert.equal(
+    renderedRequests[1]?.headers.get(PARTICIPANT_FOUNDER_INTEREST_HEADER),
+    null,
+  );
 
   const disclosureProbe = JSON.stringify({
     entryDocument,

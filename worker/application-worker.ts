@@ -125,6 +125,7 @@ export type ApplicationWorkerDependencies = Readonly<{
   ownerAuditHistory?: OwnerAuditHistoryRouteDependencies;
   participantFounderInterest?: FounderInterestRouteDependencies;
   participantInvestmentInterests?: InvestmentInterestRouteDependencies;
+  participantProfile?: ParticipantProfileRouteDependencies;
   participantPackageReader?: ParticipantPackageReaderDependencies;
   participantPackageAcknowledgment?: ParticipantPackageAcknowledgmentRouteDependencies;
   participantAccessReader?: ParticipantAccessStateReader;
@@ -222,15 +223,16 @@ export function createApplicationWorker(
         : publicCampaign;
       const participantAccessReader = dependencies.participantAccessReader ??
         participantRequest?.participantAccessReader();
-      const participantAccess = await resolveParticipantAccess(
+      const participantAccessResolution = await resolveParticipantAccess(
         actor,
         participantAccessReader,
       );
+      const participantAccess = participantAccessResolution.access;
       const participantRegistration = dependencies.dispatchRoute === undefined &&
           applicationRuntime !== null &&
           (url.pathname === PARTICIPANT_REGISTRATION_PATH ||
             (url.pathname === PARTICIPANT_HOME_PATH &&
-              participantAccess === null))
+              participantAccessResolution.kind === "missing"))
         ? await runtimeParticipantRegistrationRoute(
             applicationRuntime,
             actor,
@@ -239,17 +241,19 @@ export function createApplicationWorker(
             url.pathname,
           )
         : null;
-      const participantProfile = dependencies.dispatchRoute === undefined &&
-          applicationRuntime !== null
-        ? runtimeParticipantProfileRoute(
-            applicationRuntime,
-            actor,
-            isOwner,
-            participantAccess,
-            resourceUrl,
-            url.pathname,
-            participantRequest,
-          )
+      const participantProfile = dependencies.dispatchRoute === undefined
+        ? dependencies.participantProfile ??
+          (applicationRuntime !== null
+            ? runtimeParticipantProfileRoute(
+                applicationRuntime,
+                actor,
+                isOwner,
+                participantAccess,
+                resourceUrl,
+                url.pathname,
+                participantRequest,
+              )
+            : null)
         : null;
       const participantFounderInterest = dependencies.dispatchRoute === undefined
         ? dependencies.participantFounderInterest ??
@@ -606,6 +610,12 @@ async function runtimeParticipantRegistrationRoute(
     const repositories = runtime.repositoryFactory;
     const currentCampaign = await repositories.campaignRepository().readSetup();
     if (currentCampaign === null) return null;
+    const newRegistrationAllowed =
+      currentCampaign.setup.publicCampaign.published === true &&
+      currentCampaign.setup.publicCampaign.status === "open";
+    if (pathname === PARTICIPANT_HOME_PATH && !newRegistrationAllowed) {
+      return null;
+    }
     const noticeEvidence = createParticipantRegistrationNoticeEvidence(
       currentCampaign.revision,
       participantRegistrationNoticesFromCampaignPolicy(
@@ -644,6 +654,7 @@ async function runtimeParticipantRegistrationRoute(
         sameAccount(candidate)
           ? runtime.mutationSession.issue(request, identity, appOrigin)
           : Promise.resolve(null),
+      newRegistrationAllowed,
       noticeEvidence,
       now: runtime.now,
       createOperationId: () => randomOperationId("participant-operation"),
@@ -1034,25 +1045,37 @@ function isOwnerPath(pathname: string): boolean {
   return pathname === "/owner" || pathname.startsWith("/owner/");
 }
 
+type ParticipantAccessResolution =
+  | Readonly<{ kind: "authorized"; access: AuthorizedParticipantAccess }>
+  | Readonly<{ kind: "missing" | "unavailable"; access: null }>;
+
 async function resolveParticipantAccess(
   actor: AuthenticatedActor | null,
   reader: ParticipantAccessStateReader | undefined,
-): Promise<AuthorizedParticipantAccess | null> {
-  if (actor === null || reader === undefined) return null;
+): Promise<ParticipantAccessResolution> {
+  if (actor === null || reader === undefined) {
+    return Object.freeze({ kind: "unavailable", access: null });
+  }
 
   const account = parseParticipantAccount({
     subject: actor.userId,
     accountEmailLabel: actor.email,
   });
-  if (!account.ok) return null;
+  if (!account.ok) {
+    return Object.freeze({ kind: "unavailable", access: null });
+  }
 
   try {
-    return authorizeParticipantAccess(
-      account.value,
-      await reader.read(account.value),
-    );
+    const state = await reader.read(account.value);
+    if (state === null) {
+      return Object.freeze({ kind: "missing", access: null });
+    }
+    const access = authorizeParticipantAccess(account.value, state);
+    return access === null
+      ? Object.freeze({ kind: "unavailable", access: null })
+      : Object.freeze({ kind: "authorized", access });
   } catch {
-    return null;
+    return Object.freeze({ kind: "unavailable", access: null });
   }
 }
 

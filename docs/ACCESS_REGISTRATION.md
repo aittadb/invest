@@ -4,11 +4,15 @@ Access registration is an injectable participant resource at
 `/participant/registration`. Hosted composition installs it for that exact path
 and uses the same capability to resolve an unregistered signed-in non-owner at
 `/participant`, using the credential-closed AittaDB repository factory and
-browser mutation session. Notice text comes only from the persisted private
-campaign policy. The public campaign's registration controls return from sign-in
-to `/participant`; HTML receives a non-cacheable `303` to the registration form,
-while hypermedia JSON receives a `participant-entry` document whose
-`open-participant-registration` action has that same target.
+browser mutation session. Entry is composed only when the trusted participant
+reader explicitly reports no profile and the persisted campaign is both
+published and open. Reader failures, malformed or identity-mismatched records,
+closed campaigns, and unpublished campaigns retain the generic unavailable
+surface. Notice text comes only from the persisted private campaign policy. The
+public campaign's registration controls return from sign-in to `/participant`;
+HTML receives a non-cacheable `303` to the registration form, while hypermedia
+JSON receives a `participant-entry` document whose sole action,
+`open-participant-registration`, has that same target.
 
 ## Representations
 
@@ -44,6 +48,12 @@ mutation or mutation proof. The next request to `/participant` reconstructs
 authorization from persisted profile, package, and acknowledgment state; it can
 then expose the current package and separately composed profile and workflow
 controls without trusting the registration response.
+
+Closing or unpublishing a campaign prevents a missing account from discovering
+or submitting a new registration. It does not hide an existing participant's
+registered resource, and an exact already-committed operation may still recover
+its immutable original response after closure. A current-evidence request that
+would create a new record fails through the fixed unavailable surface.
 
 ## Mutation Boundary
 

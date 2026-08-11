@@ -15,11 +15,16 @@ package management only in the configured-owner route group. For a signed-in
 non-owner, it derives the trusted `participantAccess` projection from that
 subject's persistent profile, current package, and current acknowledgment gate.
 An unregistered subject stops after the profile read without opening package or
-acknowledgment storage. Public registration controls return from ChatGPT sign-in
-to `/participant`. An unregistered HTML request then receives a non-cacheable
-redirect to `/participant/registration`; JSON receives the equivalent versioned
-entry action. For either entry or the exact registration path, the runtime
-combines a subject-bound participant repository, the hosted mutation session,
+acknowledgment storage. Only an explicit missing-profile result is eligible for
+entry; read failures and malformed or identity-mismatched projections stay
+generically unavailable. Public registration controls on a published open
+campaign return from ChatGPT sign-in to `/participant`. An eligible
+unregistered HTML request then receives a non-cacheable redirect to
+`/participant/registration`; JSON receives the equivalent single versioned
+entry action. Closed and unpublished campaigns advertise and accept no new
+registration. Existing records and exact committed retries remain available
+after closure. For either eligible entry or the exact registration path, the
+runtime combines a subject-bound participant repository, the hosted mutation session,
 and versioned evidence derived from the persisted campaign revision and only
 its two registration notices. The next request after registration reconstructs
 the current package and permitted profile and workflow controls from persistent
