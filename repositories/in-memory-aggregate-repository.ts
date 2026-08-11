@@ -43,6 +43,7 @@ import {
   type StorageOperationId,
   type StoragePage,
   type StorageRecord,
+  type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
 import {
   prepareAuditAppend,
@@ -160,6 +161,7 @@ export type ApplyAggregateCorrectionResult = Readonly<{
 
 export type ApplyAuditedAggregateCorrectionRequest = Readonly<{
   operationId: unknown;
+  expectedCampaignRevision: unknown;
   confirmation: unknown;
   ownerSubject: unknown;
   occurredAt: unknown;
@@ -199,6 +201,12 @@ export interface AtomicInvestmentAggregateCorrectionRepository {
   applyConfirmedCorrectionWithAudit(
     request: ApplyAuditedAggregateCorrectionRequest,
   ): Promise<ApplyAuditedAggregateCorrectionResult>;
+}
+
+/** Owner route capability bound to one exact persisted campaign revision. */
+export interface CampaignRevisionBoundAggregateCorrectionRepository
+  extends AtomicInvestmentAggregateCorrectionRepository {
+  readonly campaignRevision: number;
 }
 
 type StoredAggregateRecord = Readonly<{
@@ -608,44 +616,31 @@ export class DevelopmentInMemoryAggregateRepository
     request: ApplyAuditedAggregateCorrectionRequest,
   ): Promise<ApplyAuditedAggregateCorrectionResult> {
     const operationId = requiredOperationId(request.operationId);
+    const expectedCampaignRevision = requiredCampaignRevision(
+      request.expectedCampaignRevision,
+    );
     const ownerSubject = requiredOwnerSubject(request.ownerSubject);
     const occurredAt = requiredOccurredAt(request.occurredAt);
     const fingerprint = await operationFingerprint({
       kind: "audited-correction",
       operationId,
+      expectedCampaignRevision,
       confirmation: requiredJsonValue(request.confirmation),
       ownerSubject,
-      ...(this.#correctionRevisionAssertion === null
-        ? {}
-        : {
-            revisionAssertion: {
-              key: storageKeyString(this.#correctionRevisionAssertion.key),
-              expectedRevision:
-                this.#correctionRevisionAssertion.expectedRevision,
-            },
-          }),
     });
-    const replay = await this.#readOperation(
+    const replay = await this.#readAuditedCorrectionReplay(
       operationId,
-      "audited-correction",
       fingerprint,
+      ownerSubject,
     );
-    if (replay !== null) {
-      const result = auditedCorrectionResult(replay, true);
-      await verifyAggregateReconciledAuditEvent(
-        result.auditEvent,
-        operationId,
-        ownerSubject,
-      );
-      const prepared = prepareAuditAppend({
-        type: "append-audit-event",
-        event: result.auditEvent,
-      });
-      verifyPreparedAuditAppend(
-        prepared,
-        await this.#storage.read(prepared.mutation.key),
-      );
-      return result;
+    if (replay !== null) return replay;
+
+    const revisionAssertion = this.#correctionRevisionAssertion;
+    if (
+      revisionAssertion === null ||
+      revisionAssertion.expectedRevision !== expectedCampaignRevision
+    ) {
+      preconditionFailed();
     }
 
     const aggregate = await this.#readStoredRecord();
@@ -669,34 +664,43 @@ export class DevelopmentInMemoryAggregateRepository
       stored: confirmed.replacement,
       auditEvent,
     });
-    const transaction = await this.#storage.transact({
-      operationId,
-      mutations: [
-        {
-          type: "put",
-          key: CURRENT_AGGREGATE_KEY,
-          expectedRevision: aggregate?.record.revision ?? null,
-          value: aggregateDocument(confirmed.replacement),
-        },
-        {
-          type: "put",
-          key: operationStorageKey(operationId),
-          expectedRevision: null,
-          value: operationDocument(
-            "audited-correction",
-            fingerprint,
-            persisted,
-          ),
-        },
-        preparedAudit.mutation,
-        ...(this.#correctionRevisionAssertion === null
-          ? []
-          : [this.#correctionRevisionAssertion]),
-      ],
-    });
+    let transaction: StorageTransactionResult;
+    try {
+      transaction = await this.#storage.transact({
+        operationId,
+        mutations: [
+          {
+            type: "put",
+            key: CURRENT_AGGREGATE_KEY,
+            expectedRevision: aggregate?.record.revision ?? null,
+            value: aggregateDocument(confirmed.replacement),
+          },
+          {
+            type: "put",
+            key: operationStorageKey(operationId),
+            expectedRevision: null,
+            value: operationDocument(
+              "audited-correction",
+              fingerprint,
+              persisted,
+            ),
+          },
+          preparedAudit.mutation,
+          revisionAssertion,
+        ],
+      });
+    } catch (error) {
+      if (!mayHaveCommittedAuditedCorrection(error)) throw error;
+      const recovered = await this.#readAuditedCorrectionReplay(
+        operationId,
+        fingerprint,
+        ownerSubject,
+      );
+      if (recovered !== null) return recovered;
+      throw error;
+    }
 
-    const expectedRecords = this.#correctionRevisionAssertion === null ? 3 : 4;
-    if (transaction.records.length !== expectedRecords) unavailable();
+    if (transaction.records.length !== 4) unavailable();
     const aggregateRecord = transaction.records[0];
     const operationRecord = transaction.records[1];
     if (!aggregateRecord || !operationRecord) unavailable();
@@ -712,16 +716,20 @@ export class DevelopmentInMemoryAggregateRepository
       fingerprint,
       this.#currency,
     );
-    verifyPreparedAuditAppend(preparedAudit, transaction.records[2]);
-    if (this.#correctionRevisionAssertion !== null) {
-      verifyCorrectionRevisionAssertion(
-        transaction.records[3],
-        this.#correctionRevisionAssertion,
-      );
-    }
     const result = auditedCorrectionResult(
       decodedOperation,
       transaction.replayed,
+    );
+    const expectedAudit = transaction.replayed
+      ? prepareAuditAppend({
+          type: "append-audit-event",
+          event: result.auditEvent,
+        })
+      : preparedAudit;
+    verifyPreparedAuditAppend(expectedAudit, transaction.records[2]);
+    verifyCorrectionRevisionAssertion(
+      transaction.records[3],
+      revisionAssertion,
     );
     await verifyAggregateReconciledAuditEvent(
       result.auditEvent,
@@ -820,6 +828,35 @@ export class DevelopmentInMemoryAggregateRepository
         );
   }
 
+  async #readAuditedCorrectionReplay(
+    operationId: StorageOperationId,
+    fingerprint: string,
+    ownerSubject: ActorSubject,
+  ): Promise<ApplyAuditedAggregateCorrectionResult | null> {
+    const replay = await this.#readOperation(
+      operationId,
+      "audited-correction",
+      fingerprint,
+    );
+    if (replay === null) return null;
+
+    const result = auditedCorrectionResult(replay, true);
+    await verifyAggregateReconciledAuditEvent(
+      result.auditEvent,
+      operationId,
+      ownerSubject,
+    );
+    const prepared = prepareAuditAppend({
+      type: "append-audit-event",
+      event: result.auditEvent,
+    });
+    verifyPreparedAuditAppend(
+      prepared,
+      await this.#storage.read(prepared.mutation.key),
+    );
+    return result;
+  }
+
   async #writeOperationOnly(
     operationId: StorageOperationId,
     kind: OperationKind,
@@ -852,8 +889,9 @@ export class DevelopmentInMemoryAggregateRepository
 
 /** Per-request configured-owner capability over persistent aggregate storage. */
 export class OwnerBoundInvestmentAggregateCorrectionRepository
-  implements AtomicInvestmentAggregateCorrectionRepository {
+  implements CampaignRevisionBoundAggregateCorrectionRepository {
   readonly correctionConsistency = "atomic-aggregate-audit" as const;
+  readonly campaignRevision: number;
   readonly #ownerSubject: ActorSubject;
   readonly #repository: DevelopmentInMemoryAggregateRepository;
 
@@ -864,10 +902,14 @@ export class OwnerBoundInvestmentAggregateCorrectionRepository
     campaignRevisionAssertion: AggregateCorrectionRevisionAssertion,
   ) {
     this.#ownerSubject = requiredOwnerSubject(ownerSubject);
+    const revisionAssertion = requiredCorrectionRevisionAssertion(
+      campaignRevisionAssertion,
+    );
+    this.campaignRevision = revisionAssertion.expectedRevision;
     this.#repository = new DevelopmentInMemoryAggregateRepository(
       storage,
       requiredCurrency(currency),
-      requiredCorrectionRevisionAssertion(campaignRevisionAssertion),
+      revisionAssertion,
     );
     Object.freeze(this);
   }
@@ -1622,6 +1664,18 @@ function requiredCorrectionRevisionAssertion(
     if (error instanceof StorageFailure) throw error;
     invalidRequest();
   }
+}
+
+function requiredCampaignRevision(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) invalidRequest();
+  return value as number;
+}
+
+function mayHaveCommittedAuditedCorrection(error: unknown): boolean {
+  return error instanceof StorageFailure &&
+    (error.code === "CONFLICT" ||
+      error.code === "PRECONDITION_FAILED" ||
+      error.code === "UNAVAILABLE");
 }
 
 function verifyCorrectionRevisionAssertion(

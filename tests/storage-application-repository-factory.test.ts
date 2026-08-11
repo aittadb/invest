@@ -367,11 +367,15 @@ test("factory exposes only named application repository capabilities", async () 
     ),
     reconciliation,
   );
-  assert.deepEqual(Object.keys(reconciliation), ["correctionConsistency"]);
+  assert.deepEqual(Object.keys(reconciliation), [
+    "correctionConsistency",
+    "campaignRevision",
+  ]);
   assert.equal(
     reconciliation.correctionConsistency,
     "atomic-aggregate-audit",
   );
+  assert.equal(reconciliation.campaignRevision, campaign.revision);
   assert.deepEqual(await reconciliation.previewReconciliation(), {
     status: "match",
     stored: {
@@ -390,6 +394,7 @@ test("factory exposes only named application repository capabilities", async () 
   await assert.rejects(
     reconciliation.applyConfirmedCorrectionWithAudit({
       operationId: "aggregate-correction:foreign",
+      expectedCampaignRevision: campaign.revision,
       confirmation: {},
       ownerSubject: foreignSubject.value,
       occurredAt: NOW.toISOString(),

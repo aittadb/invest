@@ -16,7 +16,7 @@ import {
 import type {
   ApplyAuditedAggregateCorrectionRequest,
   ApplyAuditedAggregateCorrectionResult,
-  AtomicInvestmentAggregateCorrectionRepository,
+  CampaignRevisionBoundAggregateCorrectionRepository,
 } from "../repositories/in-memory-aggregate-repository.ts";
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
 import { createOwnerAggregateReconciliationRouteHandler } from "../worker/routes/owner-aggregate-reconciliation.ts";
@@ -27,6 +27,7 @@ const PATH = "/owner/aggregate-reconciliation";
 const OWNER_SUBJECT = "issuer.invalid/subject:owner";
 const CSRF_TOKEN = "owner_reconciliation_csrf_token_1234567890";
 const OPERATION_ID = "aggregate-correction:test-operation";
+const CAMPAIGN_REVISION = 7;
 const OCCURRED_AT = "2026-08-09T12:00:00.000Z";
 const PROOF_COOKIE =
   "__Host-investor_app_mutation_test=encrypted; Path=/; Secure; HttpOnly; SameSite=Strict";
@@ -57,6 +58,7 @@ test("owner reconciliation renders one equivalent HTML form and JSON action", as
     type: string;
     data: {
       status: string;
+      campaign_revision: number;
       correction_available: boolean;
       stored: { revision: number; amount: number };
       calculated: { amount: number };
@@ -68,6 +70,7 @@ test("owner reconciliation renders one equivalent HTML form and JSON action", as
     }>;
   };
   assert.equal(document.type, "owner-aggregate-reconciliation");
+  assert.equal(document.data.campaign_revision, CAMPAIGN_REVISION);
   assert.equal(document.data.status, "mismatch");
   assert.equal(document.data.correction_available, true);
   assert.equal(document.data.stored.revision, 1);
@@ -95,7 +98,9 @@ test("owner reconciliation renders one equivalent HTML form and JSON action", as
   assert.equal(html.status, 200);
   assert.equal(html.headers.get(MUTATION_CSRF_HEADER), CSRF_TOKEN);
   assert.match(body, /Stored and calculated totals differ/);
+  assert.match(body, /Campaign revision: 7/u);
   assert.match(body, /<th scope="row">Stored<\/th><td>1<\/td>/u);
+  assert.match(body, /name="expected-campaign-revision" value="7"/u);
   assert.match(body, /name="operation-id" value="aggregate-correction:test-operation"/);
   assert.match(body, new RegExp(`name="${MUTATION_CSRF_FIELD}"`));
   assert.match(body, /Apply the calculated totals shown above/);
@@ -172,6 +177,7 @@ test("JSON and form mutations enforce the guard and bind the exact preview", asy
     assert.equal(repository.previewCalls, 0);
     assert.deepEqual(repository.applyCalls[0], {
       operationId: OPERATION_ID,
+      expectedCampaignRevision: CAMPAIGN_REVISION,
       confirmation: {
         confirmation: APPLY_CALCULATED_AGGREGATE_CONFIRMATION,
         expectedStoredRevision: 1,
@@ -442,8 +448,9 @@ test("stale correction previews return a fixed precondition failure", async () =
 });
 
 class FakeAtomicReconciliationRepository
-implements AtomicInvestmentAggregateCorrectionRepository {
+implements CampaignRevisionBoundAggregateCorrectionRepository {
   readonly correctionConsistency = "atomic-aggregate-audit" as const;
+  readonly campaignRevision = CAMPAIGN_REVISION;
   previewCalls = 0;
   applyCalls: ApplyAuditedAggregateCorrectionRequest[] = [];
   failure: StorageFailure | null = null;
@@ -506,6 +513,7 @@ async function mutationGuard() {
 function correctionFields(): Record<string, string | number> {
   return {
     "operation-id": OPERATION_ID,
+    "expected-campaign-revision": CAMPAIGN_REVISION,
     confirmation: APPLY_CALCULATED_AGGREGATE_CONFIRMATION,
     "expected-stored-revision": 1,
     "expected-stored-amount": 8_000,
@@ -518,6 +526,7 @@ function correctionFields(): Record<string, string | number> {
 function correctionFieldNames(): readonly string[] {
   return [
     "operation-id",
+    "expected-campaign-revision",
     "confirmation",
     "expected-stored-revision",
     "expected-stored-amount",

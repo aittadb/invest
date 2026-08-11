@@ -44,12 +44,16 @@ participant authorization. Its create and edit repositories add the exact
 sampled campaign revision as an atomic transaction check, so a concurrent
 policy change cannot authorize a stale write.
 
-The configured owner reconciliation resource loads the persisted campaign
-revision and amount configuration, binds correction authority to the trusted
-owner subject, and atomically persists the corrected aggregate, retry receipt,
-audit evidence, and an exact non-mutating assertion that the same campaign
-revision is still current. Its contribution scan stops at 1,000 records or 20
-page reads and rejects malformed or non-progressing pagination.
+The configured owner reconciliation resource loads and advertises the persisted
+campaign revision and amount configuration, binds correction authority to the
+trusted owner subject, and requires new correction work to return that exact
+revision. It atomically persists the corrected aggregate, retry receipt, audit
+evidence, and an exact non-mutating assertion that the advertised campaign
+revision is still current. Existing exact receipts are verified before current
+campaign state so delayed retries survive later campaign revisions, while one
+bounded recovery verification converges an overlapping exact retry on the
+immutable winner. Its contribution scan stops at 1,000 records or 20 page reads
+and rejects malformed or non-progressing pagination.
 
 The persistent owner indication-detail primitive can resolve one deployment-key
 opaque review ID to a bounded verified current record and notification without a

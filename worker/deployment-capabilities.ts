@@ -22,7 +22,7 @@ import type {
   AuditEventReader,
 } from "../repositories/in-memory-audit-notification-repositories.ts";
 import type { PublicCampaignStateReader } from "../repositories/storage-public-campaign-state-reader.ts";
-import type { AtomicInvestmentAggregateCorrectionRepository } from "../repositories/in-memory-aggregate-repository.ts";
+import type { CampaignRevisionBoundAggregateCorrectionRepository } from "../repositories/in-memory-aggregate-repository.ts";
 import type {
   AtomicParticipantInvestmentInterestMutationPort,
   ParticipantInvestmentInterestReader,
@@ -46,7 +46,7 @@ export type ApplicationRepositoryFactory = Readonly<{
   ownerAggregateReconciliation(
     ownerSubject: ActorSubject,
     campaign: CampaignSetupRevision,
-  ): AtomicInvestmentAggregateCorrectionRepository;
+  ): CampaignRevisionBoundAggregateCorrectionRepository;
   participantRequest(
     account: ParticipantAccount,
   ): ParticipantRequestRepositoryScope;

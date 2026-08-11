@@ -25,6 +25,7 @@ export type OwnerAggregateReconciliationDocument = Readonly<{
   type: "owner-aggregate-reconciliation";
   id: "investment-interest-aggregate";
   data: Readonly<{
+    campaign_revision: number | null;
     status: InvestmentAggregateReconciliationPreview["status"];
     correction_required: boolean;
     correction_consistency: AggregateCorrectionConsistency;
@@ -54,11 +55,13 @@ export function createOwnerAggregateReconciliationResource(
   requestUrl: string,
   preview: InvestmentAggregateReconciliationPreview,
   consistency: AggregateCorrectionConsistency,
+  campaignRevision: number | null,
   operationId: string,
 ): OwnerAggregateReconciliationResource {
   const correction = actionWhenAllowed(
     preview.correctionRequired &&
       preview.stored.revision < Number.MAX_SAFE_INTEGER &&
+      campaignRevision !== null &&
       consistency === "atomic-aggregate-audit",
     () => defineAction({
       name: "apply-calculated-aggregate",
@@ -68,6 +71,11 @@ export function createOwnerAggregateReconciliationResource(
       requestMediaType: "application/x-www-form-urlencoded",
       fields: [
         textField("operation-id", "Operation ID", operationId),
+        integerField(
+          "expected-campaign-revision",
+          "Expected campaign revision",
+          requiredActionCampaignRevision(campaignRevision),
+        ),
         {
           name: "confirmation",
           title: "Confirmation",
@@ -117,6 +125,7 @@ export function createOwnerAggregateReconciliationResource(
       type: "owner-aggregate-reconciliation",
       id: "investment-interest-aggregate",
       data: {
+        campaign_revision: campaignRevision,
         status: preview.status,
         correction_required: preview.correctionRequired,
         correction_consistency: consistency,
@@ -172,6 +181,11 @@ function integerField(name: string, title: string, value: number) {
     step: 1,
     value,
   };
+}
+
+function requiredActionCampaignRevision(value: number | null): number {
+  if (value === null) throw new TypeError("Campaign revision unavailable.");
+  return value;
 }
 
 function deepFreeze<Value>(value: Value): Value {

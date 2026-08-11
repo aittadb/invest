@@ -25,6 +25,10 @@ import {
   type CampaignSetup,
 } from "../repositories/in-memory-campaign-repository.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
+import {
+  MAX_OWNER_AGGREGATE_RECONCILIATION_FORM_FIELDS,
+  MAX_OWNER_AGGREGATE_RECONCILIATION_JSON_FIELDS,
+} from "../worker/routes/owner-aggregate-reconciliation.ts";
 import type {
   InvestorAppEnv,
   WorkerExecutionContext,
@@ -88,6 +92,7 @@ test("hosted owner reconciles a persistent AittaDB aggregate and audit atomicall
   const resource = await resourceResponse.json() as
     OwnerAggregateReconciliationDocument;
   assert.equal(resource.data.status, "mismatch");
+  assert.equal(resource.data.campaign_revision, 1);
   assert.equal(resource.data.stored.revision, 2);
   assert.equal(resource.data.stored.amount, 45_000);
   assert.equal(resource.data.calculated.amount, 50_000);
@@ -104,6 +109,7 @@ test("hosted owner reconciles a persistent AittaDB aggregate and audit atomicall
   const html = await htmlResponse.text();
   assert.equal(htmlResponse.status, 200);
   assert.match(html, /Stored and calculated totals differ/u);
+  assert.match(html, /Campaign revision: 1/u);
   assert.match(html, /<th scope="row">Stored<\/th><td>2<\/td>/u);
   assert.match(html, /<form[^>]+method="post"/u);
   assert.match(html, /name="_csrf"/u);
@@ -237,6 +243,14 @@ test("hosted mutation field boundaries reject before consuming the one-use proof
     const resource = await resourceResponse.json() as
       OwnerAggregateReconciliationDocument;
     const valid = actionBody(resource);
+    assert.equal(
+      Object.keys(valid).length,
+      mediaType === "json"
+        ? MAX_OWNER_AGGREGATE_RECONCILIATION_JSON_FIELDS
+        : MAX_OWNER_AGGREGATE_RECONCILIATION_FORM_FIELDS - 1,
+    );
+    assert.equal(MAX_OWNER_AGGREGATE_RECONCILIATION_JSON_FIELDS, 8);
+    assert.equal(MAX_OWNER_AGGREGATE_RECONCILIATION_FORM_FIELDS, 9);
     const overLimit = { ...valid, unexpected: "extra" };
     const wrongShape = { ...valid, unexpected: "replacement" } as
       Record<string, unknown>;
@@ -270,6 +284,62 @@ test("hosted mutation field boundaries reject before consuming the one-use proof
     assert.equal(corrected.status, 200);
     assert.match(corrected.headers.get("set-cookie") ?? "", /Max-Age=0/u);
   }
+});
+
+test("hosted rev1 preview cannot correct after the campaign advances to rev2", async () => {
+  const service = storageService();
+  const seeded = await seedMismatch(service);
+  const campaigns = new StorageCampaignRepository(storageAdapter(service));
+  const worker = hostedWorker(service);
+  const env = environment();
+  const resourceResponse = await worker.fetch(
+    ownerRequest(PATH),
+    env,
+    executionContext,
+  );
+  const proof = mutationProof(resourceResponse);
+  const resource = await resourceResponse.json() as
+    OwnerAggregateReconciliationDocument;
+  const advertised = actionBody(resource);
+  assert.equal(resource.data.campaign_revision, 1);
+  assert.equal(advertised["expected-campaign-revision"], 1);
+
+  const revisionOne = await campaigns.readSetup();
+  assert(revisionOne);
+  await campaigns.saveSetup({
+    operationId: "campaign-operation:advance-before-correction",
+    recordedAt: "2026-08-11T09:01:00.000Z",
+    expectedRevision: revisionOne.revision,
+    setup: campaignSetupWithCurrency(
+      revisionOne.setup,
+      "SEK",
+      "Advanced campaign",
+    ),
+  });
+  const listRequestsBeforePost = service.listRequests;
+
+  const failed = await worker.fetch(
+    ownerMutation(advertised, proof),
+    env,
+    executionContext,
+  );
+  assert.equal(failed.status, 412);
+  assert.match(failed.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+  assert.equal(service.listRequests, listRequestsBeforePost);
+  assert.equal((await campaigns.readSetup())?.revision, 2);
+  assert.equal((await seeded.aggregate.previewReconciliation()).status, "mismatch");
+  assert.deepEqual(
+    (await new DevelopmentInMemoryAuditRepository(seeded.adapter).list({
+      limit: 10,
+    })).items,
+    [],
+  );
+  assert.equal(
+    service.recordKeys().some((key) =>
+      key.startsWith("investment-aggregate-operations/aggregate-correction:")
+    ),
+    false,
+  );
 });
 
 test("hosted maximum aggregate revision exposes comparison without action or proof", async () => {

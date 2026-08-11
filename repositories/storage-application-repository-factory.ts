@@ -72,7 +72,7 @@ import {
 import { StorageParticipantInvestmentInterestRepository } from "./storage-participant-investment-repository.ts";
 import {
   OwnerBoundInvestmentAggregateCorrectionRepository,
-  type AtomicInvestmentAggregateCorrectionRepository,
+  type CampaignRevisionBoundAggregateCorrectionRepository,
 } from "./in-memory-aggregate-repository.ts";
 import {
   StorageAuditEventReader,
@@ -268,7 +268,7 @@ export class StorageApplicationRepositoryFactory {
   ownerAggregateReconciliation(
     ownerSubject: ActorSubject,
     campaign: CampaignSetupRevision,
-  ): AtomicInvestmentAggregateCorrectionRepository {
+  ): CampaignRevisionBoundAggregateCorrectionRepository {
     return new OwnerBoundInvestmentAggregateCorrectionRepository(
       this.#storage,
       ownerSubject,

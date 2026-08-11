@@ -25,7 +25,7 @@ import {
   type VerifiedMutationRequest,
 } from "../../http/mutation-security.ts";
 import type {
-  AtomicInvestmentAggregateCorrectionRepository,
+  CampaignRevisionBoundAggregateCorrectionRepository,
   InvestmentAggregateRepository,
 } from "../../repositories/in-memory-aggregate-repository.ts";
 import type { ApplicationRouteHandler } from "../contracts.ts";
@@ -37,6 +37,7 @@ import {
 const RECONCILIATION_PATH = "/owner/aggregate-reconciliation";
 const MUTATION_KEYS = new Set([
   "operation-id",
+  "expected-campaign-revision",
   "confirmation",
   "expected-stored-revision",
   "expected-stored-amount",
@@ -45,7 +46,7 @@ const MUTATION_KEYS = new Set([
   "expected-calculated-count",
 ]);
 
-/** Seven correction fields plus the form-only CSRF field, all short scalars. */
+/** Eight correction fields plus the form-only CSRF field, all short scalars. */
 export const MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_BYTES = 4_096;
 export const MAX_OWNER_AGGREGATE_RECONCILIATION_JSON_FIELDS = MUTATION_KEYS.size;
 export const MAX_OWNER_AGGREGATE_RECONCILIATION_FORM_FIELDS =
@@ -82,7 +83,7 @@ export type ReadOnlyAggregateReconciliationRepository = Pick<
 > & Readonly<{ correctionConsistency: "unavailable" }>;
 
 export type OwnerAggregateReconciliationRepository =
-  | AtomicInvestmentAggregateCorrectionRepository
+  | CampaignRevisionBoundAggregateCorrectionRepository
   | ReadOnlyAggregateReconciliationRepository;
 
 export type OwnerAggregateReconciliationRouteOptions = Readonly<{
@@ -171,11 +172,12 @@ export function createOwnerAggregateReconciliationRouteHandler(
         );
         const correction = await options.repository
           .applyConfirmedCorrectionWithAudit({
-          operationId: mutation.operationId,
-          confirmation: mutation.confirmation,
-          ownerSubject: verified.actor.subject,
-          occurredAt: currentTimestamp(now),
-        });
+            operationId: mutation.operationId,
+            expectedCampaignRevision: mutation.expectedCampaignRevision,
+            confirmation: mutation.confirmation,
+            ownerSubject: verified.actor.subject,
+            occurredAt: currentTimestamp(now),
+          });
         try {
           preview = previewInvestmentAggregateReconciliation(
             correction.stored,
@@ -193,10 +195,15 @@ export function createOwnerAggregateReconciliationRouteHandler(
       const operationId = requiredOperationId(issueOperationId());
       const consistency = options.repository.correctionConsistency satisfies
         AggregateCorrectionConsistency;
+      const campaignRevision =
+        options.repository.correctionConsistency === "atomic-aggregate-audit"
+          ? options.repository.campaignRevision
+          : null;
       const resource = createOwnerAggregateReconciliationResource(
         context.resourceUrl,
         preview,
         consistency,
+        campaignRevision,
         operationId,
       );
       const csrf = resource.correctionForm === null
@@ -234,6 +241,7 @@ export function createOwnerAggregateReconciliationRouteHandler(
 
 type ParsedCorrectionMutation = Readonly<{
   operationId: string;
+  expectedCampaignRevision: number;
   confirmation: Readonly<{
     confirmation: string;
     expectedStoredRevision: number;
@@ -255,6 +263,10 @@ function parseCorrectionMutation(
   }
   return Object.freeze({
     operationId: requiredOperationId(body["operation-id"]),
+    expectedCampaignRevision: requiredInteger(
+      body["expected-campaign-revision"],
+      mediaType,
+    ),
     confirmation: Object.freeze({
       confirmation: requiredString(body.confirmation),
       expectedStoredRevision: requiredInteger(
@@ -369,7 +381,7 @@ function renderResource(
     : renderCorrectionForm(resource.correctionForm, csrf);
   return page(
     "Aggregate reconciliation",
-    `<main><p class="section-kicker">Owner workspace</p><h1>Aggregate reconciliation</h1><p>${escapeHtml(status)}</p><table><thead><tr><th scope="col">Source</th><th scope="col">Revision</th><th scope="col">Amount</th><th scope="col">Currency</th><th scope="col">Indications</th></tr></thead><tbody><tr><th scope="row">Stored</th><td>${data.stored.revision}</td><td>${data.stored.amount}</td><td>${escapeHtml(data.stored.currency)}</td><td>${data.stored.contributing_indication_count}</td></tr><tr><th scope="row">Calculated</th><td>-</td><td>${data.calculated.amount}</td><td>${escapeHtml(data.calculated.currency)}</td><td>${data.calculated.contributing_indication_count}</td></tr></tbody></table>${form}<p><a href="/owner">Back to owner workspace</a></p></main>`,
+    `<main><p class="section-kicker">Owner workspace</p><h1>Aggregate reconciliation</h1><p>${escapeHtml(status)}</p><p>Campaign revision: ${data.campaign_revision === null ? "unavailable" : data.campaign_revision}</p><table><thead><tr><th scope="col">Source</th><th scope="col">Revision</th><th scope="col">Amount</th><th scope="col">Currency</th><th scope="col">Indications</th></tr></thead><tbody><tr><th scope="row">Stored</th><td>${data.stored.revision}</td><td>${data.stored.amount}</td><td>${escapeHtml(data.stored.currency)}</td><td>${data.stored.contributing_indication_count}</td></tr><tr><th scope="row">Calculated</th><td>-</td><td>${data.calculated.amount}</td><td>${escapeHtml(data.calculated.currency)}</td><td>${data.calculated.contributing_indication_count}</td></tr></tbody></table>${form}<p><a href="/owner">Back to owner workspace</a></p></main>`,
   );
 }
 

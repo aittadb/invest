@@ -302,9 +302,15 @@ test("persisted mismatches require an exact preview-bound correction", async () 
 test("audited corrections commit one retry-stable aggregate and audit transaction", async () => {
   const state = new MemoryStorageState();
   const adapter = new DeterministicMemoryStorageAdapter(state);
+  const campaignKey = requiredTestStorageKey(
+    "campaign-setup-current",
+    "configured-campaign",
+  );
+  setCampaignRevision(state, campaignKey, 1);
   const repository = new DevelopmentInMemoryAggregateRepository(
     adapter,
     currency,
+    revisionAssertion(campaignKey, 1),
   );
   await repository.applyContribution(applyRequest(
     "aggregate-operation:audited-seed",
@@ -317,6 +323,7 @@ test("audited corrections commit one retry-stable aggregate and audit transactio
   const preview = await repository.previewReconciliation();
   const request = {
     operationId: "aggregate-operation:audited-correction",
+    expectedCampaignRevision: 1,
     confirmation: confirmationFor(preview),
     ownerSubject: "issuer.invalid/subject:owner",
     occurredAt: "2026-08-09T12:00:00.000Z",
@@ -348,6 +355,7 @@ test("audited corrections commit one retry-stable aggregate and audit transactio
   const replay = await new DevelopmentInMemoryAggregateRepository(
     adapter,
     currency,
+    revisionAssertion(campaignKey, 1),
   ).applyConfirmedCorrectionWithAudit({
     ...request,
     occurredAt: "2026-08-09T12:05:00.000Z",
@@ -366,7 +374,70 @@ test("audited corrections commit one retry-stable aggregate and audit transactio
   );
 });
 
-test("audited correction atomically asserts its campaign revision and retries after a race", async () => {
+test("overlapping exact audited corrections boundedly recover the winning receipt", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state);
+  const campaignKey = requiredTestStorageKey(
+    "campaign-setup-current",
+    "configured-campaign",
+  );
+  setCampaignRevision(state, campaignKey, 1);
+  const seed = new DevelopmentInMemoryAggregateRepository(adapter, currency);
+  await seed.applyContribution(applyRequest(
+    "aggregate-operation:overlap-seed",
+    0,
+    contribution("indication:overlap", 1, "active", 25_000),
+  ));
+  mutateAggregateRecord(state, (snapshot) => {
+    snapshot.totalAmount = 20_000;
+  });
+  const preview = await seed.previewReconciliation();
+  const overlapping = new OverlappingAuditedCorrectionAdapter(adapter);
+  const repositories = [
+    new DevelopmentInMemoryAggregateRepository(
+      overlapping,
+      currency,
+      revisionAssertion(campaignKey, 1),
+    ),
+    new DevelopmentInMemoryAggregateRepository(
+      overlapping,
+      currency,
+      revisionAssertion(campaignKey, 1),
+    ),
+  ] as const;
+  const baseRequest = {
+    operationId: "aggregate-operation:overlapping-correction",
+    expectedCampaignRevision: 1,
+    confirmation: confirmationFor(preview),
+    ownerSubject: "issuer.invalid/subject:owner",
+  };
+
+  const results = await Promise.all([
+    repositories[0].applyConfirmedCorrectionWithAudit({
+      ...baseRequest,
+      occurredAt: "2026-08-09T12:00:00.000Z",
+    }),
+    repositories[1].applyConfirmedCorrectionWithAudit({
+      ...baseRequest,
+      occurredAt: "2026-08-09T12:05:00.000Z",
+    }),
+  ]);
+  const winner = results.find((result) => !result.replayed);
+  const recovered = results.find((result) => result.replayed);
+  assert(winner);
+  assert(recovered);
+  assert.deepEqual(recovered, { ...winner, replayed: true });
+  assert.equal(overlapping.auditedTransactions, 2);
+  assert.equal(overlapping.operationReads, 3);
+  assert.equal(overlapping.auditReads, 1);
+  assert.deepEqual(
+    (await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }))
+      .items,
+    [winner.auditEvent],
+  );
+});
+
+test("audited correction atomically asserts its advertised campaign revision", async () => {
   const state = new MemoryStorageState();
   const adapter = new DeterministicMemoryStorageAdapter(state);
   const seed = new DevelopmentInMemoryAggregateRepository(adapter, currency);
@@ -390,6 +461,7 @@ test("audited correction atomically asserts its campaign revision and retries af
   }));
   const request = {
     operationId: "aggregate-operation:campaign-race-correction",
+    expectedCampaignRevision: 1,
     confirmation: confirmationFor(preview),
     ownerSubject: "issuer.invalid/subject:owner",
     occurredAt: "2026-08-09T12:00:00.000Z",
@@ -427,7 +499,18 @@ test("audited correction atomically asserts its campaign revision and retries af
     currency,
     revisionAssertion(campaignKey, 2),
   );
-  const corrected = await reopened.applyConfirmedCorrectionWithAudit(request);
+  await rejectsStorage(
+    () => reopened.applyConfirmedCorrectionWithAudit(request),
+    "PRECONDITION_FAILED",
+  );
+  const restartedRequest = {
+    ...request,
+    operationId: "aggregate-operation:campaign-race-restarted",
+    expectedCampaignRevision: 2,
+  };
+  const corrected = await reopened.applyConfirmedCorrectionWithAudit(
+    restartedRequest,
+  );
   assert.equal(corrected.replayed, false);
   assert.deepEqual(corrected.stored, stored(2, 25_000, 1));
   const replayed = await new DevelopmentInMemoryAggregateRepository(
@@ -435,10 +518,79 @@ test("audited correction atomically asserts its campaign revision and retries af
     currency,
     revisionAssertion(campaignKey, 2),
   ).applyConfirmedCorrectionWithAudit({
-    ...request,
+    ...restartedRequest,
     occurredAt: "2026-08-09T12:05:00.000Z",
   });
   assert.deepEqual(replayed, { ...corrected, replayed: true });
+});
+
+test("delayed exact correction retry survives campaign advance while new stale work fails", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state);
+  const campaignKey = requiredTestStorageKey(
+    "campaign-setup-current",
+    "configured-campaign",
+  );
+  setCampaignRevision(state, campaignKey, 1);
+  const seed = new DevelopmentInMemoryAggregateRepository(adapter, currency);
+  await seed.applyContribution(applyRequest(
+    "aggregate-operation:delayed-retry-seed",
+    0,
+    contribution("indication:delayed-retry", 1, "active", 25_000),
+  ));
+  mutateAggregateRecord(state, (snapshot) => {
+    snapshot.totalAmount = 20_000;
+  });
+  const preview = await seed.previewReconciliation();
+  const request = {
+    operationId: "aggregate-operation:delayed-correction",
+    expectedCampaignRevision: 1,
+    confirmation: confirmationFor(preview),
+    ownerSubject: "issuer.invalid/subject:owner",
+    occurredAt: "2026-08-09T12:00:00.000Z",
+  };
+  const committed = await new DevelopmentInMemoryAggregateRepository(
+    adapter,
+    currency,
+    revisionAssertion(campaignKey, 1),
+  ).applyConfirmedCorrectionWithAudit(request);
+  assert.equal(committed.replayed, false);
+
+  setCampaignRevision(state, campaignKey, 2);
+  const revisionTwoRepository = new DevelopmentInMemoryAggregateRepository(
+    adapter,
+    currency,
+    revisionAssertion(campaignKey, 2),
+  );
+  const transactionsBeforeRetries = state.transactionCalls;
+  const delayed = await revisionTwoRepository.applyConfirmedCorrectionWithAudit({
+    ...request,
+    occurredAt: "2026-08-10T12:00:00.000Z",
+  });
+  assert.deepEqual(delayed, { ...committed, replayed: true });
+
+  await rejectsStorage(
+    () => revisionTwoRepository.applyConfirmedCorrectionWithAudit({
+      ...request,
+      expectedCampaignRevision: 2,
+      occurredAt: "2026-08-10T12:05:00.000Z",
+    }),
+    "CONFLICT",
+  );
+  await rejectsStorage(
+    () => revisionTwoRepository.applyConfirmedCorrectionWithAudit({
+      ...request,
+      operationId: "aggregate-operation:new-stale-correction",
+      occurredAt: "2026-08-10T12:10:00.000Z",
+    }),
+    "PRECONDITION_FAILED",
+  );
+  assert.equal(state.transactionCalls, transactionsBeforeRetries);
+  assert.deepEqual(
+    (await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }))
+      .items,
+    [committed.auditEvent],
+  );
 });
 
 test("aggregate contribution listing rejects oversized legitimate collections finitely", async () => {
@@ -530,14 +682,21 @@ test("audited correction failure leaves both aggregate and audit untouched", asy
     snapshot.totalAmount = 4_000;
   });
   const preview = await seed.previewReconciliation();
+  const campaignKey = requiredTestStorageKey(
+    "campaign-setup-current",
+    "configured-campaign",
+  );
+  setCampaignRevision(state, campaignKey, 1);
   const failing = new DevelopmentInMemoryAggregateRepository(
     new RejectAuditedCorrectionAdapter(adapter),
     currency,
+    revisionAssertion(campaignKey, 1),
   );
 
   await rejectsStorage(
     () => failing.applyConfirmedCorrectionWithAudit({
       operationId: "aggregate-operation:atomic-failure",
+      expectedCampaignRevision: 1,
       confirmation: confirmationFor(preview),
       ownerSubject: "issuer.invalid/subject:owner",
       occurredAt: "2026-08-09T12:00:00.000Z",
@@ -830,6 +989,18 @@ function revisionAssertion(
   return Object.freeze({ type: "check", key, expectedRevision });
 }
 
+function setCampaignRevision(
+  state: MemoryStorageState,
+  key: StorageKey,
+  revision: number,
+): void {
+  state.records.set(storageKeyString(key), freezeRecord({
+    key,
+    revision,
+    value: { kind: "campaign-revision-fixture" },
+  }));
+}
+
 function hasStoredOperation(
   state: MemoryStorageState,
   kind: string,
@@ -941,6 +1112,66 @@ class CampaignRevisionRaceAdapter implements StorageAdapter {
       }));
       this.raced = true;
     }
+    return this.#delegate.transact(request);
+  }
+}
+
+class OverlappingAuditedCorrectionAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #bothArrived: Promise<void>;
+  readonly #winnerCommitted: Promise<void>;
+  #releaseBothArrived: () => void = () => {};
+  #releaseWinnerCommitted: () => void = () => {};
+  #arrivals = 0;
+  auditedTransactions = 0;
+  operationReads = 0;
+  auditReads = 0;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+    this.#bothArrived = new Promise((resolve) => {
+      this.#releaseBothArrived = resolve;
+    });
+    this.#winnerCommitted = new Promise((resolve) => {
+      this.#releaseWinnerCommitted = resolve;
+    });
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    if (key.collection === "investment-aggregate-operations") {
+      this.operationReads += 1;
+    } else if (key.collection === "audit-events") {
+      this.auditReads += 1;
+    }
+    return this.#delegate.read(key);
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    if (!request.mutations.some((mutation) =>
+      mutation.type === "put" && mutation.value.kind === "audit-event"
+    )) {
+      return this.#delegate.transact(request);
+    }
+
+    this.auditedTransactions += 1;
+    this.#arrivals += 1;
+    if (this.#arrivals === 1) {
+      await this.#bothArrived;
+      try {
+        return await this.#delegate.transact(request);
+      } finally {
+        this.#releaseWinnerCommitted();
+      }
+    }
+
+    this.#releaseBothArrived();
+    await this.#winnerCommitted;
     return this.#delegate.transact(request);
   }
 }
