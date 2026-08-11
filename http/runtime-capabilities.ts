@@ -10,6 +10,8 @@ export const OWNER_FOUNDER_REVIEW_HEADER =
   "x-investor-app-owner-founder-review";
 export const OWNER_NOTIFICATION_HISTORY_HEADER =
   "x-investor-app-owner-notification-history";
+export const OWNER_AGGREGATE_RECONCILIATION_HEADER =
+  "x-investor-app-owner-aggregate-reconciliation";
 export const PARTICIPANT_FOUNDER_INTEREST_HEADER =
   "x-investor-app-participant-founder-interest";
 export const PARTICIPANT_INVESTMENT_INTERESTS_HEADER =
@@ -34,6 +36,7 @@ export function withRuntimeCapabilities(
     ownerAuditHistory?: boolean;
     ownerFounderReview?: boolean;
     ownerNotificationHistory?: boolean;
+    ownerAggregateReconciliation?: boolean;
     participantFounderInterest?: boolean;
     participantInvestmentInterests?: boolean;
     participantProfileSelfService?: boolean;
@@ -47,6 +50,7 @@ export function withRuntimeCapabilities(
   headers.delete(OWNER_AUDIT_HISTORY_HEADER);
   headers.delete(OWNER_FOUNDER_REVIEW_HEADER);
   headers.delete(OWNER_NOTIFICATION_HISTORY_HEADER);
+  headers.delete(OWNER_AGGREGATE_RECONCILIATION_HEADER);
   headers.delete(PARTICIPANT_FOUNDER_INTEREST_HEADER);
   headers.delete(PARTICIPANT_INVESTMENT_INTERESTS_HEADER);
   headers.delete(PARTICIPANT_PROFILE_SELF_SERVICE_HEADER);
@@ -70,6 +74,9 @@ export function withRuntimeCapabilities(
   }
   if (capabilities.ownerNotificationHistory) {
     headers.set(OWNER_NOTIFICATION_HISTORY_HEADER, "available");
+  }
+  if (capabilities.ownerAggregateReconciliation) {
+    headers.set(OWNER_AGGREGATE_RECONCILIATION_HEADER, "available");
   }
   if (capabilities.participantFounderInterest) {
     headers.set(PARTICIPANT_FOUNDER_INTEREST_HEADER, "available");
@@ -125,6 +132,12 @@ export function hasOwnerFounderReview(value: string | null): boolean {
 }
 
 export function hasOwnerNotificationHistory(value: string | null): boolean {
+  return value === "available";
+}
+
+export function hasOwnerAggregateReconciliation(
+  value: string | null,
+): boolean {
   return value === "available";
 }
 

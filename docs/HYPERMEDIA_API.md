@@ -344,6 +344,14 @@ When an investment-interest JSON representation advertises at least one mutation
 
 Investment-interest reads and writes are separate injected capabilities. Reads require only participant-owned `get` and `listOwned` operations. Every write requires `AtomicParticipantInvestmentInterestMutationPort` with the explicit `atomic-indication-aggregate-audit` guarantee: the new indication revision, aggregate projection, allowlisted audit transition, and idempotent retry result are committed together or none are changed. The participant service rejects weaker mutation persistence during composition and validates the closed result before returning it.
 
+## Owner Aggregate Reconciliation
+
+`GET /owner/aggregate-reconciliation` is the configured owner's private comparison of the stored investment-interest aggregate with a fresh calculation from persisted contribution projections. HTML and version `0.1` hypermedia JSON expose the same stored revision, amount, currency, private contributing count, calculated summary, owner link, and current correction capability. Anonymous callers receive authentication guidance, while authenticated non-owners receive the generic not-found surface before aggregate storage is read.
+
+Only a mismatch backed by `atomic-aggregate-audit` persistence exposes `apply-calculated-aggregate`. Its seven body fields bind a server-issued operation ID and explicit confirmation to every stored and calculated preview value. Native HTML adds the one-use CSRF transport field; JSON returns the same owner-bound proof only in `MUTATION_CSRF_HEADER`. A consumed proof cookie is cleared on success and every later fixed failure, and a matching resource has no mutation action or replacement proof.
+
+The hosted Worker derives the repository currency from the persisted current campaign and binds mutation authority to the trusted configured-owner subject. The correction compare-and-sets the aggregate revision and commits the corrected snapshot, immutable retry receipt, and allowlisted `reconciled` audit event in one AittaDB transaction. Exact repository retries return the original evidence, stale previews return `412`, and storage failure changes neither aggregate nor audit. Responses remain private and non-cacheable and never expose credentials, storage keys, indication identities, or participant fields.
+
 ## Owner AittaDB Connection Proof
 
 `GET /owner/aittadb-connection` is an optionally injected owner-only resource. When exact issuer discovery satisfies the configured confidential Authorization Code, S256, introspection, and storage-scope contract, both HTML and version `0.1` JSON advertise `verify-aittadb-connection` as a `POST` action with no feature fields. HTML adds the shared hidden CSRF transport value; JSON returns that proof only in the designated response header.

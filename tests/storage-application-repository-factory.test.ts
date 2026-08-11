@@ -188,6 +188,7 @@ test("factory exposes only named application repository capabilities", async () 
     accountEmailLabel: "factory@example.test",
   });
   const foreignSubject = parseActorSubject("issuer.invalid/participant:foreign");
+  const ownerSubject = parseActorSubject("issuer.invalid/owner:configured");
   const foreignAccount = parseParticipantAccount({
     subject: "issuer.invalid/participant:foreign",
     accountEmailLabel: "foreign@example.test",
@@ -195,6 +196,7 @@ test("factory exposes only named application repository capabilities", async () 
   assert(subject.ok);
   assert(account.ok);
   assert(foreignSubject.ok);
+  assert(ownerSubject.ok);
   assert(foreignAccount.ok);
   const ownerIndicationReviews = factory.ownerIndicationReviews(
     subject.value,
@@ -215,6 +217,7 @@ test("factory exposes only named application repository capabilities", async () 
     "ownerIndicationReviews",
     "ownerFounderApplicationReviews",
     "ownerManualNotificationActivity",
+    "ownerAggregateReconciliation",
     "participantRequest",
     "participantInvestmentRepository",
     "participantRepository",
@@ -343,6 +346,47 @@ test("factory exposes only named application repository capabilities", async () 
     publicAggregate: { visibility: "hidden" },
   });
   assert(amount.ok);
+  const reconciliation = factory.ownerAggregateReconciliation(
+    ownerSubject.value,
+    amount.value.amount,
+  );
+  assert.notEqual(
+    factory.ownerAggregateReconciliation(
+      ownerSubject.value,
+      amount.value.amount,
+    ),
+    reconciliation,
+  );
+  assert.deepEqual(Object.keys(reconciliation), ["correctionConsistency"]);
+  assert.equal(
+    reconciliation.correctionConsistency,
+    "atomic-aggregate-audit",
+  );
+  assert.deepEqual(await reconciliation.previewReconciliation(), {
+    status: "match",
+    stored: {
+      revision: 0,
+      totalAmount: 0,
+      currency: "EUR",
+      contributingIndicationCount: 0,
+    },
+    calculated: {
+      totalAmount: 0,
+      currency: "EUR",
+      contributingIndicationCount: 0,
+    },
+    correctionRequired: false,
+  });
+  await assert.rejects(
+    reconciliation.applyConfirmedCorrectionWithAudit({
+      operationId: "aggregate-correction:foreign",
+      confirmation: {},
+      ownerSubject: foreignSubject.value,
+      occurredAt: NOW.toISOString(),
+    }),
+    (error) => storageFailure(error, "NOT_FOUND"),
+  );
+  assertNoGenericStorageSurface(reconciliation, storage);
   const investment = factory.participantInvestmentRepository(
     subject.value,
     amount.value.amount,

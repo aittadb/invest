@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   OWNER_AITTADB_CONNECTION_HEADER,
+  OWNER_AGGREGATE_RECONCILIATION_HEADER,
   OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER,
   OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER,
   OWNER_INDICATION_MODERATION_HEADER,
@@ -14,6 +15,7 @@ import {
   PARTICIPANT_INVESTMENT_INTERESTS_HEADER,
   PARTICIPANT_PROFILE_SELF_SERVICE_HEADER,
   hasOwnerAittaDBConnection,
+  hasOwnerAggregateReconciliation,
   hasOwnerCampaignEditorCapability,
   hasOwnerCampaignSetupCapability,
   hasOwnerIndicationModeration,
@@ -41,6 +43,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
       [PARTICIPANT_INVESTMENT_INTERESTS_HEADER]: "available",
       [PARTICIPANT_PROFILE_SELF_SERVICE_HEADER]: "available",
       [OWNER_AITTADB_CONNECTION_HEADER]: "available",
+      [OWNER_AGGREGATE_RECONCILIATION_HEADER]: "available",
     },
   });
   const unavailable = withRuntimeCapabilities(spoofed, {
@@ -55,6 +58,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
     participantInvestmentInterests: false,
     participantProfileSelfService: false,
     ownerAittadbConnection: false,
+    ownerAggregateReconciliation: false,
   });
   assert.equal(unavailable.headers.get(OWNER_PACKAGE_WORKSPACE_HEADER), null);
   assert.equal(
@@ -79,6 +83,10 @@ test("the Worker replaces client-supplied owner feature availability", () => {
     null,
   );
   assert.equal(unavailable.headers.get(OWNER_AITTADB_CONNECTION_HEADER), null);
+  assert.equal(
+    unavailable.headers.get(OWNER_AGGREGATE_RECONCILIATION_HEADER),
+    null,
+  );
   assert.equal(hasOwnerPackageWorkspace("AVAILABLE"), false);
   assert.equal(hasOwnerCampaignEditorCapability("AVAILABLE"), false);
   assert.equal(hasOwnerCampaignSetupCapability("AVAILABLE"), false);
@@ -90,6 +98,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   assert.equal(hasParticipantInvestmentInterests("AVAILABLE"), false);
   assert.equal(hasParticipantProfileSelfService("AVAILABLE"), false);
   assert.equal(hasOwnerAittaDBConnection("AVAILABLE"), false);
+  assert.equal(hasOwnerAggregateReconciliation("AVAILABLE"), false);
 
   const available = withRuntimeCapabilities(spoofed, {
     ownerPackageWorkspace: true,
@@ -103,6 +112,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
     participantInvestmentInterests: true,
     participantProfileSelfService: true,
     ownerAittadbConnection: true,
+    ownerAggregateReconciliation: true,
   });
   assert.equal(
     available.headers.get(OWNER_PACKAGE_WORKSPACE_HEADER),
@@ -171,6 +181,12 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   assert.equal(
     hasOwnerAittaDBConnection(
       available.headers.get(OWNER_AITTADB_CONNECTION_HEADER),
+    ),
+    true,
+  );
+  assert.equal(
+    hasOwnerAggregateReconciliation(
+      available.headers.get(OWNER_AGGREGATE_RECONCILIATION_HEADER),
     ),
     true,
   );

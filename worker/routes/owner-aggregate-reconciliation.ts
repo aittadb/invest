@@ -9,13 +9,16 @@ import {
 } from "../../domain/public-campaign-resource.ts";
 import { parseStorageOperationId, StorageFailure } from "../../domain/storage-adapter.ts";
 import { negotiateRepresentation } from "../../http/content-negotiation.ts";
+import type {
+  BrowserMutationProof,
+} from "../../http/browser-mutation-session.ts";
 import {
   MUTATION_CSRF_FIELD,
   MUTATION_CSRF_HEADER,
   MutationSecurityFailure,
   toPublicMutationSecurityFailure,
-  type BrowserMutationGuard,
   type MutationMediaType,
+  type VerifiedMutationRequest,
 } from "../../http/mutation-security.ts";
 import type {
   AtomicInvestmentAggregateCorrectionRepository,
@@ -38,6 +41,16 @@ const MUTATION_KEYS = new Set([
   "expected-calculated-count",
 ]);
 
+/** Seven correction fields plus the form-only CSRF field, all short scalars. */
+export const MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_BYTES = 4_096;
+export const MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_FIELDS = 8;
+
+type OwnerAggregateReconciliationMutationVerifier = (
+  request: Request,
+) => Promise<
+  VerifiedMutationRequest & Readonly<{ clearCookie?: string }>
+>;
+
 export type ReadOnlyAggregateReconciliationRepository = Pick<
   InvestmentAggregateRepository,
   "previewReconciliation"
@@ -49,8 +62,10 @@ export type OwnerAggregateReconciliationRepository =
 
 export type OwnerAggregateReconciliationRouteOptions = Readonly<{
   repository: OwnerAggregateReconciliationRepository;
-  guardMutation: BrowserMutationGuard;
-  csrfToken: (request: Request) => Promise<string>;
+  guardMutation: OwnerAggregateReconciliationMutationVerifier;
+  csrfToken: (
+    request: Request,
+  ) => Promise<string | BrowserMutationProof | null>;
   issueOperationId?: () => string;
   now?: () => Date;
 }>;
@@ -69,15 +84,6 @@ export function createOwnerAggregateReconciliationRouteHandler(
     if (representation.kind === "not-acceptable") {
       return notAcceptableResponse(context.resourceUrl);
     }
-    if (context.request.method !== "GET" && context.request.method !== "POST") {
-      return errorResponse(
-        representation.kind,
-        context.resourceUrl,
-        405,
-        "method_not_allowed",
-        "This resource supports GET and POST.",
-      );
-    }
     if (context.actor === null) {
       return authenticationRequiredResponse(
         representation.kind,
@@ -93,7 +99,17 @@ export function createOwnerAggregateReconciliationRouteHandler(
         "The requested resource was not found.",
       );
     }
+    if (context.request.method !== "GET" && context.request.method !== "POST") {
+      return errorResponse(
+        representation.kind,
+        context.resourceUrl,
+        405,
+        "method_not_allowed",
+        "This resource supports GET and POST.",
+      );
+    }
 
+    let clearCookie: string | null = null;
     try {
       if (context.request.method === "POST") {
         if (options.repository.correctionConsistency !==
@@ -107,6 +123,15 @@ export function createOwnerAggregateReconciliationRouteHandler(
           );
         }
         const verified = await options.guardMutation(context.request);
+        if (
+          Object.hasOwn(verified, "clearCookie") &&
+          !validSetCookie(verified.clearCookie)
+        ) {
+          throw new StorageFailure("UNAVAILABLE");
+        }
+        clearCookie = validSetCookie(verified.clearCookie)
+          ? verified.clearCookie
+          : null;
         if (
           verified.method !== "POST" ||
           verified.actor.type !== "owner" ||
@@ -138,30 +163,33 @@ export function createOwnerAggregateReconciliationRouteHandler(
       );
       const csrf = resource.correctionForm === null
         ? null
-        : requiredCsrfToken(await options.csrfToken(context.request));
+        : requiredCsrfProof(await options.csrfToken(context.request));
       const response = representation.kind === "hypermedia-json"
         ? hypermediaResponse(resource.document)
-        : htmlResponse(renderResource(resource, csrf));
-      return csrf === null ? response : withCsrfToken(response, csrf);
+        : htmlResponse(renderResource(resource, csrf?.token ?? null));
+      if (csrf !== null) {
+        response.headers.set(MUTATION_CSRF_HEADER, csrf.token);
+      }
+      return withSetCookies(response, [clearCookie, csrf?.setCookie ?? null]);
     } catch (error) {
       if (error instanceof MutationSecurityFailure) {
         const failure = toPublicMutationSecurityFailure(error);
-        return errorResponse(
+        return withSetCookie(errorResponse(
           representation.kind,
           context.resourceUrl,
           failure.status,
           failure.body.error.code.toLowerCase(),
           failure.body.error.message,
-        );
+        ), clearCookie);
       }
       const storage = storageError(error);
-      return errorResponse(
+      return withSetCookie(errorResponse(
         representation.kind,
         context.resourceUrl,
         storage.status,
         storage.code,
         storage.message,
-      );
+      ), clearCookie);
     }
   };
 }
@@ -240,16 +268,29 @@ function requiredOperationId(value: unknown): string {
   return parsed.value;
 }
 
-function requiredCsrfToken(value: unknown): string {
+function validCsrfToken(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length >= 32 &&
+    value.length <= 256 &&
+    /^[A-Za-z0-9_-]+$/.test(value);
+}
+
+function requiredCsrfProof(
+  value: string | BrowserMutationProof | null,
+): Readonly<{ token: string; setCookie: string | null }> {
+  if (typeof value === "string") {
+    if (!validCsrfToken(value)) throw new StorageFailure("UNAVAILABLE");
+    return Object.freeze({ token: value, setCookie: null });
+  }
   if (
-    typeof value !== "string" ||
-    value.length < 32 ||
-    value.length > 256 ||
-    !/^[A-Za-z0-9_-]+$/.test(value)
+    typeof value !== "object" ||
+    value === null ||
+    !validCsrfToken(value.token) ||
+    !validSetCookie(value.setCookie)
   ) {
     throw new StorageFailure("UNAVAILABLE");
   }
-  return value;
+  return Object.freeze({ token: value.token, setCookie: value.setCookie });
 }
 
 function currentTimestamp(now: () => Date): string {
@@ -398,9 +439,25 @@ function htmlResponse(body: string, status = 200): Response {
   });
 }
 
-function withCsrfToken(response: Response, token: string): Response {
+function validSetCookie(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 4_096 &&
+    !/[\r\n]/u.test(value);
+}
+
+function withSetCookie(response: Response, cookie: string | null): Response {
+  return withSetCookies(response, [cookie]);
+}
+
+function withSetCookies(
+  response: Response,
+  cookies: readonly (string | null)[],
+): Response {
+  const selected = cookies.filter(validSetCookie);
+  if (selected.length === 0) return response;
   const headers = new Headers(response.headers);
-  headers.set(MUTATION_CSRF_HEADER, token);
+  for (const cookie of selected) headers.append("Set-Cookie", cookie);
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,

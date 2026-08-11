@@ -90,6 +90,12 @@ import { createOwnerFounderReviewCollectionRouteHandler } from "./routes/owner-f
 import { createOwnerInitialSetupRouteHandler } from "./routes/owner-initial-setup.ts";
 import { createOwnerRouteHandler } from "./routes/owner.ts";
 import {
+  createOwnerAggregateReconciliationRouteHandler,
+  MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_BYTES,
+  MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_FIELDS,
+  type OwnerAggregateReconciliationRouteOptions,
+} from "./routes/owner-aggregate-reconciliation.ts";
+import {
   createOwnerPackageRouteHandler,
   MAX_OWNER_PACKAGE_MUTATION_BYTES,
   MAX_OWNER_PACKAGE_MUTATION_FIELDS,
@@ -139,6 +145,7 @@ export type ApplicationWorkerDependencies = Readonly<{
   ownerAuditHistory?: OwnerAuditHistoryRouteDependencies;
   ownerFounderReview?: FounderApplicationReviewCollectionRepository;
   ownerAuditNotificationHistory?: OwnerAuditNotificationRouteDependencies;
+  ownerAggregateReconciliation?: OwnerAggregateReconciliationRouteOptions;
   participantFounderInterest?: FounderInterestRouteDependencies;
   participantInvestmentInterests?: InvestmentInterestRouteDependencies;
   participantProfile?: ParticipantProfileRouteDependencies;
@@ -264,6 +271,20 @@ export function createApplicationWorker(
       const campaign = isOwner && isOwnerPath(url.pathname) && campaignWorkspace
         ? await resolveOwnerCampaign(campaignWorkspace, publicCampaign)
         : publicCampaign;
+      const ownerAggregateReconciliation =
+        dependencies.dispatchRoute === undefined
+          ? dependencies.ownerAggregateReconciliation ??
+            await runtimeOwnerAggregateReconciliation(
+              applicationRuntime,
+              actor,
+              isOwner,
+              resourceUrl,
+              url.pathname,
+            )
+          : undefined;
+      const ownerAggregateReconciliationAvailable =
+        ownerAggregateReconciliation?.repository.correctionConsistency ===
+          "atomic-aggregate-audit";
       const participantAccessReader = dependencies.participantAccessReader ??
         participantRequest?.participantAccessReader();
       const participantAccessResolution = await resolveParticipantAccess(
@@ -346,6 +367,10 @@ export function createApplicationWorker(
                 normalApplication && ownerFounderReviewAvailable && isOwner,
               ownerNotificationHistory:
                 normalApplication && ownerNotificationHistoryAvailable && isOwner,
+              ownerAggregateReconciliation:
+                normalApplication &&
+                ownerAggregateReconciliationAvailable &&
+                isOwner,
               participantFounderInterest:
                 normalApplication && participantFounderInterestAvailable,
               participantInvestmentInterests:
@@ -375,6 +400,7 @@ export function createApplicationWorker(
         ownerReviewExportsAvailable ||
         ownerAuditHistoryAvailable ||
         ownerFounderReviewAvailable ||
+        ownerAggregateReconciliation !== undefined ||
         participantFounderInterestAvailable ||
         participantInvestmentInterestsAvailable ||
         campaignEditorAvailable ||
@@ -390,6 +416,7 @@ export function createApplicationWorker(
               ownerAuditHistory,
               ownerFounderReview,
               ownerAuditNotificationHistory,
+              ownerAggregateReconciliation,
               participantFounderInterest ?? null,
               {
                 owner: ownerPackage,
@@ -406,6 +433,7 @@ export function createApplicationWorker(
                 ownerAuditHistoryAvailable,
                 ownerFounderReviewAvailable,
                 ownerNotificationHistoryAvailable,
+                ownerAggregateReconciliationAvailable,
                 participantFounderInterestAvailable,
                 participantInvestmentInterestsAvailable,
                 campaignEditorAvailable,
@@ -455,6 +483,7 @@ type InjectedRouteAvailability = Readonly<{
   ownerAuditHistoryAvailable: boolean;
   ownerFounderReviewAvailable: boolean;
   ownerNotificationHistoryAvailable: boolean;
+  ownerAggregateReconciliationAvailable: boolean;
   participantFounderInterestAvailable: boolean;
   participantInvestmentInterestsAvailable: boolean;
   campaignEditorAvailable: boolean;
@@ -480,6 +509,8 @@ function createInjectedRouteDispatcher(
     | undefined,
   ownerAuditNotificationHistory:
     OwnerAuditNotificationRouteDependencies | undefined,
+  ownerAggregateReconciliation:
+    OwnerAggregateReconciliationRouteOptions | undefined,
   participantFounderInterest: FounderInterestRouteDependencies | null,
   packageRoutes: ResolvedPackageRoutes,
   available: InjectedRouteAvailability,
@@ -552,6 +583,11 @@ function createInjectedRouteDispatcher(
               ownerFounderReview,
             )]
           : []),
+        ...(ownerAggregateReconciliation
+          ? [createOwnerAggregateReconciliationRouteHandler(
+              ownerAggregateReconciliation,
+            )]
+          : []),
         ...(campaignWorkspace
           ? [
               createOwnerInitialSetupRouteHandler({
@@ -582,6 +618,8 @@ function createInjectedRouteDispatcher(
         auditHistory: available.ownerAuditHistoryAvailable,
         founderApplicationReview: available.ownerFounderReviewAvailable,
         auditNotificationHistory: available.ownerNotificationHistoryAvailable,
+        aggregateReconciliation:
+          available.ownerAggregateReconciliationAvailable,
         campaignEditor: available.campaignEditorAvailable,
         campaignSetup: available.campaignSetupAvailable,
         aittadbConnection: available.ownerOAuthProofAvailable,
@@ -1121,6 +1159,93 @@ function runtimeOwnerAuditNotificationHistory(
   }
 }
 
+const OWNER_AGGREGATE_RECONCILIATION_PATH =
+  "/owner/aggregate-reconciliation";
+
+async function runtimeOwnerAggregateReconciliation(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  resourceUrl: string,
+  pathname: string,
+): Promise<OwnerAggregateReconciliationRouteOptions | undefined> {
+  if (
+    runtime === null ||
+    (pathname !== "/owner" &&
+      pathname !== OWNER_AGGREGATE_RECONCILIATION_PATH)
+  ) {
+    return undefined;
+  }
+  if (actor === null || !isOwner) {
+    return pathname === OWNER_AGGREGATE_RECONCILIATION_PATH
+      ? unavailableOwnerAggregateReconciliationRoute()
+      : undefined;
+  }
+
+  const ownerSubject = parseActorSubject(actor.userId);
+  if (!ownerSubject.ok) {
+    return pathname === OWNER_AGGREGATE_RECONCILIATION_PATH
+      ? unavailableOwnerAggregateReconciliationRoute()
+      : undefined;
+  }
+
+  try {
+    const campaign = await runtime.repositoryFactory.campaignRepository()
+      .readSetup();
+    if (campaign === null) {
+      return pathname === OWNER_AGGREGATE_RECONCILIATION_PATH
+        ? unavailableOwnerAggregateReconciliationRoute()
+        : undefined;
+    }
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "owner" as const,
+      subject: ownerSubject.value,
+    });
+    return Object.freeze({
+      repository: runtime.repositoryFactory.ownerAggregateReconciliation(
+        ownerSubject.value,
+        campaign.setup.amountAggregate.amount,
+      ),
+      guardMutation: (request: Request) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          {
+            maxBodyBytes:
+              MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_BYTES,
+            maxFields:
+              MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_FIELDS,
+            repeatedFormFields: [],
+          },
+        ),
+      csrfToken: (request: Request) =>
+        runtime.mutationSession.issue(request, identity, appOrigin),
+      issueOperationId: () => randomOperationId("aggregate-correction"),
+      now: runtime.now,
+    });
+  } catch {
+    return pathname === OWNER_AGGREGATE_RECONCILIATION_PATH
+      ? unavailableOwnerAggregateReconciliationRoute()
+      : undefined;
+  }
+}
+
+function unavailableOwnerAggregateReconciliationRoute():
+  OwnerAggregateReconciliationRouteOptions {
+  return Object.freeze({
+    repository: Object.freeze({
+      correctionConsistency: "unavailable" as const,
+      previewReconciliation: () =>
+        Promise.reject(new StorageFailure("UNAVAILABLE")),
+    }),
+    guardMutation: () =>
+      Promise.reject(new StorageFailure("UNAVAILABLE")),
+    csrfToken: () => Promise.resolve(null),
+  });
+}
+
 async function resolveApplicationRuntime(
   dependencies: ApplicationWorkerDependencies,
   env: InvestorAppEnv,
@@ -1166,6 +1291,7 @@ function withRuntimeConfiguration(
     ownerAuditHistory: boolean;
     ownerFounderReview: boolean;
     ownerNotificationHistory: boolean;
+    ownerAggregateReconciliation: boolean;
     participantFounderInterest: boolean;
     participantInvestmentInterests: boolean;
     participantProfileSelfService: boolean;

@@ -787,6 +787,46 @@ export class DevelopmentInMemoryAggregateRepository
   }
 }
 
+/** Per-request configured-owner capability over persistent aggregate storage. */
+export class OwnerBoundInvestmentAggregateCorrectionRepository
+  implements AtomicInvestmentAggregateCorrectionRepository {
+  readonly correctionConsistency = "atomic-aggregate-audit" as const;
+  readonly #ownerSubject: ActorSubject;
+  readonly #repository: DevelopmentInMemoryAggregateRepository;
+
+  constructor(
+    storage: StorageAdapter,
+    ownerSubject: ActorSubject,
+    currency: CurrencyCode,
+  ) {
+    this.#ownerSubject = requiredOwnerSubject(ownerSubject);
+    this.#repository = new DevelopmentInMemoryAggregateRepository(
+      storage,
+      requiredCurrency(currency),
+    );
+    Object.freeze(this);
+  }
+
+  previewReconciliation(): Promise<InvestmentAggregateReconciliationPreview> {
+    return this.#repository.previewReconciliation();
+  }
+
+  applyConfirmedCorrectionWithAudit(
+    request: ApplyAuditedAggregateCorrectionRequest,
+  ): Promise<ApplyAuditedAggregateCorrectionResult> {
+    let subject: ActorSubject;
+    try {
+      subject = requiredOwnerSubject(request.ownerSubject);
+    } catch {
+      return Promise.reject(new StorageFailure("NOT_FOUND"));
+    }
+    if (subject !== this.#ownerSubject) {
+      return Promise.reject(new StorageFailure("NOT_FOUND"));
+    }
+    return this.#repository.applyConfirmedCorrectionWithAudit(request);
+  }
+}
+
 function classifyContribution(
   current: InvestmentAggregateContribution | undefined,
   candidate: InvestmentAggregateContribution,

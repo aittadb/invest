@@ -70,8 +70,12 @@ import {
 } from "./in-memory-participant-repository.ts";
 import { StorageParticipantInvestmentInterestRepository } from "./storage-participant-investment-repository.ts";
 import {
-  StorageManualNotificationRepository,
+  OwnerBoundInvestmentAggregateCorrectionRepository,
+  type AtomicInvestmentAggregateCorrectionRepository,
+} from "./in-memory-aggregate-repository.ts";
+import {
   StorageAuditEventReader,
+  StorageManualNotificationRepository,
   type AtomicManualNotificationActivityRepository,
   type AuditEventReader,
 } from "./in-memory-audit-notification-repositories.ts";
@@ -258,6 +262,17 @@ export class StorageApplicationRepositoryFactory {
 
   ownerManualNotificationActivity(): AtomicManualNotificationActivityRepository {
     return this.#ownerManualNotificationActivity;
+  }
+
+  ownerAggregateReconciliation(
+    ownerSubject: ActorSubject,
+    amountConfiguration: AmountConfiguration,
+  ): AtomicInvestmentAggregateCorrectionRepository {
+    return new OwnerBoundInvestmentAggregateCorrectionRepository(
+      this.#storage,
+      ownerSubject,
+      amountConfiguration.currency,
+    );
   }
 
   participantRequest(

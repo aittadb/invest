@@ -10,6 +10,7 @@ import {
 } from "../../http/runtime-campaign";
 import {
   hasOwnerAittaDBConnection,
+  hasOwnerAggregateReconciliation,
   hasOwnerAuditHistory,
   hasOwnerNotificationHistory,
   hasOwnerCampaignEditorCapability,
@@ -19,6 +20,7 @@ import {
   hasOwnerPackageWorkspace,
   hasOwnerReviewExports,
   OWNER_AITTADB_CONNECTION_HEADER,
+  OWNER_AGGREGATE_RECONCILIATION_HEADER,
   OWNER_AUDIT_HISTORY_HEADER,
   OWNER_NOTIFICATION_HISTORY_HEADER,
   OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER,
@@ -69,6 +71,9 @@ export default async function OwnerHome() {
   const notificationHistoryAvailable = hasOwnerNotificationHistory(
     requestHeaders.get(OWNER_NOTIFICATION_HISTORY_HEADER),
   );
+  const aggregateReconciliationAvailable = hasOwnerAggregateReconciliation(
+    requestHeaders.get(OWNER_AGGREGATE_RECONCILIATION_HEADER),
+  );
   const setupState = campaign ? "Configured" : "Setup required";
   const publicationState = campaign
     ? campaign.published
@@ -108,6 +113,9 @@ export default async function OwnerHome() {
           ) : null}
           {notificationHistoryAvailable ? (
             <Link href="/owner/manual-notifications">Manual notifications</Link>
+          ) : null}
+          {aggregateReconciliationAvailable ? (
+            <Link href="/owner/aggregate-reconciliation">Aggregate reconciliation</Link>
           ) : null}
           <a href={chatGPTSignOutPath("/")}>Sign out</a>
         </nav>

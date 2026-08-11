@@ -9,10 +9,12 @@ factory, and one browser-mutation session per immutable Sites environment.
 
 The runtime now composes named persistent campaign, package, participant-access,
 participant founder-application, owner founder-review collection, owner audit,
-and owner manual-notification capabilities over that adapter.
+owner manual-notification, and owner aggregate-reconciliation capabilities over
+that adapter.
 `createApplicationWorker` installs
 `/owner/setup`, campaign editing, draft preview, publish/unpublish, owner package
-management, and the exact founder-review collection only in the
+management, the exact founder-review collection, and aggregate reconciliation
+only in the
 configured-owner route group. For a signed-in
 non-owner, it derives the trusted `participantAccess` projection from that
 subject's persistent profile, current package, and current acknowledgment gate.
@@ -41,6 +43,11 @@ campaign/profile/application scope only for the exact founder resource after
 participant authorization. Its create and edit repositories add the exact
 sampled campaign revision as an atomic transaction check, so a concurrent
 policy change cannot authorize a stale write.
+
+The configured owner reconciliation resource loads the persisted campaign
+amount configuration, binds correction authority to the trusted owner subject,
+and atomically persists the corrected aggregate, retry receipt, and audit
+evidence.
 
 The persistent owner indication-detail primitive can resolve one deployment-key
 opaque review ID to a bounded verified current record and notification without a
@@ -149,6 +156,10 @@ reader, the atomic manual-notification activity repository, a participant
 package reader, subject-bound package acknowledgment, one participant-access
 state reader, and one participant-bound founder campaign/profile/application
 scope.
+Its owner aggregate method
+returns a fresh configured-owner-bound capability with only preview and atomic
+audited correction operations; it exposes no adapter, generic collection, or
+participant subject selector.
 That reader creates fresh profile and acknowledgment repositories for each
 trusted account and combines them only through the bounded projection service.
 The named `participantRepository(account)` capability returns a fresh repository

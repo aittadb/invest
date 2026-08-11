@@ -28,6 +28,10 @@ const OWNER_SUBJECT = "issuer.invalid/subject:owner";
 const CSRF_TOKEN = "owner_reconciliation_csrf_token_1234567890";
 const OPERATION_ID = "aggregate-correction:test-operation";
 const OCCURRED_AT = "2026-08-09T12:00:00.000Z";
+const PROOF_COOKIE =
+  "__Host-investor_app_mutation_test=encrypted; Path=/; Secure; HttpOnly; SameSite=Strict";
+const CLEAR_PROOF_COOKIE =
+  "__Host-investor_app_mutation_test=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict";
 
 test("owner reconciliation renders one equivalent HTML form and JSON action", async () => {
   const repository = new FakeAtomicReconciliationRepository(mismatchPreview());
@@ -173,6 +177,49 @@ test("JSON and form mutations enforce the guard and bind the exact preview", asy
   }
 });
 
+test("hosted proof cookies are issued and consumed without surviving correction", async () => {
+  const repository = new FakeAtomicReconciliationRepository(mismatchPreview());
+  const guard = await mutationGuard();
+  const handler = createOwnerAggregateReconciliationRouteHandler({
+    repository,
+    guardMutation: async (request) => Object.freeze({
+      ...await guard(request),
+      clearCookie: CLEAR_PROOF_COOKIE,
+    }),
+    csrfToken: async () => ({
+      token: CSRF_TOKEN,
+      expiresAt: "2026-08-09T12:05:00.000Z" as never,
+      setCookie: PROOF_COOKIE,
+    }),
+    issueOperationId: () => OPERATION_ID,
+    now: () => new Date(OCCURRED_AT),
+  });
+
+  const get = await requiredResponse(await handler(context(new Request(
+    `${ORIGIN}${PATH}`,
+    { headers: { Accept: "application/json" } },
+  ))));
+  assert.equal(get.headers.get(MUTATION_CSRF_HEADER), CSRF_TOKEN);
+  assert.equal(get.headers.get("set-cookie"), PROOF_COOKIE);
+
+  const response = await requiredResponse(await handler(context(new Request(
+    `${ORIGIN}${PATH}`,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Origin: ORIGIN,
+        [MUTATION_CSRF_HEADER]: CSRF_TOKEN,
+      },
+      body: JSON.stringify(correctionFields()),
+    },
+  ))));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.equal(response.headers.get("set-cookie"), CLEAR_PROOF_COOKIE);
+});
+
 test("authentication, ownership, and mutation proofs fail without repository writes", async () => {
   const repository = new FakeAtomicReconciliationRepository(mismatchPreview());
   const handler = createOwnerAggregateReconciliationRouteHandler({
@@ -194,6 +241,30 @@ test("authentication, ownership, and mutation proofs fail without repository wri
   )));
   assert.equal(foreign.status, 404);
 
+  const anonymousPut = await requiredResponse(await handler(context(
+    new Request(`${ORIGIN}${PATH}`, {
+      method: "PUT",
+      headers: { Accept: "application/json" },
+    }),
+    { actor: null, isOwner: false },
+  )));
+  assert.equal(anonymousPut.status, 401);
+  const foreignPut = await requiredResponse(await handler(context(
+    new Request(`${ORIGIN}${PATH}`, {
+      method: "PUT",
+      headers: { Accept: "application/json" },
+    }),
+    { actor: participantActor(), isOwner: false },
+  )));
+  assert.equal(foreignPut.status, 404);
+  const ownerPut = await requiredResponse(await handler(context(
+    new Request(`${ORIGIN}${PATH}`, {
+      method: "PUT",
+      headers: { Accept: "application/json" },
+    }),
+  )));
+  assert.equal(ownerPut.status, 405);
+
   const badCsrf = await requiredResponse(await handler(context(new Request(
     `${ORIGIN}${PATH}`,
     {
@@ -208,6 +279,36 @@ test("authentication, ownership, and mutation proofs fail without repository wri
     },
   ))));
   assert.equal(badCsrf.status, 403);
+  assert.equal(repository.applyCalls.length, 0);
+  assert.equal(repository.previewCalls, 0);
+});
+
+test("an invalid consumed-proof cookie fails closed before correction", async () => {
+  const repository = new FakeAtomicReconciliationRepository(mismatchPreview());
+  const guard = await mutationGuard();
+  const handler = createOwnerAggregateReconciliationRouteHandler({
+    repository,
+    guardMutation: async (request) => Object.freeze({
+      ...await guard(request),
+      clearCookie: "invalid\r\ncookie",
+    }),
+    csrfToken: async () => CSRF_TOKEN,
+    issueOperationId: () => OPERATION_ID,
+  });
+  const response = await requiredResponse(await handler(context(new Request(
+    `${ORIGIN}${PATH}`,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Origin: ORIGIN,
+        [MUTATION_CSRF_HEADER]: CSRF_TOKEN,
+      },
+      body: JSON.stringify(correctionFields()),
+    },
+  ))));
+  assert.equal(response.status, 503);
   assert.equal(repository.applyCalls.length, 0);
   assert.equal(repository.previewCalls, 0);
 });
