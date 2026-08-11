@@ -47,7 +47,10 @@ import {
   withRuntimeCampaignPreview,
   type RuntimeCampaignPreview,
 } from "../http/runtime-preview.ts";
-import type { PublicCampaignPresentationReader } from "../repositories/in-memory-campaign-repository.ts";
+import type {
+  CampaignSetupRevision,
+  PublicCampaignPresentationReader,
+} from "../repositories/in-memory-campaign-repository.ts";
 import type {
   FounderApplicationReviewCollectionRepository,
   FounderApplicationReviewDetailRepository,
@@ -63,7 +66,10 @@ import type {
   ParticipantPackageAcknowledgmentRepositories,
   ParticipantRequestRepositoryScope,
 } from "../repositories/storage-application-repository-factory.ts";
-import type { ParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
+import type {
+  ParticipantProfileSnapshot,
+  ParticipantRepository,
+} from "../repositories/in-memory-participant-repository.ts";
 import {
   StorageFailure,
   parseStorageOperationId,
@@ -897,6 +903,12 @@ async function runtimeParticipantFounderInterestRoute(
   ) {
     return unavailableRoute;
   }
+  if (pathname === PARTICIPANT_HOME_PATH) {
+    return participantAccess.declaredInterest === "founder" ||
+        participantAccess.declaredInterest === "both"
+      ? unavailableFounderInterestRoute()
+      : null;
+  }
 
   const account = parseParticipantAccount({
     subject: actor.userId,
@@ -1030,9 +1042,19 @@ async function runtimeParticipantInvestmentInterestRoute(
     isOwner ||
     participantAccess === null ||
     participantAccess.subject !== actor.userId ||
-    participantAccess.accountStatus !== "active" ||
-    (participantAccess.declaredInterest !== "investor" &&
-      participantAccess.declaredInterest !== "both")
+    participantAccess.accountStatus !== "active"
+  ) {
+    return unavailableRoute;
+  }
+  if (pathname === PARTICIPANT_HOME_PATH) {
+    return participantAccess.declaredInterest === "investor" ||
+        participantAccess.declaredInterest === "both"
+      ? unavailableInvestmentInterestRoute()
+      : null;
+  }
+  if (
+    participantAccess.declaredInterest !== "investor" &&
+    participantAccess.declaredInterest !== "both"
   ) {
     return unavailableRoute;
   }
@@ -1058,10 +1080,21 @@ async function runtimeParticipantInvestmentInterestRoute(
     const acknowledgments = participantScope.participantPackageAcknowledgments(
       account.value.subject,
     );
-    const interests = repositories.participantInvestmentRepository(
-      account.value.subject,
+    const interests = participantScope.participantInvestmentInterests(
       amountConfiguration,
     );
+    let policySnapshot: Promise<InvestmentPolicySnapshot> | null = null;
+    const loadPolicySnapshot = (): Promise<InvestmentPolicySnapshot> => {
+      policySnapshot ??= loadInvestmentPolicySnapshot(
+        repositories,
+        participant,
+        acknowledgments,
+        account.value.subject,
+        campaign.revision,
+        amountConfiguration,
+      );
+      return policySnapshot;
+    };
     const appOrigin = new URL(resourceUrl).origin;
     const identity = Object.freeze({
       type: "participant" as const,
@@ -1078,18 +1111,10 @@ async function runtimeParticipantInvestmentInterestRoute(
           amountConfiguration,
           reader: interests,
           mutations: interests,
-          loadAcknowledgmentContext: () =>
-            loadInvestmentAcknowledgmentContext(
-              acknowledgments,
-              account.value.subject,
-            ),
-          loadPermissions: () => investmentInterestPermissions(
-            repositories,
-            participant,
-            account.value.subject,
-            campaign.revision,
-            amountConfiguration,
-          ),
+          loadAcknowledgmentContext: async () =>
+            (await loadPolicySnapshot()).acknowledgmentContext,
+          loadPermissions: async () =>
+            (await loadPolicySnapshot()).permissions,
           indicationIdForOperation: investmentIndicationIdForOperation,
           now: runtime.now,
         });
@@ -1124,42 +1149,66 @@ function unavailableInvestmentInterestRoute(): InvestmentInterestRouteDependenci
   });
 }
 
-async function loadInvestmentAcknowledgmentContext(
+type InvestmentPolicySnapshot = Readonly<{
+  acknowledgmentContext: TrustedPackageAcknowledgmentContext | null;
+  permissions: InvestmentInterestPermissions;
+}>;
+
+async function loadInvestmentPolicySnapshot(
+  applicationRepositories:
+    ApplicationRuntimeDeploymentCapability["repositoryFactory"],
+  participant: Pick<ParticipantRepository, "current">,
   repositories: ParticipantPackageAcknowledgmentRepositories,
   subject: ActorSubject,
-): Promise<TrustedPackageAcknowledgmentContext | null> {
-  const first = await repositories.packages.current();
-  if (first === null) return null;
-  const latest = await repositories.acknowledgments.latest();
-  const second = await repositories.packages.current();
+  expectedCampaignRevision: number,
+  expectedAmountConfiguration: AmountConfiguration,
+): Promise<InvestmentPolicySnapshot> {
+  const [firstCampaign, firstParticipant] = await Promise.all([
+    applicationRepositories.campaignRepository().readSetup(),
+    participant.current(),
+  ]);
+  const firstPackage = await repositories.packages.current();
+  const latest = firstPackage === null
+    ? null
+    : await repositories.acknowledgments.latest();
+  const secondPackage = await repositories.packages.current();
+  const [secondParticipant, secondCampaign] = await Promise.all([
+    participant.current(),
+    applicationRepositories.campaignRepository().readSetup(),
+  ]);
   if (
-    second === null ||
-    first.revision !== second.revision ||
-    first.snapshot.id !== second.snapshot.id ||
-    first.snapshot.contentHash !== second.snapshot.contentHash ||
-    first.snapshot.requiredAcceptanceHash !==
-      second.snapshot.requiredAcceptanceHash ||
+    !sameCampaignRevision(firstCampaign, secondCampaign) ||
+    !sameParticipantRevision(firstParticipant, secondParticipant) ||
+    !samePackageRevision(firstPackage, secondPackage) ||
     (latest !== null && latest.snapshot.participantSubject !== subject)
   ) {
     throw new StorageFailure("PRECONDITION_FAILED");
   }
+  const acknowledgmentContext = secondPackage === null
+    ? null
+    : Object.freeze({
+      currentVersion: secondPackage.snapshot,
+      latestAcceptance: latest?.snapshot ?? null,
+    });
   return Object.freeze({
-    currentVersion: second.snapshot,
-    latestAcceptance: latest?.snapshot ?? null,
+    acknowledgmentContext,
+    permissions: investmentInterestPermissions(
+      secondCampaign,
+      secondParticipant,
+      subject,
+      expectedCampaignRevision,
+      expectedAmountConfiguration,
+    ),
   });
 }
 
-async function investmentInterestPermissions(
-  repositories: ApplicationRuntimeDeploymentCapability["repositoryFactory"],
-  participant: Pick<ParticipantRepository, "current">,
+function investmentInterestPermissions(
+  campaign: CampaignSetupRevision | null,
+  currentParticipant: ParticipantProfileSnapshot | null,
   subject: ActorSubject,
   expectedCampaignRevision: number,
   expectedAmountConfiguration: AmountConfiguration,
-): Promise<InvestmentInterestPermissions> {
-  const [campaign, currentParticipant] = await Promise.all([
-    repositories.campaignRepository().readSetup(),
-    participant.current(),
-  ]);
+): InvestmentInterestPermissions {
   const permitted = campaign !== null &&
     campaign.revision === expectedCampaignRevision &&
     sameAmountConfiguration(
@@ -1184,6 +1233,38 @@ async function investmentInterestPermissions(
     reactivatePersonal: permitted,
     reactivateCompany: permitted,
   });
+}
+
+function sameCampaignRevision(
+  left: CampaignSetupRevision | null,
+  right: CampaignSetupRevision | null,
+): boolean {
+  return left === null
+    ? right === null
+    : right !== null && left.revision === right.revision;
+}
+
+function sameParticipantRevision(
+  left: ParticipantProfileSnapshot | null,
+  right: ParticipantProfileSnapshot | null,
+): boolean {
+  return left === null
+    ? right === null
+    : right !== null && left.revision === right.revision;
+}
+
+function samePackageRevision(
+  left: Awaited<ReturnType<ParticipantPackageAcknowledgmentRepositories["packages"]["current"]>>,
+  right: Awaited<ReturnType<ParticipantPackageAcknowledgmentRepositories["packages"]["current"]>>,
+): boolean {
+  return left === null
+    ? right === null
+    : right !== null &&
+      left.revision === right.revision &&
+      left.snapshot.id === right.snapshot.id &&
+      left.snapshot.contentHash === right.snapshot.contentHash &&
+      left.snapshot.requiredAcceptanceHash ===
+        right.snapshot.requiredAcceptanceHash;
 }
 
 function profilePermitsInvestor(

@@ -123,6 +123,8 @@ export const PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT =
   2 * MAX_CAMPAIGN_SETUP_MATERIALIZATION_READS +
   3 * MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS +
   MAX_FOUNDER_APPLICATION_STORAGE_READS;
+export const MAX_INVESTMENT_COLLECTION_STORAGE_READS =
+  PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads;
 export const PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT =
   PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads - 1 +
   MAX_PARTICIPANT_PROJECTION_ATTEMPTS *
@@ -136,6 +138,7 @@ export const PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT =
     MAX_ACKNOWLEDGMENT_ROUTE_STORAGE_READS,
     MAX_PROFILE_ROUTE_STORAGE_READS,
     PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT,
+    MAX_INVESTMENT_COLLECTION_STORAGE_READS,
   );
 export const PARTICIPANT_REQUEST_STORAGE_READ_LIMIT =
   PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT +
@@ -172,6 +175,10 @@ export type ParticipantRequestRepositoryScope = Readonly<{
     participantSubject: ActorSubject,
   ): ParticipantPackageAcknowledgmentRepositories;
   participantFounderApplications(): ParticipantFounderApplicationRepositories;
+  participantInvestmentInterests(
+    amountConfiguration: AmountConfiguration,
+    parsingOptions?: InvestmentIndicationParsingOptions,
+  ): StorageParticipantInvestmentInterestRepository;
 }>;
 
 /**
@@ -321,19 +328,6 @@ export class StorageApplicationRepositoryFactory {
     account: ParticipantAccount,
   ): ParticipantRequestRepositoryScope {
     return this.#participantRequest(account);
-  }
-
-  participantInvestmentRepository(
-    participantSubject: ActorSubject,
-    amountConfiguration: AmountConfiguration,
-    parsingOptions: InvestmentIndicationParsingOptions = {},
-  ): StorageParticipantInvestmentInterestRepository {
-    return new StorageParticipantInvestmentInterestRepository(
-      this.#storage,
-      participantSubject,
-      amountConfiguration,
-      parsingOptions,
-    );
   }
 
   participantRepository(
@@ -496,6 +490,18 @@ function createParticipantRequestRepositoryScope(
             participantProfileRevision,
           ),
       });
+    },
+    participantInvestmentInterests: (
+      amountConfiguration: AmountConfiguration,
+      parsingOptions: InvestmentIndicationParsingOptions = {},
+    ) => {
+      beginRouteReads(MAX_INVESTMENT_COLLECTION_STORAGE_READS);
+      return new StorageParticipantInvestmentInterestRepository(
+        mutationStorage,
+        account.subject,
+        amountConfiguration,
+        parsingOptions,
+      );
     },
   });
 }

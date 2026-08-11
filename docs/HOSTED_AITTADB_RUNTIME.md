@@ -403,7 +403,7 @@ running that bounded loop.
 
 Hosted composition calls `participantRequest(account)` once for each eligible
 participant HTTP request. Authorization and the subsequently selected profile,
-package, acknowledgment, or founder route receive the same subject-bound scope;
+package, acknowledgment, founder, or investment route receive the same subject-bound scope;
 route repository factories cannot reopen the underlying uncapped adapter. A
 second HTTP request receives a new scope.
 
@@ -413,7 +413,8 @@ records plus two outer attempts, each containing six profile reads, two package
 head reads, and three four-read accepted gate attempts. The profile reads cover
 current, matching latest history, and immutable registration revision 1 for
 each sample. The selected capability then owns its own finite route budget:
-package one, acknowledgment eight, profile 23, or founder 1,063 reads. The
+package one, acknowledgment eight, profile 23, investment 512, or founder 1,063
+reads. The
 founder budget covers five maximum 209-read application materializations, four
 retry/recovery reads, and two maximum seven-read private campaign-setup
 materializations, including final campaign/profile policy sampling, one
@@ -426,7 +427,9 @@ route's smaller ceiling rejects the next read before adapter access. Public
 campaign-presentation reads and storage transactions are outside these
 participant read counters, while both private founder campaign samples and all
 profile, package, gate, acceptance-head, acceptance-record, and
-participant-route record reads are inside them.
+participant-route record reads are inside them. The investment allowance bounds
+current owned-state projection and policy sampling; unusually deep combined
+indication histories fail closed.
 
 Within the scope, one read-only package reader reuses up to 64 verified immutable
 version reconstructions. Cache hits recharge complete ancestry and logical read

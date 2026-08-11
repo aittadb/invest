@@ -141,10 +141,8 @@ test("delayed registration replay authenticates later ownership activity", async
   assert.equal(first.replayed, false);
 
   const amount = amountConfiguration();
-  const investment = factory.participantInvestmentRepository(
-    ACCOUNT.subject,
-    amount,
-  );
+  const investment = factory.participantRequest(ACCOUNT)
+    .participantInvestmentInterests(amount);
   const context = await acknowledgmentContext(ACCOUNT.subject);
   const service = createParticipantInvestmentInterestService({
     actorSubject: ACCOUNT.subject,

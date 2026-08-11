@@ -1,4 +1,7 @@
 import type { DeploymentPublicationReadinessCheck } from "../domain/campaign-publication-readiness.ts";
+import type { AmountConfiguration } from "../domain/amount-aggregate-configuration.ts";
+import type { ActorSubject } from "../domain/foundation.ts";
+import type { InvestmentIndicationParsingOptions } from "../domain/investment-indication.ts";
 import type {
   BrowserMutationReplayClaimer,
   BrowserMutationSession,
@@ -8,9 +11,6 @@ import type {
   CampaignSetupRevision,
   PublicCampaignPresentationReader,
 } from "../repositories/in-memory-campaign-repository.ts";
-import type { ActorSubject } from "../domain/foundation.ts";
-import type { AmountConfiguration } from "../domain/amount-aggregate-configuration.ts";
-import type { InvestmentIndicationParsingOptions } from "../domain/investment-indication.ts";
 import type { ParticipantAccount } from "../domain/participant-profile.ts";
 import type { ParticipantRequestRepositoryScope } from "../repositories/storage-application-repository-factory.ts";
 import type { ParticipantRegistrationRepository } from "../repositories/in-memory-participant-repository.ts";
@@ -28,10 +28,6 @@ import type { PublicCampaignStateReader } from "../repositories/storage-public-c
 import type { CampaignRevisionBoundAggregateCorrectionRepository } from "../repositories/in-memory-aggregate-repository.ts";
 import type { OwnerIndicationReviewTokenBoundary } from "../services/owner-indication-review-tokens.ts";
 import type { AtomicOwnerIndicationModerationRepository } from "../services/owner-indication-moderation.ts";
-import type {
-  AtomicParticipantInvestmentInterestMutationPort,
-  ParticipantInvestmentInterestReader,
-} from "./participant-investment-mutation-port.ts";
 
 export type CampaignWorkspaceOperationKind =
   | "setup"
@@ -63,12 +59,6 @@ export type ApplicationRepositoryFactory = Readonly<{
   participantRequest(
     account: ParticipantAccount,
   ): ParticipantRequestRepositoryScope;
-  participantInvestmentRepository(
-    participantSubject: ActorSubject,
-    amountConfiguration: AmountConfiguration,
-    parsingOptions?: InvestmentIndicationParsingOptions,
-  ): ParticipantInvestmentInterestReader &
-    AtomicParticipantInvestmentInterestMutationPort;
   participantRepository(
     account: ParticipantAccount,
   ): ParticipantRegistrationRepository;

@@ -223,7 +223,6 @@ test("factory exposes only named application repository capabilities", async () 
     "ownerManualNotificationActivity",
     "ownerAggregateReconciliation",
     "participantRequest",
-    "participantInvestmentRepository",
     "participantRepository",
   ]);
   assert.equal(
@@ -317,6 +316,7 @@ test("factory exposes only named application repository capabilities", async () 
     "participantPackageReader",
     "participantPackageAcknowledgments",
     "participantFounderApplications",
+    "participantInvestmentInterests",
   ]);
   assert.deepEqual(
     Object.keys(participantRequest.participantPackageReader(subject.value)),
@@ -444,12 +444,11 @@ test("factory exposes only named application repository capabilities", async () 
     assert.equal(property in moderation, false, property);
   }
   assert.equal(Object.values(moderation).includes(storage), false);
-  const investment = factory.participantInvestmentRepository(
-    subject.value,
+  const investment = participantRequest.participantInvestmentInterests(
     amount.value.amount,
   );
   assert.notEqual(
-    factory.participantInvestmentRepository(subject.value, amount.value.amount),
+    participantRequest.participantInvestmentInterests(amount.value.amount),
     investment,
   );
   assert.deepEqual(Object.keys(investment), ["mutationConsistency"]);
