@@ -310,6 +310,36 @@ test("corrupt registration ownership replay is fixed and non-disclosing", async 
   );
 });
 
+test("ownership replay adapter failures are fresh and non-disclosing", async () => {
+  const state = new MemoryStorageState();
+  const request = registrationRequest();
+  await applicationFactory(new MemoryStorageAdapter(state))
+    .participantRepository(ACCOUNT)
+    .register(request);
+  const storage = new SecretOwnershipReadFailureAdapter(
+    new MemoryStorageAdapter(state),
+  );
+  const before = stateFingerprint(state);
+
+  const failure = await captureStorageFailure(() =>
+    applicationFactory(storage)
+      .participantRepository(ACCOUNT)
+      .register(request)
+  );
+
+  assert.equal(failure.code, "UNAVAILABLE");
+  assert.equal(failure.message, "Storage is temporarily unavailable.");
+  assert.notEqual(failure, storage.failure);
+  assert.equal(Object.hasOwn(failure, "cause"), false);
+  assert.doesNotMatch(
+    `${failure.name}:${failure.message}:${JSON.stringify(
+      toPublicStorageFailure(failure),
+    )}`,
+    /PRIVATE_PROVIDER_BODY|registration-ownership-participant|participant@example\.test/iu,
+  );
+  assert.equal(stateFingerprint(state), before);
+});
+
 function applicationFactory(storage: StorageAdapter) {
   return new StorageApplicationRepositoryFactory(
     storage,
@@ -484,6 +514,30 @@ class RecordingTransactionAdapter implements StorageAdapter {
   }
   transact(request: StorageTransactionRequest) {
     this.lastTransaction = request;
+    return this.delegate.transact(request);
+  }
+}
+
+class SecretOwnershipReadFailureAdapter implements StorageAdapter {
+  readonly delegate: StorageAdapter;
+  readonly failure = new Error(
+    "PRIVATE_PROVIDER_BODY oidc:registration-ownership-participant participant@example.test",
+    { cause: new Error("PRIVATE_PROVIDER_CAUSE") },
+  );
+
+  constructor(delegate: StorageAdapter) {
+    this.delegate = delegate;
+  }
+  read(key: Parameters<StorageAdapter["read"]>[0]) {
+    if (key.collection === "participant-investment-ownership-roots") {
+      throw this.failure;
+    }
+    return this.delegate.read(key);
+  }
+  list(request: Parameters<StorageAdapter["list"]>[0]) {
+    return this.delegate.list(request);
+  }
+  transact(request: StorageTransactionRequest) {
     return this.delegate.transact(request);
   }
 }

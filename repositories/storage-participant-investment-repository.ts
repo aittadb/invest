@@ -239,48 +239,56 @@ export function createParticipantRegistrationInvestmentProvisioning(
       subject: ActorSubject,
       operationId: StorageOperationId,
     ) {
-      const trustedSubject = requiredSubject(subject);
-      const parsed = await parseOwnershipInitializationRequest(
-        trustedSubject,
-        { operationId, indications: Object.freeze([]) },
-      );
-      const root: StoragePutMutation = Object.freeze({
-        type: "put",
-        key: await participantOwnershipRootKey(trustedSubject),
-        expectedRevision: null,
-        value: ownershipRootDocument(parsed),
-      });
-      const index = await participantIndexMutation(
-        trustedSubject,
-        Object.freeze({ record: null, ids: Object.freeze([]) }),
-        Object.freeze([]),
-      );
-      const witness = await participantOwnershipWitnessMutation(
-        trustedSubject,
-        null,
-        Object.freeze([]),
-      );
-      const mutations: readonly [
-        StoragePutMutation,
-        StoragePutMutation,
-        StoragePutMutation,
-      ] = Object.freeze([root, index, witness]);
-      return mutations;
+      try {
+        const trustedSubject = requiredSubject(subject);
+        const parsed = await parseOwnershipInitializationRequest(
+          trustedSubject,
+          { operationId, indications: Object.freeze([]) },
+        );
+        const root: StoragePutMutation = Object.freeze({
+          type: "put",
+          key: await participantOwnershipRootKey(trustedSubject),
+          expectedRevision: null,
+          value: ownershipRootDocument(parsed),
+        });
+        const index = await participantIndexMutation(
+          trustedSubject,
+          Object.freeze({ record: null, ids: Object.freeze([]) }),
+          Object.freeze([]),
+        );
+        const witness = await participantOwnershipWitnessMutation(
+          trustedSubject,
+          null,
+          Object.freeze([]),
+        );
+        const mutations: readonly [
+          StoragePutMutation,
+          StoragePutMutation,
+          StoragePutMutation,
+        ] = Object.freeze([root, index, witness]);
+        return mutations;
+      } catch (error) {
+        return mapRegistrationProvisioningError(error);
+      }
     },
     async verifyExactReplay(
       subject: ActorSubject,
       operationId: StorageOperationId,
     ) {
-      const trustedSubject = requiredSubject(subject);
-      const parsed = await parseOwnershipInitializationRequest(
-        trustedSubject,
-        { operationId, indications: Object.freeze([]) },
-      );
-      const complete = await readCompleteParticipantIndex(
-        adapter,
-        trustedSubject,
-      );
-      requireMatchingInitializationRoot(complete.root, parsed, "request");
+      try {
+        const trustedSubject = requiredSubject(subject);
+        const parsed = await parseOwnershipInitializationRequest(
+          trustedSubject,
+          { operationId, indications: Object.freeze([]) },
+        );
+        const complete = await readCompleteParticipantIndex(
+          adapter,
+          trustedSubject,
+        );
+        requireMatchingInitializationRoot(complete.root, parsed, "request");
+      } catch (error) {
+        return mapRegistrationProvisioningError(error);
+      }
     },
   };
   return Object.freeze(provisioning);
@@ -2017,6 +2025,33 @@ function mapRepositoryError(error: unknown): never {
   if (error instanceof StorageFailure) throw error;
   if (error instanceof DomainError) return mapDomainError(error);
   unavailable();
+}
+
+function mapRegistrationProvisioningError(error: unknown): never {
+  try {
+    mapRepositoryError(error);
+  } catch (mapped) {
+    let code: StorageFailure["code"] = "UNAVAILABLE";
+    try {
+      if (mapped instanceof StorageFailure) {
+        const descriptor = Object.getOwnPropertyDescriptor(mapped, "code");
+        if (
+          descriptor !== undefined &&
+          "value" in descriptor &&
+          (descriptor.value === "INVALID_REQUEST" ||
+            descriptor.value === "NOT_FOUND" ||
+            descriptor.value === "CONFLICT" ||
+            descriptor.value === "PRECONDITION_FAILED" ||
+            descriptor.value === "UNAVAILABLE")
+        ) {
+          code = descriptor.value;
+        }
+      }
+    } catch {
+      code = "UNAVAILABLE";
+    }
+    throw new StorageFailure(code);
+  }
 }
 
 function mapDomainError(error: DomainError): never {
