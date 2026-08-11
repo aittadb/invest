@@ -159,6 +159,7 @@ test("delayed registration replay authenticates later ownership activity", async
     loadPermissions: () => ({
       createPersonal: true,
       createCompany: true,
+      edit: true,
       reactivatePersonal: true,
       reactivateCompany: true,
     }),

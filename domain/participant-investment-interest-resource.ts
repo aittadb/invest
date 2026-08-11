@@ -4,6 +4,7 @@ import {
   type InvestmentIndication,
   type InvestmentIndicationFields,
   type InvestmentIndicationHistoryEntry,
+  type InvestmentIndicationSummary,
 } from "./investment-indication.ts";
 import {
   actionWhenAllowed,
@@ -126,7 +127,7 @@ export type InvestmentInterestItemCapabilityModel = Readonly<{
 
 export type InvestmentInterestCollectionResourceInput = Readonly<{
   requestUrl: string;
-  indications: readonly InvestmentIndication[];
+  indications: readonly InvestmentIndicationSummary[];
   amountConfiguration: AmountConfiguration;
   acknowledgmentCurrent: boolean;
   canCreatePersonal: boolean;
@@ -542,20 +543,19 @@ function textField(
 }
 
 function projectSummary(
-  indication: InvestmentIndication,
+  indication: InvestmentIndicationSummary,
   href: string,
 ): InvestmentInterestSummaryData {
   return Object.freeze({
     id: indication.id,
     href,
     kind: indication.kind,
-    status: indication.lifecycle.status,
+    status: indication.status,
     revision: indication.revision,
     created_at: indication.createdAt,
     updated_at: indication.updatedAt,
     fields: projectFields(indication.fields),
-    rejection_reason:
-      participantVisibleIndicationLifecycle(indication).rejectionReason,
+    rejection_reason: indication.rejectionReason,
   });
 }
 

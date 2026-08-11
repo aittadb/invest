@@ -86,6 +86,7 @@ const AMOUNT = configuredAmount();
 const ALLOW_ALL = Object.freeze({
   createPersonal: true,
   createCompany: true,
+  edit: true,
   reactivatePersonal: true,
   reactivateCompany: true,
 }) satisfies InvestmentInterestPermissions;

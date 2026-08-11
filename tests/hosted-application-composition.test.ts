@@ -796,9 +796,9 @@ test("participant access keeps nested package retry reads inside one budget", as
 test("participant request scope enforces exact maximum route and retry read budgets", async () => {
   assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 551);
   assert.equal(PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT, 1_063);
-  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 1_063);
-  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 1_614);
-  assert.equal(MAX_INVESTMENT_COLLECTION_STORAGE_READS, 512);
+  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 1_504);
+  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 2_055);
+  assert.equal(MAX_INVESTMENT_COLLECTION_STORAGE_READS, 1_504);
 
   const service = new SyntheticAittaDBService();
   await registerHostedParticipant(
@@ -3550,6 +3550,69 @@ test("hosted investment creation and reactivation recheck phase and package poli
   assert.equal(recordsIn(service, "investment-aggregate-states").length, 1);
 });
 
+test("hosted withdrawal retains persisted currency after campaign evolution", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedInvestmentFixture(service);
+  const createProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  const createAction = requiredAction(
+    createProof.document,
+    "create-personal-investment-interest",
+  );
+  const createOperation = "investment-operation:hosted-currency-create";
+  assert.equal(
+    (await submitInvestmentMutation(
+      hostedPackageWorker(service),
+      env,
+      createProof,
+      createAction,
+      actionBody(createAction, {
+        "operation-id": createOperation,
+        "residence-country": "FI",
+        amount: 25_000,
+        "availability-period": "Within twelve months.",
+      }),
+    )).status,
+    201,
+  );
+
+  const itemPath = investmentItemPath(createOperation);
+  const withdrawalProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  const withdrawalAction = requiredAction(
+    withdrawalProof.document,
+    "withdraw-investment-interest",
+  );
+  await configureHostedInvestmentCampaign(service, "open", "eur");
+  const response = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    withdrawalProof,
+    withdrawalAction,
+    actionBody(withdrawalAction, {
+      "operation-id": "investment-operation:hosted-currency-withdraw",
+      "expected-revision": 1,
+      "confirm-withdrawal": true,
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  const withdrawn = await response.json() as InvestmentInterestItemDocument;
+  assert.equal(withdrawn.data.status, "withdrawn");
+  assert.equal(withdrawn.data.fields.currency, "SEK");
+  const aggregate = recordsIn(service, "investment-aggregate-states")[0];
+  assert(aggregate);
+  const aggregateSnapshot = requiredObject(aggregate.value.snapshot);
+  assert.equal(aggregateSnapshot.currency, "SEK");
+  assert.equal(aggregateSnapshot.totalAmount, 0);
+});
+
 test("hosted investment mutation rejects policy heads changed during one request", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
@@ -3580,6 +3643,74 @@ test("hosted investment mutation rejects policy heads changed during one request
   assert.equal(recordsIn(service, "investment-indications").length, 0);
   assert.equal(recordsIn(service, "investment-indication-history").length, 0);
   assert.equal(recordsIn(service, "investment-aggregate-states").length, 0);
+});
+
+test("hosted investment edit rejects campaign policy changed after its proof", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedInvestmentFixture(service);
+  const worker = hostedPackageWorker(service);
+  const createProof = await investmentResource(worker, env);
+  const createAction = requiredAction(
+    createProof.document,
+    "create-personal-investment-interest",
+  );
+  const operationId = "investment-operation:hosted-edit-policy-race";
+  assert.equal(
+    (await submitInvestmentMutation(
+      worker,
+      env,
+      createProof,
+      createAction,
+      actionBody(createAction, {
+        "operation-id": operationId,
+        "residence-country": "FI",
+        amount: 25_000,
+        "availability-period": "Within twelve months.",
+      }),
+    )).status,
+    201,
+  );
+
+  const itemPath = investmentItemPath(operationId);
+  const editProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  const editAction = requiredAction(
+    editProof.document,
+    "edit-investment-interest",
+  );
+  service.interceptReadAfter("campaign-setup-current", 1, async () => {
+    await configureHostedInvestmentCampaign(service, "closed");
+  });
+
+  const response = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    editProof,
+    editAction,
+    actionBody(editAction, {
+      "operation-id": "investment-operation:hosted-edit-policy-raced",
+      "expected-revision": 1,
+      "residence-country": "FI",
+      amount: 30_000,
+      "availability-period": "Within twelve months.",
+    }),
+  );
+
+  assert.equal(response.status, 412);
+  const retained = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  assert.equal(retained.document.data.revision, 1);
+  assert.equal(retained.document.data.fields.amount, 25_000);
+  assert.deepEqual(actionNames(retained.document), [
+    "withdraw-investment-interest",
+  ]);
 });
 
 for (
@@ -6565,6 +6696,7 @@ async function seedHostedMaximumActiveInvestmentCollection(
     loadPermissions: () => Object.freeze({
       createPersonal: true,
       createCompany: true,
+      edit: true,
       reactivatePersonal: true,
       reactivateCompany: true,
     }),
@@ -6627,17 +6759,18 @@ async function registerHostedAcceptedInvestor(
 async function configureHostedInvestmentCampaign(
   service: SyntheticAittaDBService,
   phaseState: "closed" | "open",
+  currency = "sek",
 ): Promise<void> {
   const repository = new StorageCampaignRepository(hostedStorageAdapter(service));
   const current = await repository.readSetup();
   const expectedRevision = current?.revision ?? null;
   const result = await repository.saveSetup({
-    operationId: `campaign-operation:hosted-investment-${phaseState}-${
+    operationId: `campaign-operation:hosted-investment-${phaseState}-${currency}-${
       expectedRevision ?? "new"
     }`,
     expectedRevision,
     recordedAt: "2026-08-10T10:30:00.000Z",
-    setup: explicitCampaignSetup({ phaseState }),
+    setup: explicitCampaignSetup({ currency, phaseState }),
   });
   assert.equal(result.setup.phases[0]?.state, phaseState);
 }

@@ -26,6 +26,7 @@ import {
   type InvestmentIndicationHistoryEntryId,
   type InvestmentIndicationId,
   type InvestmentIndicationParsingOptions,
+  type InvestmentIndicationSummary,
   type WithdrawnInvestmentIndication,
 } from "../domain/investment-indication.ts";
 import {
@@ -66,6 +67,7 @@ import {
 import {
   DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_FIELDS_CHUNKS,
+  MAX_PARTICIPANT_INDICATION_SUMMARY_READS,
   MAX_INDICATION_STORAGE_READS,
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
@@ -104,6 +106,10 @@ export const MAX_PARTICIPANT_CAPACITY_READS =
   MAX_PARTICIPANT_INDEX_SNAPSHOT_READS +
     2 * MAX_OWNED_INVESTMENT_INDICATIONS +
     MAX_PARTICIPANT_ACTIVE_LEASE_PROOF_READS;
+export const MAX_PARTICIPANT_INVESTMENT_SUMMARY_COLLECTION_READS =
+  MAX_PARTICIPANT_CAPACITY_READS +
+  MAX_OWNED_INVESTMENT_INDICATIONS *
+    MAX_PARTICIPANT_INDICATION_SUMMARY_READS;
 export const MAX_PARTICIPANT_OWNERSHIP_FIRST_INITIALIZATION_READS =
   3 + 2 * MAX_OWNED_INVESTMENT_INDICATIONS +
   MAX_PARTICIPANT_ACTIVE_LEASE_PROOF_READS;
@@ -738,20 +744,26 @@ export class StorageParticipantInvestmentInterestRepository
     }
   }
 
-  async listOwned(): Promise<readonly InvestmentIndication[]> {
+  async listOwned(): Promise<readonly InvestmentIndicationSummary[]> {
     try {
-      const { index } = await readCompleteParticipantIndex(
+      const { index, witness } = await readCompleteParticipantIndex(
         this.#storage,
         this.#subject,
       );
-      const indications: InvestmentIndication[] = [];
+      const indications: InvestmentIndicationSummary[] = [];
       for (const id of index.ids) {
         const indication = await this.#indications
-          .readCurrentParticipantProjection(id);
+          .readCurrentParticipantSummary(id);
+        const ownership = witness.indications.find((entry) =>
+          entry.indicationId === id
+        );
         if (
           indication === null ||
           indication.id !== id ||
-          indication.participantSubject !== this.#subject
+          indication.participantSubject !== this.#subject ||
+          ownership === undefined ||
+          ownership.indicationRevision !== indication.revision ||
+          ownership.lifecycleStatus !== indication.status
         ) {
           unavailable();
         }
@@ -870,9 +882,12 @@ export class StorageParticipantInvestmentInterestRepository
       !sameStrings(ownershipEntryIds(stagedWitness.indications), nextIndexIds)
     ) unavailable();
 
+    const aggregateCurrency = prepared.command.kind === "withdraw"
+      ? indication.snapshot.fields.currency
+      : this.#amount.currency;
     const aggregateBefore = await new DevelopmentInMemoryAggregateRepository(
       staged,
-      this.#amount.currency,
+      aggregateCurrency,
     ).readStored();
     const aggregate = await prepareAtomicAggregateContribution(staged, {
       operationId,
@@ -880,7 +895,7 @@ export class StorageParticipantInvestmentInterestRepository
       contribution: projectInvestmentIndicationForAggregation(
         indication.snapshot,
       ),
-    }, this.#amount.currency);
+    }, aggregateCurrency);
     await staged.stage(aggregate.mutations);
 
     if (
@@ -911,7 +926,6 @@ export class StorageParticipantInvestmentInterestRepository
     const receipt = decodeOperationReceipt(
       receiptRecord,
       receiptKey,
-      this.#amount,
     );
     requireMatchingReceipt(receipt, prepared);
     verifyPreparedAuditAppend(
@@ -937,7 +951,7 @@ export class StorageParticipantInvestmentInterestRepository
     );
     const record = await this.#storage.read(receiptKey);
     if (record === null) return null;
-    const receipt = decodeOperationReceipt(record, receiptKey, this.#amount);
+    const receipt = decodeOperationReceipt(record, receiptKey);
     requireMatchingReceipt(receipt, prepared);
 
     const indication = await this.#indications
@@ -954,7 +968,7 @@ export class StorageParticipantInvestmentInterestRepository
             indication.snapshot,
           ),
         },
-        this.#amount.currency,
+        receipt.aggregate.currency,
       );
     } catch (error) {
       if (error instanceof StorageFailure) unavailable();
@@ -1138,7 +1152,6 @@ function operationReceiptMutation(
 function decodeOperationReceipt(
   record: StorageRecord | null | undefined,
   expectedKey: StorageKey,
-  amount: AmountConfiguration,
 ): StoredOperationReceipt {
   if (!record) unavailable();
   const envelope = exactStoredRecordEnvelope(record, expectedKey);
@@ -1155,7 +1168,7 @@ function decodeOperationReceipt(
     source.indicationId,
   );
   const auditEventId = parseStableId<"audit-event">(source.auditEventId);
-  const aggregate = decodeAggregate(source.aggregate, amount);
+  const aggregate = decodeAggregate(source.aggregate);
   if (
     !indicationId.ok ||
     !auditEventId.ok ||
@@ -2017,20 +2030,28 @@ function canonicalJsonValue(
 
 function decodeAggregate(
   value: unknown,
-  amount: AmountConfiguration,
 ): StoredInvestmentAggregateSnapshot {
   const source = exactRecord(value, AGGREGATE_KEYS);
   const totalAmount = parseMinorUnits(source.totalAmount);
+  const amount = parseAmountAggregateConfiguration({
+    amount: {
+      currency: source.currency,
+      minimum: 0,
+      increment: 1,
+      maximum: null,
+    },
+    publicAggregate: { visibility: "hidden" },
+  });
   if (
     !nonNegativeInteger(source.revision) ||
     !totalAmount.ok ||
-    source.currency !== amount.currency ||
+    !amount.ok ||
     !nonNegativeInteger(source.contributingIndicationCount)
   ) unavailable();
   return Object.freeze({
     revision: source.revision,
     totalAmount: totalAmount.value,
-    currency: amount.currency,
+    currency: amount.value.amount.currency,
     contributingIndicationCount: source.contributingIndicationCount,
   });
 }

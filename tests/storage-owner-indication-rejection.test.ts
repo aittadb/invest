@@ -592,6 +592,7 @@ async function seedActiveIndication(
     loadPermissions: () => ({
       createPersonal: true,
       createCompany: true,
+      edit: true,
       reactivatePersonal: true,
       reactivateCompany: true,
     }),

@@ -88,9 +88,10 @@ const AMOUNT = amountConfiguration();
 const CHOICES = contributionAreaChoices();
 const REQUESTED_AT = "2026-08-12T12:00:00.000Z";
 const ALLOW_ALL = Object.freeze({
-  createPersonal: true,
-  createCompany: true,
-  reactivatePersonal: true,
+      createPersonal: true,
+      createCompany: true,
+      edit: true,
+      reactivatePersonal: true,
   reactivateCompany: true,
 });
 
@@ -766,7 +767,7 @@ test("maximum response-loss shape stays inside the full atomic boundary", async 
   ).listOwned();
   assert.equal(current.length, MAX_OWNED_INVESTMENT_INDICATIONS);
   assert.equal(
-    current.every(({ lifecycle }) => lifecycle.status !== "active"),
+    current.every(({ status }) => status !== "active"),
     true,
   );
   assert.equal(counted.listCalls, 0);

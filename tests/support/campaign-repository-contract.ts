@@ -100,6 +100,7 @@ export async function verifyCampaignRepositoryContract(
 
 export type ExplicitCampaignSetupOptions = Readonly<{
   campaignName?: string;
+  currency?: string;
   phaseState?: "closed" | "open";
 }>;
 
@@ -124,7 +125,7 @@ export function explicitCampaignSetup(
     ],
     amountAggregate: {
       amount: {
-        currency: "sek",
+        currency: options.currency ?? "sek",
         minimum: 25_000,
         increment: 5_000,
         maximum: 500_000,

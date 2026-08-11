@@ -29,6 +29,7 @@ import {
   type InvestmentIndicationHistoryEntryId,
   type InvestmentIndicationId,
   type InvestmentIndicationParsingOptions,
+  type InvestmentIndicationSummary,
   type OwnerIndicationActor,
   type ParticipantIndicationActor,
   type RejectedInvestmentIndication,
@@ -97,6 +98,8 @@ export const MAX_INDICATION_MATERIALIZATION_READS =
     (1 + MAX_INDICATION_FIELDS_CHUNKS);
 export const MAX_INDICATION_STORAGE_READS =
   2 + 2 * MAX_INDICATION_MATERIALIZATION_READS;
+export const MAX_PARTICIPANT_INDICATION_SUMMARY_READS =
+  4 + MAX_INDICATION_FIELDS_CHUNKS;
 export const MAX_INDICATION_STORAGE_MUTATIONS =
   5 + MAX_INDICATION_FIELDS_CHUNKS;
 export const MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE = 25;
@@ -773,6 +776,75 @@ export class DevelopmentInMemoryIndicationRepository
       subject,
     );
     return stored?.indication ?? null;
+  }
+
+  /** Read one current collection summary without replaying its full ancestry. */
+  async readCurrentParticipantSummary(
+    id: InvestmentIndicationId,
+  ): Promise<InvestmentIndicationSummary | null> {
+    const subject = this.#authenticatedSubject;
+    if (subject === null || subject === this.#configuredOwnerSubject) return null;
+    const indicationId = requiredIndicationId(id);
+    const currentKey = await currentIndicationKey(indicationId);
+    const currentRecord = await this.#storage.read(currentKey);
+    if (currentRecord === null) return null;
+    if (peekParticipantSubject(currentRecord) !== subject) return null;
+    const current = decodeStoredCurrent(
+      currentRecord,
+      currentKey,
+      indicationId,
+      subject,
+    );
+    const terminalKey = await indicationHistoryKey(
+      indicationId,
+      current.revision,
+    );
+    const terminalRecord = await this.#storage.read(terminalKey);
+    if (terminalRecord === null) unavailable();
+    const terminal = decodeStoredTransition(
+      terminalRecord,
+      terminalKey,
+      subject,
+      indicationId,
+      current.revision,
+    );
+    requireCurrentMatchesTerminal(current, terminal);
+    const fields = await readStoredFields(
+      this.#storage,
+      subject,
+      indicationId,
+      current.fields,
+    );
+    const status = await verifyOwnerReviewTerminal(terminal, fields.fields);
+    await verifyStoredActiveLease(this.#storage, current, fields.fields, status);
+
+    let created = terminal;
+    if (current.revision > 1) {
+      const createdKey = await indicationHistoryKey(indicationId, 1);
+      const createdRecord = await this.#storage.read(createdKey);
+      if (createdRecord === null) unavailable();
+      created = decodeStoredTransition(
+        createdRecord,
+        createdKey,
+        subject,
+        indicationId,
+        1,
+      );
+    }
+    requireSummaryCreationTransition(created);
+    if (created.occurredAt > terminal.occurredAt) unavailable();
+
+    return Object.freeze({
+      id: indicationId,
+      participantSubject: subject,
+      kind: fields.fields.kind,
+      status,
+      revision: current.revision,
+      createdAt: created.occurredAt,
+      updatedAt: terminal.occurredAt,
+      fields: fields.fields,
+      rejectionReason: participantSummaryRejectionReason(terminal, status),
+    });
   }
 
   async edit(
@@ -1479,6 +1551,40 @@ function requireCurrentMatchesTerminal(
   ) {
     unavailable();
   }
+}
+
+function requireSummaryCreationTransition(
+  transition: StoredTransition,
+): void {
+  const source = exactRecord(transition.document, TRANSITION_DOCUMENT_KEYS);
+  const acknowledgment = storedAcknowledgment(source.acknowledgment);
+  const actor = storedParticipantActor(source.actor);
+  if (
+    transition.transitionKind !== "created" ||
+    transition.revision !== 1 ||
+    transition.fields.revision !== 1 ||
+    acknowledgment.participantSubject !== transition.participantSubject ||
+    actor.subject !== transition.participantSubject ||
+    source.rejection !== null ||
+    canonicalJson(acknowledgmentDocument(acknowledgment)) !==
+      canonicalJson(source.acknowledgment) ||
+    canonicalJson(actorDocument(actor)) !== canonicalJson(source.actor)
+  ) {
+    unavailable();
+  }
+}
+
+function participantSummaryRejectionReason(
+  terminal: StoredTransition,
+  status: InvestmentIndication["lifecycle"]["status"],
+): string | null {
+  if (status !== "rejected") return null;
+  const source = exactRecord(terminal.document, TRANSITION_DOCUMENT_KEYS);
+  const rejection = exactRecord(
+    source.rejection,
+    new Set(["reason", "rejectedAt", "rejectedBy"]),
+  );
+  return parseRejectionReason(rejection.reason) ?? unavailable();
 }
 
 async function verifyOwnerReviewTerminal(

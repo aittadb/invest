@@ -1228,6 +1228,7 @@ function investmentInterestPermissions(
   return Object.freeze({
     createPersonal: permitted,
     createCompany: permitted,
+    edit: permitted,
     reactivatePersonal: permitted,
     reactivateCompany: permitted,
   });

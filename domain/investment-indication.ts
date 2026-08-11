@@ -16,6 +16,7 @@ import {
   parseTimestamp,
   valid,
   type Actor,
+  type ActorSubject,
   type CountryCode,
   type CountryCodeOptions,
   type MinorUnits,
@@ -232,6 +233,18 @@ export type RejectedInvestmentIndication =
 export type InvestmentIndication =
   | PersonalInvestmentIndication
   | CompanyInvestmentIndication;
+
+export type InvestmentIndicationSummary = Readonly<{
+  id: InvestmentIndicationId;
+  participantSubject: ActorSubject;
+  kind: InvestmentIndication["kind"];
+  status: InvestmentIndicationStatus;
+  revision: number;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  fields: InvestmentIndicationFields;
+  rejectionReason: string | null;
+}>;
 
 /**
  * This context must be assembled from the trusted current package and the
@@ -817,6 +830,24 @@ export function participantVisibleIndicationLifecycle(
     status: "rejected",
     rejectionReason: indication.lifecycle.rejection.reason,
     transitions: NO_PARTICIPANT_TRANSITIONS,
+  });
+}
+
+/** Project the current participant-visible fields without immutable history. */
+export function investmentIndicationSummary(
+  indication: InvestmentIndication,
+): InvestmentIndicationSummary {
+  const lifecycle = participantVisibleIndicationLifecycle(indication);
+  return Object.freeze({
+    id: indication.id,
+    participantSubject: indication.participantSubject,
+    kind: indication.kind,
+    status: lifecycle.status,
+    revision: indication.revision,
+    createdAt: indication.createdAt,
+    updatedAt: indication.updatedAt,
+    fields: indication.fields,
+    rejectionReason: lifecycle.rejectionReason,
   });
 }
 

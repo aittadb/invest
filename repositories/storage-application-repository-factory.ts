@@ -77,6 +77,7 @@ import {
   type ParticipantRepository,
 } from "./in-memory-participant-repository.ts";
 import {
+  MAX_PARTICIPANT_INVESTMENT_SUMMARY_COLLECTION_READS,
   StorageParticipantInvestmentInterestRepository,
   createParticipantRegistrationInvestmentProvisioning,
 } from "./storage-participant-investment-repository.ts";
@@ -126,7 +127,7 @@ export const PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT =
   3 * MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS +
   MAX_FOUNDER_APPLICATION_STORAGE_READS;
 export const MAX_INVESTMENT_COLLECTION_STORAGE_READS =
-  PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads;
+  MAX_PARTICIPANT_INVESTMENT_SUMMARY_COLLECTION_READS + 64;
 export const PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT =
   PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads - 1 +
   MAX_PARTICIPANT_PROJECTION_ATTEMPTS *

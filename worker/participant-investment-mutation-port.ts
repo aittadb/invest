@@ -6,6 +6,7 @@ import type { StoredInvestmentAggregateSnapshot } from "../domain/investment-agg
 import type {
   InvestmentIndication,
   InvestmentIndicationId,
+  InvestmentIndicationSummary,
   TrustedPackageAcknowledgmentContext,
 } from "../domain/investment-indication.ts";
 import type {
@@ -23,7 +24,7 @@ export const MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS = 4;
 /** Subject-bound reads stay independent from the stronger mutation capability. */
 export interface ParticipantInvestmentInterestReader {
   get(id: InvestmentIndicationId): Promise<InvestmentIndication | null>;
-  listOwned(): Promise<readonly InvestmentIndication[]>;
+  listOwned(): Promise<readonly InvestmentIndicationSummary[]>;
 }
 
 type AtomicMutationCommandBase = Readonly<{

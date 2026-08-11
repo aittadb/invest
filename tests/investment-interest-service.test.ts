@@ -42,6 +42,7 @@ const AMOUNT = configuredAmount();
 const ALLOW_ALL = Object.freeze({
   createPersonal: true,
   createCompany: true,
+  edit: true,
   reactivatePersonal: true,
   reactivateCompany: true,
 }) satisfies InvestmentInterestPermissions;
@@ -302,6 +303,21 @@ test("current acknowledgment and deployment permissions gate advertised and pers
     operationId: "investment-operation:gated-personal",
     fields: personalFields(),
   });
+  permissions = Object.freeze({ ...ALLOW_ALL, edit: false });
+  const editDeniedItem = await service.getItemState(personal.snapshot.id);
+  assert.equal(editDeniedItem?.canEdit, false);
+  assert.equal(
+    (await captureStorageFailure(() =>
+      service.edit({
+        operationId: "investment-operation:gated-policy-edit",
+        indicationId: personal.snapshot.id,
+        expectedRevision: 1,
+        fields: personalFields({ amount: 1_500 }),
+      })
+    )).code,
+    "PRECONDITION_FAILED",
+  );
+  permissions = ALLOW_ALL;
   context = stale;
 
   const staleCollection = await service.getCollectionState();

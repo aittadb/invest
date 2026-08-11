@@ -10,10 +10,11 @@ import {
   parseStableId,
   type ActorSubject,
 } from "../domain/foundation.ts";
-import type {
-  InvestmentIndicationParsingOptions,
-  InvestmentIndicationId,
-  TrustedPackageAcknowledgmentContext,
+import {
+  investmentIndicationSummary,
+  type InvestmentIndicationParsingOptions,
+  type InvestmentIndicationId,
+  type TrustedPackageAcknowledgmentContext,
 } from "../domain/investment-indication.ts";
 import { MAX_INVESTMENT_INDICATION_REVISIONS } from "../domain/investment-indication.ts";
 import { projectInvestmentIndicationForAggregation } from "../domain/investment-aggregate.ts";
@@ -53,6 +54,7 @@ import {
   MAX_PARTICIPANT_ACCOUNT_DELETION_WITHDRAWAL_SET_READS,
   MAX_PARTICIPANT_CAPACITY_READS,
   MAX_PARTICIPANT_INDEX_SNAPSHOT_READS,
+  MAX_PARTICIPANT_INVESTMENT_SUMMARY_COLLECTION_READS,
   MAX_PARTICIPANT_OWNERSHIP_CONCURRENT_REPLAY_READS,
   MAX_PARTICIPANT_OWNERSHIP_FIRST_INITIALIZATION_READS,
   MAX_PARTICIPANT_OWNERSHIP_RESTART_READS,
@@ -78,6 +80,7 @@ const AMOUNT = amountConfiguration();
 const ALLOW_ALL = Object.freeze({
   createPersonal: true,
   createCompany: true,
+  edit: true,
   reactivatePersonal: true,
   reactivateCompany: true,
 }) satisfies InvestmentInterestPermissions;
@@ -495,7 +498,9 @@ test("legacy ID-only ownership metadata migrates once to the status summary", as
     "investment-indication-ownership-witnesses",
   )[0];
   assert.equal(witness?.value.schemaVersion, 2);
-  assert.deepEqual(await repository.listOwned(), [created.snapshot]);
+  assert.deepEqual(await repository.listOwned(), [
+    investmentIndicationSummary(created.snapshot),
+  ]);
 });
 
 test("storage participant investment repository commits one persistent atomic lifecycle", async () => {
@@ -595,7 +600,7 @@ test("storage participant investment repository commits one persistent atomic li
   assert.deepEqual(reopened, reactivated.snapshot);
   assert.deepEqual(
     await restartedRepository.listOwned(),
-    [reactivated.snapshot],
+    [investmentIndicationSummary(reactivated.snapshot)],
   );
   const foreign = new StorageParticipantInvestmentInterestRepository(
     new MemoryStorageAdapter(state),
@@ -654,6 +659,65 @@ test("atomic exact retries survive amount-policy evolution before current valida
   assert.equal(changed.code, "CONFLICT");
   assertAggregate(state, 1, 1_250, 1);
   assert.equal(recordsIn(state, "audit-events").length, 1);
+});
+
+test("withdrawal and exact retry retain the persisted aggregate currency", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "storage-currency-withdrawal");
+  const context = await currentContext(ALICE, "storage-currency-withdrawal");
+  const original = serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      storage,
+      ALICE,
+      AMOUNT,
+    ),
+    ALICE,
+    context,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  const created = await original.create({
+    operationId: "investment-operation:storage-currency-create",
+    fields: personalFields(),
+  });
+
+  const evolvedAmount = amountConfiguration({ currency: "usd" });
+  const withdrawalInput = Object.freeze({
+    operationId: "investment-operation:storage-currency-withdraw",
+    indicationId: created.snapshot.id,
+    expectedRevision: 1,
+  });
+  const evolved = serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      evolvedAmount,
+    ),
+    ALICE,
+    context,
+    () => new Date("2026-08-12T11:00:00.000Z"),
+    evolvedAmount,
+  );
+  const withdrawn = await evolved.withdraw(withdrawalInput);
+  assert.equal(withdrawn.snapshot.lifecycle.status, "withdrawn");
+  assert.equal(withdrawn.snapshot.fields.currency, AMOUNT.currency);
+  assertAggregate(state, 2, 0, 0);
+
+  const restarted = serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      evolvedAmount,
+    ),
+    ALICE,
+    context,
+    () => new Date("2026-08-12T12:00:00.000Z"),
+    evolvedAmount,
+  );
+  const replay = await restarted.withdraw(withdrawalInput);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.snapshot, withdrawn.snapshot);
+  assertAggregate(state, 2, 0, 0);
 });
 
 test("atomic exact retries survive normalizer evolution without semantic substitution", async () => {
@@ -1924,6 +1988,22 @@ test("capacity checks 100 fully materialized maximum histories within its read c
     true,
   );
 
+  const collectionStorage = new CountingStorageAdapter(
+    new MemoryStorageAdapter(state),
+  );
+  const summaries = await new StorageParticipantInvestmentInterestRepository(
+    collectionStorage,
+    ALICE,
+    AMOUNT,
+  ).listOwned();
+  assert.equal(summaries.length, MAX_OWNED_INVESTMENT_INDICATIONS);
+  assert.equal(collectionStorage.listCalls, 0);
+  assert.ok(
+    collectionStorage.readCalls <=
+      MAX_PARTICIPANT_INVESTMENT_SUMMARY_COLLECTION_READS,
+    `${collectionStorage.readCalls} summary reads exceeded the collection ceiling`,
+  );
+
   const restartStorage = new CountingStorageAdapter(
     new MemoryStorageAdapter(state),
   );
@@ -2457,9 +2537,7 @@ test("account deletion stages four active withdrawals once without durable work"
   );
   assert.equal(activeOwned(await reopened.listOwned()), 0);
   assert.equal(
-    (await reopened.listOwned()).every(({ lifecycle }) =>
-      lifecycle.status === "withdrawn"
-    ),
+    (await reopened.listOwned()).every(({ status }) => status === "withdrawn"),
     true,
   );
 });
@@ -2590,8 +2668,8 @@ test("account deletion barriers complete withdrawn and rejected ownership", asyn
     ALICE,
     AMOUNT,
   ).listOwned(), [
-    rejected.snapshot,
-    withdrawn.snapshot,
+    investmentIndicationSummary(rejected.snapshot),
+    investmentIndicationSummary(withdrawn.snapshot),
   ]);
 });
 
@@ -3353,7 +3431,7 @@ function activeOwned(
   >,
 ): number {
   return indications.filter((indication) =>
-    indication.lifecycle.status === "active"
+    indication.status === "active"
   ).length;
 }
 

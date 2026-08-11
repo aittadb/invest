@@ -522,6 +522,7 @@ async function seedIndication(storage: AittaDBStorageAdapter): Promise<void> {
     loadPermissions: () => ({
       createPersonal: true,
       createCompany: true,
+      edit: true,
       reactivatePersonal: true,
       reactivateCompany: true,
     }),
