@@ -4,6 +4,7 @@ import {
   readFile,
   readdir,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -47,7 +48,10 @@ import {
 import {
   StorageParticipantInvestmentInterestRepository,
 } from "../repositories/storage-participant-investment-repository.ts";
-import { executeLegacyInvestmentOwnershipMigrationCommand } from "../scripts/migrate-legacy-investment-ownership.ts";
+import {
+  executeLegacyInvestmentOwnershipMigrationCommand,
+  type LegacyInvestmentOwnershipMigrationManifestMetadata,
+} from "../scripts/migrate-legacy-investment-ownership.ts";
 import {
   MAX_LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_MANIFEST_BYTES,
   MAX_LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_SUBJECTS,
@@ -96,9 +100,17 @@ test("ownership inventory is closed, sorted, bounded, and permits empty work", a
     manifest([bob, alice]),
     manifest([{ ...alice, extra: true }]),
     manifest([{ ...alice, participantSubject: "" }]),
+    manifest([{
+      ...alice,
+      participantSubject: "issuer.invalid/subject:\ud800",
+    }]),
     manifest([alice, { ...bob, operationId: alice.operationId }]),
     manifest([{ ...alice, indications: [two, one] }]),
     manifest([{ ...alice, indications: [one, one] }]),
+    manifest([
+      { ...alice, indications: [one] },
+      { ...bob, indications: [one] },
+    ]),
     manifest([{ ...alice, indications: [{ ...one, extra: true }] }]),
     manifest([{ ...alice, indications: [{ ...one, indicationRevision: 0 }] }]),
     manifest([{ ...alice, indications: [{ ...one, lifecycleStatus: "unknown" }] }]),
@@ -147,8 +159,8 @@ test("ownership inventory is closed, sorted, bounded, and permits empty work", a
 
   const noStorage = new CountingStorageAdapter(new ThrowingStorageAdapter());
   const invalidLateEntry = manifest([
-    alice,
-    { ...bob, indications: [one, one] },
+    { ...alice, indications: [one] },
+    { ...bob, indications: [one] },
   ]);
   assert.equal((await captureAsync(() =>
     runLegacyInvestmentOwnershipMigration(noStorage, invalidLateEntry)
@@ -571,7 +583,7 @@ test("operator command accepts the exact maximum canonical manifest", async () =
     { length: MAX_LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_SUBJECTS },
     (_, participantIndex) => ({
       participantSubject: actorSubject(
-        `${"\ud800".repeat(254)}${String.fromCharCode(0xd800 + participantIndex)}`,
+        `${"\u0800".repeat(254)}${String.fromCharCode(0x0900 + participantIndex)}`,
       ),
       operationId: stableOperationId(participantIndex),
       indications: Array.from(
@@ -615,6 +627,174 @@ test("operator command accepts the exact maximum canonical manifest", async () =
   }
 });
 
+test("operator command rejects duplicate JSON members before storage access", async () => {
+  const trickySubject = 'issuer.invalid/subject:"[{\\,:}]';
+  assert.equal(parseActorSubject(trickySubject).ok, true);
+  const encodedSubject = JSON.stringify(trickySubject);
+  const indicationId = "investment-indication:duplicate-json-member";
+  const duplicateManifests = [
+    '{"schemaVersion":1,"schema\\u0056ersion":1,"participants":[]}',
+    `{"schemaVersion":1,"participants":[{"participantSubject":${encodedSubject},"participant\\u0053ubject":${encodedSubject},"operationId":"investment-ownership-migration:duplicate-participant-key","indications":[]}]}`,
+    `{"schemaVersion":1,"participants":[{"participantSubject":${encodedSubject},"operationId":"investment-ownership-migration:duplicate-indication-key","indications":[{"indicationId":"${indicationId}","indication\\u0049d":"${indicationId}","indicationRevision":1,"lifecycleStatus":"withdrawn"}]}]}`,
+  ];
+  const directory = await mkdtemp(
+    join(tmpdir(), "invest-ownership-migration-duplicate-json-"),
+  );
+  const path = join(directory, "manifest.json");
+  try {
+    for (const duplicateManifest of duplicateManifests) {
+      await writeFile(path, duplicateManifest, "utf8");
+      let fetches = 0;
+      await assert.rejects(
+        () => executeLegacyInvestmentOwnershipMigrationCommand(
+          ["--apply", "--manifest", path],
+          migrationEnvironment(),
+          {
+            fetch: async () => {
+              fetches += 1;
+              throw new Error("Unexpected fetch.");
+            },
+          },
+        ),
+        (error: unknown) =>
+          error instanceof Error &&
+          error.message ===
+            "Legacy investment ownership migration configuration is invalid.",
+      );
+      assert.equal(fetches, 0);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("operator command rejects symbolic-link manifests before storage access", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "invest-ownership-migration-symlink-"),
+  );
+  const target = join(directory, "reviewed.json");
+  const link = join(directory, "manifest.json");
+  try {
+    await writeFile(target, JSON.stringify(manifest([])), "utf8");
+    await symlink(target, link);
+    let fetches = 0;
+    await assert.rejects(
+      () => executeLegacyInvestmentOwnershipMigrationCommand(
+        ["--apply", "--manifest", link],
+        migrationEnvironment(),
+        {
+          fetch: async () => {
+            fetches += 1;
+            throw new Error("Unexpected fetch.");
+          },
+        },
+      ),
+      (error: unknown) =>
+        error instanceof Error &&
+        error.message ===
+          "Legacy investment ownership migration configuration is invalid.",
+    );
+    assert.equal(fetches, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("operator command rejects a same-size manifest rewrite", async () => {
+  const first = new TextEncoder().encode(JSON.stringify(manifest([])));
+  const second = new TextEncoder().encode(
+    JSON.stringify({ schemaVersion: 2, participants: [] }),
+  );
+  assert.equal(second.byteLength, first.byteLength);
+  let snapshot = 0;
+  let stats = 0;
+  let closes = 0;
+  let fetches = 0;
+  await assert.rejects(
+    () => executeLegacyInvestmentOwnershipMigrationCommand(
+      ["--apply", "--manifest", "rewritten-private.json"],
+      migrationEnvironment(),
+      {
+        openManifest: async () => ({
+          stat: async () => {
+            stats += 1;
+            return manifestMetadata({ size: BigInt(first.byteLength) });
+          },
+          read: async (buffer, offset, length, position) => {
+            if (position === 0) snapshot += 1;
+            const source = snapshot === 1 ? first : second;
+            const bytesRead = Math.min(length, source.byteLength - position);
+            if (bytesRead > 0) {
+              buffer.set(source.subarray(position, position + bytesRead), offset);
+            }
+            return { bytesRead };
+          },
+          close: async () => {
+            closes += 1;
+          },
+        }),
+        fetch: async () => {
+          fetches += 1;
+          throw new Error("Unexpected fetch.");
+        },
+      },
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message ===
+        "Legacy investment ownership migration configuration is invalid.",
+  );
+  assert.equal(snapshot, 2);
+  assert.equal(stats, 3);
+  assert.equal(closes, 1);
+  assert.equal(fetches, 0);
+});
+
+test("operator command rejects manifest identity substitution", async () => {
+  const bytes = new TextEncoder().encode(JSON.stringify(manifest([])));
+  let stats = 0;
+  let closes = 0;
+  let fetches = 0;
+  await assert.rejects(
+    () => executeLegacyInvestmentOwnershipMigrationCommand(
+      ["--apply", "--manifest", "substituted-private.json"],
+      migrationEnvironment(),
+      {
+        openManifest: async () => ({
+          stat: async () => {
+            stats += 1;
+            return manifestMetadata({
+              inode: BigInt(stats === 1 ? 41 : 42),
+              size: BigInt(bytes.byteLength),
+            });
+          },
+          read: async (buffer, offset, length, position) => {
+            const bytesRead = Math.min(length, bytes.byteLength - position);
+            if (bytesRead > 0) {
+              buffer.set(bytes.subarray(position, position + bytesRead), offset);
+            }
+            return { bytesRead };
+          },
+          close: async () => {
+            closes += 1;
+          },
+        }),
+        fetch: async () => {
+          fetches += 1;
+          throw new Error("Unexpected fetch.");
+        },
+      },
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message ===
+        "Legacy investment ownership migration configuration is invalid.",
+  );
+  assert.equal(stats, 2);
+  assert.equal(closes, 1);
+  assert.equal(fetches, 0);
+});
+
 test("operator command rejects manifest growth after one max-plus-one read", async () => {
   let reads = 0;
   let requestedBytes = 0;
@@ -626,9 +806,10 @@ test("operator command rejects manifest growth after one max-plus-one read", asy
       migrationEnvironment(),
       {
         openManifest: async () => ({
-          stat: async () => ({
-            size: MAX_LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_MANIFEST_BYTES,
-            isFile: () => true,
+          stat: async () => manifestMetadata({
+            size: BigInt(
+              MAX_LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_MANIFEST_BYTES,
+            ),
           }),
           read: async (buffer, offset, length) => {
             reads += 1;
@@ -890,6 +1071,21 @@ function assertRedactedFailure(
   assert.equal(failure.cause, undefined);
   assert.equal(String(failure).includes(subject), false);
   assert.equal(String(failure).includes(id), false);
+}
+
+function manifestMetadata(
+  overrides: Partial<LegacyInvestmentOwnershipMigrationManifestMetadata> = {},
+): LegacyInvestmentOwnershipMigrationManifestMetadata {
+  return Object.freeze({
+    device: overrides.device ?? BigInt(1),
+    inode: overrides.inode ?? BigInt(1),
+    mode: overrides.mode ?? BigInt(0o100600),
+    linkCount: overrides.linkCount ?? BigInt(1),
+    size: overrides.size ?? BigInt(1),
+    modifiedNanoseconds: overrides.modifiedNanoseconds ?? BigInt(1),
+    changedNanoseconds: overrides.changedNanoseconds ?? BigInt(1),
+    isFile: overrides.isFile ?? (() => true),
+  });
 }
 
 function migrationEnvironment(): Record<string, string> {

@@ -1,3 +1,4 @@
+import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
@@ -15,6 +16,7 @@ import {
 
 const TOKEN_REQUEST_TIMEOUT_MS = 10_000;
 const STORAGE_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_JSON_NESTING_DEPTH = 16;
 
 type MigrationEnvironment = Readonly<Record<string, string | undefined>>;
 
@@ -37,7 +39,7 @@ export type LegacyInvestmentOwnershipMigrationCommandDependencies = Readonly<{
 }>;
 
 export type LegacyInvestmentOwnershipMigrationManifestFile = Readonly<{
-  stat(): Promise<Readonly<{ size: number; isFile(): boolean }>>;
+  stat(): Promise<LegacyInvestmentOwnershipMigrationManifestMetadata>;
   read(
     buffer: Uint8Array,
     offset: number,
@@ -45,6 +47,17 @@ export type LegacyInvestmentOwnershipMigrationManifestFile = Readonly<{
     position: number,
   ): Promise<Readonly<{ bytesRead: number }>>;
   close(): Promise<void>;
+}>;
+
+export type LegacyInvestmentOwnershipMigrationManifestMetadata = Readonly<{
+  device: bigint;
+  inode: bigint;
+  mode: bigint;
+  linkCount: bigint;
+  size: bigint;
+  modifiedNanoseconds: bigint;
+  changedNanoseconds: bigint;
+  isFile(): boolean;
 }>;
 
 export type LegacyInvestmentOwnershipMigrationManifestOpener = (
@@ -167,7 +180,29 @@ function parseCommandConfigurationUnchecked(
 async function openManifest(
   path: string,
 ): Promise<LegacyInvestmentOwnershipMigrationManifestFile> {
-  return open(path, "r");
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  return Object.freeze({
+    async stat() {
+      const metadata = await file.stat({ bigint: true });
+      return Object.freeze({
+        device: metadata.dev,
+        inode: metadata.ino,
+        mode: metadata.mode,
+        linkCount: metadata.nlink,
+        size: metadata.size,
+        modifiedNanoseconds: metadata.mtimeNs,
+        changedNanoseconds: metadata.ctimeNs,
+        isFile: () => metadata.isFile(),
+      });
+    },
+    async read(buffer, offset, length, position) {
+      const result = await file.read(buffer, offset, length, position);
+      return Object.freeze({ bytesRead: result.bytesRead });
+    },
+    async close() {
+      await file.close();
+    },
+  });
 }
 
 async function readManifest(
@@ -177,43 +212,248 @@ async function readManifest(
   let file: LegacyInvestmentOwnershipMigrationManifestFile | null = null;
   try {
     file = await opener(path);
-    const metadata = await file.stat();
+    const initialMetadata = await file.stat();
+    const expectedSize = manifestSize(initialMetadata);
+    const firstSnapshot = await readManifestSnapshot(file, expectedSize);
+    const middleMetadata = await file.stat();
+    if (!sameManifestMetadata(initialMetadata, middleMetadata)) invalid();
+    const secondSnapshot = await readManifestSnapshot(file, expectedSize);
+    const finalMetadata = await file.stat();
     if (
-      !metadata.isFile() ||
-      !Number.isSafeInteger(metadata.size) ||
-      metadata.size < 1 ||
-      metadata.size >
-        MAX_LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_MANIFEST_BYTES
-    ) invalid();
-    const bytes = new Uint8Array(
-      MAX_LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_MANIFEST_BYTES + 1,
-    );
-    let offset = 0;
-    while (offset < bytes.byteLength) {
-      const requested = bytes.byteLength - offset;
-      const result = await file.read(bytes, offset, requested, offset);
-      if (
-        !Number.isSafeInteger(result.bytesRead) ||
-        result.bytesRead < 0 ||
-        result.bytesRead > requested
-      ) invalid();
-      if (result.bytesRead === 0) break;
-      offset += result.bytesRead;
-    }
-    if (
-      offset < 1 ||
-      offset > MAX_LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_MANIFEST_BYTES ||
-      offset !== metadata.size
+      !sameManifestMetadata(initialMetadata, finalMetadata) ||
+      !sameBytes(firstSnapshot, secondSnapshot)
     ) invalid();
     const text = new TextDecoder("utf-8", { fatal: true }).decode(
-      bytes.subarray(0, offset),
+      firstSnapshot,
     );
+    rejectDuplicateJsonObjectMembers(text);
     return JSON.parse(text) as unknown;
   } catch {
     invalid();
   } finally {
     if (file !== null) await file.close().catch(() => undefined);
   }
+}
+
+function manifestSize(
+  metadata: LegacyInvestmentOwnershipMigrationManifestMetadata,
+): number {
+  const maximum = BigInt(
+    MAX_LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_MANIFEST_BYTES,
+  );
+  if (
+    !metadata.isFile() ||
+    metadata.linkCount < BigInt(1) ||
+    metadata.size < BigInt(1) ||
+    metadata.size > maximum
+  ) invalid();
+  return Number(metadata.size);
+}
+
+async function readManifestSnapshot(
+  file: LegacyInvestmentOwnershipMigrationManifestFile,
+  expectedSize: number,
+): Promise<Uint8Array> {
+  const bytes = new Uint8Array(expectedSize + 1);
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const requested = bytes.byteLength - offset;
+    const result = await file.read(bytes, offset, requested, offset);
+    if (
+      !Number.isSafeInteger(result.bytesRead) ||
+      result.bytesRead < 0 ||
+      result.bytesRead > requested
+    ) invalid();
+    if (result.bytesRead === 0) break;
+    offset += result.bytesRead;
+  }
+  if (offset !== expectedSize) invalid();
+  return bytes.slice(0, offset);
+}
+
+function sameManifestMetadata(
+  left: LegacyInvestmentOwnershipMigrationManifestMetadata,
+  right: LegacyInvestmentOwnershipMigrationManifestMetadata,
+): boolean {
+  return right.isFile() &&
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.mode === right.mode &&
+    left.linkCount === right.linkCount &&
+    left.size === right.size &&
+    left.modifiedNanoseconds === right.modifiedNanoseconds &&
+    left.changedNanoseconds === right.changedNanoseconds;
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function rejectDuplicateJsonObjectMembers(text: string): void {
+  let index = 0;
+
+  const skipWhitespace = (): void => {
+    while (
+      text[index] === " " ||
+      text[index] === "\n" ||
+      text[index] === "\r" ||
+      text[index] === "\t"
+    ) index += 1;
+  };
+
+  const scanString = (decode: boolean): string => {
+    if (text[index] !== '"') invalid();
+    const start = index;
+    index += 1;
+    while (index < text.length) {
+      const codeUnit = text.charCodeAt(index);
+      if (codeUnit === 0x22) {
+        index += 1;
+        return decode ? JSON.parse(text.slice(start, index)) as string : "";
+      }
+      if (codeUnit <= 0x1f) invalid();
+      if (codeUnit !== 0x5c) {
+        index += 1;
+        continue;
+      }
+      index += 1;
+      const escape = text[index];
+      if (escape === "u") {
+        if (!/^[0-9A-Fa-f]{4}$/u.test(text.slice(index + 1, index + 5))) {
+          invalid();
+        }
+        index += 5;
+      } else if (
+        escape === '"' ||
+        escape === "\\" ||
+        escape === "/" ||
+        escape === "b" ||
+        escape === "f" ||
+        escape === "n" ||
+        escape === "r" ||
+        escape === "t"
+      ) {
+        index += 1;
+      } else {
+        invalid();
+      }
+    }
+    invalid();
+  };
+
+  const scanNumber = (): void => {
+    if (text[index] === "-") index += 1;
+    if (text[index] === "0") {
+      index += 1;
+    } else {
+      if (!isDigitOneToNine(text[index])) invalid();
+      while (isDigit(text[index])) index += 1;
+    }
+    if (text[index] === ".") {
+      index += 1;
+      if (!isDigit(text[index])) invalid();
+      while (isDigit(text[index])) index += 1;
+    }
+    if (text[index] === "e" || text[index] === "E") {
+      index += 1;
+      if (text[index] === "+" || text[index] === "-") index += 1;
+      if (!isDigit(text[index])) invalid();
+      while (isDigit(text[index])) index += 1;
+    }
+  };
+
+  const scanLiteral = (literal: string): void => {
+    if (text.slice(index, index + literal.length) !== literal) invalid();
+    index += literal.length;
+  };
+
+  const scanValue = (depth: number): void => {
+    skipWhitespace();
+    const token = text[index];
+    if (token === '"') {
+      scanString(false);
+    } else if (token === "{") {
+      scanObject(depth + 1);
+    } else if (token === "[") {
+      scanArray(depth + 1);
+    } else if (token === "t") {
+      scanLiteral("true");
+    } else if (token === "f") {
+      scanLiteral("false");
+    } else if (token === "n") {
+      scanLiteral("null");
+    } else {
+      scanNumber();
+    }
+  };
+
+  const scanObject = (depth: number): void => {
+    if (depth > MAX_JSON_NESTING_DEPTH || text[index] !== "{") invalid();
+    index += 1;
+    skipWhitespace();
+    if (text[index] === "}") {
+      index += 1;
+      return;
+    }
+    const keys = new Set<string>();
+    while (index < text.length) {
+      const member = scanString(true);
+      if (keys.has(member)) invalid();
+      keys.add(member);
+      skipWhitespace();
+      if (text[index] !== ":") invalid();
+      index += 1;
+      scanValue(depth);
+      skipWhitespace();
+      if (text[index] === "}") {
+        index += 1;
+        return;
+      }
+      if (text[index] !== ",") invalid();
+      index += 1;
+      skipWhitespace();
+    }
+    invalid();
+  };
+
+  const scanArray = (depth: number): void => {
+    if (depth > MAX_JSON_NESTING_DEPTH || text[index] !== "[") invalid();
+    index += 1;
+    skipWhitespace();
+    if (text[index] === "]") {
+      index += 1;
+      return;
+    }
+    while (index < text.length) {
+      scanValue(depth);
+      skipWhitespace();
+      if (text[index] === "]") {
+        index += 1;
+        return;
+      }
+      if (text[index] !== ",") invalid();
+      index += 1;
+      skipWhitespace();
+    }
+    invalid();
+  };
+
+  skipWhitespace();
+  scanValue(0);
+  skipWhitespace();
+  if (index !== text.length) invalid();
+}
+
+function isDigit(value: string | undefined): boolean {
+  return value !== undefined && value >= "0" && value <= "9";
+}
+
+function isDigitOneToNine(value: string | undefined): boolean {
+  return value !== undefined && value >= "1" && value <= "9";
 }
 
 function exactPath(value: unknown): string {

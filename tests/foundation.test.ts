@@ -83,6 +83,9 @@ test("timestamps, stable identifiers, and actor subjects preserve canonical valu
     value: "issuer.example/user:CaseSensitive",
   });
   assert.equal(parseActorSubject(" subject-with-padding ").ok, false);
+  assert.equal(parseActorSubject("issuer.example/user:\ud800").ok, false);
+  assert.equal(parseActorSubject("issuer.example/user:\udfff").ok, false);
+  assert.equal(parseActorSubject("issuer.example/user:\ud83d\ude00").ok, true);
 });
 
 test("validation-result helpers retain only structured issues", () => {

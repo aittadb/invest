@@ -272,13 +272,16 @@ without explicit approval.
 
 The ignored JSON manifest is the authority for scope and completeness. It has
 exact `schemaVersion: 1` and a `participants` array sorted by subject. The array
-contains at most 100 unique subjects. Each entry has exactly
+contains at most 100 unique well-formed Unicode subjects. Each entry has exactly
 `participantSubject`, one globally unique stable `operationId`, and a complete
 `indications` array sorted by indication ID. That array contains at most 100
-unique IDs with exact current revision and `active`, `withdrawn`, or `rejected`
-status; at most four may be active. Unknown fields, duplicates, sparse arrays,
-non-canonical order, excess capacity, and an over-limit or growing file are
-rejected before storage access. The command does not generate, infer, list, or
+IDs that are globally unique across the manifest, with exact current revision
+and `active`, `withdrawn`, or `rejected` status; at most four may be active.
+Unknown fields, duplicate JSON member names, duplicates, sparse arrays,
+non-canonical order, excess capacity, and an over-limit or changing file are
+rejected before storage access. The command opens one non-symbolic-link regular
+file, compares identity metadata around two bounded byte-identical reads, and
+parses only that stable snapshot. The command does not generate, infer, list, or
 repair an inventory. Prepare it from a separately reviewed authoritative source
 and keep it only under ignored `migration-inventories/`.
 
@@ -299,9 +302,10 @@ terminal head, validates active field chunks and uniqueness leases, and creates
 the root, index, and current witness in one three-record transaction. It stops
 at the first fixed failure and stores no separate checkpoint. Rerun the exact
 unchanged manifest to resume: completed subjects replay from their immutable
-root and operation receipt, while later subjects continue. A changed operation
-ID or inventory conflicts, and incomplete, crossed, missing, corrupt, or
-continuously changing evidence remains unavailable for operator investigation.
+root, index, and witness evidence; this migration creates no operation receipt.
+Later subjects then continue. A changed operation ID or inventory conflicts, and
+incomplete, crossed, missing, corrupt, or continuously changing evidence remains
+unavailable for operator investigation.
 Standard output contains only scanned, initialized, already-initialized, and
 indication counters; command and adapter failures contain no subject, record ID,
 credential, backend response, or transport exception.

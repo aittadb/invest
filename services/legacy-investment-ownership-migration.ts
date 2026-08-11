@@ -26,9 +26,9 @@ import { MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS } from "../worker/participant-i
 export const LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_MANIFEST_VERSION = 1;
 export const MAX_LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_SUBJECTS = 100;
 
-const MAX_JSON_STRING_BYTES_PER_CODE_UNIT = 6;
+const MAX_UTF8_BYTES_PER_WELL_FORMED_CODE_UNIT = 3;
 const MAX_SUBJECT_JSON_BYTES =
-  2 + MAX_ACTOR_SUBJECT_LENGTH * MAX_JSON_STRING_BYTES_PER_CODE_UNIT;
+  2 + MAX_ACTOR_SUBJECT_LENGTH * MAX_UTF8_BYTES_PER_WELL_FORMED_CODE_UNIT;
 const MAX_STABLE_ID_JSON_BYTES = 2 + MAX_STABLE_ID_LENGTH;
 const MAX_REVISION_JSON_BYTES = String(
   MAX_INVESTMENT_INDICATION_REVISIONS,
@@ -118,6 +118,7 @@ export function parseLegacyInvestmentOwnershipMigrationInventory(
       MAX_LEGACY_INVESTMENT_OWNERSHIP_MIGRATION_SUBJECTS,
     );
     const entries: LegacyInvestmentOwnershipMigrationEntry[] = [];
+    const indicationIds = new Set<string>();
     const operationIds = new Set<string>();
     let previousSubject: string | null = null;
     for (const candidate of candidates) {
@@ -132,7 +133,7 @@ export function parseLegacyInvestmentOwnershipMigrationInventory(
       if (operationIds.has(operationId.value)) invalidRequest();
       previousSubject = participantSubject.value;
       operationIds.add(operationId.value);
-      const indications = parseIndications(entry.indications);
+      const indications = parseIndications(entry.indications, indicationIds);
       if (
         indications.filter(({ lifecycleStatus }) =>
           lifecycleStatus === "active"
@@ -183,6 +184,7 @@ export async function runLegacyInvestmentOwnershipMigration(
 
 function parseIndications(
   value: unknown,
+  manifestIndicationIds: Set<string>,
 ): readonly LegacyInvestmentOwnershipMigrationIndication[] {
   const candidates = denseArray(value, MAX_OWNED_INVESTMENT_INDICATIONS);
   const indications: LegacyInvestmentOwnershipMigrationIndication[] = [];
@@ -195,12 +197,14 @@ function parseIndications(
     if (
       !indicationId.ok ||
       previousId !== null && compareCodeUnits(indicationId.value, previousId) <= 0 ||
+      indicationId.ok && manifestIndicationIds.has(indicationId.value) ||
       !Number.isSafeInteger(entry.indicationRevision) ||
       (entry.indicationRevision as number) < 1 ||
       (entry.indicationRevision as number) > MAX_INVESTMENT_INDICATION_REVISIONS ||
       !isLifecycleStatus(entry.lifecycleStatus)
     ) invalidRequest();
     previousId = indicationId.value;
+    manifestIndicationIds.add(indicationId.value);
     indications.push(Object.freeze({
       indicationId: indicationId.value,
       indicationRevision: entry.indicationRevision as number,
