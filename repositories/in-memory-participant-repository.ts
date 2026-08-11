@@ -31,7 +31,9 @@ import {
   type StorageCollection,
   type StorageDocument,
   type StorageKey,
+  type StorageMutation,
   type StorageOperationId,
+  type StoragePutMutation,
   type StorageRecord,
 } from "../domain/storage-adapter.ts";
 
@@ -210,6 +212,18 @@ export interface ParticipantRegistrationRepository
   ): Promise<ParticipantProfileMutationResult>;
 }
 
+/** Three-record ownership effect attached only to authoritative registration. */
+export interface ParticipantRegistrationProvisioning {
+  prepare(
+    subject: ActorSubject,
+    operationId: StorageOperationId,
+  ): Promise<readonly [StoragePutMutation, StoragePutMutation, StoragePutMutation]>;
+  verifyExactReplay(
+    subject: ActorSubject,
+    operationId: StorageOperationId,
+  ): Promise<void>;
+}
+
 /** Subject-bound participant persistence over a credential-bound StorageAdapter. */
 export class StorageParticipantRepository
   implements ParticipantRegistrationRepository {
@@ -217,15 +231,18 @@ export class StorageParticipantRepository
 
   readonly #storage: StorageAdapter;
   readonly #account: ParticipantAccount | null;
+  readonly #registrationProvisioning: ParticipantRegistrationProvisioning | null;
 
   constructor(
     storage: StorageAdapter,
     authenticatedAccount: ParticipantAccount | null,
+    registrationProvisioning: ParticipantRegistrationProvisioning | null = null,
   ) {
     this.#storage = storage;
     this.#account = authenticatedAccount === null
       ? null
       : requiredParticipantAccount(authenticatedAccount);
+    this.#registrationProvisioning = registrationProvisioning;
   }
 
   async current(): Promise<ParticipantProfileSnapshot | null> {
@@ -400,6 +417,10 @@ export class StorageParticipantRepository
     ) {
       throw new StorageFailure("CONFLICT");
     }
+    await this.#verifyRegistrationProvisioningReplay(
+      account.subject,
+      operationId,
+    );
     return mutationResult(replay.revision, replay.snapshot, true, []);
   }
 
@@ -556,6 +577,13 @@ export class StorageParticipantRepository
       operationId,
       requestHash,
     );
+    const registrationProvisioning = expectedRevision === null &&
+        action === "register"
+      ? this.#registrationProvisioning
+      : null;
+    const provisioningMutations = registrationProvisioning === null
+      ? Object.freeze([])
+      : await registrationProvisioning.prepare(account.subject, operationId);
     if (expectedRevision !== null) {
       if (verifiedCurrentRevision === null) unavailable();
       if (verifiedCurrentRevision < expectedRevision) unavailable();
@@ -588,6 +616,7 @@ export class StorageParticipantRepository
             expectedRevision: null,
             value,
           },
+          ...provisioningMutations,
         ],
       });
       result = await storageTransact(this.#storage, transaction);
@@ -597,21 +626,32 @@ export class StorageParticipantRepository
         action === "register" &&
         isReplayConflict(error)
       ) {
-        return this.#recoverRegistrationReplay(
+        const recovered = await this.#recoverRegistrationReplay(
           historyKey,
           account.subject,
           operationId,
           requestHash,
           error.code,
         );
+        await this.#verifyRegistrationProvisioningReplay(
+          account.subject,
+          operationId,
+        );
+        return recovered;
       }
       throw error;
     }
-    const verified = verifyParticipantTransactionResult(result, [
+    const expectedRecords = Object.freeze([
       { key, revision: nextRevision, value },
       { key: historyKey, revision: 1, value },
+      ...provisioningMutations.map(expectedCreatedRecord),
     ]);
+    const verified = verifyParticipantTransactionResult(
+      result,
+      expectedRecords,
+    );
     const [currentRecord, historyRecord] = verified.records;
+    if (currentRecord === undefined || historyRecord === undefined) unavailable();
     const decoded = decodeCurrentParticipantRecord(
       currentRecord,
       key,
@@ -629,6 +669,12 @@ export class StorageParticipantRepository
       !equalData(decoded, history)
     ) {
       unavailable();
+    }
+    if (verified.replayed && registrationProvisioning !== null) {
+      await registrationProvisioning.verifyExactReplay(
+        account.subject,
+        operationId,
+      );
     }
     return mutationResult(
       decoded.revision,
@@ -697,6 +743,16 @@ export class StorageParticipantRepository
     }
     return mutationResult(replay.revision, replay.snapshot, true, []);
   }
+
+  async #verifyRegistrationProvisioningReplay(
+    subject: ActorSubject,
+    operationId: StorageOperationId,
+  ): Promise<void> {
+    await this.#registrationProvisioning?.verifyExactReplay(
+      subject,
+      operationId,
+    );
+  }
 }
 
 /** Compatibility name retained for existing local development composition. */
@@ -712,7 +768,7 @@ type ExpectedParticipantStorageRecord = Readonly<{
 
 type VerifiedParticipantTransactionResult = Readonly<{
   replayed: boolean;
-  records: readonly [StorageRecord, StorageRecord];
+  records: readonly StorageRecord[];
 }>;
 
 async function storageRead(
@@ -739,10 +795,7 @@ async function storageTransact(
 
 function verifyParticipantTransactionResult(
   value: unknown,
-  expected: readonly [
-    ExpectedParticipantStorageRecord,
-    ExpectedParticipantStorageRecord,
-  ],
+  expected: readonly ExpectedParticipantStorageRecord[],
 ): VerifiedParticipantTransactionResult {
   try {
     const source = exactDataRecord(value, TRANSACTION_RESULT_KEYS);
@@ -765,11 +818,24 @@ function verifyParticipantTransactionResult(
 
     return deepFreeze({
       replayed: source.replayed,
-      records: records as unknown as readonly [StorageRecord, StorageRecord],
+      records,
     });
   } catch {
     unavailable();
   }
+}
+
+function expectedCreatedRecord(
+  mutation: StorageMutation,
+): ExpectedParticipantStorageRecord {
+  if (mutation.type !== "put" || mutation.expectedRevision !== null) {
+    unavailable();
+  }
+  return Object.freeze({
+    key: mutation.key,
+    revision: 1,
+    value: mutation.value,
+  });
 }
 
 function participantProfileDocument(

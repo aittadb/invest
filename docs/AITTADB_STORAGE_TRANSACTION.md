@@ -84,10 +84,15 @@ completeness and stability. A changed retry conflicts. A missing, incomplete,
 over-capacity, malformed, mismatched, or moving state is unavailable and changes
 nothing.
 
-This storage primitive is not a production provisioning or migration workflow.
-`TASK-158` must compose authoritative empty initialization with first
-registration, and `TASK-159` must provide the bounded operator-only migration
-path for legacy participants before hosted investment persistence is ready.
+The application registration repository now attaches authoritative empty
+initialization to the first profile transaction: current profile, immutable
+profile revision, ownership root, empty index, and empty summary commit under
+one operation ID or none do. Exact registration replay authenticates the
+immutable root and the complete current ownership state, so later valid
+indication activity does not invalidate the original result. Existing profiles
+never gain ownership metadata through ordinary absence fallback. `TASK-159`
+still must provide the bounded operator-only migration path for legacy
+participants before hosted investment persistence is ready.
 
 One capacity proof reads the root, summary, and index, then the current and
 terminal record for each owned ID, and finally re-reads the summary. It

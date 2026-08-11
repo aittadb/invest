@@ -266,14 +266,15 @@ must never call this function as an absence fallback. Existing-root corruption
 is unavailable and requires operator investigation rather than automatic
 reinitialization.
 
-This primitive does not yet make hosted participant investment persistence
-ready. `TASK-158` must atomically provision empty ownership metadata with first
-registration, and `TASK-159` must provide the credential-closed complete
-inventory migration for legacy participants. Ordinary hosted investment routes
-must remain unavailable for a subject until the applicable prerequisite has
-completed. Exact initialization retries use immutable root evidence and return
-their original counts after later valid lifecycle activity, but every retry
-still validates the current root, index, summary, and compact ownership heads.
+The application factory's registration repository now adds the empty ownership
+root, index, and summary to the same atomic transaction as the first current and
+immutable profile records. Exact and stale-policy registration recovery verify
+that immutable root and the complete current bounded ownership state, including
+after later valid lifecycle activity. An existing legacy profile with absent
+ownership metadata remains unavailable rather than being initialized by an
+ordinary request. `TASK-159` must still provide the credential-closed complete
+inventory migration for those legacy participants before hosted investment
+routes are enabled for the relevant population.
 Each head recomputes the terminal operation fingerprint, including the
 normalized field-reference commitment for create and edit, before its lifecycle
 status can affect capacity. Each active head then verifies its one-to-eight

@@ -44,6 +44,7 @@ import {
   type StorageMutation,
   type StorageOperationId,
   type StoragePage,
+  type StoragePutMutation,
   type StorageRecord,
   type StorageTransactionRequest,
   type StorageTransactionResult,
@@ -86,6 +87,7 @@ import {
   type ParticipantInvestmentInterestReader,
 } from "../worker/participant-investment-mutation-port.ts";
 import { StagedStorageTransaction as SharedStagedStorageTransaction } from "./staged-storage-transaction.ts";
+import type { ParticipantRegistrationProvisioning } from "./in-memory-participant-repository.ts";
 
 const PARTICIPANT_INDEX_SCHEMA_VERSION = 1;
 const PARTICIPANT_OPERATION_SCHEMA_VERSION = 2;
@@ -226,6 +228,63 @@ export type PreparedParticipantAccountDeletionInvestmentWithdrawalSet = Readonly
   aggregate: StoredInvestmentAggregateSnapshot;
   mutationCount: number;
 }>;
+
+/** Prepare the authoritative empty ownership side of first registration. */
+export function createParticipantRegistrationInvestmentProvisioning(
+  storage: StorageAdapter,
+): ParticipantRegistrationProvisioning {
+  const adapter = requiredStorageAdapter(storage);
+  const provisioning: ParticipantRegistrationProvisioning = {
+    async prepare(
+      subject: ActorSubject,
+      operationId: StorageOperationId,
+    ) {
+      const trustedSubject = requiredSubject(subject);
+      const parsed = await parseOwnershipInitializationRequest(
+        trustedSubject,
+        { operationId, indications: Object.freeze([]) },
+      );
+      const root: StoragePutMutation = Object.freeze({
+        type: "put",
+        key: await participantOwnershipRootKey(trustedSubject),
+        expectedRevision: null,
+        value: ownershipRootDocument(parsed),
+      });
+      const index = await participantIndexMutation(
+        trustedSubject,
+        Object.freeze({ record: null, ids: Object.freeze([]) }),
+        Object.freeze([]),
+      );
+      const witness = await participantOwnershipWitnessMutation(
+        trustedSubject,
+        null,
+        Object.freeze([]),
+      );
+      const mutations: readonly [
+        StoragePutMutation,
+        StoragePutMutation,
+        StoragePutMutation,
+      ] = Object.freeze([root, index, witness]);
+      return mutations;
+    },
+    async verifyExactReplay(
+      subject: ActorSubject,
+      operationId: StorageOperationId,
+    ) {
+      const trustedSubject = requiredSubject(subject);
+      const parsed = await parseOwnershipInitializationRequest(
+        trustedSubject,
+        { operationId, indications: Object.freeze([]) },
+      );
+      const complete = await readCompleteParticipantIndex(
+        adapter,
+        trustedSubject,
+      );
+      requireMatchingInitializationRoot(complete.root, parsed, "request");
+    },
+  };
+  return Object.freeze(provisioning);
+}
 
 type ParsedOwnershipInitialization = Readonly<{
   operationId: StorageOperationId;
@@ -1256,7 +1315,7 @@ async function participantOwnershipWitnessMutation(
   subject: ActorSubject,
   current: StorageRecord | null,
   indications: readonly ParticipantIndicationOwnershipEntry[],
-): Promise<StorageMutation> {
+): Promise<StoragePutMutation> {
   const revision = (current?.revision ?? 0) + 1;
   if (!Number.isSafeInteger(revision)) unavailable();
   return Object.freeze({
@@ -1438,7 +1497,7 @@ async function participantIndexMutation(
   subject: ActorSubject,
   current: ParticipantIndex,
   ids: readonly InvestmentIndicationId[],
-): Promise<StorageMutation> {
+): Promise<StoragePutMutation> {
   const revision = (current.record?.revision ?? 0) + 1;
   if (!Number.isSafeInteger(revision)) unavailable();
   return Object.freeze({

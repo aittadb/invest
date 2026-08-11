@@ -74,7 +74,10 @@ import {
   type ParticipantRegistrationRepository,
   type ParticipantRepository,
 } from "./in-memory-participant-repository.ts";
-import { StorageParticipantInvestmentInterestRepository } from "./storage-participant-investment-repository.ts";
+import {
+  StorageParticipantInvestmentInterestRepository,
+  createParticipantRegistrationInvestmentProvisioning,
+} from "./storage-participant-investment-repository.ts";
 import {
   OwnerBoundInvestmentAggregateCorrectionRepository,
   type CampaignRevisionBoundAggregateCorrectionRepository,
@@ -215,8 +218,14 @@ export class StorageApplicationRepositoryFactory {
       new StorageManualNotificationRepository(adapter);
     this.#participantRequest = (account) =>
       createParticipantRequestRepositoryScope(adapter, account);
+    const participantRegistrationProvisioning =
+      createParticipantRegistrationInvestmentProvisioning(adapter);
     this.#participantRepositoryFor = (account) =>
-      new StorageParticipantRepository(adapter, account);
+      new StorageParticipantRepository(
+        adapter,
+        account,
+        participantRegistrationProvisioning,
+      );
     this.#claimBrowserMutationReplay = Object.freeze(
       (claim: BrowserMutationReplayClaim) => claimReplay(adapter, clock, claim),
     );

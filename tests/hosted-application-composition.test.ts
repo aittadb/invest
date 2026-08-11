@@ -3310,6 +3310,15 @@ test("hosted participant registration persists policy-bound submissions across r
   const createdDocument = await created.json() as ParticipantRegistrationDocument;
   assert.equal(createdDocument.data.status, "registered");
   assert.deepEqual(actionNames(createdDocument), []);
+  assert.equal(
+    recordsIn(service, "participant-investment-ownership-roots").length,
+    1,
+  );
+  assert.equal(recordsIn(service, "participant-investment-indexes").length, 1);
+  assert.equal(
+    recordsIn(service, "investment-indication-ownership-witnesses").length,
+    1,
+  );
 
   await new StorageCampaignRepository(hostedStorageAdapter(service)).saveSetup({
     operationId: "campaign-operation:registration-policy-update",
@@ -3392,6 +3401,10 @@ test("hosted participant registration persists policy-bound submissions across r
   );
   assert.equal(duplicate.status, 409);
   assert.doesNotMatch(await duplicate.text(), /Hosted participant|Changed duplicate/u);
+  assert.equal(
+    recordsIn(service, "participant-investment-ownership-roots").length,
+    1,
+  );
 
   const persisted = await participantRegistration(restarted, env);
   assert.equal(persisted.document.data.status, "registered");

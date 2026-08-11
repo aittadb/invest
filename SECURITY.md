@@ -22,6 +22,7 @@ If exposure is suspected, do not echo or paste the value. Escalate privately wit
 - Every server route must enforce authorization independently.
 - Browser mutation identity comes only from the trusted session resolver, never request-supplied actor fields or untrusted headers.
 - Participant reads pass only a parsed trusted account to an explicitly composed credential-bound state reader. Environment bindings are never participant authority. The Worker deletes or replaces its bounded internal participant render header, and foreign, missing, malformed, or unavailable state grants no private capability.
+- First persistent participant registration commits the profile and authoritative empty investment-ownership root, index, and completeness summary in one transaction. Existing profiles, partial ownership metadata, conflicts, and failed or malformed transaction evidence must never trigger an ordinary-request initialization fallback.
 - Browser mutations require an exact configured origin, an unexpired session, an expiring server-verified CSRF proof, and a bounded supported body before feature code runs.
 - A shared browser-mutation session is only an absolute ceiling. Every composed route supplies its own body and field limits, which are validated and applied during proof extraction as well as body parsing.
 - Once browser mutation verification consumes replay authority, setup and editor routes clear that exact cookie on every later success or fixed error response. A repeated replay neither accumulates cookies nor receives a replacement proof.
