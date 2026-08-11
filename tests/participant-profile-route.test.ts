@@ -741,6 +741,20 @@ test("post-replay projection rejects well-formed higher revisions with illegal a
       representation: "html",
     },
     {
+      name: "one-step withdrawal with detached update timestamp",
+      current: result,
+      latest: profileSnapshot(3, {
+        ...result.snapshot,
+        marketingConsent: {
+          state: "withdrawn",
+          grantedAt: REGISTERED_AT,
+          withdrawnAt: timestamp("2026-08-09T10:01:00.000Z"),
+        },
+        updatedAt: timestamp("2026-08-09T10:02:00.000Z"),
+      }),
+      revisionReads: 1,
+    },
+    {
       name: "compressed edit and deletion request",
       current: result,
       latest: profileSnapshot(3, {

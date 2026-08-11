@@ -214,6 +214,17 @@ test("descendant ancestry requires prior marketing consent before withdrawal", (
     isParticipantProfileDescendantProjection(granted, validWithdrawal, 1),
     true,
   );
+  assert.equal(
+    isParticipantProfileDescendantProjection(
+      granted,
+      {
+        ...validWithdrawal,
+        updatedAt: DELETION_AT,
+      },
+      1,
+    ),
+    false,
+  );
 });
 
 test("deletion requests produce a retry-stable active-interest withdrawal intent", () => {
