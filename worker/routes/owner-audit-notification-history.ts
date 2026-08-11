@@ -20,6 +20,7 @@ import {
 } from "../../domain/storage-adapter.ts";
 import { negotiateRepresentation } from "../../http/content-negotiation.ts";
 import type {
+  BrowserMutationExactReplayScopeResolver,
   BrowserMutationPreReplayValidator,
   BrowserMutationProof,
 } from "../../http/browser-mutation-session.ts";
@@ -34,6 +35,7 @@ import {
   MAX_OWNER_NOTIFICATION_PAGE_SIZE,
   type AtomicManualNotificationActivityRepository,
   type AuditEventReader,
+  type ManualNotificationTerminalReplay,
 } from "../../repositories/in-memory-audit-notification-repositories.ts";
 import type {
   ApplicationRouteContext,
@@ -82,11 +84,13 @@ export type OwnerAuditNotificationRouteDependencies = Readonly<{
   verifyMutation: (
     request: Request,
     validateBeforeReplayClaim?: BrowserMutationPreReplayValidator,
+    exactReplayScopeFor?: BrowserMutationExactReplayScopeResolver,
   ) => Promise<
     VerifiedMutationRequest & Readonly<{ clearCookie?: string }>
   >;
   csrfToken: (
     request: Request,
+    exactReplayScope?: string | null,
   ) => Promise<string | BrowserMutationProof | null>;
   issueOperationId: OwnerNotificationOperationIdIssuer;
   now?: () => Date;
@@ -196,25 +200,30 @@ export function createOwnerAuditNotificationHistoryRouteHandler(
       if (route.notificationId === null) {
         throw new StorageFailure("INVALID_REQUEST");
       }
-      const snapshot = await dependencies.notifications.get(
+      const state = await dependencies.notifications.getActivityState(
         route.notificationId,
       );
-      if (snapshot === null) throw new StorageFailure("NOT_FOUND");
+      if (state === null) throw new StorageFailure("NOT_FOUND");
+      const activityAllowed =
+        state.snapshot.record.template.generatedBy.subject ===
+          context.actor.userId;
+      const terminalReplay = activityAllowed ? state.terminalReplay : null;
       return detailResponse(
         { ...context, resourceUrl },
         representation,
         createOwnerNotificationDetailResource(
           resourceUrl,
-          snapshot,
+          state.snapshot,
           issueOperationId,
           {
-            activityAllowed:
-              snapshot.record.template.generatedBy.subject ===
-                context.actor.userId,
+            activityAllowed,
+            terminalReplay,
           },
         ),
         dependencies.csrfToken,
         dependencies.mutationVerificationMode,
+        [],
+        terminalReplay,
       );
     } catch (error) {
       return mappedFailureResponse(
@@ -298,6 +307,7 @@ async function mutateNotification(
     const verified = await dependencies.verifyMutation(
       context.request,
       validNotificationMutationShape,
+      notificationReplayScopeFor(route),
     );
     clearCookie = requiredMutationClearCookie(
       verified.clearCookie,
@@ -339,24 +349,30 @@ async function mutateNotification(
       }), [clearCookie]);
     }
 
-    const current = await dependencies.notifications.get(route.notificationId);
-    if (current === null) throw new StorageFailure("UNAVAILABLE");
+    const state = await dependencies.notifications.getActivityState(
+      route.notificationId,
+    );
+    if (state === null) throw new StorageFailure("UNAVAILABLE");
+    const activityAllowed =
+      state.snapshot.record.template.generatedBy.subject ===
+        verified.actor.subject;
+    const terminalReplay = activityAllowed ? state.terminalReplay : null;
     return detailResponse(
       { ...context, resourceUrl: detailUrl },
       representation,
       createOwnerNotificationDetailResource(
         detailUrl,
-        current,
+        state.snapshot,
         issueOperationId,
         {
-          activityAllowed:
-            current.record.template.generatedBy.subject ===
-              verified.actor.subject,
+          activityAllowed,
+          terminalReplay,
         },
       ),
       dependencies.csrfToken,
       dependencies.mutationVerificationMode,
       [clearCookie],
+      terminalReplay,
     );
   } catch (error) {
     return withSetCookies(
@@ -373,11 +389,18 @@ async function detailResponse(
   csrfToken: OwnerAuditNotificationRouteDependencies["csrfToken"],
   verificationMode: OwnerNotificationMutationVerificationMode,
   cookies: readonly (string | null)[] = [],
+  terminalReplay: ManualNotificationTerminalReplay | null = null,
 ): Promise<Response> {
-  const hasMutation = resource.recordCopy !== null || resource.markSent !== null;
+  const hasMutation = resource.recordCopy !== null ||
+    resource.markSent !== null || resource.terminalRetry !== null;
   const proof = hasMutation
     ? requiredCsrfProof(
-        await csrfToken(context.request),
+        await csrfToken(
+          context.request,
+          terminalReplay === null
+            ? null
+            : notificationReplayScope(terminalReplay, resource.document.id),
+        ),
         verificationMode,
       )
     : null;
@@ -570,6 +593,50 @@ function validNotificationMutationShape(
   } catch {
     return false;
   }
+}
+
+function notificationReplayScopeFor(
+  route: Extract<HistoryRoute, Readonly<{ kind: "notification-activity" }>>,
+): BrowserMutationExactReplayScopeResolver {
+  return (request) => {
+    if (route.notificationId === null || request.method !== "POST") return null;
+    try {
+      const mutation = parseMutation(request.body, request.mediaType);
+      return notificationReplayScope({
+        activity: route.activity,
+        operationId: mutation.operationId,
+        expectedRevision: mutation.expectedRevision,
+      }, route.notificationId);
+    } catch {
+      return null;
+    }
+  };
+}
+
+function notificationReplayScope(
+  replay: ManualNotificationTerminalReplay,
+  notificationId: string,
+): string {
+  const parsedNotificationId = parseStableId<"manual-notification">(
+    notificationId,
+  );
+  const parsedOperationId = parseStorageOperationId(replay.operationId);
+  if (
+    !parsedNotificationId.ok ||
+    !parsedOperationId.ok ||
+    (replay.activity !== "template-copied" &&
+      replay.activity !== "sent-marked") ||
+    !Number.isSafeInteger(replay.expectedRevision) ||
+    replay.expectedRevision < 1 ||
+    replay.expectedRevision >= Number.MAX_SAFE_INTEGER
+  ) throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+  return JSON.stringify([
+    "owner-notification-terminal-replay:v1",
+    parsedNotificationId.value,
+    replay.activity,
+    parsedOperationId.value,
+    replay.expectedRevision,
+  ]);
 }
 
 function checkedOperationIssuer(
@@ -832,7 +899,11 @@ function renderNotificationDetail(
   const audit = resource.document.links.find((link) =>
     link.rel.includes("audit-events")
   );
-  const actions = [resource.recordCopy, resource.markSent]
+  const actions = [
+    resource.recordCopy,
+    resource.markSent,
+    resource.terminalRetry,
+  ]
     .filter((value): value is OwnerNotificationControl => value !== null)
     .map((control) => renderActivityForm(control.form, csrfToken))
     .join("");

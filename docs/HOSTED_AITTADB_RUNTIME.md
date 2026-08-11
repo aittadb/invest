@@ -433,6 +433,12 @@ original immutable copy or sent fact and audit event only when the requested
 result revision's transition introduced that operation evidence. A changed
 expected revision cannot adopt a later activity revision; owner rotation,
 changed work, stale revisions, and missing or corrupt history fail closed.
+When the final allowed copy or sent transition makes a notification fully
+terminal, verified operation-bearing evidence reconstructs one exact retry
+action. The Worker uses `issueExactReplay` and the route's exact scope resolver,
+binding the one-use proof to notification, activity, operation, and prior
+revision; a changed or foreign request cannot consume it. Older evidence
+formats remain readable without gaining this replay capability.
 
 Publication checks combine intrinsic campaign readiness with the immutable
 runtime boolean. The runtime defaults to false and accepts only exact configured

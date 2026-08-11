@@ -71,6 +71,8 @@ export const MAX_MANUAL_NOTIFICATION_STORAGE_READS =
   1 + MAX_MANUAL_NOTIFICATION_REVISIONS;
 export const MAX_OWNER_NOTIFICATION_PAGE_SIZE = 25;
 export const MAX_OWNER_NOTIFICATION_CURSOR_LENGTH = 512;
+const COPY_OPERATION_EVIDENCE_PREFIX = "notification-copy-operation:v1:";
+const SENT_OPERATION_EVIDENCE_PREFIX = "notification-sent-operation:v1:";
 
 export type AuditAppendResult = Readonly<{
   event: AuditEvent;
@@ -212,6 +214,17 @@ export type ManualNotificationPage = Readonly<{
   nextCursor: StorageCursor | null;
 }>;
 
+export type ManualNotificationTerminalReplay = Readonly<{
+  activity: "template-copied" | "sent-marked";
+  operationId: StorageOperationId;
+  expectedRevision: number;
+}>;
+
+export type ManualNotificationActivityState = Readonly<{
+  snapshot: ManualNotificationSnapshot;
+  terminalReplay: ManualNotificationTerminalReplay | null;
+}>;
+
 /** Private manual-notification persistence boundary. */
 export interface ManualNotificationRepository {
   create(
@@ -232,6 +245,9 @@ export interface ManualNotificationRepository {
 export interface AtomicManualNotificationActivityRepository {
   readonly activityConsistency: "atomic-notification-audit";
   get(id: unknown): Promise<ManualNotificationSnapshot | null>;
+  getActivityState(
+    id: unknown,
+  ): Promise<ManualNotificationActivityState | null>;
   list(
     request: ManualNotificationListRequest,
   ): Promise<ManualNotificationPage>;
@@ -315,6 +331,12 @@ export class StorageManualNotificationRepository
   }
 
   async get(id: unknown): Promise<ManualNotificationSnapshot | null> {
+    return (await this.getActivityState(id))?.snapshot ?? null;
+  }
+
+  async getActivityState(
+    id: unknown,
+  ): Promise<ManualNotificationActivityState | null> {
     const notificationId = requiredNotificationId(id);
     const key = await currentNotificationKey(notificationId);
     const stored = await readNotificationStorage(this.#storage, key);
@@ -327,8 +349,8 @@ export class StorageManualNotificationRepository
       notificationId,
       null,
     );
-    await this.#verifyHistory(snapshot);
-    return snapshot;
+    const terminalReplay = await this.#verifyHistory(snapshot);
+    return Object.freeze({ snapshot, terminalReplay });
   }
 
   async list(
@@ -452,16 +474,16 @@ export class StorageManualNotificationRepository
     const base = current;
     const changed = activity === "template-copied"
       ? recordManualNotificationCopy(base.record, {
-          id: await activityEvidenceId<"manual-notification-copy">(
-            "notification-copy",
+          id: activityOperationEvidenceId<"manual-notification-copy">(
+            activity,
             operationId,
           ),
           copiedAt: occurredAt,
           copiedBy: { type: "owner", subject: ownerSubject },
         })
       : markManualNotificationSent(base.record, {
-          id: await activityEvidenceId<"manual-notification-sent-marker">(
-            "notification-sent",
+          id: activityOperationEvidenceId<"manual-notification-sent-marker">(
+            activity,
             operationId,
           ),
           sentAt: occurredAt,
@@ -522,30 +544,20 @@ export class StorageManualNotificationRepository
     activity: "template-copied" | "sent-marked",
   ): Promise<AuditedManualNotificationMutationResult | null> {
     const resultRevision = expectedRevision + 1;
-    const evidenceId = activity === "template-copied"
-      ? await activityEvidenceId<"manual-notification-copy">(
-          "notification-copy",
-          operationId,
-        )
-      : await activityEvidenceId<"manual-notification-sent-marker">(
-          "notification-sent",
-          operationId,
-        );
+    const evidenceId = activityOperationEvidenceId(
+      activity,
+      operationId,
+    );
     const currentEvidence = activity === "template-copied"
       ? current.record.copyEvidence.find((item) => item.id === evidenceId) ?? null
       : current.record.sentMarker?.id === evidenceId
       ? current.record.sentMarker
       : null;
     if (currentEvidence === null) {
-      const changedActivityId = activity === "template-copied"
-        ? await activityEvidenceId<"manual-notification-sent-marker">(
-            "notification-sent",
-            operationId,
-          )
-        : await activityEvidenceId<"manual-notification-copy">(
-            "notification-copy",
-            operationId,
-          );
+      const changedActivityId = activityOperationEvidenceId(
+        activity === "template-copied" ? "sent-marked" : "template-copied",
+        operationId,
+      );
       const changedActivityExists = activity === "template-copied"
         ? current.record.sentMarker?.id === changedActivityId
         : current.record.copyEvidence.some(({ id }) => id === changedActivityId);
@@ -739,8 +751,11 @@ export class StorageManualNotificationRepository
     });
   }
 
-  async #verifyHistory(snapshot: ManualNotificationSnapshot): Promise<void> {
+  async #verifyHistory(
+    snapshot: ManualNotificationSnapshot,
+  ): Promise<ManualNotificationTerminalReplay | null> {
     let previous: ManualNotificationSnapshot | null = null;
+    let finalBase: ManualNotificationSnapshot | null = null;
     for (let revision = 1; revision <= snapshot.revision; revision += 1) {
       const key = await notificationHistoryKey(snapshot.record.template.id, revision);
       const stored = await readNotificationStorage(this.#storage, key);
@@ -762,6 +777,7 @@ export class StorageManualNotificationRepository
       } else if (!isValidNotificationTransition(previous.record, historical.record)) {
         unavailable();
       }
+      finalBase = previous;
       previous = historical;
     }
 
@@ -772,6 +788,7 @@ export class StorageManualNotificationRepository
     ) {
       unavailable();
     }
+    return terminalNotificationReplay(finalBase, snapshot);
   }
 }
 
@@ -1450,6 +1467,37 @@ function hasContinuousNotificationOwner(
     record.sentMarker.sentBy.subject === ownerSubject);
 }
 
+function terminalNotificationReplay(
+  previous: ManualNotificationSnapshot | null,
+  current: ManualNotificationSnapshot,
+): ManualNotificationTerminalReplay | null {
+  if (
+    previous === null ||
+    current.record.copyEvidence.length !==
+      MANUAL_NOTIFICATION_LIMITS.copyEvidence ||
+    current.record.sentMarker === null ||
+    current.revision !== previous.revision + 1
+  ) return null;
+
+  const appendedCopy =
+    current.record.copyEvidence.length ===
+      previous.record.copyEvidence.length + 1 &&
+    canonicalJson(current.record.sentMarker) ===
+      canonicalJson(previous.record.sentMarker);
+  const activity = appendedCopy ? "template-copied" : "sent-marked";
+  const evidenceId = appendedCopy
+    ? current.record.copyEvidence.at(-1)?.id
+    : current.record.sentMarker.id;
+  const operationId = operationIdFromActivityEvidence(activity, evidenceId);
+  return operationId === null
+    ? null
+    : Object.freeze({
+        activity,
+        operationId,
+        expectedRevision: previous.revision,
+      });
+}
+
 function auditEventKey(id: StableId<"audit-event">): StorageKey {
   return requiredStorageKey(AUDIT_EVENTS, id);
 }
@@ -1492,6 +1540,30 @@ async function activityEvidenceId<Entity extends string>(
   operationId: StorageOperationId,
 ): Promise<StableId<Entity>> {
   return requiredStableId<Entity>(await hashedStorageId(namespace, operationId));
+}
+
+function activityOperationEvidenceId<Entity extends string>(
+  activity: "template-copied" | "sent-marked",
+  operationId: StorageOperationId,
+): StableId<Entity> {
+  const prefix = activity === "template-copied"
+    ? COPY_OPERATION_EVIDENCE_PREFIX
+    : SENT_OPERATION_EVIDENCE_PREFIX;
+  return requiredStableId<Entity>(`${prefix}${operationId}`);
+}
+
+function operationIdFromActivityEvidence(
+  activity: "template-copied" | "sent-marked",
+  evidenceId: unknown,
+): StorageOperationId | null {
+  const prefix = activity === "template-copied"
+    ? COPY_OPERATION_EVIDENCE_PREFIX
+    : SENT_OPERATION_EVIDENCE_PREFIX;
+  if (typeof evidenceId !== "string" || !evidenceId.startsWith(prefix)) {
+    return null;
+  }
+  const parsed = parseStorageOperationId(evidenceId.slice(prefix.length));
+  return parsed.ok ? parsed.value : null;
 }
 
 async function manualNotificationAuditEvent(

@@ -128,9 +128,16 @@ export type OwnerNotificationDetailResource = Readonly<{
   document: OwnerNotificationDetailDocument;
   recordCopy: OwnerNotificationControl | null;
   markSent: OwnerNotificationControl | null;
+  terminalRetry: OwnerNotificationControl | null;
 }>;
 
 export type OwnerNotificationOperationIdIssuer = () => StorageOperationId;
+
+export type OwnerNotificationTerminalReplay = Readonly<{
+  activity: "template-copied" | "sent-marked";
+  operationId: StorageOperationId;
+  expectedRevision: number;
+}>;
 
 export function createOwnerAuditCollectionDocument(
   requestUrl: string,
@@ -192,7 +199,10 @@ export function createOwnerNotificationDetailResource(
   requestUrl: string,
   snapshot: OwnerNotificationSnapshot,
   issueOperationId: OwnerNotificationOperationIdIssuer,
-  options: Readonly<{ activityAllowed?: boolean }> = { activityAllowed: true },
+  options: Readonly<{
+    activityAllowed?: boolean;
+    terminalReplay?: OwnerNotificationTerminalReplay | null;
+  }> = { activityAllowed: true },
 ): OwnerNotificationDetailResource {
   const self = new URL(requestUrl);
   const { record } = snapshot;
@@ -216,7 +226,30 @@ export function createOwnerNotificationDetailResource(
         issueOperationId(),
       )
     : null;
-  const actions = [recordCopy, markSent]
+  const terminalRetry = activityAllowed &&
+      recordCopy === null &&
+      markSent === null &&
+      options.terminalReplay
+    ? activityControl(
+        options.terminalReplay.activity === "template-copied"
+          ? "retry-notification-template-copy"
+          : "retry-notification-sent-marker",
+        options.terminalReplay.activity === "template-copied"
+          ? "Retry recorded template copy"
+          : "Retry recorded sent marker",
+        new URL(
+          `${self.pathname}/${
+            options.terminalReplay.activity === "template-copied"
+              ? "copies"
+              : "sent-marker"
+          }`,
+          self,
+        ).href,
+        options.terminalReplay.expectedRevision,
+        options.terminalReplay.operationId,
+      )
+    : null;
+  const actions = [recordCopy, markSent, terminalRetry]
     .filter((value): value is OwnerNotificationControl => value !== null);
 
   return deepFreeze({
@@ -258,6 +291,7 @@ export function createOwnerNotificationDetailResource(
     },
     recordCopy,
     markSent,
+    terminalRetry,
   });
 }
 

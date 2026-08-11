@@ -588,6 +588,13 @@ class FakeNotificationRepository {
     return typeof id === "string" ? this.current(id) : null;
   }
 
+  async getActivityState(id: unknown) {
+    const snapshot = await this.get(id);
+    return snapshot === null
+      ? null
+      : Object.freeze({ snapshot, terminalReplay: null });
+  }
+
   async list(request: Readonly<{ limit: number; cursor?: StorageCursor }>): Promise<ManualNotificationPage> {
     const values = [...this.#records.values()];
     const offset = cursorOffset(request.cursor);

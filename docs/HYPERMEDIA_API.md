@@ -268,6 +268,11 @@ owner. The detail advertises `record-notification-template-copy` while the copy
 history limit permits another entry, and advertises `mark-notification-sent`
 only until a sent marker exists. Both are `POST` actions carrying hidden,
 server-issued `operation-id` and `expected-revision` fields.
+When the copy limit and sent marker make the record fully terminal, the detail
+advertises only one exact retry action for the final immutable transition. Its
+operation and prior revision come from operation-bound evidence in the verified
+history; older evidence formats remain readable but cannot create this recovery
+capability.
 
 The production repository accepts only closed data-only current, immutable
 history, template, actor, copy, and sent records. A notification has at most 66
@@ -308,6 +313,10 @@ evidence merely retained by a later activity revision cannot satisfy recovery.
 The original server timestamp is retained without another transaction. A
 changed retry conflicts, a stale new operation fails its revision precondition,
 and a failed transaction changes neither history.
+The fully terminal retry receives a version-2 browser proof scoped to the exact
+notification, activity, operation, and prior revision. Changed requests cannot
+claim that proof, foreign callers never receive the private resource, and one
+successful exact use consumes it.
 
 ## Participant Investment Interest
 

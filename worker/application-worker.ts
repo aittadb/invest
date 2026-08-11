@@ -1086,7 +1086,11 @@ function runtimeOwnerAuditNotificationHistory(
       notifications:
         runtime.repositoryFactory.ownerManualNotificationActivity(),
       mutationVerificationMode: "persistent-claim" as const,
-      verifyMutation: (request, validateBeforeReplayClaim) =>
+      verifyMutation: (
+        request,
+        validateBeforeReplayClaim,
+        exactReplayScopeFor,
+      ) =>
         session.verifyMutation(
           request,
           identity,
@@ -1096,9 +1100,18 @@ function runtimeOwnerAuditNotificationHistory(
             maxFields: ownerNotificationMutationFieldLimit(request),
             repeatedFormFields: [],
             validateBeforeReplayClaim,
+            exactReplayScopeFor,
           },
         ),
-      csrfToken: (request) => session.issue(request, identity, appOrigin),
+      csrfToken: (request, exactReplayScope = null) =>
+        exactReplayScope === null
+          ? session.issue(request, identity, appOrigin)
+          : session.issueExactReplay(
+              request,
+              identity,
+              appOrigin,
+              exactReplayScope,
+            ),
       issueOperationId: () =>
         randomOperationId("manual-notification-activity"),
       now: runtime.now,

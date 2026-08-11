@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { MANUAL_NOTIFICATION_LIMITS } from "../domain/audit-notification.ts";
+
 import {
   toPublicStorageFailure,
   StorageFailure,
@@ -609,6 +611,76 @@ test("manual notification activity preserves the template owner boundary", async
       .items,
     [],
   );
+});
+
+test("fully terminal notification state recovers the exact final activity", async () => {
+  for (const finalActivity of ["template-copied", "sent-marked"] as const) {
+    const state = new MemoryStorageState();
+    const storage = new DeterministicMemoryStorageAdapter(state, true);
+    const repository = new DevelopmentInMemoryManualNotificationRepository(storage);
+    const notificationId = `notification:terminal-${finalActivity}`;
+    await repository.create({
+      operationId: `notification-operation:terminal-create-${finalActivity}`,
+      template: templateInput(notificationId),
+    });
+
+    let revision = 1;
+    if (finalActivity === "template-copied") {
+      await repository.markSent({
+        operationId: "notification-operation:terminal-seed-sent",
+        notificationId,
+        expectedRevision: revision++,
+        marker: {
+          id: "notification-sent:terminal-seed",
+          sentAt: SENT_AT,
+          sentBy: OWNER,
+        },
+      });
+    }
+    const seedCopies = finalActivity === "template-copied"
+      ? MANUAL_NOTIFICATION_LIMITS.copyEvidence - 1
+      : MANUAL_NOTIFICATION_LIMITS.copyEvidence;
+    for (let index = 0; index < seedCopies; index += 1) {
+      await repository.recordCopy({
+        operationId: `notification-operation:terminal-seed-copy-${index}`,
+        notificationId,
+        expectedRevision: revision++,
+        evidence: {
+          id: `notification-copy:terminal-seed-${index}`,
+          copiedAt: COPIED_AT,
+          copiedBy: OWNER,
+        },
+      });
+    }
+
+    const operationId = `manual-notification-activity:terminal-${finalActivity}`;
+    const expectedRevision = revision;
+    if (finalActivity === "template-copied") {
+      await repository.recordCopyWithAudit({
+        operationId,
+        notificationId,
+        expectedRevision,
+        ownerSubject: OWNER.subject,
+        occurredAt: COPIED_AT,
+      });
+    } else {
+      await repository.markSentWithAudit({
+        operationId,
+        notificationId,
+        expectedRevision,
+        ownerSubject: OWNER.subject,
+        occurredAt: SENT_AT,
+      });
+    }
+
+    const activityState = await repository.getActivityState(notificationId);
+    assert.equal(activityState?.snapshot.revision, expectedRevision + 1);
+    assert.deepEqual(activityState?.terminalReplay, {
+      activity: finalActivity,
+      operationId,
+      expectedRevision,
+    });
+  }
 });
 
 test("manual notification collection rejects corrupt finite pages", async () => {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { MANUAL_NOTIFICATION_LIMITS } from "../domain/audit-notification.ts";
 import type { HypermediaAction } from "../domain/public-campaign-resource.ts";
 import type {
   OwnerAuditCollectionDocument,
@@ -269,6 +270,156 @@ test("hosted owner notification activity survives response loss and Worker resta
   assert.match(html, /href="https:\/\/invest\.example\.test\/owner\/audit-events"/u);
   assert.match(html, /href="\/">View campaign<\/a>/u);
   assert.doesNotMatch(html, /service-secret|access-token|storage-runtime/iu);
+});
+
+test("hosted terminal notification retry is exact, scoped, and one-use", async () => {
+  let failedOperation: string | null = null;
+  let failOnce = true;
+  const service = storageService({
+    failCommittedTransaction(operationId) {
+      if (failOnce && operationId === failedOperation) {
+        failOnce = false;
+        return "unavailable";
+      }
+      return null;
+    },
+  });
+  await seedNotification(service);
+  const repository = notificationRepository(service);
+  let revision = 1;
+  await repository.markSent({
+    operationId: "notification-operation:terminal-seed-sent",
+    notificationId: NOTIFICATION_ID,
+    expectedRevision: revision++,
+    marker: {
+      id: "notification-sent:terminal-seed",
+      sentAt: "2026-08-11T09:01:00.000Z",
+      sentBy: { type: "owner", subject: OWNER_SUBJECT },
+    },
+  });
+  for (
+    let index = 0;
+    index < MANUAL_NOTIFICATION_LIMITS.copyEvidence - 1;
+    index += 1
+  ) {
+    await repository.recordCopy({
+      operationId: `notification-operation:terminal-seed-copy-${index}`,
+      notificationId: NOTIFICATION_ID,
+      expectedRevision: revision++,
+      evidence: {
+        id: `notification-copy:terminal-seed-${index}`,
+        copiedAt: "2026-08-11T09:02:00.000Z",
+        copiedBy: { type: "owner", subject: OWNER_SUBJECT },
+      },
+    });
+  }
+  assert.equal(revision, 65);
+
+  const env = environment();
+  const randomBytes = deterministicRandomBytes(131);
+  const firstWorker = hostedWorker(service, NOW, randomBytes);
+  const path = `/owner/manual-notifications/${encodeURIComponent(NOTIFICATION_ID)}`;
+  const discovery = await firstWorker.fetch(
+    ownerRequest(path),
+    env,
+    executionContext,
+  );
+  const firstProof = mutationProof(discovery);
+  const document = await discovery.json() as OwnerNotificationDetailDocument;
+  const finalCopy = requiredAction(
+    document,
+    "record-notification-template-copy",
+  );
+  const finalBody = actionBody(finalCopy);
+  failedOperation = String(finalBody["operation-id"]);
+  assert.equal(finalBody["expected-revision"], 65);
+
+  const committedResponse = await submitJson(
+    firstWorker,
+    finalCopy.href,
+    finalBody,
+    firstProof,
+    env,
+  );
+  assert.equal(committedResponse.status, 200);
+  const terminal = await repository.getActivityState(NOTIFICATION_ID);
+  assert.equal(terminal?.snapshot.revision, 66);
+  assert.equal(terminal?.snapshot.record.copyEvidence.length, 64);
+  assert.deepEqual(terminal?.terminalReplay, {
+    activity: "template-copied",
+    operationId: failedOperation,
+    expectedRevision: 65,
+  });
+
+  const restartedWorker = hostedWorker(
+    service,
+    new Date(NOW.valueOf() + 60_000),
+    randomBytes,
+  );
+  const retryDiscovery = await restartedWorker.fetch(
+    ownerRequest(path),
+    env,
+    executionContext,
+  );
+  const retryProof = mutationProof(retryDiscovery);
+  const retryDocument = await retryDiscovery.json() as
+    OwnerNotificationDetailDocument;
+  assert.deepEqual(actionNames(retryDocument), [
+    "retry-notification-template-copy",
+  ]);
+  const retryAction = requiredAction(
+    retryDocument,
+    "retry-notification-template-copy",
+  );
+  assert.deepEqual(actionBody(retryAction), finalBody);
+
+  const changed = await submitJson(
+    restartedWorker,
+    retryAction.href,
+    { ...finalBody, "expected-revision": 64 },
+    retryProof,
+    env,
+  );
+  assert.equal(changed.status, 400);
+  assert.equal(changed.headers.get("set-cookie"), null);
+
+  const foreignHeaders = mutationHeaders(retryProof, "application/json");
+  foreignHeaders.set("oai-authenticated-user-id", "oidc:foreign");
+  foreignHeaders.set("oai-authenticated-user-email", "foreign@example.test");
+  const foreign = await restartedWorker.fetch(new Request(retryAction.href, {
+    method: "POST",
+    headers: foreignHeaders,
+    body: JSON.stringify(finalBody),
+  }), env, executionContext);
+  assert.equal(foreign.status, 404);
+
+  const exact = await submitJson(
+    restartedWorker,
+    retryAction.href,
+    finalBody,
+    retryProof,
+    env,
+  );
+  assert.equal(exact.status, 200);
+  assert.match(exact.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+  const exactDocument = await exact.json() as OwnerNotificationDetailDocument;
+  assert.deepEqual(actionNames(exactDocument), [
+    "retry-notification-template-copy",
+  ]);
+  assert.equal(
+    service.transactionOperationIds.filter((value) => value === failedOperation)
+      .length,
+    1,
+  );
+
+  const reused = await submitJson(
+    restartedWorker,
+    retryAction.href,
+    finalBody,
+    retryProof,
+    env,
+  );
+  assert.equal(reused.status, 403);
 });
 
 test("hosted notification proofs reject unsafe requests before durable claim", async () => {
