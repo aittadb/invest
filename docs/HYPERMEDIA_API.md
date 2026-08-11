@@ -340,6 +340,13 @@ The collection may expose:
 
 An active item may expose `edit-investment-interest` with `PATCH` when the current package acknowledgment is valid and `withdraw-investment-interest` with `DELETE`. A withdrawn item may expose `reactivate-investment-interest` with `POST` when renewed acknowledgment and deployment policy permit it. A rejected item exposes no participant mutation action.
 
+Hosted HTML and JSON use the same subject-bound persistent reader and atomic
+mutation port. Create, edit, and reactivate atomically assert the campaign,
+participant-profile, package-version, and package-acceptance heads from which
+their actions were derived; withdrawal remains available after policy closure.
+Missing legacy ownership metadata returns a fixed unavailable response and is
+never initialized by a representation request.
+
 Create and edit use exact kind-specific fields. Personal fields are residence country, configured integer-minor-unit amount, availability period, and optional note. Company fields additionally include company name, registration country, normalized local identifier, representative name, and an explicit authority declaration. Every mutation carries a server-issued `operation-id`; item mutations also carry `expected-revision`, and withdrawal or reactivation requires explicit confirmation. Kind, operation, revision, CSRF, and method-override controls are never authorization boundaries.
 
 The trusted participant selects an injected request-scoped service. Browser input cannot select a subject, package version, acknowledgment, currency, indication ID, permission policy, or timestamp. Company uniqueness conflicts use one fixed response and do not reveal the occupied identifier, record, or participant. Canonical links and action targets derive from deployment `context.resourceUrl`, not the request hostname or a committed instance hostname.

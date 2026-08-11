@@ -3580,6 +3580,58 @@ test("hosted investment mutation rejects policy heads changed during one request
   assert.equal(recordsIn(service, "investment-aggregate-states").length, 0);
 });
 
+for (
+  const policyHeadCollection of [
+    "campaign-setup-current",
+    "private-participant-profiles",
+    "private-package-version-heads",
+    "private-package-acceptance-heads",
+  ] as const
+) {
+  test(
+    `hosted investment mutation atomically rejects a changed ${policyHeadCollection} head`,
+    async () => {
+      const service = new SyntheticAittaDBService();
+      const env = configuredEnvironment({ OWNER_EMAIL });
+      await configureHostedInvestmentFixture(service);
+      const proof = await investmentResource(hostedPackageWorker(service), env);
+      const action = requiredAction(
+        proof.document,
+        "create-personal-investment-interest",
+      );
+      service.raceNextTransactionContaining(
+        "investment-indications",
+        async () => bumpHostedRecordRevision(service, policyHeadCollection),
+      );
+
+      const response = await submitInvestmentMutation(
+        hostedPackageWorker(service),
+        env,
+        proof,
+        action,
+        actionBody(action, {
+          "operation-id":
+            `investment-operation:policy-race-${policyHeadCollection}`,
+          "residence-country": "FI",
+          amount: 25_000,
+          "availability-period": "Within twelve months.",
+        }),
+      );
+
+      assert.equal(response.status, 412);
+      assert.equal(recordsIn(service, "investment-indications").length, 0);
+      assert.equal(
+        recordsIn(service, "investment-indication-history").length,
+        0,
+      );
+      assert.equal(
+        recordsIn(service, "investment-aggregate-states").length,
+        0,
+      );
+    },
+  );
+}
+
 test("hosted maximum active investment collection stays inside the shared request budget", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
@@ -3601,6 +3653,46 @@ test("hosted maximum active investment collection stays inside the shared reques
   assert.ok(
     service.readRequests - readsBefore <=
       PARTICIPANT_REQUEST_STORAGE_READ_LIMIT,
+  );
+});
+
+test("hosted investment reads do not initialize missing ownership metadata", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedInvestmentFixture(service);
+  for (const [identity, record] of service.records) {
+    if (record.key.collection === "participant-investment-ownership-roots") {
+      service.records.delete(identity);
+    }
+  }
+  assert.equal(
+    recordsIn(service, "participant-investment-ownership-roots").length,
+    0,
+  );
+  const transactionsBefore = service.transactionRequests;
+
+  for (const accept of ["application/json", "text/html"]) {
+    const response = await hostedPackageWorker(service).fetch(
+      new Request(`${APP_ORIGIN}${INVESTMENT_INTEREST_PATH}`, {
+        headers: {
+          accept,
+          "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+          "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+        },
+      }),
+      env,
+      executionContext,
+    );
+    assert.equal(response.status, 503);
+    assert.doesNotMatch(
+      await response.text(),
+      /participant-investment-ownership-roots|participant@example\.test/iu,
+    );
+  }
+  assert.equal(service.transactionRequests, transactionsBefore);
+  assert.equal(
+    recordsIn(service, "participant-investment-ownership-roots").length,
+    0,
   );
 });
 
@@ -5028,6 +5120,7 @@ test("hosted signed-in entry advances through registration and trusted participa
     "read-private-package",
     "open-participant-profile",
     "open-founder-interest",
+    "open-investment-interests",
     "sign-out",
   ]);
 
@@ -7496,6 +7589,21 @@ function recordsIn(
   return [...service.records.values()].filter(
     (record) => record.key.collection === collection,
   );
+}
+
+function bumpHostedRecordRevision(
+  service: SyntheticAittaDBService,
+  collection: string,
+): void {
+  const records = recordsIn(service, collection);
+  assert.equal(records.length, 1);
+  const record = records[0];
+  assert(record);
+  service.records.set(`${record.key.collection}/${record.key.id}`, Object.freeze({
+    key: record.key,
+    revision: record.revision + 1,
+    value: structuredClone(record.value),
+  }));
 }
 
 function founderCollectionSnapshot(

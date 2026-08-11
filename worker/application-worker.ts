@@ -48,6 +48,7 @@ import {
   type RuntimeCampaignPreview,
 } from "../http/runtime-preview.ts";
 import type {
+  AtomicCampaignAuditRepository,
   CampaignSetupRevision,
   PublicCampaignPresentationReader,
 } from "../repositories/in-memory-campaign-repository.ts";
@@ -904,10 +905,7 @@ async function runtimeParticipantFounderInterestRoute(
     return unavailableRoute;
   }
   if (pathname === PARTICIPANT_HOME_PATH) {
-    return participantAccess.declaredInterest === "founder" ||
-        participantAccess.declaredInterest === "both"
-      ? unavailableFounderInterestRoute()
-      : null;
+    return unavailableFounderInterestRoute();
   }
 
   const account = parseParticipantAccount({
@@ -1071,22 +1069,23 @@ async function runtimeParticipantInvestmentInterestRoute(
   }
 
   try {
-    const repositories = runtime.repositoryFactory;
-    const campaign = await repositories.campaignRepository().readSetup();
-    if (campaign === null) return unavailableRoute;
-    const amountConfiguration = campaign.setup.amountAggregate.amount;
     const participantScope = requiredParticipantRequest(participantRequest);
+    const policyCampaign =
+      participantScope.participantInvestmentPolicyCampaign();
     const participant = participantScope.participantProfileRepository();
     const acknowledgments = participantScope.participantPackageAcknowledgments(
       account.value.subject,
     );
+    const campaign = await policyCampaign.readSetup();
+    if (campaign === null) return unavailableRoute;
+    const amountConfiguration = campaign.setup.amountAggregate.amount;
     const interests = participantScope.participantInvestmentInterests(
       amountConfiguration,
     );
     let policySnapshot: Promise<InvestmentPolicySnapshot> | null = null;
     const loadPolicySnapshot = (): Promise<InvestmentPolicySnapshot> => {
       policySnapshot ??= loadInvestmentPolicySnapshot(
-        repositories,
+        policyCampaign,
         participant,
         acknowledgments,
         account.value.subject,
@@ -1155,8 +1154,7 @@ type InvestmentPolicySnapshot = Readonly<{
 }>;
 
 async function loadInvestmentPolicySnapshot(
-  applicationRepositories:
-    ApplicationRuntimeDeploymentCapability["repositoryFactory"],
+  campaignRepository: Pick<AtomicCampaignAuditRepository, "readSetup">,
   participant: Pick<ParticipantRepository, "current">,
   repositories: ParticipantPackageAcknowledgmentRepositories,
   subject: ActorSubject,
@@ -1164,7 +1162,7 @@ async function loadInvestmentPolicySnapshot(
   expectedAmountConfiguration: AmountConfiguration,
 ): Promise<InvestmentPolicySnapshot> {
   const [firstCampaign, firstParticipant] = await Promise.all([
-    applicationRepositories.campaignRepository().readSetup(),
+    campaignRepository.readSetup(),
     participant.current(),
   ]);
   const firstPackage = await repositories.packages.current();
@@ -1174,7 +1172,7 @@ async function loadInvestmentPolicySnapshot(
   const secondPackage = await repositories.packages.current();
   const [secondParticipant, secondCampaign] = await Promise.all([
     participant.current(),
-    applicationRepositories.campaignRepository().readSetup(),
+    campaignRepository.readSetup(),
   ]);
   if (
     !sameCampaignRevision(firstCampaign, secondCampaign) ||

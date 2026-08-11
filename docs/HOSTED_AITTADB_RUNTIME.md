@@ -254,17 +254,17 @@ operation index, public projection, and audit evidence.
 
 ## Participant Investment Ownership Runtime
 
-Hosted participant investment persistence is unavailable until the exact
-subject has passed `initializeParticipantInvestmentOwnership`. New-account
-provisioning may supply an empty inventory only when it authoritatively knows
-that no indication record exists for that subject. Migration must instead
-supply the complete sorted inventory of at most 100 indication IDs, current
-revisions, and lifecycle statuses. The function verifies each current and
-terminal record, rejects more than four active entries, and atomically creates
-the immutable subject root, index, and summary. Ordinary request composition
-must never call this function as an absence fallback. Existing-root corruption
-is unavailable and requires operator investigation rather than automatic
-reinitialization.
+Hosted composition supplies the persistent participant investment route only
+for an exact subject with authoritative ownership metadata. New-account
+registration atomically provisions an empty inventory because that first write
+authoritatively knows no indication exists for the subject. A legacy migration
+must instead call `initializeParticipantInvestmentOwnership` with the complete
+sorted inventory of at most 100 indication IDs, current revisions, and lifecycle
+statuses. The function verifies each current and terminal record, rejects more
+than four active entries, and atomically creates the immutable subject root,
+index, and summary. Ordinary request composition never calls this function as
+an absence fallback. Missing or corrupt metadata is unavailable and requires
+operator investigation rather than automatic reinitialization.
 
 The application factory's registration repository now adds the empty ownership
 root, index, and summary to the same atomic transaction as the first current and
@@ -430,6 +430,14 @@ profile, package, gate, acceptance-head, acceptance-record, and
 participant-route record reads are inside them. The investment allowance bounds
 current owned-state projection and policy sampling; unusually deep combined
 indication histories fail closed.
+
+The investment scope records the exact campaign, participant-profile,
+package-version, and package-acceptance heads used to derive policy. Create,
+edit, and reactivate stage checks for all four heads in the same transaction as
+the indication, aggregate, audit, ownership, and retry effects. A head changed
+after the final read therefore commits nothing. Withdrawal intentionally omits
+those policy checks so an owner can reduce an existing indication after phase
+closure or renewed-acknowledgment changes.
 
 Within the scope, one read-only package reader reuses up to 64 verified immutable
 version reconstructions. Cache hits recharge complete ancestry and logical read

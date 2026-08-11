@@ -16,7 +16,9 @@ import {
   parseStorageCollection,
   parseStorageKey,
   parseStorageOperationId,
+  storageKeyString,
   type StorageAdapter,
+  type StorageCheckMutation,
   type StorageCollection,
   type StorageDocument,
   type StorageKey,
@@ -175,6 +177,10 @@ export type ParticipantRequestRepositoryScope = Readonly<{
     participantSubject: ActorSubject,
   ): ParticipantPackageAcknowledgmentRepositories;
   participantFounderApplications(): ParticipantFounderApplicationRepositories;
+  participantInvestmentPolicyCampaign(): Pick<
+    AtomicCampaignAuditRepository,
+    "readSetup"
+  >;
   participantInvestmentInterests(
     amountConfiguration: AmountConfiguration,
     parsingOptions?: InvestmentIndicationParsingOptions,
@@ -342,7 +348,20 @@ type ParticipantRequestReadBudget = {
   remainingRouteReads: number;
   routeReadLimit: number | null;
   routeReadsUsed: number;
+  investmentPolicyHeads: Map<string, InvestmentPolicyHead>;
 };
+
+type InvestmentPolicyHead = Readonly<{
+  key: StorageKey;
+  expectedRevision: number | null;
+}>;
+
+const INVESTMENT_POLICY_HEAD_COLLECTIONS = Object.freeze([
+  "campaign-setup-current",
+  "private-participant-profiles",
+  "private-package-version-heads",
+  "private-package-acceptance-heads",
+] as const);
 
 function createParticipantRequestRepositoryScope(
   storage: StorageAdapter,
@@ -354,6 +373,7 @@ function createParticipantRequestRepositoryScope(
     remainingRouteReads: 0,
     routeReadLimit: null,
     routeReadsUsed: 0,
+    investmentPolicyHeads: new Map(),
   };
   const readStorage = participantRequestStorage(storage, budget, false);
   const mutationStorage = participantRequestStorage(storage, budget, true);
@@ -414,9 +434,14 @@ function createParticipantRequestRepositoryScope(
     if (requiredActorSubject(value) !== account.subject) unavailable();
   };
   const beginRouteReads = (limit: number): void => {
-    if (budget.routeReadLimit === null || budget.routeReadsUsed === 0) {
+    if (budget.routeReadLimit === null) {
       budget.routeReadLimit = limit;
       budget.remainingRouteReads = limit;
+      return;
+    }
+    if (budget.routeReadsUsed === 0) {
+      budget.routeReadLimit = Math.max(budget.routeReadLimit, limit);
+      budget.remainingRouteReads = budget.routeReadLimit;
       return;
     }
     if (budget.routeReadLimit !== limit) unavailable();
@@ -491,6 +516,12 @@ function createParticipantRequestRepositoryScope(
           ),
       });
     },
+    participantInvestmentPolicyCampaign: () => {
+      beginRouteReads(MAX_INVESTMENT_COLLECTION_STORAGE_READS);
+      return Object.freeze({
+        readSetup: () => campaign.readSetup(),
+      });
+    },
     participantInvestmentInterests: (
       amountConfiguration: AmountConfiguration,
       parsingOptions: InvestmentIndicationParsingOptions = {},
@@ -501,6 +532,7 @@ function createParticipantRequestRepositoryScope(
         account.subject,
         amountConfiguration,
         parsingOptions,
+        () => investmentPolicyAssertions(budget),
       );
     },
   });
@@ -522,7 +554,9 @@ function participantRequestStorage(
         budget.remainingRouteReads -= 1;
         budget.routeReadsUsed += 1;
       }
-      return await storage.read(key);
+      const record = await storage.read(key);
+      observeInvestmentPolicyHead(budget, key, record);
+      return record;
     },
     async list() {
       unavailable();
@@ -532,6 +566,51 @@ function participantRequestStorage(
       return await storage.transact(request);
     },
   });
+}
+
+function observeInvestmentPolicyHead(
+  budget: ParticipantRequestReadBudget,
+  key: StorageKey,
+  record: StorageRecord | null,
+): void {
+  if (
+    !INVESTMENT_POLICY_HEAD_COLLECTIONS.includes(
+      key.collection as typeof INVESTMENT_POLICY_HEAD_COLLECTIONS[number],
+    )
+  ) {
+    return;
+  }
+  if (
+    record !== null &&
+    (storageKeyString(record.key) !== storageKeyString(key) ||
+      !Number.isSafeInteger(record.revision) ||
+      record.revision < 1)
+  ) {
+    unavailable();
+  }
+  budget.investmentPolicyHeads.set(storageKeyString(key), Object.freeze({
+    key: Object.freeze({ ...key }),
+    expectedRevision: record?.revision ?? null,
+  }));
+}
+
+function investmentPolicyAssertions(
+  budget: ParticipantRequestReadBudget,
+): readonly StorageCheckMutation[] {
+  const observations = [...budget.investmentPolicyHeads.values()];
+  return Object.freeze(INVESTMENT_POLICY_HEAD_COLLECTIONS.map((collection) => {
+    const matches = observations.filter(
+      (observation) => observation.key.collection === collection,
+    );
+    if (matches.length !== 1) unavailable();
+    const observation = matches[0];
+    if (observation === undefined) unavailable();
+    return Object.freeze({
+      type: "check" as const,
+      key: Object.freeze({ ...observation.key }),
+      expectedRevision: observation.expectedRevision,
+    });
+  }));
 }
 
 async function claimReplay(

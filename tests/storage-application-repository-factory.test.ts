@@ -316,6 +316,7 @@ test("factory exposes only named application repository capabilities", async () 
     "participantPackageReader",
     "participantPackageAcknowledgments",
     "participantFounderApplications",
+    "participantInvestmentPolicyCampaign",
     "participantInvestmentInterests",
   ]);
   assert.deepEqual(
@@ -444,6 +445,11 @@ test("factory exposes only named application repository capabilities", async () 
     assert.equal(property in moderation, false, property);
   }
   assert.equal(Object.values(moderation).includes(storage), false);
+  const investmentCampaign =
+    participantRequest.participantInvestmentPolicyCampaign();
+  assert.deepEqual(Object.keys(investmentCampaign), ["readSetup"]);
+  assert.equal(Object.isFrozen(investmentCampaign), true);
+  assert.equal((await investmentCampaign.readSetup())?.revision, campaign.revision);
   const investment = participantRequest.participantInvestmentInterests(
     amount.value.amount,
   );

@@ -26,7 +26,10 @@ import {
 } from "../domain/storage-adapter.ts";
 import { StorageParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
 import { StorageApplicationRepositoryFactory } from "../repositories/storage-application-repository-factory.ts";
-import { initializeParticipantInvestmentOwnership } from "../repositories/storage-participant-investment-repository.ts";
+import {
+  StorageParticipantInvestmentInterestRepository,
+  initializeParticipantInvestmentOwnership,
+} from "../repositories/storage-participant-investment-repository.ts";
 import { createParticipantInvestmentInterestService } from "../worker/investment-interest-service.ts";
 import {
   MemoryStorageAdapter,
@@ -141,8 +144,11 @@ test("delayed registration replay authenticates later ownership activity", async
   assert.equal(first.replayed, false);
 
   const amount = amountConfiguration();
-  const investment = factory.participantRequest(ACCOUNT)
-    .participantInvestmentInterests(amount);
+  const investment = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ACCOUNT.subject,
+    amount,
+  );
   const context = await acknowledgmentContext(ACCOUNT.subject);
   const service = createParticipantInvestmentInterestService({
     actorSubject: ACCOUNT.subject,

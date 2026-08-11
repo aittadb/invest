@@ -37,6 +37,7 @@ import {
   parseStorageOperationId,
   storageKeyString,
   type StorageAdapter,
+  type StorageCheckMutation,
   type StorageCollection,
   type StorageDocument,
   type StorageKey,
@@ -186,6 +187,10 @@ const ACCOUNT_DELETION_WITHDRAWAL_REPLAY_KEYS = new Set([
   "indicationRevision",
   "historyEntryId",
 ]);
+const MAX_INVESTMENT_POLICY_ASSERTIONS = 4;
+
+export type InvestmentPolicyAssertionProvider =
+  () => readonly StorageCheckMutation[];
 
 type ParticipantIndex = Readonly<{
   record: StorageRecord | null;
@@ -695,17 +700,26 @@ export class StorageParticipantInvestmentInterestRepository
   readonly #amount: AmountConfiguration;
   readonly #parsingOptions: InvestmentIndicationParsingOptions;
   readonly #indications: DevelopmentInMemoryIndicationRepository;
+  readonly #policyAssertions: InvestmentPolicyAssertionProvider | null;
 
   constructor(
     storage: StorageAdapter,
     participantSubject: unknown,
     amountConfiguration: AmountConfiguration,
     parsingOptions: InvestmentIndicationParsingOptions = {},
+    policyAssertions?: InvestmentPolicyAssertionProvider,
   ) {
     this.#storage = requiredStorageAdapter(storage);
     this.#subject = requiredSubject(participantSubject);
     this.#amount = requiredAmountConfiguration(amountConfiguration);
     this.#parsingOptions = Object.freeze({ ...parsingOptions });
+    if (
+      policyAssertions !== undefined &&
+      typeof policyAssertions !== "function"
+    ) {
+      invalid();
+    }
+    this.#policyAssertions = policyAssertions ?? null;
     this.#indications = new DevelopmentInMemoryIndicationRepository(
       this.#storage,
       this.#subject,
@@ -791,6 +805,14 @@ export class StorageParticipantInvestmentInterestRepository
   ): Promise<AtomicParticipantInvestmentInterestResult> {
     const operationId = prepared.indication.operationId;
     const staged = new StagedStorageTransaction(this.#storage, operationId);
+    if (
+      prepared.command.kind !== "withdraw" &&
+      this.#policyAssertions !== null
+    ) {
+      await staged.stage(
+        requiredPolicyAssertions(operationId, this.#policyAssertions),
+      );
+    }
     const indications = new DevelopmentInMemoryIndicationRepository(
       staged,
       this.#subject,
@@ -957,6 +979,32 @@ export class StorageParticipantInvestmentInterestRepository
       auditEvent,
     });
   }
+}
+
+function requiredPolicyAssertions(
+  operationId: StorageOperationId,
+  provider: InvestmentPolicyAssertionProvider | null,
+): readonly StorageCheckMutation[] {
+  if (provider === null) return Object.freeze([]);
+  let value: unknown;
+  try {
+    value = provider();
+  } catch (error) {
+    if (error instanceof StorageFailure) throw error;
+    unavailable();
+  }
+  if (
+    !Array.isArray(value) ||
+    value.length !== MAX_INVESTMENT_POLICY_ASSERTIONS
+  ) {
+    invalid();
+  }
+  const normalized = normalizeStorageTransactionRequest({
+    operationId,
+    mutations: value as readonly StorageMutation[],
+  }).mutations;
+  if (normalized.some((mutation) => mutation.type !== "check")) invalid();
+  return normalized as readonly StorageCheckMutation[];
 }
 
 async function prepareCommand(
