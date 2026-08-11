@@ -62,7 +62,7 @@ test("persistent founder review paging is opaque, bounded, and restartable", asy
   assert.match(first.items[0]?.reviewId ?? "", /^founder-review:[0-9a-f]{64}$/u);
   assert.doesNotMatch(JSON.stringify(first), /founder-application:self|Private founder note/u);
   assert.equal(observed.listCalls, 1);
-  assert.ok(observed.readCalls <= MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS);
+  assert.ok(observed.readCalls <= 1 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS);
 
   observed.reset();
   const restarted = new StorageFounderApplicationReviewCollectionRepository(
@@ -75,7 +75,7 @@ test("persistent founder review paging is opaque, bounded, and restartable", asy
   assert.equal(second.items.length, 1);
   assert.equal(second.nextCursor, null);
   assert.equal(observed.listCalls, 1);
-  assert.ok(observed.readCalls <= MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS);
+  assert.ok(observed.readCalls <= 1 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS);
   assert.equal(state.operations.size, operationCount);
   assert.equal(
     new Set([...first.items, ...second.items].map((item) => item.reviewId)).size,
@@ -246,9 +246,75 @@ test("persistent founder review corruption fails within the page read ceiling", 
     );
     assert.equal(observed.listCalls, 1, corruption.name);
     assert.ok(
-      observed.readCalls <= MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS,
+      observed.readCalls <= 1 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS,
       corruption.name,
     );
+  }
+});
+
+test("persistent founder review rejects valid-looking edited and withdrawn current drift", async () => {
+  for (const lifecycle of ["edited", "withdrawn"] as const) {
+    const state = new MemoryStorageState();
+    const storage = new MemoryStorageAdapter(state);
+    const participant = await seedApplication(
+      storage,
+      ALICE,
+      lifecycle,
+      "area:engineering",
+    );
+    const edited = await participant.edit({
+      operationId: `founder-operation:${lifecycle}-edit`,
+      expectedRevision: 1,
+      id: "founder-application:self",
+      occurredAt: "2026-08-10T11:00:00.000Z",
+      historyEntryId: `founder-history:${lifecycle}-edit`,
+      fields: founderFields("area:product"),
+    });
+    assert.equal(edited.revision, 2);
+
+    if (lifecycle === "withdrawn") {
+      const withdrawn = await participant.withdraw({
+        operationId: "founder-operation:withdrawn-withdraw",
+        expectedRevision: 2,
+        id: "founder-application:self",
+        occurredAt: "2026-08-10T12:00:00.000Z",
+        historyEntryId: "founder-history:withdrawn-withdraw",
+      });
+      assert.equal(withdrawn.revision, 3);
+    }
+
+    const valid = await new StorageFounderApplicationReviewCollectionRepository(
+      storage,
+    ).list({ limit: 1 });
+    assert.equal(valid.items[0]?.status, lifecycle === "edited" ? "received" : "withdrawn");
+    assert.equal(valid.items[0]?.revision, lifecycle === "edited" ? 2 : 3);
+
+    const corrupted = cloneState(state);
+    mutateFirstRecord(
+      corrupted,
+      "founder-applications",
+      (value) => {
+        value.updatedAt = lifecycle === "edited"
+          ? "2026-08-10T11:30:00.000Z"
+          : "2026-08-10T12:30:00.000Z";
+        if (lifecycle === "withdrawn") {
+          value.withdrawnAt = value.updatedAt;
+        }
+      },
+    );
+    const observed = new ObservedStorageAdapter(
+      new MemoryStorageAdapter(corrupted),
+    );
+    const restarted = new StorageFounderApplicationReviewCollectionRepository(
+      observed,
+    );
+    await rejectsStorage(
+      () => restarted.list({ limit: 1 }),
+      "UNAVAILABLE",
+      lifecycle,
+    );
+    assert.equal(observed.listCalls, 1, lifecycle);
+    assert.equal(observed.readCalls, 1, lifecycle);
   }
 });
 
@@ -301,7 +367,7 @@ async function seedApplication(
   applicantSubject: ActorSubject,
   suffix: string,
   primaryContributionAreaId: string,
-): Promise<void> {
+): Promise<StorageFounderApplicationRepository> {
   const repository = new StorageFounderApplicationRepository(
     storage,
     applicantSubject,
@@ -313,19 +379,24 @@ async function seedApplication(
     id: "founder-application:self",
     occurredAt: "2026-08-10T10:00:00.000Z",
     historyEntryId: `founder-history:${suffix}-create`,
-    fields: {
-      expertiseSummary: "Experience developing data products.",
-      intendedContribution: "Contribute to product delivery and validation.",
-      primaryContributionAreaId,
-      secondaryContributionAreaIds: [],
-      approximateAvailability: "Two days each week.",
-      possibleStartTiming: "After mutual confirmation.",
-      compensationExpectation: "Open to discussion.",
-      professionalProfileLinks: [],
-      note: PRIVATE_NOTE,
-    },
+    fields: founderFields(primaryContributionAreaId),
   });
   assert.equal(result.revision, 1);
+  return repository;
+}
+
+function founderFields(primaryContributionAreaId: string) {
+  return {
+    expertiseSummary: "Experience developing data products.",
+    intendedContribution: "Contribute to product delivery and validation.",
+    primaryContributionAreaId,
+    secondaryContributionAreaIds: [],
+    approximateAvailability: "Two days each week.",
+    possibleStartTiming: "After mutual confirmation.",
+    compensationExpectation: "Open to discussion.",
+    professionalProfileLinks: [],
+    note: PRIVATE_NOTE,
+  };
 }
 
 function contributionChoices(): readonly ContributionAreaChoice[] {

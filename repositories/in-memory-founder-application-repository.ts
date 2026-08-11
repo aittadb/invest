@@ -63,7 +63,7 @@ export const MAX_FOUNDER_APPLICATION_REVIEW_PAGE_SIZE = 25;
 export const MAX_FOUNDER_APPLICATION_REVIEW_CURSOR_CHARACTERS = 2_048;
 export const MAX_FOUNDER_APPLICATION_REVIEW_PAGE_RECORD_READS =
   MAX_FOUNDER_APPLICATION_REVIEW_PAGE_SIZE *
-  MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS;
+  (1 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS);
 
 const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const CURRENT_DOCUMENT_KEYS = new Set([
@@ -248,6 +248,10 @@ type StoredTransition = Readonly<{
   occurredAt: Timestamp;
   revision: number;
   transitionKind: TransitionKind;
+  status: FounderApplication["status"];
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  withdrawnAt: Timestamp | null;
   fields: StoredFieldsReference;
   document: StorageDocument;
 }>;
@@ -872,6 +876,21 @@ async function decodeFounderApplicationReviewCollectionItem(
     coordinates.subject,
     coordinates.id,
   );
+  const transitionKey = await applicationHistoryKey(
+    coordinates.subject,
+    coordinates.id,
+    current.revision,
+  );
+  const transitionRecord = await storage.read(transitionKey);
+  if (transitionRecord === null) unavailable();
+  const terminal = decodeStoredTransition(
+    transitionRecord,
+    transitionKey,
+    coordinates.subject,
+    coordinates.id,
+    current.revision,
+  );
+  verifyCurrentMatchesTerminal(current, terminal);
   const fields = await readStoredFields(
     storage,
     coordinates.subject,
@@ -885,6 +904,31 @@ async function decodeFounderApplicationReviewCollectionItem(
     updatedAt: current.updatedAt,
     revision: current.revision,
   });
+}
+
+function verifyCurrentMatchesTerminal(
+  current: StoredCurrent,
+  terminal: StoredTransition,
+): void {
+  const expectedTransitionKind = current.status === "withdrawn"
+    ? "withdrawn"
+    : current.revision === 1
+    ? "created"
+    : "edited";
+  if (
+    terminal.operationId !== current.operationId ||
+    terminal.operationFingerprint !== current.operationFingerprint ||
+    terminal.transitionKind !== expectedTransitionKind ||
+    terminal.status !== current.status ||
+    terminal.createdAt !== current.createdAt ||
+    terminal.updatedAt !== current.updatedAt ||
+    terminal.withdrawnAt !== current.withdrawnAt ||
+    terminal.occurredAt !== current.updatedAt ||
+    canonicalJson(fieldsReferenceDocument(terminal.fields)) !==
+      canonicalJson(fieldsReferenceDocument(current.fields))
+  ) {
+    unavailable();
+  }
 }
 
 function projectFounderReviewCollectionItem(
@@ -1172,6 +1216,12 @@ function decodeStoredTransition(
   const occurredAt = storedTimestamp(source.occurredAt);
   const revision = storedRevision(source.revision);
   const transitionKind = storedTransitionKind(source.transitionKind);
+  const status = storedFounderApplicationStatus(source.status);
+  const createdAt = storedTimestamp(source.createdAt);
+  const updatedAt = storedTimestamp(source.updatedAt);
+  const withdrawnAt = source.withdrawnAt === null
+    ? null
+    : storedTimestamp(source.withdrawnAt);
   const fields = storedFieldsReference(source.fields);
   if (
     applicationId !== expectedId ||
@@ -1190,6 +1240,10 @@ function decodeStoredTransition(
     occurredAt,
     revision,
     transitionKind,
+    status,
+    createdAt,
+    updatedAt,
+    withdrawnAt,
     fields,
     document: record.value,
   });

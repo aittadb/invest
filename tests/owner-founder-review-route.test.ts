@@ -56,11 +56,16 @@ test("owner founder review exposes equivalent collection resources", async () =>
   const nextLink = collectionDocument.links.find(
     (link) => link.rel.includes("next"),
   );
+  const ownerLink = collectionDocument.links.find(
+    (link) => link.rel.includes("owner"),
+  );
   assert(nextLink);
+  assert(ownerLink);
   assert.equal(
     nextLink.href,
     "https://invest.example/owner/founder-applications?page_size=10&cursor=opaque-review-page%3A2",
   );
+  assert.equal(ownerLink.href, "https://invest.example/owner");
 
   const htmlCollection = await requiredResponse(await handler(context(
     "https://invest.example/owner/founder-applications?page_size=10",
@@ -72,6 +77,10 @@ test("owner founder review exposes equivalent collection resources", async () =>
   assert.doesNotMatch(collectionHtml, /Review application/);
   assert.match(collectionHtml, new RegExp(item.reviewId));
   assert.match(collectionHtml, /Next page/);
+  assert.match(
+    collectionHtml,
+    /<a href="https:\/\/invest\.example\/owner">Back to campaign workspace<\/a>/u,
+  );
   assert.equal(collectionHtml.includes(item.application.applicantSubject), false);
   assert.equal(collectionHtml.includes(item.application.id), false);
 

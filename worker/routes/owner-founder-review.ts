@@ -322,9 +322,10 @@ function renderCollection(
       return `<li><article><p>${escapeHtml(item.status)}</p><h2>${escapeHtml(item.primary_contribution_area_id)}</h2><dl><dt>Reference</dt><dd><code>${escapeHtml(item.review_id)}</code></dd><dt>Updated</dt><dd>${escapeHtml(item.updated_at)}</dd><dt>Revision</dt><dd>${item.revision}</dd></dl>${detailLink}</article></li>`;
     }).join("")}</ol>`;
   const next = document.links.find((link) => link.rel.includes("next"));
+  const owner = document.links.find((link) => link.rel.includes("owner"));
   return page(
     "Founder applications",
-    `<main><p class="section-kicker">Owner review</p><h1>Founder applications</h1>${items}${next ? `<p><a href="${escapeAttribute(next.href)}">Next page</a></p>` : ""}</main>`,
+    `<main><p class="section-kicker">Owner review</p><h1>Founder applications</h1>${items}${next ? `<p><a href="${escapeAttribute(next.href)}">Next page</a></p>` : ""}${owner ? `<p><a href="${escapeAttribute(owner.href)}">Back to campaign workspace</a></p>` : ""}</main>`,
   );
 }
 

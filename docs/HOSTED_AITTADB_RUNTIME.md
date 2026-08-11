@@ -171,8 +171,9 @@ campaign content, logs, or browser-visible failures.
 
 The owner founder-review capability is a singleton read port with only `list`.
 It exposes neither the adapter nor a detail lookup. Each request lists at most 25
-current founder records, validates each current field payload within a fixed
-300-record-read ceiling, and returns only one-way review identifiers and the
+current founder records, binds each to its immutable terminal transition, and
+validates each current field payload within a fixed 325-record-read ceiling. It
+returns only one-way review identifiers and the
 collection summary allowlist. A new factory can continue an existing AittaDB
 cursor after a Worker restart. AittaDB's validated cursor contract keeps
 principal, namespace, and physical-key data out of that continuation; the
