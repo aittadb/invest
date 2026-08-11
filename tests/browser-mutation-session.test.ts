@@ -491,6 +491,34 @@ test("exact-replay proofs are bounded, route-scoped, actor-bound, and one-use", 
   );
 });
 
+test("fixed-size exact replay scopes support the maximum actor subject", async () => {
+  const harness = await configuredHarness();
+  const identity = Object.freeze({
+    type: "participant",
+    subject: "s".repeat(255),
+  }) satisfies TrustedSitesMutationIdentity;
+  const scope = `participant-investment-withdrawal-replay:v1:sha256:${"a".repeat(64)}`;
+  const proof = await harness.session.issueExactReplay(
+    new Request(`${APP_ORIGIN}/participant/investment-interests/id/withdrawal-replay`),
+    identity,
+    APP_ORIGIN,
+    scope,
+  );
+  const verified = await harness.session.verifyMutation(
+    jsonRequest(proof, { "operation-id": "o".repeat(127) }, "DELETE"),
+    identity,
+    APP_ORIGIN,
+    {
+      exactReplayScopeFor: () => Promise.resolve(scope),
+      requireExactReplayScope: true,
+    },
+  );
+
+  assert.equal(verified.actor.subject, identity.subject);
+  assert.equal(verified.body["operation-id"], "o".repeat(127));
+  assert.equal(harness.claims.calls.length, 1);
+});
+
 test("aggregate exact-replay proofs bind a bounded route command and one claim", async () => {
   const harness = await configuredHarness();
   const body = {

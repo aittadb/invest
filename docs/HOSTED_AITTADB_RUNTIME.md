@@ -448,12 +448,13 @@ withdrawal or replay.
 A terminal withdrawn indication links to a dedicated
 `/participant/investment-interests/{id}/withdrawal-replay` resource. Its HTML and
 JSON representations expose only the immutable recorded withdrawal command and
-issue a mandatory exact-replay proof. The encrypted scope digest binds the
-participant, canonical path, `DELETE`, indication, operation, prior and result
-revisions, and confirmation. Ordinary item proofs, changed commands, other
-routes or methods, foreign callers, and reused proofs fail before another replay
-claim. An exact request after response loss or Worker restart returns the stored
-result without another indication, aggregate, or audit write.
+issue a mandatory exact-replay proof. A fixed-length digest of the canonical
+scope binds the participant, canonical path, `DELETE`, indication, operation,
+prior and result revisions, and confirmation without exceeding the proof
+boundary for accepted maximum-sized values. Ordinary item proofs, changed
+commands, other routes or methods, foreign callers, and reused proofs fail before
+another replay claim. An exact request after response loss or Worker restart
+returns the stored result without another indication, aggregate, or audit write.
 
 Within the scope, one read-only package reader reuses up to 64 verified immutable
 version reconstructions. Cache hits recharge complete ancestry and logical read

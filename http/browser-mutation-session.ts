@@ -74,7 +74,7 @@ export type BrowserMutationPreReplayValidator = (
 
 export type BrowserMutationExactReplayScopeResolver = (
   request: VerifiedMutationRequest,
-) => string | null;
+) => string | null | Promise<string | null>;
 
 export type BrowserMutationVerificationLimits = Readonly<{
   maxBodyBytes?: number;
@@ -335,7 +335,7 @@ export function createBrowserMutationSession(
         if (resolver === undefined) rejectRequest();
         let scope: unknown;
         try {
-          scope = resolver(verified);
+          scope = await resolver(verified);
         } catch {
           throw new MutationSecurityFailure("INVALID_REQUEST");
         }

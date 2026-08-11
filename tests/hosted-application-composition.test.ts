@@ -3555,6 +3555,8 @@ test("hosted investment creation and reactivation recheck phase and package poli
 test("hosted withdrawal retains persisted currency after campaign evolution", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
+  const withdrawalOperation = `investment-operation:${"w".repeat(106)}`;
+  assert.equal(withdrawalOperation.length, 127);
   await configureHostedInvestmentFixture(service);
   const createProof = await investmentResource(
     hostedPackageWorker(service),
@@ -3598,7 +3600,7 @@ test("hosted withdrawal retains persisted currency after campaign evolution", as
     withdrawalProof,
     withdrawalAction,
     actionBody(withdrawalAction, {
-      "operation-id": "investment-operation:hosted-currency-withdraw",
+      "operation-id": withdrawalOperation,
       "expected-revision": 1,
       "confirm-withdrawal": true,
     }),
@@ -3616,7 +3618,7 @@ test("hosted withdrawal retains persisted currency after campaign evolution", as
 
   const committedIndications = hostedRecordsWithoutMutationClaims(service);
   const committedOperation = service.operations.get(
-    "investment-operation:hosted-currency-withdraw",
+    withdrawalOperation,
   );
   assert(committedOperation);
   const replayPath = `${itemPath}/withdrawal-replay`;
@@ -3653,7 +3655,7 @@ test("hosted withdrawal retains persisted currency after campaign evolution", as
   });
   assert.equal(
     String(replayBody["operation-id"]),
-    "investment-operation:hosted-currency-withdraw",
+    withdrawalOperation,
   );
   assert.equal(replayBody["expected-revision"], 1);
 
@@ -3700,7 +3702,7 @@ test("hosted withdrawal retains persisted currency after campaign evolution", as
   ]);
   assert.deepEqual(hostedRecordsWithoutMutationClaims(service), committedIndications);
   assert.strictEqual(
-    service.operations.get("investment-operation:hosted-currency-withdraw"),
+    service.operations.get(withdrawalOperation),
     committedOperation,
   );
 

@@ -52,6 +52,7 @@ import {
 import {
   createInvestmentInterestRouteHandler,
   investmentInterestMutationLimits,
+  investmentWithdrawalReplayScope,
   MAX_INVESTMENT_DELETE_MUTATION_BYTES,
   MAX_INVESTMENT_DELETE_MUTATION_FIELDS,
   MAX_INVESTMENT_PATCH_MUTATION_BYTES,
@@ -92,6 +93,36 @@ const ALLOW_ALL = Object.freeze({
   reactivatePersonal: true,
   reactivateCompany: true,
 }) satisfies InvestmentInterestPermissions;
+
+test("withdrawal replay scope stays bounded at accepted identity and command maxima", async () => {
+  const maximum = await investmentWithdrawalReplayScope(
+    "s".repeat(255),
+    "i".repeat(128),
+    Object.freeze({
+      operationId: "o".repeat(127),
+      expectedRevision: Number.MAX_SAFE_INTEGER - 2,
+      resultingRevision: Number.MAX_SAFE_INTEGER - 1,
+    }),
+  );
+
+  assert.match(
+    maximum,
+    /^participant-investment-withdrawal-replay:v1:sha256:[0-9a-f]{64}$/u,
+  );
+  assert.ok(new TextEncoder().encode(maximum).byteLength < 512);
+  assert.notEqual(
+    await investmentWithdrawalReplayScope(
+      `t${"s".repeat(254)}`,
+      "i".repeat(128),
+      Object.freeze({
+        operationId: "o".repeat(127),
+        expectedRevision: Number.MAX_SAFE_INTEGER - 2,
+        resultingRevision: Number.MAX_SAFE_INTEGER - 1,
+      }),
+    ),
+    maximum,
+  );
+});
 
 test("participant investment route completes personal create, edit, withdraw, reactivate, and retry lifecycle", async () => {
   const harness = await createHarness();

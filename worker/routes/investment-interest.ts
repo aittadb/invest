@@ -586,16 +586,16 @@ function parseItemMutation(
   invalidRequest();
 }
 
-export function investmentWithdrawalReplayScopeFor(
+export async function investmentWithdrawalReplayScopeFor(
   request: VerifiedMutationRequest,
   pathname: string,
-): string | null {
+): Promise<string | null> {
   try {
     const matched = matchRoute(pathname);
     if (matched?.kind !== "withdrawal-replay") return null;
     const mutation = parseItemMutation(request, matched.indicationId);
     if (mutation.kind !== "withdraw") return null;
-    return investmentWithdrawalReplayScope(
+    return await investmentWithdrawalReplayScope(
       request.actor.subject,
       matched.indicationId,
       Object.freeze({
@@ -615,11 +615,11 @@ export function investmentWithdrawalReplayScopeRequired(
   return matchRoute(pathname)?.kind === "withdrawal-replay";
 }
 
-export function investmentWithdrawalReplayScope(
+export async function investmentWithdrawalReplayScope(
   actorSubject: unknown,
   indicationId: unknown,
   replay: InvestmentTerminalWithdrawalReplay,
-): string {
+): Promise<string> {
   const actor = parseActorSubject(actorSubject);
   const indication = parseStableId<"investment-indication">(indicationId);
   const operation = parseStorageOperationId(replay?.operationId);
@@ -635,7 +635,7 @@ export function investmentWithdrawalReplayScope(
   ) {
     throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
   }
-  return JSON.stringify([
+  const canonicalScope = JSON.stringify([
     INVESTMENT_WITHDRAWAL_REPLAY_SCOPE_PREFIX,
     actor.value,
     investmentWithdrawalReplayPath(indication.value),
@@ -647,6 +647,19 @@ export function investmentWithdrawalReplayScope(
     "confirm-withdrawal",
     true,
   ]);
+  let digest: ArrayBuffer;
+  try {
+    digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(canonicalScope),
+    );
+  } catch (error) {
+    throw new MutationSecurityFailure("SERVICE_UNAVAILABLE", { cause: error });
+  }
+  const hexadecimal = [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `${INVESTMENT_WITHDRAWAL_REPLAY_SCOPE_PREFIX}:sha256:${hexadecimal}`;
 }
 
 type PersonalFieldsInput = Readonly<{
@@ -839,7 +852,7 @@ async function resourceResponse(input: ResourceResponseInput): Promise<Response>
       input.context,
       input.actorSubject,
       input.csrfTokenFor,
-      investmentWithdrawalReplayScope(
+      await investmentWithdrawalReplayScope(
         input.actorSubject,
         state.indication.id,
         replay,
