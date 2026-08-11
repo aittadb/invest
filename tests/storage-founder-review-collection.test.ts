@@ -228,6 +228,26 @@ test("persistent founder review corruption fails within the page read ceiling", 
         },
       ),
     },
+    {
+      name: "missing review lookup",
+      apply: (state) => {
+        const entry = [...state.records.entries()].find(([, record]) =>
+          record.key.collection === "founder-review-lookups"
+        );
+        assert(entry);
+        state.records.delete(entry[0]);
+      },
+    },
+    {
+      name: "crossed review lookup",
+      apply: (state) => mutateFirstRecord(
+        state,
+        "founder-review-lookups",
+        (value) => {
+          value.applicantSubject = BOB;
+        },
+      ),
+    },
   ];
 
   for (const corruption of corruptions) {
@@ -246,7 +266,7 @@ test("persistent founder review corruption fails within the page read ceiling", 
     );
     assert.equal(observed.listCalls, 1, corruption.name);
     assert.ok(
-      observed.readCalls <= 1 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS,
+      observed.readCalls <= 2 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS,
       corruption.name,
     );
   }

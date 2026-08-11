@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MAX_FOUNDER_APPLICATION_REVISIONS,
+  MAX_PROFILE_LINKS,
+  MAX_PROFILE_LINK_LENGTH,
   parseContributionAreaChoices,
   type ContributionAreaChoice,
 } from "../domain/founder-application.ts";
@@ -16,9 +19,12 @@ import {
   type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
 import {
+  FOUNDER_APPLICATION_FIELDS_CHUNK_RAW_BYTES,
   MAX_FOUNDER_APPLICATION_REVIEW_DETAIL_RECORD_READS,
+  MAX_FOUNDER_APPLICATION_REVIEW_LOOKUP_BACKFILL_READS,
   StorageFounderApplicationRepository,
   StorageFounderApplicationReviewDetailRepository,
+  StorageFounderApplicationReviewLookupBackfillRepository,
 } from "../repositories/in-memory-founder-application-repository.ts";
 import {
   MemoryStorageAdapter,
@@ -42,7 +48,12 @@ test("persistent founder detail resolves one opaque key across restart", async (
     historyEntryId: "founder-history:alice-edit",
     fields: founderFields("area:product"),
   });
-  const reviewId = reviewIdForCurrentRecord(state, ALICE);
+  const reviewId = await reviewIdForApplication(ALICE);
+  const currentKey = currentRecordFor(state, ALICE).key.id;
+  assert.notEqual(
+    reviewId.slice("founder-review:".length),
+    currentKey.slice("founder-current:".length),
+  );
   const operationCount = state.operations.size;
   const observed = new ObservedStorageAdapter(storage);
 
@@ -76,6 +87,157 @@ test("persistent founder detail resolves one opaque key across restart", async (
     observed.readCalls <= MAX_FOUNDER_APPLICATION_REVIEW_DETAIL_RECORD_READS,
   );
   assert.equal(state.operations.size, operationCount);
+});
+
+test("legacy review IDs gain one bounded backend-only lookup without changing identity", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await seedApplication(storage, ALICE, "alice-backfill");
+  const reviewId = await reviewIdForApplication(ALICE);
+  const lookupOperationId =
+    `founder-review-index:${reviewId.slice("founder-review:".length)}`;
+  const lookupEntry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "founder-review-lookups"
+  );
+  assert(lookupEntry);
+  state.records.delete(lookupEntry[0]);
+  state.operations.delete(lookupOperationId);
+
+  const before = await new StorageFounderApplicationReviewDetailRepository(
+    storage,
+  ).get(reviewId);
+  assert.equal(before, null);
+
+  const responseLoss = new CommitThenUnavailableStorageAdapter(storage);
+  const observed = new ObservedStorageAdapter(responseLoss);
+  const backfill = new StorageFounderApplicationReviewLookupBackfillRepository(
+    observed,
+  );
+  assert.equal(await backfill.backfill({
+    applicantSubject: ALICE,
+    applicationId: "founder-application:self",
+  }), reviewId);
+  assert.equal(observed.listCalls, 0);
+  assert.equal(responseLoss.transactionCalls, 1);
+  assert.ok(
+    observed.readCalls <=
+      MAX_FOUNDER_APPLICATION_REVIEW_LOOKUP_BACKFILL_READS,
+  );
+  const durableRecordCount = state.records.size;
+  const durableOperationCount = state.operations.size;
+
+  observed.reset();
+  const restartedBackfill =
+    new StorageFounderApplicationReviewLookupBackfillRepository(observed);
+  assert.equal(await restartedBackfill.backfill({
+    applicantSubject: ALICE,
+    applicationId: "founder-application:self",
+  }), reviewId);
+  assert.equal(responseLoss.transactionCalls, 2);
+  assert.equal(state.records.size, durableRecordCount);
+  assert.equal(state.operations.size, durableOperationCount);
+  assert.equal(observed.listCalls, 0);
+  assert.ok(
+    observed.readCalls <=
+      MAX_FOUNDER_APPLICATION_REVIEW_LOOKUP_BACKFILL_READS,
+  );
+
+  observed.reset();
+  const restored = await new StorageFounderApplicationReviewDetailRepository(
+    observed,
+  ).get(reviewId);
+  assert(restored);
+  assert.equal(restored.reviewId, reviewId);
+  assert.equal(restored.application.applicantSubject, ALICE);
+  assert.equal(observed.listCalls, 0);
+  assert.ok(
+    observed.readCalls <= MAX_FOUNDER_APPLICATION_REVIEW_DETAIL_RECORD_READS,
+  );
+});
+
+test("valid revision-16 maximum fields resolve directly inside the finite read ceiling", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const configuredChoices = maximumContributionAreaChoices();
+  const participant = new StorageFounderApplicationRepository(
+    storage,
+    ALICE,
+    configuredChoices,
+  );
+  const fields = maximumFounderFields("\u0800", configuredChoices);
+  await participant.create({
+    operationId: "founder-operation:maximum-detail-create",
+    expectedRevision: null,
+    id: "founder-application:self",
+    occurredAt: "2026-08-11T10:00:00.000Z",
+    historyEntryId: "founder-history:maximum-detail-create",
+    fields,
+  });
+  for (
+    let revision = 1;
+    revision < MAX_FOUNDER_APPLICATION_REVISIONS - 1;
+    revision += 1
+  ) {
+    await participant.edit({
+      operationId: `founder-operation:maximum-detail-edit-${revision}`,
+      expectedRevision: revision,
+      id: "founder-application:self",
+      occurredAt: new Date(
+        Date.parse("2026-08-11T10:00:00.000Z") + revision * 60_000,
+      ).toISOString(),
+      historyEntryId: `founder-history:maximum-detail-edit-${revision}`,
+      fields,
+    });
+  }
+  const withdrawn = await participant.withdraw({
+    operationId: "founder-operation:maximum-detail-withdraw",
+    expectedRevision: MAX_FOUNDER_APPLICATION_REVISIONS - 1,
+    id: "founder-application:self",
+    occurredAt: "2026-08-11T12:00:00.000Z",
+    historyEntryId: "founder-history:maximum-detail-withdraw",
+  });
+  assert.equal(withdrawn.revision, MAX_FOUNDER_APPLICATION_REVISIONS);
+
+  const fieldRecords = [...state.records.values()].filter((record) =>
+    record.key.collection === "founder-application-fields"
+  );
+  const editableRevisions = MAX_FOUNDER_APPLICATION_REVISIONS - 1;
+  assert.equal(fieldRecords.length % editableRevisions, 0);
+  const chunksPerEditableRevision = fieldRecords.length / editableRevisions;
+  const maximumFieldBytes = new TextEncoder().encode(
+    JSON.stringify(withdrawn.snapshot.fields),
+  ).byteLength;
+  assert.equal(
+    chunksPerEditableRevision,
+    Math.ceil(
+      maximumFieldBytes / FOUNDER_APPLICATION_FIELDS_CHUNK_RAW_BYTES,
+    ),
+  );
+  assert.equal(chunksPerEditableRevision, 5);
+
+  const observed = new ObservedStorageAdapter(storage);
+  const reviewId = await reviewIdForApplication(ALICE);
+  const detail = await new StorageFounderApplicationReviewDetailRepository(
+    observed,
+  ).get(reviewId);
+  assert(detail);
+  assert.equal(detail.application.revision, MAX_FOUNDER_APPLICATION_REVISIONS);
+  assert.equal(
+    detail.application.history.length,
+    MAX_FOUNDER_APPLICATION_REVISIONS,
+  );
+  assert.equal(
+    detail.application.fields.professionalProfileLinks.length,
+    MAX_PROFILE_LINKS,
+  );
+  assert.equal(observed.listCalls, 0);
+  assert.equal(
+    observed.readCalls,
+    2 + MAX_FOUNDER_APPLICATION_REVISIONS + fieldRecords.length,
+  );
+  assert.ok(
+    observed.readCalls <= MAX_FOUNDER_APPLICATION_REVIEW_DETAIL_RECORD_READS,
+  );
 });
 
 test("persistent founder detail rejects malformed and missing IDs finitely", async () => {
@@ -133,6 +295,25 @@ test("persistent founder detail fails closed on crossed and corrupt records", as
     apply(state: MemoryStorageState): void;
   }>[] = [
     {
+      name: "crossed review lookup",
+      apply(state) {
+        const alice = reviewLookupRecordFor(state, ALICE);
+        const bob = reviewLookupRecordFor(state, BOB);
+        replaceRecord(state, alice, bob.value, alice.revision);
+      },
+    },
+    {
+      name: "missing current record",
+      apply(state) {
+        const current = currentRecordFor(state, ALICE);
+        const entry = [...state.records.entries()].find(([, record]) =>
+          record === current
+        );
+        assert(entry);
+        state.records.delete(entry[0]);
+      },
+    },
+    {
       name: "crossed current record",
       apply(state) {
         const alice = currentRecordFor(state, ALICE);
@@ -176,7 +357,7 @@ test("persistent founder detail fails closed on crossed and corrupt records", as
     const storage = new MemoryStorageAdapter(state);
     await seedApplication(storage, ALICE, `alice-${corruption.name}`);
     await seedApplication(storage, BOB, `bob-${corruption.name}`);
-    const reviewId = reviewIdForCurrentRecord(state, ALICE);
+    const reviewId = await reviewIdForApplication(ALICE);
     corruption.apply(state);
     const observed = new ObservedStorageAdapter(
       new MemoryStorageAdapter(state),
@@ -227,6 +408,31 @@ class ObservedStorageAdapter implements StorageAdapter {
   }
 }
 
+class CommitThenUnavailableStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  transactionCalls = 0;
+  #failed = false;
+
+  constructor(delegate: StorageAdapter) {
+    this.#delegate = delegate;
+  }
+
+  read: StorageAdapter["read"] = (key) => this.#delegate.read(key);
+  list: StorageAdapter["list"] = (request) => this.#delegate.list(request);
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    this.transactionCalls += 1;
+    const result = await this.#delegate.transact(request);
+    if (!this.#failed) {
+      this.#failed = true;
+      throw new StorageFailure("UNAVAILABLE");
+    }
+    return result;
+  }
+}
+
 async function seedApplication(
   storage: StorageAdapter,
   applicantSubject: ActorSubject,
@@ -249,13 +455,19 @@ async function seedApplication(
   return repository;
 }
 
-function reviewIdForCurrentRecord(
-  state: MemoryStorageState,
+async function reviewIdForApplication(
   applicantSubject: ActorSubject,
-): string {
-  const current = currentRecordFor(state, applicantSubject);
-  assert.match(current.key.id, /^founder-current:[0-9a-f]{64}$/u);
-  return `founder-review:${current.key.id.slice("founder-current:".length)}`;
+): Promise<string> {
+  const applicationId = "founder-application:self";
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(
+      `founder-review\u0000${applicantSubject}\u0000${applicationId}`,
+    ),
+  );
+  return `founder-review:${[...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")}`;
 }
 
 function currentRecordFor(
@@ -264,6 +476,18 @@ function currentRecordFor(
 ): StorageRecord {
   const record = [...state.records.values()].find((candidate) =>
     candidate.key.collection === "founder-applications" &&
+    candidate.value.applicantSubject === applicantSubject
+  );
+  assert(record);
+  return record;
+}
+
+function reviewLookupRecordFor(
+  state: MemoryStorageState,
+  applicantSubject: ActorSubject,
+): StorageRecord {
+  const record = [...state.records.values()].find((candidate) =>
+    candidate.key.collection === "founder-review-lookups" &&
     candidate.value.applicantSubject === applicantSubject
   );
   assert(record);
@@ -318,6 +542,45 @@ function founderFields(primaryContributionAreaId: string) {
     compensationExpectation: "Open to discussion.",
     professionalProfileLinks: ["https://profiles.example.invalid/founder"],
     note: PRIVATE_NOTE,
+  };
+}
+
+function maximumContributionAreaChoices(): readonly ContributionAreaChoice[] {
+  const parsed = parseContributionAreaChoices(
+    Array.from({ length: 64 }, (_, index) => {
+      const prefix = `area:${index}:`;
+      return {
+        id: `${prefix}${"x".repeat(128 - prefix.length)}`,
+        label: `Area ${index}`,
+      };
+    }),
+  );
+  assert(parsed.ok);
+  return parsed.value;
+}
+
+function maximumFounderFields(
+  character: string,
+  configuredChoices: readonly ContributionAreaChoice[],
+) {
+  return {
+    expertiseSummary: character.repeat(4_000),
+    intendedContribution: character.repeat(4_000),
+    primaryContributionAreaId: configuredChoices[0]?.id,
+    secondaryContributionAreaIds: configuredChoices
+      .slice(1, 17)
+      .map((choice) => choice.id),
+    approximateAvailability: character.repeat(500),
+    possibleStartTiming: character.repeat(500),
+    compensationExpectation: character.repeat(500),
+    professionalProfileLinks: Array.from(
+      { length: MAX_PROFILE_LINKS },
+      (_, index) => {
+        const prefix = `https://profiles.invalid/${index}/`;
+        return `${prefix}${character.repeat(MAX_PROFILE_LINK_LENGTH - prefix.length)}`;
+      },
+    ),
+    note: character.repeat(4_000),
   };
 }
 

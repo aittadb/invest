@@ -215,21 +215,33 @@ failures.
 Owner founder review uses two independent singleton read ports. The collection
 port exposes only `list`; each request lists at most 25 current founder records,
 binds each to its immutable terminal transition, and validates each current
-field payload within a fixed 325-record-read ceiling. It returns only one-way
-review identifiers and the collection summary allowlist. A new factory can
+field payload and dedicated review lookup within a fixed 350-record-read
+ceiling. It returns only established one-way review identifiers and the
+collection summary allowlist. A new factory can
 continue an existing AittaDB cursor after a Worker restart. AittaDB's validated
 cursor contract keeps principal, namespace, and physical-key data out of that
 continuation; the Worker does not log or decode it.
 
 The detail port exposes only `get`. It maps one valid one-way review identifier
-to one current-record key without listing, then reconstructs and verifies the
-bounded immutable application ancestry within a fixed 210-record-read ceiling.
-Malformed identifiers read nothing and missing identifiers read only the
-derived current key. Hosted routing composes the two ports so a collection item
-links to its available detail and that detail links back to the collection.
+to one dedicated private lookup record without listing, verifies the stored
+subject and internal application coordinates, derives the distinct current key
+server-side, then reconstructs and verifies the complete bounded immutable
+application ancestry within a fixed 210-record-read ceiling. Malformed
+identifiers read nothing and missing identifiers read only the lookup key.
+Hosted routing composes the two ports so a collection item links to its
+available detail and that detail links back to the collection.
 Independently composed ports omit links to the unavailable sibling resource.
 Anonymous and non-owner callers are rejected before either founder-review port
 is invoked.
+
+New founder creates provision the lookup through a deterministic transaction
+after the original retry-compatible application transaction and before success
+is returned. Pre-index applications require an explicit backend-only bounded
+backfill that verifies their complete current and immutable ancestry first;
+owner collection and detail GET requests never create lookup state. The public
+review ID remains the established subject-and-application identity and is not
+the current application storage key, although its digest intentionally
+addresses the dedicated lookup record.
 
 `StorageCampaignRepository` is production-neutral and retains no state outside
 its supplied adapter. `StorageFounderApplicationRepository` follows the same

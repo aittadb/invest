@@ -28,6 +28,8 @@ import { createOwnerRouteHandler } from "../worker/routes/owner.ts";
 
 const PRIVATE_EXPERTISE = "Distributed systems and product validation.";
 const PRIVATE_NOTE = "Available for a confidential follow-up.";
+const PROFESSIONAL_PROFILE_LINK =
+  "https://profiles.example.invalid/applicant?focus=founders&source=owner";
 
 test("owner founder review exposes equivalent collection resources", async () => {
   const item = reviewItem();
@@ -197,6 +199,22 @@ test("founder detail HTML renders every hypermedia lifecycle fact and navigation
 
   assert.equal(jsonResponse.status, 200);
   assert.equal(htmlResponse.status, 200);
+  assert.equal(jsonResponse.headers.get("referrer-policy"), "no-referrer");
+  assert.equal(htmlResponse.headers.get("referrer-policy"), "no-referrer");
+  assert.deepEqual(
+    document.data.professional_profile_links,
+    [PROFESSIONAL_PROFILE_LINK],
+  );
+  const escapedProfileLink = PROFESSIONAL_PROFILE_LINK.replaceAll(
+    "&",
+    "&amp;",
+  );
+  assert.ok(
+    html.includes(
+      `<a href="${escapedProfileLink}" rel="noreferrer">${escapedProfileLink}</a>`,
+    ),
+  );
+  assert.equal(html.includes(`href="${PROFESSIONAL_PROFILE_LINK}"`), false);
   assert.match(
     html,
     new RegExp(`<dt>Application ID</dt><dd><code>${document.data.application_id}</code></dd>`, "u"),
@@ -572,7 +590,7 @@ function reviewItem(): FounderApplicationReviewItem {
       approximateAvailability: "Two days each week.",
       possibleStartTiming: "After mutual confirmation.",
       compensationExpectation: "Open to discussion.",
-      professionalProfileLinks: ["https://profiles.example.invalid/applicant"],
+      professionalProfileLinks: [PROFESSIONAL_PROFILE_LINK],
       note: PRIVATE_NOTE,
     },
   }, choices.value);

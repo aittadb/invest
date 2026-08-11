@@ -498,11 +498,12 @@ test("concurrent exact creates recover one immutable server-timed result", async
     results.map((result) => result.replayed).sort(),
     [false, true],
   );
-  assert.equal(state.operations.size, 1);
+  assert.equal(state.operations.size, 2);
   assert.equal(
     state.records.size,
-    2 + recordsIn(state, "founder-application-fields").length,
+    3 + recordsIn(state, "founder-application-fields").length,
   );
+  assert.equal(recordsIn(state, "founder-review-lookups").length, 1);
 });
 
 test("founder writes reject a malformed transaction result matrix", async (t) => {
@@ -1087,7 +1088,7 @@ test("founder ancestry is finite and always reserves the final transition for wi
   );
   assert.equal(
     state.records.size,
-    1 + MAX_FOUNDER_APPLICATION_REVISIONS + fieldRecordsBeforeWithdrawal,
+    2 + MAX_FOUNDER_APPLICATION_REVISIONS + fieldRecordsBeforeWithdrawal,
   );
   const observedContentionReads = Math.max(
     firstObserved.reads,
@@ -1227,7 +1228,7 @@ test("concurrent evolved-choice work with one operation id commits once and conf
   const current = await repository(delegate, ALICE_SUBJECT).get(APPLICATION_ID);
   assert.equal(current?.revision, 2);
   assert.equal(current?.history.length, 2);
-  assert.equal(state.operations.size, 2);
+  assert.equal(state.operations.size, 3);
 });
 
 test("configured owner can page and inspect opaque founder review records", async () => {

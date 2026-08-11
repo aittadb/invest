@@ -48,8 +48,12 @@ const APPLICATION_FIELDS = storageCollection("founder-application-fields");
 const APPLICATION_POLICY_REVISIONS = storageCollection(
   "founder-application-policy-revisions",
 );
+const APPLICATION_REVIEW_LOOKUPS = storageCollection(
+  "founder-review-lookups",
+);
 const LEGACY_FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION = 1;
 const FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION = 2;
+const FOUNDER_APPLICATION_REVIEW_LOOKUP_SCHEMA_VERSION = 1;
 
 export const MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES = 65_536;
 export const MAX_FOUNDER_APPLICATION_STORAGE_TRANSACTION_BYTES = 1_048_576;
@@ -68,8 +72,10 @@ export const MAX_FOUNDER_APPLICATION_REVIEW_PAGE_SIZE = 25;
 export const MAX_FOUNDER_APPLICATION_REVIEW_CURSOR_CHARACTERS = 2_048;
 export const MAX_FOUNDER_APPLICATION_REVIEW_PAGE_RECORD_READS =
   MAX_FOUNDER_APPLICATION_REVIEW_PAGE_SIZE *
-  (1 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS);
+  (2 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS);
 export const MAX_FOUNDER_APPLICATION_REVIEW_DETAIL_RECORD_READS =
+  1 + MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS;
+export const MAX_FOUNDER_APPLICATION_REVIEW_LOOKUP_BACKFILL_READS =
   1 + MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS;
 
 const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
@@ -137,6 +143,13 @@ const LEGACY_POLICY_REVISION_DOCUMENT_KEYS = [
 const POLICY_REVISION_DOCUMENT_KEYS = [
   ...LEGACY_POLICY_REVISION_DOCUMENT_KEYS,
   "participantProfileRevision",
+] as const;
+const REVIEW_LOOKUP_DOCUMENT_KEYS = [
+  "kind",
+  "schemaVersion",
+  "reviewId",
+  "applicationId",
+  "applicantSubject",
 ] as const;
 
 export type FounderApplicationMutationResult<
@@ -237,6 +250,18 @@ export interface FounderApplicationReviewCollectionRepository {
 /** Direct opaque lookup of one bounded, fully verified founder application. */
 export interface FounderApplicationReviewDetailRepository {
   get(reviewId: unknown): Promise<FounderApplicationReviewItem | null>;
+}
+
+export type FounderApplicationReviewLookupBackfillRequest = Readonly<{
+  applicantSubject: unknown;
+  applicationId: unknown;
+}>;
+
+/** Backend-only compatibility backfill for one pre-index founder application. */
+export interface FounderApplicationReviewLookupBackfillRepository {
+  backfill(
+    request: FounderApplicationReviewLookupBackfillRequest,
+  ): Promise<string>;
 }
 
 /** Configured-owner development contract over collection and detail reads. */
@@ -783,6 +808,10 @@ export class StorageFounderApplicationRepository
       }
     }
 
+    if (request.expectedRevision === null) {
+      await ensureFounderReviewLookup(this.#storage, subject, request.id);
+    }
+
     return mutationResult(prepared.application, result.replayed);
   }
 
@@ -891,7 +920,7 @@ implements FounderApplicationReviewCollectionRepository {
   }
 }
 
-/** Persistent direct detail projection over one opaque current-record key. */
+/** Persistent direct detail projection through one opaque review lookup. */
 export class StorageFounderApplicationReviewDetailRepository
 implements FounderApplicationReviewDetailRepository {
   readonly #storage: StorageAdapter;
@@ -910,6 +939,44 @@ implements FounderApplicationReviewDetailRepository {
         error.code === "INVALID_REQUEST"
       ) {
         throw new StorageFailure("INVALID_REQUEST");
+      }
+      throw new StorageFailure("UNAVAILABLE");
+    }
+  }
+}
+
+/** Backend-only one-record backfill for applications created before lookup indexing. */
+export class StorageFounderApplicationReviewLookupBackfillRepository
+implements FounderApplicationReviewLookupBackfillRepository {
+  readonly #storage: StorageAdapter;
+
+  constructor(storage: StorageAdapter) {
+    this.#storage = requiredStorageAdapter(storage);
+    Object.freeze(this);
+  }
+
+  async backfill(
+    request: FounderApplicationReviewLookupBackfillRequest,
+  ): Promise<string> {
+    try {
+      const source = exactDataObject(request, [
+        "applicantSubject",
+        "applicationId",
+      ]);
+      if (source === null) invalidRequest();
+      const subject = requiredActorSubject(source.applicantSubject);
+      const id = requiredApplicationId(source.applicationId);
+      const key = await currentApplicationKey(subject, id);
+      const record = await this.#storage.read(key);
+      if (record === null) notFound();
+      await loadCurrentApplication(this.#storage, record, subject, id);
+      return await ensureFounderReviewLookup(this.#storage, subject, id);
+    } catch (error) {
+      if (
+        error instanceof StorageFailure &&
+        (error.code === "INVALID_REQUEST" || error.code === "NOT_FOUND")
+      ) {
+        throw new StorageFailure(error.code);
       }
       throw new StorageFailure("UNAVAILABLE");
     }
@@ -981,8 +1048,15 @@ implements FounderApplicationReviewRepository {
       coordinates.subject,
       coordinates.id,
     );
+    const reviewId = await founderReviewId(coordinates.subject, coordinates.id);
+    await requireFounderReviewLookup(
+      this.#storage,
+      reviewId,
+      coordinates.subject,
+      coordinates.id,
+    );
     return Object.freeze({
-      reviewId: await founderReviewId(coordinates.subject, coordinates.id),
+      reviewId,
       application: stored.application,
     });
   }
@@ -1105,8 +1179,15 @@ async function decodeFounderApplicationReviewCollectionItem(
     coordinates.id,
     current.fields,
   );
+  const reviewId = await founderReviewId(coordinates.subject, coordinates.id);
+  await requireFounderReviewLookup(
+    storage,
+    reviewId,
+    coordinates.subject,
+    coordinates.id,
+  );
   return Object.freeze({
-    reviewId: await founderReviewId(coordinates.subject, coordinates.id),
+    reviewId,
     status: current.status,
     primaryContributionAreaId: fields.fields.primaryContributionAreaId,
     updatedAt: current.updatedAt,
@@ -1152,16 +1233,146 @@ function projectFounderReviewCollectionItem(
   });
 }
 
+type FounderReviewLookupCoordinates = Readonly<{
+  subject: ActorSubject;
+  id: FounderApplicationId;
+}>;
+
+async function ensureFounderReviewLookup(
+  storage: StorageAdapter,
+  subject: ActorSubject,
+  id: FounderApplicationId,
+): Promise<string> {
+  const reviewId = await founderReviewId(subject, id);
+  const key = founderReviewLookupKey(reviewId);
+  const value = founderReviewLookupDocument(reviewId, subject, id);
+  const operationId = storedOperationId(
+    `founder-review-index:${reviewId.slice("founder-review:".length)}`,
+  );
+  const transaction: StorageTransactionRequest = Object.freeze({
+    operationId,
+    mutations: Object.freeze([{
+      type: "put" as const,
+      key,
+      expectedRevision: null,
+      value,
+    }]),
+  });
+  if (
+    jsonByteLength(transaction) >
+      MAX_FOUNDER_APPLICATION_STORAGE_TRANSACTION_BYTES
+  ) {
+    unavailable();
+  }
+
+  try {
+    const result = exactStorageTransactionResult(
+      await storage.transact(transaction),
+      1,
+    );
+    verifyExactRecord(result.records[0], key, 1, value);
+  } catch {
+    // A read below distinguishes a committed response loss from no index.
+  }
+
+  const record = await storage.read(key);
+  if (record === null) unavailable();
+  const coordinates = await decodeFounderReviewLookup(
+    record,
+    key,
+    reviewId,
+  );
+  if (coordinates.subject !== subject || coordinates.id !== id) unavailable();
+  return reviewId;
+}
+
+async function requireFounderReviewLookup(
+  storage: StorageAdapter,
+  reviewId: string,
+  expectedSubject: ActorSubject,
+  expectedId: FounderApplicationId,
+): Promise<void> {
+  const coordinates = await readFounderReviewLookup(storage, reviewId);
+  if (
+    coordinates === null ||
+    coordinates.subject !== expectedSubject ||
+    coordinates.id !== expectedId
+  ) {
+    unavailable();
+  }
+}
+
+async function readFounderReviewLookup(
+  storage: StorageAdapter,
+  reviewId: string,
+): Promise<FounderReviewLookupCoordinates | null> {
+  const key = founderReviewLookupKey(reviewId);
+  const record = await storage.read(key);
+  return record === null
+    ? null
+    : decodeFounderReviewLookup(record, key, reviewId);
+}
+
+async function decodeFounderReviewLookup(
+  record: unknown,
+  expectedKey: StorageKey,
+  expectedReviewId: string,
+): Promise<FounderReviewLookupCoordinates> {
+  const envelope = exactDataObject(record, ["key", "revision", "value"]);
+  const key = envelope === null
+    ? null
+    : exactDataObject(envelope.key, ["collection", "id"]);
+  const source = envelope === null
+    ? null
+    : exactDataObject(envelope.value, [...REVIEW_LOOKUP_DOCUMENT_KEYS]);
+  if (
+    envelope === null ||
+    key === null ||
+    source === null ||
+    key.collection !== expectedKey.collection ||
+    key.id !== expectedKey.id ||
+    envelope.revision !== 1 ||
+    source.kind !== "founder-review-lookup" ||
+    source.schemaVersion !== FOUNDER_APPLICATION_REVIEW_LOOKUP_SCHEMA_VERSION ||
+    source.reviewId !== expectedReviewId ||
+    jsonByteLength(envelope.value) >
+      MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES
+  ) {
+    unavailable();
+  }
+  const subject = storedActorSubject(source.applicantSubject);
+  const id = storedApplicationId(source.applicationId);
+  if (await founderReviewId(subject, id) !== expectedReviewId) unavailable();
+  return Object.freeze({ subject, id });
+}
+
+function founderReviewLookupDocument(
+  reviewId: string,
+  subject: ActorSubject,
+  id: FounderApplicationId,
+): StorageDocument {
+  const value = Object.freeze({
+    kind: "founder-review-lookup",
+    schemaVersion: FOUNDER_APPLICATION_REVIEW_LOOKUP_SCHEMA_VERSION,
+    reviewId,
+    applicationId: id,
+    applicantSubject: subject,
+  });
+  requireBoundedRecord(value);
+  return value;
+}
+
 async function loadFounderReviewDetail(
   storage: StorageAdapter,
   reviewId: unknown,
 ): Promise<FounderApplicationReviewItem | null> {
   const expectedReviewId = requiredReviewId(reviewId);
-  const key = currentApplicationKeyFromReviewId(expectedReviewId);
+  const coordinates = await readFounderReviewLookup(storage, expectedReviewId);
+  if (coordinates === null) return null;
+  const key = await currentApplicationKey(coordinates.subject, coordinates.id);
   const record = await storage.read(key);
-  if (record === null) return null;
+  if (record === null) unavailable();
 
-  const coordinates = storedApplicationCoordinates(record.value);
   const stored = await loadCurrentApplication(
     storage,
     record,
@@ -2341,10 +2552,10 @@ async function founderReviewId(
   subject: ActorSubject,
   id: FounderApplicationId,
 ): Promise<string> {
-  const key = await currentApplicationKey(subject, id);
-  const prefix = "founder-current:";
-  if (!key.id.startsWith(prefix)) unavailable();
-  return `founder-review:${key.id.slice(prefix.length)}`;
+  const digest = await hashBytes(
+    new TextEncoder().encode(`founder-review\u0000${subject}\u0000${id}`),
+  );
+  return `founder-review:${digest.slice("sha256:".length)}`;
 }
 
 function requiredReviewId(value: unknown): string {
@@ -2357,10 +2568,10 @@ function requiredReviewId(value: unknown): string {
   return value;
 }
 
-function currentApplicationKeyFromReviewId(reviewId: string): StorageKey {
+function founderReviewLookupKey(reviewId: string): StorageKey {
   return requiredStorageKey(
-    CURRENT_APPLICATIONS,
-    `founder-current:${reviewId.slice("founder-review:".length)}`,
+    APPLICATION_REVIEW_LOOKUPS,
+    `founder-review-lookup:${reviewId.slice("founder-review:".length)}`,
   );
 }
 

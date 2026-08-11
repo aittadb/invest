@@ -37,6 +37,8 @@ const OWNER_SUBJECT = "sites-owner-subject";
 const ALICE = subject("sites-founder-alice");
 const BOB = subject("sites-founder-bob");
 const PRIVATE_NOTE = "Private hosted founder note must stay out of summaries.";
+const PROFESSIONAL_PROFILE_LINK =
+  "https://profiles.example.invalid/hosted-founder?focus=data&source=owner";
 const CHOICES = contributionChoices();
 const NOW = new Date("2026-08-10T12:00:00.000Z");
 
@@ -268,6 +270,10 @@ test("hosted owner founder detail preserves lifecycle parity across restart", as
   assert.equal(detail.data.primary_contribution_area_id, "area:product");
   assert.equal(detail.data.note, PRIVATE_NOTE);
   assert.deepEqual(
+    detail.data.professional_profile_links,
+    [PROFESSIONAL_PROFILE_LINK],
+  );
+  assert.deepEqual(
     detail.data.history.map((entry) => entry.transition),
     ["created", "edited", "withdrawn"],
   );
@@ -297,6 +303,7 @@ test("hosted owner founder detail preserves lifecycle parity across restart", as
   );
   const html = await htmlResponse.text();
   assert.equal(htmlResponse.status, 200);
+  assert.equal(htmlResponse.headers.get("referrer-policy"), "no-referrer");
   assert.match(html, /Founder application/u);
   assert.match(html, /Experience developing hosted data products\./u);
   assert.match(html, /area:product/u);
@@ -328,6 +335,16 @@ test("hosted owner founder detail preserves lifecycle parity across restart", as
     assert(link);
     assert.ok(html.includes(`href="${link.href}"`));
   }
+  const escapedProfileLink = PROFESSIONAL_PROFILE_LINK.replaceAll(
+    "&",
+    "&amp;",
+  );
+  assert.ok(
+    html.includes(
+      `<a href="${escapedProfileLink}" rel="noreferrer">${escapedProfileLink}</a>`,
+    ),
+  );
+  assert.equal(html.includes(`href="${PROFESSIONAL_PROFILE_LINK}"`), false);
   assert.doesNotMatch(html, /sites-founder-|sites-owner-subject|owner@example/u);
   assert.ok(
     service.readKeys.length - htmlReadStart <=
@@ -423,6 +440,9 @@ test("hosted founder detail denials and invalid IDs do not disclose or read", as
   assert.equal(renderedRequests.length, 0);
 
   const missingId = `founder-review:${"f".repeat(64)}`;
+  const missingReadStart = service.readKeys.length;
+  const missingLookupReadStart = founderReviewLookupReadCount(service);
+  const missingListStart = service.listCollections.length;
   const missing = await worker.fetch(
     ownerRequest(
       `/owner/founder-applications/${encodeURIComponent(missingId)}`,
@@ -434,7 +454,13 @@ test("hosted founder detail denials and invalid IDs do not disclose or read", as
   const missingBody = await missing.text();
   assert.equal(missingBody.includes(PRIVATE_NOTE), false);
   assert.equal(missingBody.includes(ALICE), false);
-  assert.equal(founderApplicationReadCount(service), deniedReadStart + 1);
+  assert.equal(founderApplicationReadCount(service), deniedReadStart);
+  assert.equal(
+    founderReviewLookupReadCount(service),
+    missingLookupReadStart + 1,
+  );
+  assert.equal(service.listCollections.length, missingListStart);
+  assert.ok(service.readKeys.length - missingReadStart <= 3);
 });
 
 test("hosted founder detail maps corrupt persistent data to a finite error", async () => {
@@ -546,7 +572,7 @@ function founderFields(primaryContributionAreaId: string) {
     approximateAvailability: "Two days each week.",
     possibleStartTiming: "After mutual confirmation.",
     compensationExpectation: "Open to discussion.",
-    professionalProfileLinks: [],
+    professionalProfileLinks: [PROFESSIONAL_PROFILE_LINK],
     note: PRIVATE_NOTE,
   };
 }
@@ -582,6 +608,16 @@ function founderApplicationReadCount(
 ): number {
   return service.readKeys.filter((storageKey) =>
     storageKey.startsWith("founder-applications/")
+  ).length;
+}
+
+function founderReviewLookupReadCount(
+  service: SyntheticAittaDBStorageService,
+): number {
+  return service.readKeys.filter((storageKey) =>
+    /^founder-review-lookups\/founder-review-lookup:[0-9a-f]{64}$/u.test(
+      storageKey,
+    )
   ).length;
 }
 
