@@ -107,6 +107,19 @@ the same lifecycle mutation slot, and the immutable root is not rewritten by a
 lifecycle transition, so the accepted 25-mutation account-deletion bound is
 unchanged.
 
+The account-deletion investment primitive accepts only the shared request-local
+staging boundary and never calls its commit method. It authenticates the full
+bounded root, index, summary, compact heads, fields, and active leases, then
+prepares deterministic withdrawals for at most four active indications. The
+prepared set contains three indication mutations per active item, one index
+replacement, one summary replacement, one aggregate snapshot replacement, and
+one contribution replacement per active item: at most 19 unique mutations.
+Withdrawn and rejected entries remain unchanged. The aggregate advances once
+for the complete set, while each affected contribution advances to the exact
+withdrawn indication revision. A stale outer commit therefore changes all of
+those records or none. The final profile, founder, audit, and retry-receipt
+composition remains the separate account-deletion coordinator.
+
 The machine-readable `transaction_shape` declares:
 
 - a stable operation ID between 1 and 128 characters;

@@ -55,11 +55,13 @@ and a deletion request cannot be cancelled through it.
 After deletion is requested, profile editing and another deletion request are
 not available. A still-granted marketing consent remains independently
 withdrawable. Recording deletion intent does not itself erase records or
-coordinate founder applications, investment indications, or aggregates; that
-atomic application operation belongs to the later account-deletion coordination
-work. The participant entry representation continues to link to this resource
-as a profile view and retains only currently permitted package access and
-sign-out alongside it; founder and investment workflow actions are withheld.
+coordinate founder applications, investment indications, or aggregates. A
+separate backend-only primitive can now stage the complete bounded investment
+withdrawal set without committing it, but the atomic profile, founder, audit,
+and retry composition still belongs to `TASK-109`. The participant entry
+representation continues to link to this resource as a profile view and
+retains only currently permitted package access and sign-out alongside it;
+founder and investment workflow actions are withheld.
 
 ## Mutation Boundary
 
