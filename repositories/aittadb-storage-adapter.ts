@@ -191,10 +191,7 @@ export class AittaDBStorageAdapter implements StorageAdapter {
       contentType: "application/json",
     });
     const maxBytes = response.status === 200
-      ? boundedSum(
-          discovery.data.limits.max_transaction_bytes,
-          RESPONSE_ENVELOPE_BYTES,
-        )
+      ? transactionResponseLimit(snapshot, discovery.data.limits)
       : ERROR_RESPONSE_MAX_BYTES;
     const document = await readProtocolJson(
       response,
@@ -521,6 +518,20 @@ function rejectProtocolResponse(response: Response): never {
 function pageResponseLimit(limit: number, limits: StorageProtocolLimits): number {
   return boundedSum(
     limit * limits.max_record_bytes,
+    RESPONSE_ENVELOPE_BYTES,
+  );
+}
+
+function transactionResponseLimit(
+  request: StorageTransactionRequest,
+  limits: StorageProtocolLimits,
+): number {
+  const recordResults = request.mutations.filter((mutation) =>
+    mutation.type === "put" ||
+    mutation.type === "check" && mutation.expectedRevision !== null
+  ).length;
+  return boundedSum(
+    recordResults * limits.max_record_bytes,
     RESPONSE_ENVELOPE_BYTES,
   );
 }

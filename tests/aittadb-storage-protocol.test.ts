@@ -10,6 +10,7 @@ import {
   parseStorageProtocolDiscovery,
   parseStorageProtocolPage,
   parseStorageProtocolRecord,
+  parseStorageProtocolTransaction,
   storageFailureFromProtocol,
   storageProtocolErrorDocument,
   storageProtocolErrorStatus,
@@ -25,7 +26,7 @@ import {
 } from "../domain/aittadb-storage-protocol.ts";
 import {
   StorageFailure,
-  assertStorageTransactionBoundary,
+  normalizeStorageTransactionRequest,
   parseStorageKey,
   parseStorageOperationId,
   storageKeyString,
@@ -79,6 +80,7 @@ test("discovery describes the complete bounded atomic storage capability", () =>
   );
   const transaction = requiredProtocolAction(document, "transact-records");
   assert.deepEqual(transaction.authorization.scopes, [
+    "storage.read",
     "storage.write",
     "storage.delete",
   ]);
@@ -91,7 +93,7 @@ test("discovery describes the complete bounded atomic storage capability", () =>
       required: true,
       max_bytes: LIMITS.max_transaction_bytes,
       description:
-        "One operation_id and an ordered mutations array of compare-and-set put or delete entries.",
+        "One operation_id and an ordered mutations array of compare-and-set put, delete, or non-mutating check entries.",
     },
   ]);
   assert.deepEqual(
@@ -105,6 +107,36 @@ test("discovery describes the complete bounded atomic storage capability", () =>
   };
   assertStorageFailure(
     () => parseStorageProtocolDiscovery(wrongVersion, ORIGIN),
+    "UNAVAILABLE",
+  );
+  const missingCheck = {
+    ...document,
+    data: {
+      ...document.data,
+      capabilities: document.data.capabilities.filter(
+        (capability) => capability !== "atomic-read-revision-check",
+      ),
+    },
+  };
+  assertStorageFailure(
+    () => parseStorageProtocolDiscovery(missingCheck, ORIGIN),
+    "UNAVAILABLE",
+  );
+  const malformedCheckShape = {
+    ...document,
+    data: {
+      ...document.data,
+      transaction_shape: {
+        ...document.data.transaction_shape,
+        mutations: {
+          ...document.data.transaction_shape.mutations,
+          check: "best-effort",
+        },
+      },
+    },
+  };
+  assertStorageFailure(
+    () => parseStorageProtocolDiscovery(malformedCheckShape, ORIGIN),
     "UNAVAILABLE",
   );
   assertStorageFailure(
@@ -123,7 +155,38 @@ test("the deterministic hypermedia fixture passes the complete StorageAdapter co
   await verifyStorageAdapterContract(() => contractFixture());
 });
 
-test("the adapter discovers arbitrary targets and preserves put/delete result order", async () => {
+test("unsupported check discovery fails before the adapter sends a transaction", async () => {
+  const unsupported = discoveryDocument();
+  const malformed = {
+    ...unsupported,
+    data: {
+      ...unsupported.data,
+      capabilities: unsupported.data.capabilities.filter(
+        (capability) => capability !== "atomic-read-revision-check",
+      ),
+    },
+  };
+  let calls = 0;
+  const adapter = new AittaDBStorageAdapter({
+    issuer: ORIGIN,
+    entryHref: ENTRY_HREF,
+    accessToken: () => OWNER_TOKEN,
+    async fetch() {
+      calls += 1;
+      return protocolResponse(200, malformed);
+    },
+  });
+
+  await assert.rejects(
+    () => adapter.transact(transaction("operation:unsupported-check", [
+      check(key("unsupported-check"), null),
+    ])),
+    unavailableStorageFailure,
+  );
+  assert.equal(calls, 1);
+});
+
+test("the adapter discovers arbitrary targets and preserves put/check/delete result order", async () => {
   const fixture = createFixture();
   const first = key("first");
   const second = key("second");
@@ -133,15 +196,17 @@ test("the adapter discovers arbitrary targets and preserves put/delete result or
   ]));
 
   const changed = transaction("operation:update-pair", [
+    check(second, 1),
     { type: "delete", key: first, expectedRevision: 1 },
-    put(second, 1, { state: "changed" }),
+    put(key("third"), null, { state: "changed" }),
   ]);
   const result = await fixture.owner.transact(changed);
   assert.equal(result.replayed, false);
-  assert.equal(result.records[0], null);
-  assert.equal(result.records[1]?.revision, 2);
+  assert.deepEqual(result.records[0], record(second, 1, { state: "second" }));
+  assert.equal(result.records[1], null);
+  assert.equal(result.records[2]?.revision, 1);
   assert.equal(await fixture.owner.read(first), null);
-  assert.equal((await fixture.owner.read(second))?.value.state, "changed");
+  assert.equal((await fixture.owner.read(second))?.value.state, "second");
 
   const replay = await fixture.owner.transact(changed);
   assert.equal(replay.replayed, true);
@@ -316,6 +381,106 @@ test("protocol decoders fail closed on oversized, malformed, or mismatched data"
   });
   assert.equal(forgedFailure.code, "UNAVAILABLE");
   assert.equal(forgedFailure.message.includes("private-existing"), false);
+});
+
+test("check commands encode exactly and malformed ordered evidence fails closed", () => {
+  const existing = key("decode-check-existing");
+  const missing = key("decode-check-missing");
+  const request = transaction("operation:decode-check", [
+    check(existing, 3),
+    check(missing, null),
+  ]);
+  assert.deepEqual(toStorageProtocolTransactionCommand(request), {
+    transaction: {
+      operation_id: "operation:decode-check",
+      mutations: [
+        {
+          type: "check",
+          key: { collection: "private-records", id: "decode-check-existing" },
+          expected_revision: 3,
+        },
+        {
+          type: "check",
+          key: { collection: "private-records", id: "decode-check-missing" },
+          expected_revision: null,
+        },
+      ],
+    },
+  });
+
+  const existingRecord = record(existing, 3, { state: "unchanged" });
+  assert.deepEqual(
+    parseStorageProtocolTransaction(
+      transactionDocument(request, [existingRecord, null], false),
+      request,
+      LIMITS.max_record_bytes,
+    ),
+    { replayed: false, records: [existingRecord, null] },
+  );
+
+  const malformedRecords = [
+    [null, null],
+    [record(existing, 2, { state: "stale" }), null],
+    [record(key("decode-check-wrong-key"), 3, { state: "wrong" }), null],
+    [existingRecord, record(missing, 1, { state: "present" })],
+    [{ key: existing, revision: 3, value: [] }, null],
+    [{ ...existingRecord, unexpected: true }, null],
+  ] as const;
+  for (const records of malformedRecords) {
+    const document = {
+      ...transactionDocument(request, [existingRecord, null], false),
+      data: {
+        ...transactionDocument(request, [existingRecord, null], false).data,
+        records,
+      },
+    };
+    assertStorageFailure(
+      () => parseStorageProtocolTransaction(
+        document,
+        request,
+        LIMITS.max_record_bytes,
+      ),
+      "UNAVAILABLE",
+    );
+  }
+});
+
+test("positive checks receive a bounded full-record response budget", async () => {
+  const limits = Object.freeze({
+    ...LIMITS,
+    max_record_bytes: 100_000,
+    max_transaction_bytes: 1_024,
+  });
+  const discovery = defineStorageProtocolDiscovery({
+    entryHref: ENTRY_HREF,
+    readRecordHref: READ_HREF,
+    listRecordsHref: LIST_HREF,
+    transactRecordsHref: TRANSACT_HREF,
+    limits,
+  });
+  const checkedKey = key("large-check-result");
+  const request = transaction("operation:large-check-result", [
+    check(checkedKey, 9),
+  ]);
+  const checked = record(checkedKey, 9, { payload: "x".repeat(90_000) });
+  const accepted = responseHarness([
+    protocolResponse(200, discovery),
+    protocolResponse(200, transactionDocument(request, [checked], false)),
+  ]);
+  const result = await accepted.adapter.transact(request);
+  assert.equal(result.records[0]?.value.payload, checked.value.payload);
+
+  const oversized = record(checkedKey, 9, {
+    payload: "x".repeat(limits.max_record_bytes + 1),
+  });
+  const rejected = responseHarness([
+    protocolResponse(200, discovery),
+    protocolResponse(200, transactionDocument(request, [oversized], false)),
+  ]);
+  await assert.rejects(
+    () => rejected.adapter.transact(request),
+    unavailableStorageFailure,
+  );
 });
 
 test("the adapter maps only backend transport while preserving logical hypermedia identity", async () => {
@@ -895,6 +1060,32 @@ test("request boundaries fail before unsafe transport and honor discovered limit
     } as unknown as StorageTransactionRequest),
     invalidStorageRequest,
   );
+  await assert.rejects(
+    () => adapter.transact(transaction("operation:bad-check-revision", [
+      check(key("bad-check-revision"), 0),
+    ])),
+    invalidStorageRequest,
+  );
+  await assert.rejects(
+    () => adapter.transact({
+      operationId: operationId("operation:decorated-check"),
+      mutations: [{
+        type: "check",
+        key: key("decorated-check"),
+        expectedRevision: null,
+        value: { forbidden: true },
+      }],
+    } as unknown as StorageTransactionRequest),
+    invalidStorageRequest,
+  );
+  const duplicateCheckKey = key("duplicate-check-key");
+  await assert.rejects(
+    () => adapter.transact(transaction("operation:duplicate-check-key", [
+      check(duplicateCheckKey, null),
+      put(duplicateCheckKey, null, { forbidden: true }),
+    ])),
+    invalidStorageRequest,
+  );
   const overriddenMutations = [
     put(key("must-remain-put"), null, { value: 1 }),
   ];
@@ -1233,7 +1424,15 @@ class DeterministicStorageProtocolService {
 
     for (const mutation of parsed.mutations) {
       const current = this.#records.get(storageKeyString(mutation.key));
-      if (mutation.expectedRevision === null) {
+      if (mutation.type === "check") {
+        if (
+          mutation.expectedRevision === null
+            ? current !== undefined
+            : current?.revision !== mutation.expectedRevision
+        ) {
+          return this.failure("precondition_failed");
+        }
+      } else if (mutation.expectedRevision === null) {
         if (current !== undefined) return this.failure("conflict");
       } else if (
         current === undefined ||
@@ -1254,6 +1453,10 @@ class DeterministicStorageProtocolService {
     for (const mutation of parsed.mutations) {
       const mapKey = storageKeyString(mutation.key);
       const current = nextRecords.get(mapKey);
+      if (mutation.type === "check") {
+        changed.push(cloneRecord(current ?? null));
+        continue;
+      }
       if (mutation.type === "delete") {
         nextRecords.delete(mapKey);
         changed.push(null);
@@ -1437,20 +1640,27 @@ function parseTransactionBody(
         key: parsedKey.value,
         expectedRevision: candidate.expected_revision,
       });
+    } else if (
+      candidate.type === "check" &&
+      validExpectedRevision(candidate.expected_revision, true)
+    ) {
+      mutations.push({
+        type: "check",
+        key: parsedKey.value,
+        expectedRevision: candidate.expected_revision,
+      });
     } else {
       return invalidTransactionResponse();
     }
   }
-  const request: StorageTransactionRequest = {
-    operationId: operation.value,
-    mutations,
-  };
   try {
-    assertStorageTransactionBoundary(request);
+    return normalizeStorageTransactionRequest({
+      operationId: operation.value,
+      mutations,
+    });
   } catch {
     return invalidTransactionResponse();
   }
-  return request;
 }
 
 function invalidTransactionResponse(): Response {
@@ -1548,6 +1758,13 @@ function put(
   value: StorageDocument,
 ): StorageTransactionRequest["mutations"][number] {
   return { type: "put", key: recordKey, expectedRevision, value };
+}
+
+function check(
+  recordKey: StorageKey,
+  expectedRevision: number | null,
+): StorageTransactionRequest["mutations"][number] {
+  return { type: "check", key: recordKey, expectedRevision };
 }
 
 function transaction(

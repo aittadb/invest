@@ -1564,10 +1564,41 @@ function verifyMutationResult(
       if (actual !== null) unavailable();
       continue;
     }
+    if (mutation.type === "check") {
+      if (mutation.expectedRevision === null) {
+        if (actual !== null) unavailable();
+      } else if (
+        !sameCheckedRecord(actual, mutation.key, mutation.expectedRevision)
+      ) {
+        unavailable();
+      }
+      continue;
+    }
     const expectedRevision = (mutation.expectedRevision ?? 0) + 1;
     if (!sameStoredRecord(actual, mutation.key, expectedRevision, mutation.value)) {
       unavailable();
     }
+  }
+}
+
+function sameCheckedRecord(
+  value: unknown,
+  expectedKey: StorageKey,
+  expectedRevision: number,
+): boolean {
+  try {
+    const record = exactRecord(value, STORAGE_RECORD_KEYS);
+    const key = exactRecord(record.key, STORAGE_KEY_KEYS);
+    if (
+      key.collection !== expectedKey.collection ||
+      key.id !== expectedKey.id ||
+      record.revision !== expectedRevision ||
+      objectRecord(record.value) === null
+    ) return false;
+    canonicalJson(record.value);
+    return true;
+  } catch {
+    return false;
   }
 }
 

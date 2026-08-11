@@ -46,7 +46,7 @@ closed.
 Reads validate the complete storage key before discovery. Lists validate the
 collection and finite page size before discovery, then validate any opaque
 cursor against the server-advertised ceiling. Transactions validate the exact
-request and mutation shapes, operation ID, `put` or `delete` discriminator,
+request and mutation shapes, operation ID, `put`, `check`, or `delete` discriminator,
 complete key grammar, unique keys, revisions, finite JSON values, and the
 compile-time one-megabyte safety ceiling before transport. Untrusted
 transaction objects are read once into an immutable data-only snapshot;
@@ -80,11 +80,12 @@ Finite budgets are derived from the operation and advertised limits:
 | Discovery success | 65,536 bytes |
 | Error document | 16,384 bytes |
 | Record success | advertised record bytes plus 65,536 envelope bytes |
-| Transaction success | advertised transaction bytes plus 65,536 envelope bytes |
+| Transaction success | number of puts and positive checks times advertised record bytes, plus 65,536 envelope bytes |
 | Page success | requested page size times advertised record bytes plus a bounded envelope |
 
 The protocol decoder then validates the exact resource type, key, revision,
-ordered transaction results, page collection and deterministic code-unit
+ordered transaction results, including unchanged positive-check records and
+absence-check nulls, page collection and deterministic code-unit
 ordering, opaque continuation, exact logical list target, same-origin links,
 declared limits, and fixed error document. A valid
 `404 not_found` read becomes `null`; malformed, dynamic, mismatched, oversized,
@@ -106,12 +107,14 @@ at the storage protocol boundary.
 `tests/aittadb-storage-protocol.test.ts` now runs the unchanged shared
 `StorageAdapter` contract against this production adapter and a deterministic
 protocol service. The same suite proves authorization equivalence, duplicate
-protection, compare-and-set behavior, atomic rollback, pagination, idempotency,
+protection, compare-and-set and non-mutating check behavior, atomic rollback,
+ordered unchanged evidence, pagination, idempotency,
 quota rollback, and non-disclosure. Adapter-specific tests cover logical and
 transport origins, exact headers, redirects, media types, declared and streamed
 sizes, fragmented and stalled streams, UTF-8 and JSON failures, discovery retry
 and concurrent-failure coalescing, exact page identity, strict mutation and
-per-record request ceilings, immutable request snapshots, early-rejection body
+per-record and mutation request ceilings, immutable request snapshots,
+unsupported check discovery, malformed check results, early-rejection body
 cancellation, deterministic ordering, and token, response, and transport-error
 redaction.
 

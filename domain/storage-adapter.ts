@@ -48,7 +48,17 @@ export type StorageDeleteMutation = Readonly<{
   expectedRevision: number;
 }>;
 
-export type StorageMutation = StoragePutMutation | StorageDeleteMutation;
+export type StorageCheckMutation = Readonly<{
+  type: "check";
+  key: StorageKey;
+  /** `null` requires absence; a positive revision requires an exact match. */
+  expectedRevision: number | null;
+}>;
+
+export type StorageMutation =
+  | StoragePutMutation
+  | StorageDeleteMutation
+  | StorageCheckMutation;
 
 /**
  * A transaction is atomic and replay-safe. Reusing an operation ID with the
@@ -62,6 +72,7 @@ export type StorageTransactionRequest = Readonly<{
 
 export type StorageTransactionResult = Readonly<{
   replayed: boolean;
+  /** Ordered per mutation: new put record, delete null, or unchanged check evidence. */
   records: readonly (StorageRecord | null)[];
 }>;
 
@@ -216,7 +227,8 @@ export function normalizeStorageTransactionRequest(
       ) invalidStorageRequest();
       const put = typeDescriptor.value === "put";
       const remove = typeDescriptor.value === "delete";
-      if (!put && !remove) invalidStorageRequest();
+      const check = typeDescriptor.value === "check";
+      if (!put && !remove && !check) invalidStorageRequest();
       const mutation = exactStorageDataRecord(
         candidate,
         put
@@ -251,11 +263,17 @@ export function normalizeStorageTransactionRequest(
           expectedRevision: expectedRevision as number | null,
           value: snapshotStorageDocument(mutation.value),
         }));
-      } else {
+      } else if (remove) {
         mutations.push(Object.freeze({
           type: "delete",
           key,
           expectedRevision: expectedRevision as number,
+        }));
+      } else {
+        mutations.push(Object.freeze({
+          type: "check",
+          key,
+          expectedRevision: expectedRevision as number | null,
         }));
       }
     }

@@ -3706,25 +3706,53 @@ class SyntheticAittaDBService {
       });
     }
 
-    const prepared: SyntheticPreparedPut[] = [];
+    const staged = new Map(this.records);
+    const changed: (SyntheticRecord | null)[] = [];
+    const keys = new Set<string>();
     for (const candidate of mutations) {
       const mutation = requiredObject(candidate);
       const key = requiredObject(mutation.key);
       const collection = requiredString(key.collection);
       const id = requiredString(key.id);
       const storageKey = `${collection}/${id}`;
-      const current = this.records.get(storageKey);
+      if (keys.has(storageKey)) return protocolFailure("invalid_request");
+      keys.add(storageKey);
+      const current = staged.get(storageKey);
       const expectedRevision = mutation.expected_revision;
-      if (expectedRevision === null) {
-        if (current !== undefined) return protocolFailure("conflict");
-      } else if (
-        typeof expectedRevision !== "number" ||
-        current === undefined ||
-        current.revision !== expectedRevision
+      if (mutation.type === "check") {
+        if (
+          expectedRevision === null
+            ? current !== undefined
+            : !positiveSyntheticRevision(expectedRevision) ||
+              current?.revision !== expectedRevision
+        ) {
+          return protocolFailure("precondition_failed");
+        }
+        changed.push(current === undefined ? null : cloneSyntheticRecord(current));
+        continue;
+      }
+      if (mutation.type === "delete") {
+        if (
+          !positiveSyntheticRevision(expectedRevision) ||
+          current?.revision !== expectedRevision
+        ) {
+          return protocolFailure("precondition_failed");
+        }
+        staged.delete(storageKey);
+        changed.push(null);
+        continue;
+      }
+      if (mutation.type !== "put") return protocolFailure("invalid_request");
+      if (expectedRevision === null && current !== undefined) {
+        return protocolFailure("conflict");
+      }
+      if (
+        expectedRevision !== null &&
+        (!positiveSyntheticRevision(expectedRevision) ||
+          current?.revision !== expectedRevision)
       ) {
         return protocolFailure("precondition_failed");
       }
-      assert.equal(mutation.type, "put");
       const recordBytes = new TextEncoder().encode(
         JSON.stringify(requiredObject(mutation.value)),
       ).byteLength;
@@ -3735,31 +3763,25 @@ class SyntheticAittaDBService {
       if (recordBytes > MAX_HOSTED_RECORD_BYTES) {
         return protocolFailure("invalid_request");
       }
-      prepared.push(Object.freeze({
-        storageKey,
-        collection,
-        id,
+      const next = Object.freeze({
+        key: Object.freeze({ collection, id }),
         revision: (current?.revision ?? 0) + 1,
         value: structuredClone(requiredObject(mutation.value)),
-      }));
+      });
+      staged.set(storageKey, next);
+      changed.push(next);
     }
 
-    const changed = prepared.map((candidate) => Object.freeze({
-      key: Object.freeze({
-        collection: candidate.collection,
-        id: candidate.id,
-      }),
-      revision: candidate.revision,
-      value: candidate.value,
-    }));
-    for (const [index, candidate] of prepared.entries()) {
-      this.records.set(candidate.storageKey, changed[index]!);
-    }
+    this.records.clear();
+    for (const [storageKey, record] of staged) this.records.set(storageKey, record);
+    const result = Object.freeze(changed.map((record) =>
+      record === null ? null : cloneSyntheticRecord(record)
+    ));
     this.operations.set(operationId, Object.freeze({
       fingerprint,
-      records: Object.freeze([...changed]),
+      records: result,
     }));
-    return protocolResponse(transactionDocument(operationId, changed, false));
+    return protocolResponse(transactionDocument(operationId, result, false));
   }
 }
 
@@ -3769,13 +3791,17 @@ type SyntheticRecord = Readonly<{
   value: Record<string, unknown>;
 }>;
 
-type SyntheticPreparedPut = Readonly<{
-  storageKey: string;
-  collection: string;
-  id: string;
-  revision: number;
-  value: Record<string, unknown>;
-}>;
+function positiveSyntheticRevision(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 1;
+}
+
+function cloneSyntheticRecord(record: SyntheticRecord): SyntheticRecord {
+  return Object.freeze({
+    key: Object.freeze({ ...record.key }),
+    revision: record.revision,
+    value: structuredClone(record.value),
+  });
+}
 
 function recordDocument(record: SyntheticRecord) {
   return {

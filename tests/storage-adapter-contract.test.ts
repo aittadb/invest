@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   StorageFailure,
   assertStorageListBoundary,
-  assertStorageTransactionBoundary,
+  normalizeStorageTransactionRequest,
   storageKeyString,
   type StorageAdapter,
   type StorageCursor,
@@ -21,7 +21,13 @@ import {
   type StorageAdapterContractFixture,
 } from "./support/storage-adapter-contract.ts";
 
-type Fault = "authorization" | "duplicate" | "drift" | "disclosure" | null;
+type Fault =
+  | "authorization"
+  | "duplicate"
+  | "drift"
+  | "check"
+  | "disclosure"
+  | null;
 
 test("the shared storage contract accepts a conforming minimal fake", async () => {
   await verifyStorageAdapterContract(() => createFixture(null));
@@ -31,6 +37,7 @@ for (const [fault, invariant] of [
   ["authorization", "authorization.foreign-read"],
   ["duplicate", "duplicate.create"],
   ["drift", "compare-and-set.stale-write"],
+  ["check", "check.stale-positive"],
   ["disclosure", "authorization.read-shape"],
 ] as const) {
   test(`the shared harness detects ${fault} contract failures`, async () => {
@@ -109,20 +116,29 @@ class MinimalFakeStorageAdapter implements StorageAdapter {
   async transact(
     request: StorageTransactionRequest,
   ): Promise<StorageTransactionResult> {
-    assertStorageTransactionBoundary(request);
+    const snapshot = normalizeStorageTransactionRequest(request);
     if (!this.permitted) throw new StorageFailure("NOT_FOUND");
 
-    const operationKey = request.operationId as string;
-    const fingerprint = JSON.stringify(request);
+    const operationKey = snapshot.operationId as string;
+    const fingerprint = JSON.stringify(snapshot);
     const prior = this.state.operations.get(operationKey);
     if (prior) {
       if (prior.fingerprint !== fingerprint) throw new StorageFailure("CONFLICT");
       return cloneResult(prior.result, true);
     }
 
-    for (const mutation of request.mutations) {
+    for (const mutation of snapshot.mutations) {
       const current = this.state.records.get(storageKeyString(mutation.key));
-      if (mutation.expectedRevision === null) {
+      if (mutation.type === "check") {
+        if (
+          (mutation.expectedRevision === null
+            ? current !== undefined
+            : current?.revision !== mutation.expectedRevision) &&
+          this.state.fault !== "check"
+        ) {
+          throw new StorageFailure("PRECONDITION_FAILED");
+        }
+      } else if (mutation.expectedRevision === null) {
         if (current && this.state.fault !== "duplicate") {
           throw new StorageFailure("CONFLICT");
         }
@@ -136,9 +152,13 @@ class MinimalFakeStorageAdapter implements StorageAdapter {
 
     const nextRecords = new Map(this.state.records);
     const results: (StorageRecord | null)[] = [];
-    for (const mutation of request.mutations) {
+    for (const mutation of snapshot.mutations) {
       const key = storageKeyString(mutation.key);
       const current = nextRecords.get(key);
+      if (mutation.type === "check") {
+        results.push(cloneRecord(current ?? null));
+        continue;
+      }
       if (mutation.type === "delete") {
         nextRecords.delete(key);
         results.push(null);

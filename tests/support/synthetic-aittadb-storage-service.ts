@@ -245,11 +245,14 @@ export class SyntheticAittaDBStorageService {
 
     const staged = new Map(this.#records);
     const records: (StorageProtocolWireRecord | null)[] = [];
+    const keys = new Set<string>();
     for (const mutation of mutations) {
       const mutationKey = requiredObject(mutation.key);
       const collection = requiredString(mutationKey.collection);
       const id = requiredString(mutationKey.id);
       const storageKey = key(collection, id);
+      if (keys.has(storageKey)) return errorResponse("invalid_request");
+      keys.add(storageKey);
       const current = staged.get(storageKey);
       const expected = mutation.expected_revision;
       if (mutation.type === "put") {
@@ -262,12 +265,13 @@ export class SyntheticAittaDBStorageService {
         if (recordBytes > this.#limits.max_record_bytes) {
           return errorResponse("quota_exceeded");
         }
-        if (
-          expected === null ? current !== undefined :
-            !Number.isSafeInteger(expected) || current?.revision !== expected
-        ) {
-          return errorResponse("precondition_failed");
+        if (expected === null && current !== undefined) {
+          return errorResponse("conflict");
         }
+        if (
+          expected !== null &&
+          (!positiveRevision(expected) || current?.revision !== expected)
+        ) return errorResponse("precondition_failed");
         const next = Object.freeze({
           revision: expected === null ? 1 : Number(expected) + 1,
           value: structuredClone(mutationValue) as StorageDocument,
@@ -275,11 +279,22 @@ export class SyntheticAittaDBStorageService {
         staged.set(storageKey, next);
         records.push(wireRecord(collection, id, next));
       } else if (mutation.type === "delete") {
-        if (!Number.isSafeInteger(expected) || current?.revision !== expected) {
+        if (!positiveRevision(expected) || current?.revision !== expected) {
           return errorResponse("precondition_failed");
         }
         staged.delete(storageKey);
         records.push(null);
+      } else if (mutation.type === "check") {
+        if (
+          expected === null
+            ? current !== undefined
+            : !positiveRevision(expected) || current?.revision !== expected
+        ) {
+          return errorResponse("precondition_failed");
+        }
+        records.push(
+          current === undefined ? null : wireRecord(collection, id, current),
+        );
       } else {
         return errorResponse("invalid_request");
       }
@@ -315,6 +330,10 @@ export class SyntheticAittaDBStorageService {
     }
     return url;
   }
+}
+
+function positiveRevision(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 1;
 }
 
 function wireRecord(

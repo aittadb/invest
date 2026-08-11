@@ -1727,7 +1727,13 @@ class DeterministicMemoryStorageAdapter implements StorageAdapter {
 
     for (const mutation of request.mutations) {
       const current = this.#state.records.get(storageKeyString(mutation.key));
-      if (mutation.expectedRevision === null) {
+      if (mutation.type === "check") {
+        if (
+          mutation.expectedRevision === null
+            ? current !== undefined
+            : current?.revision !== mutation.expectedRevision
+        ) throw new StorageFailure("PRECONDITION_FAILED");
+      } else if (mutation.expectedRevision === null) {
         if (current) throw new StorageFailure("CONFLICT");
       } else if (!current || current.revision !== mutation.expectedRevision) {
         throw new StorageFailure("PRECONDITION_FAILED");
@@ -1739,6 +1745,10 @@ class DeterministicMemoryStorageAdapter implements StorageAdapter {
     for (const mutation of request.mutations) {
       const key = storageKeyString(mutation.key);
       const current = nextRecords.get(key);
+      if (mutation.type === "check") {
+        resultRecords.push(cloneRecord(current ?? null));
+        continue;
+      }
       if (mutation.type === "delete") {
         nextRecords.delete(key);
         resultRecords.push(null);

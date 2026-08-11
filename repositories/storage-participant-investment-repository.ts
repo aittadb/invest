@@ -679,7 +679,15 @@ class StagedStorageTransaction implements StorageAdapter {
       const identity = storageKeyString(mutation.key);
       if (this.#keys.has(identity) || overlay.has(identity)) invalid();
       const current = await this.read(mutation.key);
-      if (mutation.type === "put") {
+      if (mutation.type === "check") {
+        if (
+          mutation.expectedRevision === null
+            ? current !== null
+            : current === null ||
+              current.revision !== mutation.expectedRevision
+        ) precondition();
+        records.push(current);
+      } else if (mutation.type === "put") {
         if (mutation.expectedRevision === null) {
           if (current !== null) conflict();
         } else if (
@@ -710,6 +718,7 @@ class StagedStorageTransaction implements StorageAdapter {
     }
     for (const mutation of mutations) {
       this.#collections.add(mutation.key.collection);
+      this.#keys.add(storageKeyString(mutation.key));
       this.#mutations.push(mutation);
     }
     this.#records.push(...records);

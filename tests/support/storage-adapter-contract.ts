@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   MAX_STORAGE_PAGE_SIZE,
+  MAX_STORAGE_TRANSACTION_MUTATIONS,
   StorageFailure,
   parseStorageKey,
   parseStorageOperationId,
@@ -36,9 +37,99 @@ export async function verifyStorageAdapterContract(
   await verifyIdempotency(createFixture());
   await verifyDuplicateProtection(createFixture());
   await verifyCompareAndSet(createFixture());
+  await verifyChecks(createFixture());
   await verifyAtomicity(createFixture());
+  await verifyTransactionBoundaries(createFixture());
   await verifyAuthorizationAndDisclosure(createFixture());
   await verifyPagination(createFixture());
+}
+
+async function verifyChecks(fixture: StorageAdapterContractFixture) {
+  const existing = privateKey("check-existing");
+  const missing = privateKey("check-missing");
+  const written = privateKey("check-written");
+  const rollback = privateKey("check-rollback");
+  await fixture.owner.transact(
+    createRequest("operation:check-seed", existing, { value: "before" }),
+  );
+  const before = await fixture.owner.read(existing);
+  requireInvariant(before !== null, "check.seed");
+
+  const request: StorageTransactionRequest = {
+    operationId: operationId("operation:check-ordered"),
+    mutations: [
+      check(existing, 1),
+      check(missing, null),
+      { type: "put", key: written, expectedRevision: null, value: { value: "new" } },
+    ],
+  };
+  const first = await fixture.owner.transact(request);
+  requireInvariant(first.replayed === false, "check.first-application");
+  requireInvariant(first.records.length === 3, "check.result-count");
+  requireInvariant(
+    JSON.stringify(first.records[0]) === JSON.stringify(before),
+    "check.unchanged-record-evidence",
+  );
+  requireInvariant(first.records[1] === null, "check.absence-evidence");
+  requireInvariant(first.records[2]?.revision === 1, "check.ordered-write");
+  requireInvariant(
+    JSON.stringify(await fixture.owner.read(existing)) === JSON.stringify(before),
+    "check.non-mutating",
+  );
+
+  await fixture.owner.transact(
+    replaceRequest("operation:check-advance", existing, 1, { value: "after" }),
+  );
+  const replay = await fixture.owner.transact(request);
+  requireInvariant(replay.replayed === true, "check.replay-marker");
+  requireInvariant(
+    JSON.stringify(replay.records) === JSON.stringify(first.records),
+    "check.replay-original-evidence",
+  );
+
+  await expectFailure(
+    () => fixture.owner.transact({
+      operationId: operationId("operation:check-stale"),
+      mutations: [
+        { type: "put", key: rollback, expectedRevision: null, value: { value: "bad" } },
+        check(existing, 1),
+      ],
+    }),
+    "PRECONDITION_FAILED",
+    "check.stale-positive",
+  );
+  requireInvariant(
+    await fixture.owner.read(rollback) === null,
+    "check.stale-rollback",
+  );
+
+  const missingRequest: StorageTransactionRequest = {
+    operationId: operationId("operation:check-missing"),
+    mutations: [
+      check(missing, 1),
+      { type: "put", key: rollback, expectedRevision: null, value: { value: "repaired" } },
+    ],
+  };
+  await expectFailure(
+    () => fixture.owner.transact(missingRequest),
+    "PRECONDITION_FAILED",
+    "check.missing-positive",
+  );
+  await fixture.owner.transact(
+    createRequest("operation:check-create-missing", missing, { value: "present" }),
+  );
+  const repaired = await fixture.owner.transact(missingRequest);
+  requireInvariant(repaired.replayed === false, "check.failed-operation-no-receipt");
+  requireInvariant(repaired.records[0]?.revision === 1, "check.repaired-evidence");
+
+  await expectFailure(
+    () => fixture.owner.transact({
+      operationId: operationId("operation:check-present"),
+      mutations: [check(existing, null)],
+    }),
+    "PRECONDITION_FAILED",
+    "check.failed-absence",
+  );
 }
 
 async function verifyIdempotency(fixture: StorageAdapterContractFixture) {
@@ -117,6 +208,48 @@ async function verifyAtomicity(fixture: StorageAdapterContractFixture) {
   );
 }
 
+async function verifyTransactionBoundaries(
+  fixture: StorageAdapterContractFixture,
+) {
+  const duplicate = privateKey("check-duplicate-key");
+  await expectFailure(
+    () => fixture.owner.transact({
+      operationId: operationId("operation:check-duplicate-key"),
+      mutations: [
+        check(duplicate, null),
+        { type: "put", key: duplicate, expectedRevision: null, value: { value: 1 } },
+      ],
+    }),
+    "INVALID_REQUEST",
+    "check.duplicate-key",
+  );
+
+  const maximum = Array.from(
+    { length: MAX_STORAGE_TRANSACTION_MUTATIONS },
+    (_, index) => check(privateKey(`check-bound-${index}`), null),
+  );
+  const result = await fixture.owner.transact({
+    operationId: operationId("operation:check-maximum"),
+    mutations: maximum,
+  });
+  requireInvariant(
+    result.records.length === MAX_STORAGE_TRANSACTION_MUTATIONS &&
+      result.records.every((record) => record === null),
+    "check.maximum-bound",
+  );
+  await expectFailure(
+    () => fixture.owner.transact({
+      operationId: operationId("operation:check-over-maximum"),
+      mutations: [
+        ...maximum,
+        check(privateKey("check-bound-overflow"), null),
+      ],
+    }),
+    "INVALID_REQUEST",
+    "check.over-maximum",
+  );
+}
+
 async function verifyAuthorizationAndDisclosure(
   fixture: StorageAdapterContractFixture,
 ) {
@@ -154,6 +287,27 @@ async function verifyAuthorizationAndDisclosure(
   );
   requireInvariant(denied.code === "NOT_FOUND", "authorization.failure-code");
   requireInvariant(absent.code === "NOT_FOUND", "authorization.missing-code");
+
+  const deniedCheck = await captureStorageFailure(
+    () => fixture.outsider.transact(checkRequest(
+      "operation:foreign-check-existing",
+      existing,
+      1,
+    )),
+    "authorization.foreign-check",
+  );
+  const absentCheck = await captureStorageFailure(
+    () => fixture.outsider.transact(checkRequest(
+      "operation:foreign-check-missing",
+      missing,
+      1,
+    )),
+    "authorization.missing-check",
+  );
+  requireInvariant(
+    deniedCheck.code === "NOT_FOUND" && absentCheck.code === "NOT_FOUND",
+    "authorization.check-equivalence",
+  );
 
   const deniedPublic = JSON.stringify(toPublicStorageFailure(denied));
   const absentPublic = JSON.stringify(toPublicStorageFailure(absent));
@@ -242,6 +396,24 @@ function replaceRequest(
     operationId: operationId(operation),
     mutations: [{ type: "put", key, expectedRevision, value }],
   };
+}
+
+function checkRequest(
+  operation: string,
+  key: StorageKey,
+  expectedRevision: number | null,
+): StorageTransactionRequest {
+  return {
+    operationId: operationId(operation),
+    mutations: [check(key, expectedRevision)],
+  };
+}
+
+function check(
+  key: StorageKey,
+  expectedRevision: number | null,
+): StorageTransactionRequest["mutations"][number] {
+  return { type: "check", key, expectedRevision };
 }
 
 function privateKey(id: string): StorageKey {

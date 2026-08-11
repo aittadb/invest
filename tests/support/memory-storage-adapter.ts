@@ -1,7 +1,7 @@
 import {
   StorageFailure,
   assertStorageListBoundary,
-  assertStorageTransactionBoundary,
+  normalizeStorageTransactionRequest,
   storageKeyString,
   type StorageAdapter,
   type StorageCursor,
@@ -56,9 +56,9 @@ export class MemoryStorageAdapter implements StorageAdapter {
   async transact(
     request: StorageTransactionRequest,
   ): Promise<StorageTransactionResult> {
-    assertStorageTransactionBoundary(request);
-    const operationKey = request.operationId as string;
-    const fingerprint = JSON.stringify(request);
+    const snapshot = normalizeStorageTransactionRequest(request);
+    const operationKey = snapshot.operationId as string;
+    const fingerprint = JSON.stringify(snapshot);
     const prior = this.#state.operations.get(operationKey);
     if (prior) {
       if (prior.fingerprint !== fingerprint) {
@@ -67,9 +67,17 @@ export class MemoryStorageAdapter implements StorageAdapter {
       return cloneResult(prior.result, true);
     }
 
-    for (const mutation of request.mutations) {
+    for (const mutation of snapshot.mutations) {
       const current = this.#state.records.get(storageKeyString(mutation.key));
-      if (mutation.expectedRevision === null) {
+      if (mutation.type === "check") {
+        if (
+          mutation.expectedRevision === null
+            ? current !== undefined
+            : current?.revision !== mutation.expectedRevision
+        ) {
+          throw new StorageFailure("PRECONDITION_FAILED");
+        }
+      } else if (mutation.expectedRevision === null) {
         if (current) throw new StorageFailure("CONFLICT");
       } else if (!current || current.revision !== mutation.expectedRevision) {
         throw new StorageFailure("PRECONDITION_FAILED");
@@ -78,9 +86,13 @@ export class MemoryStorageAdapter implements StorageAdapter {
 
     const nextRecords = new Map(this.#state.records);
     const changed: (StorageRecord | null)[] = [];
-    for (const mutation of request.mutations) {
+    for (const mutation of snapshot.mutations) {
       const key = storageKeyString(mutation.key);
       const current = nextRecords.get(key);
+      if (mutation.type === "check") {
+        changed.push(cloneRecord(current ?? null));
+        continue;
+      }
       if (mutation.type === "delete") {
         nextRecords.delete(key);
         changed.push(null);

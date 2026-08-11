@@ -19,7 +19,7 @@ import {
 export const AITTADB_HYPERMEDIA_API_VERSION = "0.1";
 export const AITTADB_HYPERMEDIA_MEDIA_TYPE =
   "application/vnd.aittadb+json; version=0.1";
-export const BOUNDED_STORAGE_PROTOCOL_VERSION = "1.0";
+export const BOUNDED_STORAGE_PROTOCOL_VERSION = "1.1";
 
 export const MAX_STORAGE_PROTOCOL_RECORD_BYTES = 262_144;
 export const MAX_STORAGE_PROTOCOL_TRANSACTION_BYTES = 1_048_576;
@@ -29,6 +29,7 @@ export const REQUIRED_STORAGE_PROTOCOL_CAPABILITIES = Object.freeze([
   "bounded-record-read",
   "opaque-cursor-page",
   "atomic-multi-record-compare-and-set",
+  "atomic-read-revision-check",
   "idempotent-operation-id",
   "atomic-rollback",
   "quota-preflight",
@@ -106,6 +107,7 @@ export type StorageProtocolDiscoveryData = Readonly<{
       order: "preserved";
       put: "null-creates-positive-revision-replaces";
       delete: "positive-revision-required";
+      check: "null-requires-absence-positive-revision-preserves-record";
     }>;
     results: "ordered-record-or-null-per-mutation";
   }>;
@@ -142,6 +144,11 @@ export type StorageProtocolWireMutation =
       type: "delete";
       key: StorageProtocolWireKey;
       expected_revision: number;
+    }>
+  | Readonly<{
+      type: "check";
+      key: StorageProtocolWireKey;
+      expected_revision: number | null;
     }>;
 
 export type StorageProtocolTransactionCommand = Readonly<{
@@ -276,6 +283,7 @@ export function defineStorageProtocolDiscovery(
           order: "preserved",
           put: "null-creates-positive-revision-replaces",
           delete: "positive-revision-required",
+          check: "null-requires-absence-positive-revision-preserves-record",
         },
         results: "ordered-record-or-null-per-mutation",
       },
@@ -335,7 +343,7 @@ export function defineStorageProtocolDiscovery(
         accept: AITTADB_HYPERMEDIA_MEDIA_TYPE,
         authorization: {
           scheme: "bearer",
-          scopes: ["storage.write", "storage.delete"],
+          scopes: ["storage.read", "storage.write", "storage.delete"],
         },
         fields: [
           {
@@ -346,7 +354,7 @@ export function defineStorageProtocolDiscovery(
             required: true,
             max_bytes: limits.max_transaction_bytes,
             description:
-              "One operation_id and an ordered mutations array of compare-and-set put or delete entries.",
+              "One operation_id and an ordered mutations array of compare-and-set put, delete, or non-mutating check entries.",
           },
         ],
       },
@@ -422,20 +430,28 @@ export function toStorageProtocolTransactionCommand(
   const command: StorageProtocolTransactionCommand = {
     transaction: {
       operation_id: snapshot.operationId,
-      mutations: snapshot.mutations.map((mutation) =>
-        mutation.type === "put"
-          ? {
-              type: "put",
-              key: { ...mutation.key },
-              expected_revision: mutation.expectedRevision,
-              value: cloneStorageDocument(mutation.value),
-            }
-          : {
-              type: "delete",
-              key: { ...mutation.key },
-              expected_revision: mutation.expectedRevision,
-            }
-      ),
+      mutations: snapshot.mutations.map((mutation) => {
+        if (mutation.type === "put") {
+          return {
+            type: "put" as const,
+            key: { ...mutation.key },
+            expected_revision: mutation.expectedRevision,
+            value: cloneStorageDocument(mutation.value),
+          };
+        }
+        if (mutation.type === "delete") {
+          return {
+            type: "delete" as const,
+            key: { ...mutation.key },
+            expected_revision: mutation.expectedRevision,
+          };
+        }
+        return {
+          type: "check" as const,
+          key: { ...mutation.key },
+          expected_revision: mutation.expectedRevision,
+        };
+      }),
     },
   };
   return deepFreeze(command);
@@ -545,7 +561,11 @@ export function parseStorageProtocolTransaction(
 ): StorageTransactionResult {
   const snapshot = normalizeStorageTransactionRequest(request);
   const object = protocolDocument(value, "bounded-storage-transaction");
-  const data = requiredObject(object.data);
+  const data = exactProtocolObject(object.data, [
+    "operation_id",
+    "replayed",
+    "records",
+  ]);
   if (
     object.id !== snapshot.operationId ||
     data.operation_id !== snapshot.operationId ||
@@ -564,7 +584,24 @@ export function parseStorageProtocolTransaction(
       if (wireRecord !== null) invalidProtocol();
       return null;
     }
-    const record = parseWireRecord(wireRecord, mutation.key, maxRecordBytes);
+    if (mutation.type === "check") {
+      if (mutation.expectedRevision === null) {
+        if (wireRecord !== null) invalidProtocol();
+        return null;
+      }
+      const record = parseTransactionWireRecord(
+        wireRecord,
+        mutation.key,
+        maxRecordBytes,
+      );
+      if (record.revision !== mutation.expectedRevision) invalidProtocol();
+      return record;
+    }
+    const record = parseTransactionWireRecord(
+      wireRecord,
+      mutation.key,
+      maxRecordBytes,
+    );
     const expectedRevision = mutation.expectedRevision === null
       ? 1
       : mutation.expectedRevision + 1;
@@ -701,6 +738,16 @@ function parseWireRecord(
     revision: object.revision,
     value: document,
   });
+}
+
+function parseTransactionWireRecord(
+  value: unknown,
+  expectedKey: StorageKey,
+  maxRecordBytes: number,
+): StorageRecord {
+  const record = exactProtocolObject(value, ["key", "revision", "value"]);
+  exactProtocolObject(record.key, ["collection", "id"]);
+  return parseWireRecord(record, expectedKey, maxRecordBytes);
 }
 
 function parseStorageDocument(value: unknown): StorageDocument {
@@ -879,6 +926,27 @@ function matchesPageUrl(
 function requiredObject(value: unknown): Readonly<Record<string, unknown>> {
   if (!isPlainObject(value)) invalidProtocol();
   return value;
+}
+
+function exactProtocolObject(
+  value: unknown,
+  expectedKeys: readonly string[],
+): Readonly<Record<string, unknown>> {
+  const object = requiredObject(value);
+  const keys = Reflect.ownKeys(object);
+  if (
+    keys.length !== expectedKeys.length ||
+    keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))
+  ) invalidProtocol();
+  for (const key of expectedKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !("value" in descriptor)
+    ) invalidProtocol();
+  }
+  return object;
 }
 
 function requiredArray(value: unknown): readonly unknown[] {

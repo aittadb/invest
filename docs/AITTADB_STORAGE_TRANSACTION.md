@@ -17,7 +17,7 @@ The current versions are:
 
 - AittaDB hypermedia envelope: `0.1`
 - response media type: `application/vnd.aittadb+json; version=0.1`
-- bounded record storage protocol: `1.0`
+- bounded record storage protocol: `1.1`
 - transaction request media type: `application/json`
 
 An unsupported envelope or protocol version fails closed. A future breaking
@@ -32,7 +32,7 @@ advertises these required controls:
 | --- | --- | --- | --- |
 | `read-record` | `GET` | Read one bounded record by collection and stable ID | `storage.read` |
 | `list-records` | `GET` | Read one finite cursor page | `storage.read` |
-| `transact-records` | `POST` | Apply one atomic ordered transaction | `storage.write`, `storage.delete` |
+| `transact-records` | `POST` | Apply one atomic ordered transaction | `storage.read`, `storage.write`, `storage.delete` |
 
 `read-record` supplies a templated HTTPS target with `collection` and `id` path
 fields. `list-records` supplies an HTTPS target with `collection`, `limit`, and
@@ -47,6 +47,7 @@ The discovery `data` contains this exact capability set:
   "bounded-record-read",
   "opaque-cursor-page",
   "atomic-multi-record-compare-and-set",
+  "atomic-read-revision-check",
   "idempotent-operation-id",
   "atomic-rollback",
   "quota-preflight",
@@ -54,7 +55,7 @@ The discovery `data` contains this exact capability set:
 ]
 ```
 
-It also advertises finite limits. Protocol `1.0` requires page size `100` and
+It also advertises finite limits. Protocol `1.1` requires page size `100` and
 transaction size `25` so an implementation can satisfy the existing adapter
 boundary. The server additionally declares positive bounds for record bytes,
 transaction bytes, and cursor length. A client rejects declarations above its
@@ -67,6 +68,7 @@ The machine-readable `transaction_shape` declares:
 - 1 through 25 ordered mutations with unique keys;
 - `put` with `null` for create or a positive expected revision for replace;
 - `delete` with a positive expected revision;
+- non-mutating `check` with `null` for absence or a positive exact revision;
 - one ordered record-or-null result for every mutation.
 
 The canonical TypeScript definition and strict decoder are in
@@ -161,6 +163,11 @@ The transaction request wraps one operation ID and an ordered mutation array:
     "operation_id": "operation:profile-and-history",
     "mutations": [
       {
+        "type": "check",
+        "key": { "collection": "settings", "id": "policy" },
+        "expected_revision": 7
+      },
+      {
         "type": "put",
         "key": { "collection": "profiles", "id": "current" },
         "expected_revision": 4,
@@ -197,10 +204,22 @@ Compare-and-set rules are closed:
 - `put` with a positive revision succeeds only when the key exists at that exact
   revision;
 - `delete` succeeds only when the key exists at its exact positive revision;
+- `check` with `expected_revision: null` succeeds only when the key is absent
+  and returns `null` without creating or changing a record;
+- `check` with a positive revision succeeds only when the key exists at that
+  exact revision and returns that unchanged record;
 - the same key may occur only once in a transaction;
 - mutation order is preserved in the response;
-- a successful put returns the new record and a successful delete returns
-  `null` at the corresponding result index.
+- each successful put returns the new record, each delete returns `null`, and
+  each check returns its matching unchanged record or absence `null` at the
+  corresponding result index.
+
+A failed check returns `412 precondition_failed` and rolls back every adjacent
+write and the operation receipt. A successful check consumes one of the 25
+mutation slots but does not consume record quota. Because a positive check can
+return a full record even though its request entry contains no value, clients
+bound transaction responses by the number of puts and positive checks times
+the advertised record limit, plus a finite envelope allowance.
 
 A successful response has type `bounded-storage-transaction`:
 
@@ -213,6 +232,11 @@ A successful response has type `bounded-storage-transaction`:
     "operation_id": "operation:profile-and-history",
     "replayed": false,
     "records": [
+      {
+        "key": { "collection": "settings", "id": "policy" },
+        "revision": 7,
+        "value": { "state": "current" }
+      },
       {
         "key": { "collection": "profiles", "id": "current" },
         "revision": 5,
@@ -296,7 +320,7 @@ deployment must prove:
    limits, links, actions, scopes, and same-origin HTTPS targets.
 2. Reads and pages are bounded, deterministic, cursor-driven, and isolated to
    the authenticated credential namespace.
-3. Multi-record put/delete operations, revision checks, durable operation
+3. Multi-record put/check/delete operations, unchanged check evidence, durable operation
    receipts, and quota evaluation commit atomically under concurrency.
 4. Every failure class rolls back both records and receipts.
 5. Missing and denied operations are observationally equivalent and all errors
@@ -308,7 +332,7 @@ deployment must prove:
 `tests/aittadb-storage-protocol.test.ts` supplies the deterministic protocol
 service and runs the production `AittaDBStorageAdapter` against it. The adapter
 follows discovered targets and runs the complete existing `StorageAdapter`
-contract unchanged, then adds mixed put/delete, quota, pre-commit rollback,
+contract unchanged, then adds mixed put/check/delete, quota, pre-commit rollback,
 strict decoding, transport mapping, response bounds, retry, redaction, and raw
 authorization-equivalence proof. The service proves the protocol mapping; it is
 not production persistence.
