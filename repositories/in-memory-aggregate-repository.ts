@@ -611,6 +611,40 @@ export class DevelopmentInMemoryAggregateRepository
     });
   }
 
+  async previewReconciliationStateForOwner(
+    ownerSubject: ActorSubject,
+  ): Promise<InvestmentAggregateReconciliationState> {
+    const subject = requiredOwnerSubject(ownerSubject);
+    const state = await this.previewReconciliationState();
+    const terminalReplay = state.terminalReplay;
+    if (terminalReplay === null) return state;
+
+    const operationId = requiredOperationId(terminalReplay.operationId);
+    const fingerprint = await operationFingerprint({
+      kind: "audited-correction",
+      operationId,
+      expectedCampaignRevision: terminalReplay.expectedCampaignRevision,
+      confirmation: requiredJsonValue(terminalReplay.confirmation),
+      ownerSubject: subject,
+    });
+    try {
+      const replay = await this.#readAuditedCorrectionReplay(
+        operationId,
+        fingerprint,
+        subject,
+      );
+      if (replay === null || !sameSnapshot(replay.stored, state.preview.stored)) {
+        unavailable();
+      }
+      return state;
+    } catch (error) {
+      if (error instanceof StorageFailure && error.code === "CONFLICT") {
+        return deepFreeze({ preview: state.preview, terminalReplay: null });
+      }
+      throw error;
+    }
+  }
+
   async applyConfirmedCorrection(
     request: ApplyAggregateCorrectionRequest,
   ): Promise<ApplyAggregateCorrectionResult> {
@@ -1000,7 +1034,9 @@ export class OwnerBoundInvestmentAggregateCorrectionRepository
   }
 
   previewReconciliationState(): Promise<InvestmentAggregateReconciliationState> {
-    return this.#repository.previewReconciliationState();
+    return this.#repository.previewReconciliationStateForOwner(
+      this.#ownerSubject,
+    );
   }
 
   applyConfirmedCorrectionWithAudit(

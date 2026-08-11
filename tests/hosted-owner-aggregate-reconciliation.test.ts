@@ -318,6 +318,117 @@ test("hosted terminal exact retry recovers a lost correction response after rest
   assert.equal(reused.status, 403);
 });
 
+test("hosted terminal replay remains bound to the owner that committed it", async () => {
+  const service = storageService();
+  await seedMismatch(service);
+  const worker = hostedWorker(service);
+  const originalEnvironment = environment();
+  const initialResponse = await worker.fetch(
+    ownerRequest(PATH),
+    originalEnvironment,
+    executionContext,
+  );
+  const initialProof = mutationProof(initialResponse);
+  const initial = await initialResponse.json() as
+    OwnerAggregateReconciliationDocument;
+  const originalBody = actionBody(initial);
+  const corrected = await worker.fetch(
+    ownerMutation(originalBody, initialProof),
+    originalEnvironment,
+    executionContext,
+  );
+  assert.equal(corrected.status, 200);
+
+  const originalRetryResponse = await worker.fetch(
+    ownerRequest(PATH),
+    originalEnvironment,
+    executionContext,
+  );
+  const originalRetryProof = mutationProof(originalRetryResponse);
+  const originalRetry = await originalRetryResponse.json() as
+    OwnerAggregateReconciliationDocument;
+  assert.deepEqual(actionBody(
+    originalRetry,
+    OWNER_AGGREGATE_CORRECTION_REPLAY_ACTION,
+  ), originalBody);
+  const exact = await worker.fetch(
+    ownerMutation(originalBody, originalRetryProof),
+    originalEnvironment,
+    executionContext,
+  );
+  assert.equal(exact.status, 200);
+
+  const originalProofForReplacement = mutationProof(await worker.fetch(
+    ownerRequest(PATH),
+    originalEnvironment,
+    executionContext,
+  ));
+  const replacementSubject = "oidc:replacement-owner";
+  const replacementEmail = "replacement-owner@example.test";
+  const replacementEnvironment = environment(replacementEmail);
+  const replacementResponse = await worker.fetch(
+    ownerRequest(
+      PATH,
+      "application/json",
+      replacementSubject,
+      replacementEmail,
+    ),
+    replacementEnvironment,
+    executionContext,
+  );
+  const replacementBody = await replacementResponse.text();
+  const replacement = JSON.parse(replacementBody) as
+    OwnerAggregateReconciliationDocument;
+  assert.equal(replacementResponse.status, 200);
+  assert.equal(replacement.data.status, "match");
+  assert.deepEqual(replacement.actions, []);
+  assert.equal(replacementResponse.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.equal(replacementResponse.headers.get("set-cookie"), null);
+  assert.doesNotMatch(
+    replacementBody,
+    /aggregate-correction|configured-owner|replacement-owner/iu,
+  );
+
+  const replacementHtmlResponse = await worker.fetch(
+    ownerRequest(
+      PATH,
+      "text/html",
+      replacementSubject,
+      replacementEmail,
+    ),
+    replacementEnvironment,
+    executionContext,
+  );
+  const replacementHtml = await replacementHtmlResponse.text();
+  assert.equal(replacementHtmlResponse.status, 200);
+  assert.doesNotMatch(replacementHtml, /<form|Retry recorded correction/iu);
+  assert.doesNotMatch(
+    replacementHtml,
+    /aggregate-correction|configured-owner|replacement-owner/iu,
+  );
+  assert.equal(replacementHtmlResponse.headers.get(MUTATION_CSRF_HEADER), null);
+  assert.equal(replacementHtmlResponse.headers.get("set-cookie"), null);
+
+  const claimsBeforeRejected = browserReplayClaimCount(service);
+  const rejected = await worker.fetch(
+    ownerMutation(
+      originalBody,
+      originalProofForReplacement,
+      replacementSubject,
+      replacementEmail,
+    ),
+    replacementEnvironment,
+    executionContext,
+  );
+  const rejectedBody = await rejected.text();
+  assert.equal(rejected.status, 403);
+  assert.doesNotMatch(
+    rejectedBody,
+    /aggregate-correction|configured-owner|replacement-owner/iu,
+  );
+  assert.equal(browserReplayClaimCount(service), claimsBeforeRejected);
+});
+
 test("hosted exact retry survives campaign currency evolution and restart", async () => {
   const service = storageService();
   await seedMismatch(service);
@@ -518,7 +629,6 @@ test("hosted mutation field boundaries reject before consuming the one-use proof
     const wrongShape = { ...valid, unexpected: "replacement" } as
       Record<string, unknown>;
     delete wrongShape.confirmation;
-
     for (const invalid of [overLimit, wrongShape]) {
       const response = await worker.fetch(
         mediaType === "json"
@@ -546,6 +656,52 @@ test("hosted mutation field boundaries reject before consuming the one-use proof
     );
     assert.equal(corrected.status, 200);
     assert.match(corrected.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+  }
+});
+
+test("hosted parser enforces the advertised positive campaign revision", async () => {
+  for (const mediaType of ["json", "form"] as const) {
+    const service = storageService();
+    await seedMismatch(service);
+    const worker = hostedWorker(service);
+    const env = environment();
+    const resourceResponse = await worker.fetch(
+      ownerRequest(PATH),
+      env,
+      executionContext,
+    );
+    const proof = mutationProof(resourceResponse);
+    const resource = await resourceResponse.json() as
+      OwnerAggregateReconciliationDocument;
+    const revisionField = requiredAction(resource).fields.find((field) =>
+      field.name === "expected-campaign-revision"
+    );
+    assert.equal(revisionField?.minimum, 1);
+    const zeroCampaignRevision = {
+      ...actionBody(resource),
+      "expected-campaign-revision": 0,
+    };
+
+    const response = await worker.fetch(
+      mediaType === "json"
+        ? ownerMutation(zeroCampaignRevision, proof)
+        : ownerFormMutation(zeroCampaignRevision, proof),
+      env,
+      executionContext,
+    );
+    assert.equal(response.status, 400);
+    assert.match(response.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+    assert.equal(
+      service.recordKeys().some((key) =>
+        key.startsWith("investment-aggregate-operations/aggregate-correction:")
+      ),
+      false,
+    );
+    assert.deepEqual(
+      (await new DevelopmentInMemoryAuditRepository(storageAdapter(service))
+        .list({ limit: 10 })).items,
+      [],
+    );
   }
 });
 
@@ -967,12 +1123,17 @@ function storageAdapter(
   });
 }
 
-function ownerRequest(path: string, accept = "application/json"): Request {
+function ownerRequest(
+  path: string,
+  accept = "application/json",
+  subject = OWNER_SUBJECT,
+  email = OWNER_EMAIL,
+): Request {
   return new Request(new URL(path, APP_ORIGIN), {
     headers: {
       accept,
-      "oai-authenticated-user-id": OWNER_SUBJECT,
-      "oai-authenticated-user-email": OWNER_EMAIL,
+      "oai-authenticated-user-id": subject,
+      "oai-authenticated-user-email": email,
     },
   });
 }
@@ -980,6 +1141,8 @@ function ownerRequest(path: string, accept = "application/json"): Request {
 function ownerMutation(
   body: Readonly<Record<string, unknown>>,
   proof: Readonly<{ token: string; cookie: string }>,
+  subject = OWNER_SUBJECT,
+  email = OWNER_EMAIL,
 ): Request {
   return new Request(`${APP_ORIGIN}${PATH}`, {
     method: "POST",
@@ -989,8 +1152,8 @@ function ownerMutation(
       cookie: proof.cookie,
       origin: APP_ORIGIN,
       [MUTATION_CSRF_HEADER]: proof.token,
-      "oai-authenticated-user-id": OWNER_SUBJECT,
-      "oai-authenticated-user-email": OWNER_EMAIL,
+      "oai-authenticated-user-id": subject,
+      "oai-authenticated-user-email": email,
     },
     body: JSON.stringify(body),
   });
@@ -1083,7 +1246,7 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function environment(): InvestorAppEnv {
+function environment(ownerEmail = OWNER_EMAIL): InvestorAppEnv {
   return {
     APP_BASE_URL: APP_ORIGIN,
     AITTADB_STORAGE_ISSUER: ISSUER,
@@ -1093,7 +1256,7 @@ function environment(): InvestorAppEnv {
     AITTADB_STORAGE_CLIENT_SECRET: CLIENT_SECRET,
     AITTADB_STORAGE_SCOPES: SCOPES,
     BROWSER_MUTATION_SESSION_KEY: MUTATION_KEY,
-    OWNER_EMAIL,
+    OWNER_EMAIL: ownerEmail,
     ASSETS: { fetch: async () => new Response("asset") },
     IMAGES: {
       input: () => ({

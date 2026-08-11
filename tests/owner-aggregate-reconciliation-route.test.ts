@@ -71,6 +71,7 @@ test("owner reconciliation renders one equivalent HTML form and JSON action", as
       fields: Array<{
         name: string;
         presentation?: string;
+        minimum?: number;
         value?: string | number;
       }>;
     }>;
@@ -95,6 +96,24 @@ test("owner reconciliation renders one equivalent HTML form and JSON action", as
       ?.value,
     OPERATION_ID,
   );
+  assert.equal(
+    document.actions[0]?.fields.find((field) =>
+      field.name === "expected-campaign-revision"
+    )?.minimum,
+    1,
+  );
+  for (const name of [
+    "expected-stored-revision",
+    "expected-stored-amount",
+    "expected-stored-count",
+    "expected-calculated-amount",
+    "expected-calculated-count",
+  ]) {
+    assert.equal(
+      document.actions[0]?.fields.find((field) => field.name === name)?.minimum,
+      0,
+    );
+  }
   assert.deepEqual(
     document.actions[0]?.fields.map((field) => [
       field.name,

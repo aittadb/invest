@@ -156,6 +156,7 @@ function correctionActionFields(
       "expected-campaign-revision",
       "Expected campaign revision",
       campaignRevision,
+      1,
     ),
     {
       name: "confirmation",
@@ -229,7 +230,12 @@ function textField(name: string, title: string, value: string) {
   };
 }
 
-function integerField(name: string, title: string, value: number) {
+function integerField(
+  name: string,
+  title: string,
+  value: number,
+  minimum = 0,
+) {
   return {
     name,
     title,
@@ -237,7 +243,7 @@ function integerField(name: string, title: string, value: number) {
     location: "body" as const,
     required: true,
     presentation: "hidden" as const,
-    minimum: 0,
+    minimum,
     maximum: Number.MAX_SAFE_INTEGER,
     step: 1,
     value,
