@@ -323,6 +323,17 @@ export class StorageOwnerIndicationRejectionRepository
       conflict();
     }
 
+    try {
+      return await this.#verifyPersistedEffects(request, receipt);
+    } catch {
+      unavailable();
+    }
+  }
+
+  async #verifyPersistedEffects(
+    request: ParsedRejection,
+    receipt: StoredReceipt,
+  ): Promise<RejectIndicationWithEffectsResult> {
     const effective = Object.freeze({
       ...request,
       occurredAt: receipt.occurredAt,

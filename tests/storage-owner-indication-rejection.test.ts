@@ -27,7 +27,9 @@ import {
   parseStorageKey,
   parseStorageOperationId,
   type StorageAdapter,
+  type StorageDocument,
   type StorageKey,
+  type StorageRecord,
   type StorageTransactionRequest,
   type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
@@ -346,6 +348,197 @@ test("commit-response loss and malformed final evidence recover from the immutab
   }
 });
 
+test("persisted-effect corruption after a matching receipt is fixed unavailable without writes", async (context) => {
+  const corruptions = [
+    {
+      name: "zero aggregate revision in receipt",
+      apply(state: MemoryStorageState): void {
+        replaceStoredValue(
+          state,
+          "owner-indication-moderation-operations",
+          () => true,
+          (value) => ({
+            ...value,
+            aggregate: {
+              ...requiredDocument(value.aggregate),
+              revision: 0,
+            },
+          }),
+        );
+      },
+    },
+    {
+      name: "crossed indication operation evidence",
+      apply(state: MemoryStorageState): void {
+        replaceStoredValue(
+          state,
+          "investment-indication-history",
+          (value) => value.transitionKind === "rejected",
+          (value) => ({
+            ...value,
+            operationId: "owner-rejection:crossed-indication",
+          }),
+        );
+      },
+    },
+    {
+      name: "crossed aggregate operation evidence",
+      apply(state: MemoryStorageState): void {
+        replaceStoredValue(
+          state,
+          "investment-aggregate-operations",
+          isRejectionAggregateOperation,
+          (value) => ({ ...value, operationKind: "correction" }),
+        );
+      },
+    },
+    {
+      name: "changed aggregate operation evidence",
+      apply(state: MemoryStorageState): void {
+        replaceStoredValue(
+          state,
+          "investment-aggregate-operations",
+          isRejectionAggregateOperation,
+          (value) => ({
+            ...value,
+            operationFingerprint: `sha256:${"0".repeat(64)}`,
+          }),
+        );
+      },
+    },
+    {
+      name: "missing audit evidence",
+      apply(state: MemoryStorageState): void {
+        deleteStoredRecord(
+          state,
+          "audit-events",
+          (value) => auditTransition(value) === "rejected",
+        );
+      },
+    },
+    {
+      name: "corrupt audit evidence",
+      apply(state: MemoryStorageState): void {
+        replaceStoredValue(
+          state,
+          "audit-events",
+          (value) => auditTransition(value) === "rejected",
+          (value) => {
+            const event = requiredDocument(value.event);
+            return {
+              ...value,
+              event: {
+                ...event,
+                detail: {
+                  ...requiredDocument(event.detail),
+                  transition: "withdrawn",
+                },
+              },
+            };
+          },
+        );
+      },
+    },
+    {
+      name: "missing notification evidence",
+      apply(state: MemoryStorageState): void {
+        deleteStoredRecord(
+          state,
+          "manual-notification-history",
+          () => true,
+        );
+      },
+    },
+    {
+      name: "corrupt notification evidence",
+      apply(state: MemoryStorageState): void {
+        replaceStoredValue(
+          state,
+          "manual-notification-history",
+          () => true,
+          (value) => {
+            const record = requiredDocument(value.record);
+            return {
+              ...value,
+              record: {
+                ...record,
+                template: {
+                  ...requiredDocument(record.template),
+                  body: "Private corrupt notification evidence.",
+                },
+              },
+            };
+          },
+        );
+      },
+    },
+  ] as const;
+
+  for (const corruption of corruptions) {
+    await context.test(corruption.name, async () => {
+      const state = new MemoryStorageState();
+      const seeded = await seedActiveIndication(state);
+      const request = await rejectionRequest(
+        seeded.indication,
+        corruption.name.replaceAll(" ", "-"),
+      );
+      await rejectionRepository(new MemoryStorageAdapter(state))
+        .rejectWithEffects(request);
+      corruption.apply(state);
+      const unchanged = serializedState(state);
+      const counted = new CountingStorageAdapter(new MemoryStorageAdapter(state));
+
+      const failure = await captureFailure(() =>
+        rejectionRepository(counted).rejectWithEffects(Object.freeze({
+          ...request,
+          occurredAt: RETRY_TIME,
+        }))
+      );
+
+      assert.equal(failure.code, "UNAVAILABLE");
+      assert.equal(
+        String(failure),
+        "StorageFailure: Storage is temporarily unavailable.",
+      );
+      assert.equal(failure.cause, undefined);
+      assert.doesNotMatch(
+        JSON.stringify({ name: failure.name, message: failure.message }),
+        /participant|private|receipt|aggregate|audit|notification/iu,
+      );
+      assert.equal(counted.transactions, 0);
+      assert.equal(serializedState(state), unchanged);
+    });
+  }
+});
+
+test("changed retry identity remains conflict when persisted effects are corrupt", async () => {
+  const state = new MemoryStorageState();
+  const seeded = await seedActiveIndication(state);
+  const request = await rejectionRequest(seeded.indication, "changed-corrupt");
+  await rejectionRepository(new MemoryStorageAdapter(state)).rejectWithEffects(
+    request,
+  );
+  deleteStoredRecord(
+    state,
+    "manual-notification-history",
+    () => true,
+  );
+  const unchanged = serializedState(state);
+  const counted = new CountingStorageAdapter(new MemoryStorageAdapter(state));
+
+  const failure = await captureFailure(() =>
+    rejectionRepository(counted).rejectWithEffects(Object.freeze({
+      ...request,
+      occurredAt: RETRY_TIME,
+      reason: "A genuinely changed retry.",
+    }))
+  );
+
+  assert.equal(failure.code, "CONFLICT");
+  assert.equal(counted.transactions, 0);
+  assert.equal(serializedState(state), unchanged);
+});
+
 test("outer rejection transaction stays bounded and contains every effect", async () => {
   const state = new MemoryStorageState();
   const seeded = await seedActiveIndication(state);
@@ -494,6 +687,66 @@ function recordsIn(state: MemoryStorageState, collection: string): number {
   return [...state.records.values()].filter(
     (record) => record.key.collection === collection,
   ).length;
+}
+
+function replaceStoredValue(
+  state: MemoryStorageState,
+  collection: string,
+  matches: (value: StorageDocument) => boolean,
+  replace: (value: StorageDocument) => StorageDocument,
+): void {
+  const [stateKey, record] = matchingStoredRecord(state, collection, matches);
+  state.records.set(stateKey, Object.freeze({
+    ...record,
+    value: Object.freeze(replace(record.value)),
+  }));
+}
+
+function deleteStoredRecord(
+  state: MemoryStorageState,
+  collection: string,
+  matches: (value: StorageDocument) => boolean,
+): void {
+  const [stateKey] = matchingStoredRecord(state, collection, matches);
+  state.records.delete(stateKey);
+}
+
+function matchingStoredRecord(
+  state: MemoryStorageState,
+  collection: string,
+  matches: (value: StorageDocument) => boolean,
+): readonly [string, StorageRecord] {
+  const candidates = [...state.records.entries()].filter(([, record]) =>
+    record.key.collection === collection && matches(record.value)
+  );
+  assert.equal(candidates.length, 1, collection);
+  return candidates[0];
+}
+
+function requiredDocument(value: unknown): StorageDocument {
+  assert.equal(typeof value, "object");
+  assert.notEqual(value, null);
+  assert.equal(Array.isArray(value), false);
+  return value as StorageDocument;
+}
+
+function auditTransition(value: StorageDocument): unknown {
+  return requiredDocument(requiredDocument(value.event).detail).transition;
+}
+
+function isRejectionAggregateOperation(value: StorageDocument): boolean {
+  return requiredDocument(requiredDocument(value.result).stored).revision === 2;
+}
+
+function serializedState(state: MemoryStorageState): string {
+  return JSON.stringify({
+    records: [...state.records.entries()].sort(([left], [right]) =>
+      left.localeCompare(right)
+    ),
+    operations: [...state.operations.entries()].sort(([left], [right]) =>
+      left.localeCompare(right)
+    ),
+  });
 }
 
 function amountConfiguration(): AmountConfiguration {
