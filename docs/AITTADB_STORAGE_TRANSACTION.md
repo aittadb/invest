@@ -89,17 +89,20 @@ This storage primitive is not a production provisioning or migration workflow.
 registration, and `TASK-159` must provide the bounded operator-only migration
 path for legacy participants before hosted investment persistence is ready.
 
-One capacity proof reads the root, summary, and index, then exactly the current
-and terminal record for each owned ID, and finally re-reads the summary. It
+One capacity proof reads the root, summary, and index, then the current and
+terminal record for each owned ID, and finally re-reads the summary. It
 recomputes every terminal operation fingerprint from the compact transition
-metadata; create and edit fingerprints commit the normalized field reference,
-whose content hash is verified during full reconstruction. It does not list a
-collection, read field chunks, or replay transition ancestry. The exact
-ceilings remain 204 reads for 100 owned records, 203 reads for first
-initialization, 205 for an initialized restart, and 407 when a maximum-size
-initialization loses a concurrent exact race and verifies the winner. A fresh
-create rejected by capacity uses 207 reads including the service's target lookup
-and both operation-receipt checks. The summary replaces the previous witness in
+metadata; create and edit fingerprints commit the normalized field reference.
+For each of at most four active entries, the proof additionally verifies the
+one-to-eight referenced field chunks, derives the normalized uniqueness scope,
+and validates its exact active-lease record. Non-active entries require neither
+field-chunk nor lease reads. The proof never lists a collection or replays
+transition ancestry. Its malformed-input-safe ceilings are 240 reads for 100
+owned records, 239 reads for first initialization, 241 for an initialized
+restart, and 479 when a maximum-size initialization loses a concurrent exact
+race and verifies the winner. A fresh create rejected by capacity uses at most
+243 reads including the service's target lookup and both operation-receipt
+checks. The summary replaces the previous witness in
 the same lifecycle mutation slot, and the immutable root is not rewritten by a
 lifecycle transition, so the accepted 25-mutation account-deletion bound is
 unchanged.

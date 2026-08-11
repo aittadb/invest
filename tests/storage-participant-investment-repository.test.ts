@@ -40,11 +40,13 @@ import {
   DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
+  MAX_INDICATION_FIELDS_CHUNKS,
   MAX_OWNED_INVESTMENT_INDICATIONS,
   readParticipantIndicationOwnershipHead,
   type ParticipantIndicationOwnershipEntry,
 } from "../repositories/in-memory-indication-repository.ts";
 import {
+  MAX_PARTICIPANT_ACTIVE_LEASE_PROOF_READS,
   MAX_PARTICIPANT_CAPACITY_READS,
   MAX_PARTICIPANT_INDEX_SNAPSHOT_READS,
   MAX_PARTICIPANT_OWNERSHIP_CONCURRENT_REPLAY_READS,
@@ -1437,7 +1439,7 @@ test("a forged non-active summary cannot hide an active terminal transition", as
   assert.equal(state.operations.size, operationsBefore);
 });
 
-test("compact ownership heads authenticate active create and edit in two reads", async () => {
+test("compact ownership heads authenticate active create and edit with exact leases", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
   await initializeEmptyOwnership(storage, ALICE, "capacity-active-proof");
@@ -1472,7 +1474,7 @@ test("compact ownership heads authenticate active create and edit in two reads",
       lifecycleStatus: "active",
     },
   );
-  assert.equal(createdReads.readCalls, 2);
+  assert.equal(createdReads.readCalls, 4);
 
   const edited = await service.edit({
     operationId: "investment-operation:capacity-active-proof-edit",
@@ -1493,7 +1495,7 @@ test("compact ownership heads authenticate active create and edit in two reads",
       lifecycleStatus: "active",
     },
   );
-  assert.equal(editedReads.readCalls, 2);
+  assert.equal(editedReads.readCalls, 4);
 });
 
 test("correlated summary and terminal-kind damage cannot hide an active edit", async () => {
@@ -1588,6 +1590,136 @@ test("withdrawn terminal rewritten as edited cannot create after correlated acti
   assert.equal(failure.code, "UNAVAILABLE");
   assert.equal(storedStateFingerprint(state), recordsBefore);
   assert.equal(state.operations.size, operationsBefore);
+});
+
+test("ownership initialization and capacity reject damaged active leases", async (t) => {
+  const cases = Object.freeze([
+    Object.freeze({
+      name: "missing lease",
+      damage: (state: MemoryStorageState) => {
+        const [entry] = recordsWithIdentitiesIn(
+          state,
+          "investment-indication-active-keys",
+        );
+        assert(entry);
+        state.records.delete(entry[0]);
+      },
+    }),
+    Object.freeze({
+      name: "crossed indication",
+      damage: (state: MemoryStorageState) => {
+        replaceOnlyActiveLease(state, {
+          indicationId: indicationIdForOperation(
+            "investment-operation:crossed-active-lease",
+          ),
+        });
+      },
+    }),
+    Object.freeze({
+      name: "corrupt fingerprint",
+      damage: (state: MemoryStorageState) => {
+        replaceOnlyActiveLease(state, {
+          uniquenessFingerprint: `sha256:${"0".repeat(64)}`,
+        });
+      },
+    }),
+  ]);
+
+  for (const [index, candidate] of cases.entries()) {
+    await t.test(candidate.name, async () => {
+      const state = new MemoryStorageState();
+      const storage = new MemoryStorageAdapter(state);
+      const suffix = `active-lease-proof-${index}`;
+      const acknowledgment = await currentContext(ALICE, suffix);
+      const indicationId = indicationIdForOperation(
+        `investment-operation:${suffix}-seed`,
+      );
+      const created = await new DevelopmentInMemoryIndicationRepository(
+        storage,
+        ALICE,
+        OWNER,
+        AMOUNT,
+      ).create({
+        operationId: `indication-operation:${suffix}-seed`,
+        id: indicationId,
+        expectedRevision: null,
+        occurredAt: "2026-08-12T10:00:00.000Z",
+        historyEntryId: `indication-history:${suffix}-seed`,
+        fields: personalFields(),
+      }, acknowledgment);
+      candidate.damage(state);
+      const recordsBefore = storedStateFingerprint(state);
+      const operationsBefore = state.operations.size;
+
+      const initializationFailure = await captureStorageFailure(() =>
+        initializeParticipantInvestmentOwnership(storage, ALICE, {
+          operationId: `investment-ownership-initialization:${suffix}`,
+          indications: [{
+            indicationId,
+            indicationRevision: created.snapshot.revision,
+            lifecycleStatus: "active",
+          }],
+        })
+      );
+      assert.equal(initializationFailure.code, "UNAVAILABLE");
+      assert.equal(
+        recordsIn(state, "participant-investment-ownership-roots").length,
+        0,
+      );
+      assert.equal(recordsIn(state, "participant-investment-indexes").length, 0);
+
+      const laterCreateFailure = await captureStorageFailure(() => serviceFor(
+        new StorageParticipantInvestmentInterestRepository(
+          new MemoryStorageAdapter(state),
+          ALICE,
+          AMOUNT,
+        ),
+        ALICE,
+        acknowledgment,
+        () => new Date("2026-08-12T11:00:00.000Z"),
+      ).create({
+        operationId: `investment-operation:${suffix}-later-create`,
+        fields: personalFields({ note: "Must not create a duplicate active scope." }),
+      }));
+      assert.equal(laterCreateFailure.code, "UNAVAILABLE");
+      assert.equal(storedStateFingerprint(state), recordsBefore);
+      assert.equal(state.operations.size, operationsBefore);
+
+      const capacityState = new MemoryStorageState();
+      const capacityStorage = new MemoryStorageAdapter(capacityState);
+      await initializeEmptyOwnership(
+        capacityStorage,
+        ALICE,
+        `${suffix}-capacity`,
+      );
+      const capacityService = serviceFor(
+        new StorageParticipantInvestmentInterestRepository(
+          capacityStorage,
+          ALICE,
+          AMOUNT,
+        ),
+        ALICE,
+        acknowledgment,
+        () => new Date("2026-08-12T12:00:00.000Z"),
+      );
+      await capacityService.create({
+        operationId: `investment-operation:${suffix}-capacity-seed`,
+        fields: personalFields(),
+      });
+      candidate.damage(capacityState);
+      const capacityRecordsBefore = storedStateFingerprint(capacityState);
+      const capacityOperationsBefore = capacityState.operations.size;
+      const capacityFailure = await captureStorageFailure(() =>
+        capacityService.create({
+          operationId: `investment-operation:${suffix}-capacity-later`,
+          fields: personalFields({ note: "Capacity must reject the damaged lease." }),
+        })
+      );
+      assert.equal(capacityFailure.code, "UNAVAILABLE");
+      assert.equal(storedStateFingerprint(capacityState), capacityRecordsBefore);
+      assert.equal(capacityState.operations.size, capacityOperationsBefore);
+    });
+  }
 });
 
 test("ownership movement between bounded witness samples fails without outer mutation", async () => {
@@ -1709,6 +1841,11 @@ test("capacity checks 100 fully materialized maximum histories within its read c
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
   const indications = await seedMaximumOwnershipHeads(state, ALICE);
+  const activeLeaseProofReads = observedActiveLeaseProofReads(state, indications);
+  const observedHeadReads =
+    2 * MAX_OWNED_INVESTMENT_INDICATIONS + activeLeaseProofReads;
+  const observedCapacityReads =
+    MAX_PARTICIPANT_INDEX_SNAPSHOT_READS + observedHeadReads;
   const operationsBeforeInitialization = state.operations.size;
   const overCapacityInventory = Object.freeze(indications.map((entry, index) =>
     index === MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS
@@ -1743,7 +1880,11 @@ test("capacity checks 100 fully materialized maximum histories within its read c
   assert.equal(initializationStorage.listCalls, 0);
   assert.equal(
     initializationStorage.readCalls,
-    MAX_PARTICIPANT_OWNERSHIP_FIRST_INITIALIZATION_READS,
+    3 + observedHeadReads,
+  );
+  assert.ok(
+    initializationStorage.readCalls <=
+      MAX_PARTICIPANT_OWNERSHIP_FIRST_INITIALIZATION_READS,
   );
   assert.equal(indications.length, MAX_OWNED_INVESTMENT_INDICATIONS);
   assert.equal(indications.every(({ indicationId }) => indicationId.length === 128), true);
@@ -1797,8 +1938,9 @@ test("capacity checks 100 fully materialized maximum histories within its read c
   );
   assert.equal(
     restartStorage.readCalls,
-    MAX_PARTICIPANT_OWNERSHIP_RESTART_READS,
+    1 + observedCapacityReads,
   );
+  assert.ok(restartStorage.readCalls <= MAX_PARTICIPANT_OWNERSHIP_RESTART_READS);
 
   const context = await currentContext(ALICE, "storage-index-ceiling");
   const counted = new CountingStorageAdapter(
@@ -1825,13 +1967,25 @@ test("capacity checks 100 fully materialized maximum histories within its read c
   }));
   assert.equal(failure.code, "CONFLICT");
   assert.equal(counted.listCalls, 0);
-  assert.equal(counted.readCalls, 3 + MAX_PARTICIPANT_CAPACITY_READS);
+  assert.equal(counted.readCalls, 3 + observedCapacityReads);
+  assert.ok(counted.readCalls <= 3 + MAX_PARTICIPANT_CAPACITY_READS);
   assert.equal(MAX_PARTICIPANT_INDEX_SNAPSHOT_READS, 4);
+  assert.equal(
+    MAX_PARTICIPANT_ACTIVE_LEASE_PROOF_READS,
+    MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS *
+      (MAX_INDICATION_FIELDS_CHUNKS + 1),
+  );
   assert.equal(
     MAX_PARTICIPANT_CAPACITY_READS,
     MAX_PARTICIPANT_INDEX_SNAPSHOT_READS +
-      2 * MAX_OWNED_INVESTMENT_INDICATIONS,
+      2 * MAX_OWNED_INVESTMENT_INDICATIONS +
+      MAX_PARTICIPANT_ACTIVE_LEASE_PROOF_READS,
   );
+  assert.equal(MAX_PARTICIPANT_ACTIVE_LEASE_PROOF_READS, 36);
+  assert.equal(MAX_PARTICIPANT_CAPACITY_READS, 240);
+  assert.equal(MAX_PARTICIPANT_OWNERSHIP_FIRST_INITIALIZATION_READS, 239);
+  assert.equal(MAX_PARTICIPANT_OWNERSHIP_RESTART_READS, 241);
+  assert.equal(MAX_PARTICIPANT_OWNERSHIP_CONCURRENT_REPLAY_READS, 479);
   assert.equal(storedStateFingerprint(state), recordsBefore);
   assert.equal(state.operations.size, operationsBefore);
 });
@@ -1840,6 +1994,12 @@ test("concurrent maximum-shape initialization replay stays inside its exact budg
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
   const indications = await seedMaximumOwnershipHeads(state, ALICE);
+  const activeLeaseProofReads = observedActiveLeaseProofReads(state, indications);
+  const observedHeadReads =
+    2 * MAX_OWNED_INVESTMENT_INDICATIONS + activeLeaseProofReads;
+  const observedFirstInitializationReads = 3 + observedHeadReads;
+  const observedCapacityReads =
+    MAX_PARTICIPANT_INDEX_SNAPSHOT_READS + observedHeadReads;
   const request = Object.freeze({
     operationId: "investment-ownership-initialization:maximum-concurrent",
     indications,
@@ -1865,7 +2025,10 @@ test("concurrent maximum-shape initialization replay stays inside its exact budg
   assert.equal(counted.listCalls, 0);
   assert.equal(
     counted.readCalls,
-    MAX_PARTICIPANT_OWNERSHIP_CONCURRENT_REPLAY_READS,
+    observedFirstInitializationReads + observedCapacityReads,
+  );
+  assert.ok(
+    counted.readCalls <= MAX_PARTICIPANT_OWNERSHIP_CONCURRENT_REPLAY_READS,
   );
 });
 
@@ -2410,6 +2573,23 @@ function maximumHistoryFields(index: number, revision: number) {
   });
 }
 
+function observedActiveLeaseProofReads(
+  state: MemoryStorageState,
+  indications: readonly ParticipantIndicationOwnershipEntry[],
+): number {
+  const currentRecords = recordsIn(state, "investment-indications");
+  return indications.reduce((total, entry) => {
+    if (entry.lifecycleStatus !== "active") return total;
+    const current = currentRecords.find((record) =>
+      record.value.indicationId === entry.indicationId
+    );
+    assert(current);
+    const fields = current.value.fields as Readonly<Record<string, unknown>>;
+    assert.equal(Number.isSafeInteger(fields.chunks), true);
+    return total + (fields.chunks as number) + 1;
+  }, 0);
+}
+
 function serviceFor(
   repository: StorageParticipantInvestmentInterestRepository,
   actorSubject: ActorSubject,
@@ -2456,9 +2636,36 @@ function companyFields(overrides: Readonly<Record<string, unknown>> = {}) {
 }
 
 function recordsIn(state: MemoryStorageState, collection: string) {
-  return [...state.records.values()].filter(
-    (record) => record.key.collection === collection,
+  return recordsWithIdentitiesIn(state, collection).map(([, record]) => record);
+}
+
+function recordsWithIdentitiesIn(
+  state: MemoryStorageState,
+  collection: string,
+) {
+  return [...state.records.entries()].filter(([, record]) =>
+    record.key.collection === collection
   );
+}
+
+function replaceOnlyActiveLease(
+  state: MemoryStorageState,
+  overrides: Readonly<Record<string, unknown>>,
+): void {
+  const entries = recordsWithIdentitiesIn(
+    state,
+    "investment-indication-active-keys",
+  );
+  assert.equal(entries.length, 1);
+  const [identity, record] = entries[0]!;
+  state.records.set(identity, Object.freeze({
+    key: record.key,
+    revision: record.revision,
+    value: Object.freeze({
+      ...record.value,
+      ...overrides,
+    }) as StorageDocument,
+  }));
 }
 
 function participantIdsIn(

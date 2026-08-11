@@ -579,6 +579,15 @@ export async function readParticipantIndicationOwnershipHead(
   ) unavailable();
   const lifecycleStatus = lifecycleStatusForTransition(transition.transitionKind);
   await verifyOwnershipTransition(transition, lifecycleStatus);
+  if (lifecycleStatus === "active") {
+    const fields = await readStoredFields(
+      storage,
+      subject,
+      indicationId,
+      transition.fields,
+    );
+    await verifyStoredActiveLease(storage, current, fields.fields, lifecycleStatus);
+  }
   return Object.freeze({
     indicationId: current.indicationId,
     indicationRevision: current.revision,
@@ -1431,7 +1440,7 @@ async function decodeOwnerIndicationReviewSummary(
     terminal,
     fields.fields,
   );
-  await verifyOwnerReviewActiveLease(storage, current, fields.fields, status);
+  await verifyStoredActiveLease(storage, current, fields.fields, status);
   return Object.freeze({
     reviewId: await tokens.reviewIdForCurrentKey(currentKey, ownerSubject),
     kind: fields.fields.kind,
@@ -1559,7 +1568,7 @@ async function verifyOwnerReviewTerminal(
   return status;
 }
 
-async function verifyOwnerReviewActiveLease(
+async function verifyStoredActiveLease(
   storage: Pick<StorageAdapter, "read">,
   current: StoredCurrent,
   fields: InvestmentIndicationFields,

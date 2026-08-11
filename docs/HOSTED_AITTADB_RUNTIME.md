@@ -248,17 +248,20 @@ their original counts after later valid lifecycle activity, but every retry
 still validates the current root, index, summary, and compact ownership heads.
 Each head recomputes the terminal operation fingerprint, including the
 normalized field-reference commitment for create and edit, before its lifecycle
-status can affect capacity.
+status can affect capacity. Each active head then verifies its one-to-eight
+current field chunks, derives its normalized uniqueness scope, and validates the
+exact active lease. Non-active heads read neither fields nor leases.
 
-The exact adapter-read ceilings remain 204 for capacity, 203 for first
-initialization, 205 for an initialized restart, and 407 for a maximum-size
+The malformed-input-safe adapter-read ceilings are 240 for capacity, 239 for
+first initialization, 241 for an initialized restart, and 479 for a maximum-size
 initialization that loses a concurrent exact race and verifies the winner. A
-fresh create rejected at capacity uses 207 reads after including its target
+fresh create rejected at capacity uses at most 243 reads after including its target
 lookup and two operation-receipt checks. These paths issue no collection list,
-field-chunk read, or ancestry reconstruction. Because an AittaDB HTTP read is a
-Worker Fetch subrequest, at least 407 subrequests must remain when this boundary
-starts; authentication, token acquisition, protocol discovery, route reads,
-and writes require additional whole-request headroom. Cloudflare's
+or ancestry reconstruction; field-chunk and lease reads are limited to the four
+active heads. Because an AittaDB HTTP read is a Worker Fetch subrequest, at least
+479 subrequests must remain when this boundary starts; authentication, token
+acquisition, protocol discovery, route reads, and writes require additional
+whole-request headroom. Cloudflare's
 [Worker subrequest limits](https://developers.cloudflare.com/workers/platform/limits/#subrequests)
 give external requests only 50 subrequests on Workers Free, which is unsupported
 for this feature. Production must use Workers Paid or a higher equivalent limit;
