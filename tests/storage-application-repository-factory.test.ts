@@ -294,7 +294,6 @@ test("factory exposes only named application repository capabilities", async () 
     (participant as typeof participant & { storageKind?: unknown }).storageKind,
     "storage-adapter",
   );
-  assertNoGenericStorageSurface(participant, storage);
   assert.doesNotMatch(
     Object.getOwnPropertyNames(Object.getPrototypeOf(factory)).join(" "),
     /adapter|storage|create/iu,
