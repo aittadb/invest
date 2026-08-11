@@ -264,30 +264,43 @@ Reads reconstruct the bounded transition ancestry from exact data-only records, 
 
 `StorageOwnerIndicationReviewCollectionRepository` is the narrow persistent
 collection projection over those current indication records. Construction binds
-one authenticated subject to the configured owner; anonymous and different
+one authenticated subject to the configured owner and accepts one separately
+injected `OwnerIndicationReviewTokenBoundary`; anonymous and different
 authenticated subjects receive the same fixed not-found failure before any
 storage request. The repository exposes only `list`, with no detail lookup,
-mutation, adapter, key-read, transaction, or credential surface.
+mutation, adapter, key-read, transaction, credential, or token-codec surface.
 
 Each page contains at most 25 allowlisted summaries. One adapter list and at
 most 25 terminal-transition reads, active-lease checks, and bounded current-field
 chunks produce the page, for a maximum of 250 record reads. Current metadata, terminal
 transition, acknowledgment, actor, operation fingerprint, field reference,
 chunk envelope, byte count, payload hash, and parsed fields must agree before a
-summary is returned. The projection includes only a one-way review ID, kind,
+summary is returned. The projection includes only an authenticated opaque review ID, kind,
 lifecycle, minor-unit amount, currency, update timestamp, and revision. It
 omits participant subject, indication ID, company identity, representative,
 availability, note, rejection reason, and notification state.
 
-Continuation state is the bounded opaque cursor returned by the validated
-AittaDB storage protocol. Investor App neither decodes nor logs that cursor;
-the protocol excludes principals, namespaces, physical keys, and authorization
-detail from cursor state. A new repository instance can continue the same
-cursor after a Worker restart. Invalid requests, malformed or non-progressing
-pages, corrupt records, and backend causes collapse to fixed failures without
-private values. Only the one-way review ID is suitable for a later owner detail
-URL. Persistent detail lookup, rejection, notification composition, and hosted
-route wiring remain separate capabilities.
+`AeadOwnerIndicationReviewTokenBoundary` places an application-owned AES-GCM
+boundary around navigation state. A public continuation token encrypts the
+bounded backend cursor and authenticates its owner subject, page size, purpose,
+and version. Raw, malformed, oversized, crossed, or tampered public values fail
+before adapter access, while malformed or oversized backend continuations fail
+as non-disclosing unavailability. Backend cursor text never enters a public URL
+or response. The capability is stateless: a fresh Worker can continue a token
+after importing the same non-extractable deployment key, without a cursor table
+or process-memory map.
+
+The same boundary deterministically encrypts the already-hashed current-record
+key into the owner-bound review ID. Decoding that ID yields exactly one validated
+`investment-indications` key, allowing a later detail repository to perform one
+bounded current-record read without scanning existing records. The stable ID
+does not contain participant subject, company identifier, note, raw indication
+ID, or plaintext storage key. Cursor and review-ID IV domains are disjoint, and
+cross-purpose, cross-owner, non-canonical, or tampered tokens fail closed. The
+AES key is deployment secret configuration, not campaign content or reusable
+source, and rotation intentionally invalidates outstanding navigation tokens.
+Persistent detail reconstruction, rejection, notification composition, key
+import, and hosted route wiring remain separate capabilities.
 
 Owner moderation is a separate application capability over the strong `AtomicOwnerIndicationModerationRepository` port. The owner collection uses opaque review identifiers, while each authorized detail projects permitted private indication fields, immutable transition history, current notification state, and only the action valid for that lifecycle. The same resource model drives native HTML and versioned hypermedia JSON at `/owner/investment-indications` and `/owner/investment-indications/{review-id}`.
 

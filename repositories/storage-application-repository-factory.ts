@@ -31,6 +31,9 @@ import {
   MAX_PARTICIPANT_PROJECTION_ATTEMPTS,
   createRepositoryParticipantAccessStateReader,
 } from "../services/participant-access.ts";
+import type {
+  OwnerIndicationReviewTokenBoundary,
+} from "../services/owner-indication-review-tokens.ts";
 import {
   StorageCampaignRepository,
   StoragePublicCampaignPresentationReader,
@@ -204,11 +207,13 @@ export class StorageApplicationRepositoryFactory {
   ownerIndicationReviews(
     authenticatedSubject: ActorSubject | null,
     configuredOwnerSubject: ActorSubject,
+    tokens: OwnerIndicationReviewTokenBoundary,
   ): StorageOwnerIndicationReviewCollectionRepository {
     return new StorageOwnerIndicationReviewCollectionRepository(
       this.#storage,
       authenticatedSubject,
       configuredOwnerSubject,
+      tokens,
     );
   }
 

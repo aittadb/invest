@@ -143,13 +143,18 @@ map. `StoragePackageVersionRepository` and
 `StorageAcknowledgmentRepository` retain no local authority; their historical
 `InMemory*` names remain compatibility exports for deterministic fixtures.
 
-`ownerIndicationReviews(authenticatedSubject, configuredOwnerSubject)` creates a
-fresh read-only repository bound to that exact owner authorization decision.
+`ownerIndicationReviews(authenticatedSubject, configuredOwnerSubject, tokens)`
+creates a fresh read-only repository bound to that exact owner authorization
+decision and to a narrow application-owned navigation-token capability.
 The repository lists only the bounded current indication collection and returns
 an allowlisted opaque summary page; it exposes no generic storage, detail, or
 mutation method. The application runtime type does not install this capability
 into a route yet. Hosted moderation composition remains separate so collection,
-detail, and rejection contracts can be validated independently.
+detail, token-key import, and rejection contracts can be validated independently.
+The future composition must import one stable, non-extractable, deployment-only
+AES-GCM key and inject the stateless token boundary; no key material, backend
+cursor, or decrypted current-record key may enter runtime configuration output,
+campaign content, logs, or browser-visible failures.
 
 `StorageCampaignRepository` is production-neutral and retains no state outside
 its supplied adapter. `StorageFounderApplicationRepository` follows the same

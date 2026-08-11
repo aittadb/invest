@@ -62,6 +62,14 @@ import type {
   OwnerIndicationReviewPage,
   OwnerIndicationReviewSummary,
 } from "../services/owner-indication-moderation.ts";
+import {
+  MAX_OWNER_INDICATION_REVIEW_CURSOR_LENGTH,
+  type OwnerIndicationReviewTokenBoundary,
+} from "../services/owner-indication-review-tokens.ts";
+
+export {
+  MAX_OWNER_INDICATION_REVIEW_CURSOR_LENGTH,
+} from "../services/owner-indication-review-tokens.ts";
 
 const INDICATION_SCHEMA_VERSION = 4;
 const CURRENT_INDICATIONS = storageCollection("investment-indications");
@@ -87,12 +95,12 @@ export const MAX_INDICATION_STORAGE_READS =
 export const MAX_INDICATION_STORAGE_MUTATIONS =
   4 + MAX_INDICATION_FIELDS_CHUNKS;
 export const MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE = 25;
-export const MAX_OWNER_INDICATION_REVIEW_CURSOR_LENGTH = 2_048;
 export const MAX_OWNER_INDICATION_REVIEW_ITEM_READS =
   2 + MAX_INDICATION_FIELDS_CHUNKS;
 export const MAX_OWNER_INDICATION_REVIEW_PAGE_RECORD_READS =
   MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE *
   MAX_OWNER_INDICATION_REVIEW_ITEM_READS;
+const MAX_OWNER_INDICATION_REVIEW_BACKEND_CURSOR_LENGTH = 2_048;
 
 const CURRENT_DOCUMENT_KEYS = new Set([
   "kind",
@@ -1015,15 +1023,18 @@ export class StorageOwnerIndicationReviewCollectionRepository
 {
   readonly #storage: OwnerIndicationReviewStorage;
   readonly #configuredOwnerSubject: ActorSubject;
+  readonly #tokens: OwnerIndicationReviewTokenBoundary;
   readonly #permitted: boolean;
 
   constructor(
     storage: OwnerIndicationReviewStorage,
     authenticatedSubject: ActorSubject | null,
     configuredOwnerSubject: ActorSubject,
+    tokens: OwnerIndicationReviewTokenBoundary,
   ) {
     this.#storage = requiredOwnerIndicationReviewStorage(storage);
     this.#configuredOwnerSubject = requiredActorSubject(configuredOwnerSubject);
+    this.#tokens = requiredOwnerIndicationReviewTokenBoundary(tokens);
     const actorSubject = authenticatedSubject === null
       ? null
       : requiredActorSubject(authenticatedSubject);
@@ -1038,25 +1049,46 @@ export class StorageOwnerIndicationReviewCollectionRepository
 
     try {
       const parsed = parseOwnerIndicationReviewListRequest(request);
+      const backendCursor = parsed.cursor === undefined
+        ? undefined
+        : await openOwnerIndicationReviewCursor(
+          this.#tokens,
+          parsed.cursor,
+          this.#configuredOwnerSubject,
+          parsed.limit,
+        );
       const storageRequest = Object.freeze({
         collection: CURRENT_INDICATIONS,
         limit: parsed.limit,
-        ...(parsed.cursor === undefined ? {} : { cursor: parsed.cursor }),
+        ...(backendCursor === undefined ? {} : { cursor: backendCursor }),
       });
       assertStorageListBoundary(storageRequest);
       const page = exactOwnerIndicationReviewStoragePage(
         await this.#storage.list(storageRequest),
-        parsed,
+        Object.freeze({
+          limit: parsed.limit,
+          ...(backendCursor === undefined ? {} : { cursor: backendCursor }),
+        }),
       );
       const items = await Promise.all(page.items.map((record) =>
         decodeOwnerIndicationReviewSummary(
           this.#storage,
           record,
+          this.#tokens,
+          this.#configuredOwnerSubject,
         )
       ));
+      const nextCursor = page.nextCursor === null
+        ? null
+        : await sealOwnerIndicationReviewCursor(
+          this.#tokens,
+          page.nextCursor,
+          this.#configuredOwnerSubject,
+          parsed.limit,
+        );
       return Object.freeze({
         items: Object.freeze(items),
-        nextCursor: page.nextCursor,
+        nextCursor,
       });
     } catch (error) {
       if (
@@ -1121,7 +1153,10 @@ function exactOwnerIndicationReviewStoragePage(
 
   const nextCursor = source.nextCursor === null
     ? null
-    : requiredOwnerIndicationReviewCursor(source.nextCursor, unavailable);
+    : requiredOwnerIndicationReviewBackendCursor(
+      source.nextCursor,
+      unavailable,
+    );
   if (
     nextCursor !== null &&
     (items.length === 0 || nextCursor === request.cursor)
@@ -1153,6 +1188,8 @@ function exactOwnerIndicationReviewStorageRecord(value: unknown): StorageRecord 
 async function decodeOwnerIndicationReviewSummary(
   storage: OwnerIndicationReviewStorage,
   record: StorageRecord,
+  tokens: OwnerIndicationReviewTokenBoundary,
+  ownerSubject: ActorSubject,
 ): Promise<OwnerIndicationReviewSummary> {
   const coordinates = storedIndicationCoordinates(record.value);
   const currentKey = await currentIndicationKey(coordinates.id);
@@ -1188,10 +1225,7 @@ async function decodeOwnerIndicationReviewSummary(
   );
   await verifyOwnerReviewActiveLease(storage, current, fields.fields, status);
   return Object.freeze({
-    reviewId: await ownerIndicationReviewId(
-      coordinates.subject,
-      coordinates.id,
-    ),
+    reviewId: await tokens.reviewIdForCurrentKey(currentKey, ownerSubject),
     kind: fields.fields.kind,
     status,
     amount: fields.fields.amount,
@@ -1375,6 +1409,26 @@ function requiredOwnerIndicationReviewCursor(
   return value as StorageCursor;
 }
 
+function requiredOwnerIndicationReviewBackendCursor(
+  value: unknown,
+  fail: () => never,
+): StorageCursor {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > MAX_OWNER_INDICATION_REVIEW_BACKEND_CURSOR_LENGTH
+  ) {
+    return fail();
+  }
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint !== undefined && (codePoint <= 31 || codePoint === 127)) {
+      return fail();
+    }
+  }
+  return value as StorageCursor;
+}
+
 function requiredOwnerIndicationReviewStorage(
   value: OwnerIndicationReviewStorage,
 ): OwnerIndicationReviewStorage {
@@ -1389,13 +1443,46 @@ function requiredOwnerIndicationReviewStorage(
   return value;
 }
 
-async function ownerIndicationReviewId(
-  subject: ActorSubject,
-  id: InvestmentIndicationId,
-): Promise<string> {
-  return `indication-review:${
-    await sha256Hex(`owner-indication-review\u0000${subject}\u0000${id}`)
-  }`;
+function requiredOwnerIndicationReviewTokenBoundary(
+  value: OwnerIndicationReviewTokenBoundary,
+): OwnerIndicationReviewTokenBoundary {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    typeof value.sealCursor !== "function" ||
+    typeof value.openCursor !== "function" ||
+    typeof value.reviewIdForCurrentKey !== "function" ||
+    typeof value.currentKeyForReviewId !== "function"
+  ) {
+    invalidRequest();
+  }
+  return value;
+}
+
+async function openOwnerIndicationReviewCursor(
+  tokens: OwnerIndicationReviewTokenBoundary,
+  publicCursor: StorageCursor,
+  ownerSubject: ActorSubject,
+  limit: number,
+): Promise<StorageCursor> {
+  try {
+    return await tokens.openCursor(publicCursor, ownerSubject, limit);
+  } catch {
+    return invalidRequest();
+  }
+}
+
+async function sealOwnerIndicationReviewCursor(
+  tokens: OwnerIndicationReviewTokenBoundary,
+  backendCursor: StorageCursor,
+  ownerSubject: ActorSubject,
+  limit: number,
+): Promise<StorageCursor> {
+  try {
+    return await tokens.sealCursor(backendCursor, ownerSubject, limit);
+  } catch {
+    return unavailable();
+  }
 }
 
 function parseCreateRequest(

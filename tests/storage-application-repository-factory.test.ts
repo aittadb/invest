@@ -12,6 +12,7 @@ import {
   type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
 import { StorageApplicationRepositoryFactory } from "../repositories/storage-application-repository-factory.ts";
+import { AeadOwnerIndicationReviewTokenBoundary } from "../services/owner-indication-review-tokens.ts";
 import {
   MemoryStorageAdapter,
   MemoryStorageState,
@@ -19,6 +20,10 @@ import {
 
 const CLAIM = replayClaim();
 const NOW = new Date("2026-08-10T12:00:00.000Z");
+const OWNER_REVIEW_TOKENS = new AeadOwnerIndicationReviewTokenBoundary({
+  encryptionKey: await ownerReviewEncryptionKey(),
+  randomBytes: (length) => crypto.getRandomValues(new Uint8Array(length)),
+});
 
 test("first replay claim wins atomically and exact retries return false", async () => {
   const state = new MemoryStorageState();
@@ -191,6 +196,7 @@ test("factory exposes only named application repository capabilities", async () 
   const ownerIndicationReviews = factory.ownerIndicationReviews(
     subject.value,
     subject.value,
+    OWNER_REVIEW_TOKENS,
   );
 
   assert.deepEqual(Object.getOwnPropertyNames(
@@ -351,6 +357,16 @@ function assertNoGenericStorageSurface(
   }
   assert.equal(Object.values(capability).includes(storage), false);
   assert.doesNotMatch(JSON.stringify(capability), /adapter|storage|transact/iu);
+}
+
+async function ownerReviewEncryptionKey(): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    "raw",
+    Uint8Array.from({ length: 32 }, (_, index) => (102 + index * 17) % 256),
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"],
+  );
 }
 
 function replayClaim() {

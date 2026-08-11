@@ -29,10 +29,12 @@ export type OwnerIndicationModerationItem = Readonly<{
 
 export type OwnerIndicationModerationListRequest = Readonly<{
   limit: number;
+  /** Untrusted application cursor; storage continuation values stay private. */
   cursor?: StorageCursor;
 }>;
 
 export type OwnerIndicationReviewSummary = Readonly<{
+  /** Owner-bound opaque identifier that resolves one current record key. */
   reviewId: string;
   kind: InvestmentIndication["kind"];
   status: InvestmentIndication["lifecycle"]["status"];
@@ -47,7 +49,11 @@ export type OwnerIndicationReviewPage = Readonly<{
   nextCursor: StorageCursor | null;
 }>;
 
-/** Owner-bound, read-only collection contract over current indications. */
+/**
+ * Owner-bound, read-only collection contract over current indications.
+ * Implementations issue application-owned cursors and never return backend
+ * continuation values unchanged.
+ */
 export interface OwnerIndicationReviewCollectionRepository {
   list(
     request: OwnerIndicationModerationListRequest,
