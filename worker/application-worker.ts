@@ -1070,12 +1070,12 @@ async function runtimeParticipantInvestmentInterestRoute(
 
   try {
     const participantScope = requiredParticipantRequest(participantRequest);
-    const policyCampaign =
-      participantScope.participantInvestmentPolicyCampaign();
     const participant = participantScope.participantProfileRepository();
     const acknowledgments = participantScope.participantPackageAcknowledgments(
       account.value.subject,
     );
+    const policyCampaign =
+      participantScope.participantInvestmentPolicyCampaign();
     const campaign = await policyCampaign.readSetup();
     if (campaign === null) return unavailableRoute;
     const amountConfiguration = campaign.setup.amountAggregate.amount;

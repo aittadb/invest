@@ -434,14 +434,9 @@ function createParticipantRequestRepositoryScope(
     if (requiredActorSubject(value) !== account.subject) unavailable();
   };
   const beginRouteReads = (limit: number): void => {
-    if (budget.routeReadLimit === null) {
+    if (budget.routeReadLimit === null || budget.routeReadsUsed === 0) {
       budget.routeReadLimit = limit;
       budget.remainingRouteReads = limit;
-      return;
-    }
-    if (budget.routeReadsUsed === 0) {
-      budget.routeReadLimit = Math.max(budget.routeReadLimit, limit);
-      budget.remainingRouteReads = budget.routeReadLimit;
       return;
     }
     if (budget.routeReadLimit !== limit) unavailable();
