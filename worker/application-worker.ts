@@ -68,6 +68,10 @@ import {
   createOwnerIndicationModerationRouteHandler,
   type OwnerIndicationModerationRouteDependencies,
 } from "./routes/owner-indication-moderation.ts";
+import {
+  createOwnerAuditHistoryRouteHandler,
+  type OwnerAuditHistoryRouteDependencies,
+} from "./routes/owner-audit-notification-history.ts";
 import { createOwnerCampaignEditorRouteHandler } from "./routes/owner-campaign-editor.ts";
 import { createOwnerInitialSetupRouteHandler } from "./routes/owner-initial-setup.ts";
 import { createOwnerRouteHandler } from "./routes/owner.ts";
@@ -117,6 +121,7 @@ export type ApplicationWorkerDependencies = Readonly<{
   ownerPackage?: OwnerPackageRouteDependencies;
   ownerIndicationModeration?: OwnerIndicationModerationRouteDependencies;
   ownerReviewExports?: OwnerReviewExportRouteDependencies;
+  ownerAuditHistory?: OwnerAuditHistoryRouteDependencies;
   participantFounderInterest?: FounderInterestRouteDependencies;
   participantInvestmentInterests?: InvestmentInterestRouteDependencies;
   participantPackageReader?: ParticipantPackageReaderDependencies;
@@ -200,6 +205,11 @@ export function createApplicationWorker(
       const ownerReviewExportsAvailable =
         dependencies.dispatchRoute === undefined &&
         dependencies.ownerReviewExports !== undefined;
+      const ownerAuditHistory = dependencies.dispatchRoute === undefined
+        ? dependencies.ownerAuditHistory ??
+          runtimeOwnerAuditHistory(applicationRuntime)
+        : undefined;
+      const ownerAuditHistoryAvailable = ownerAuditHistory !== undefined;
       const participantInvestmentInterestsAvailable =
         dependencies.dispatchRoute === undefined &&
         dependencies.participantInvestmentInterests !== undefined;
@@ -274,6 +284,8 @@ export function createApplicationWorker(
                 normalApplication && ownerIndicationModerationAvailable,
               ownerReviewExports:
                 normalApplication && ownerReviewExportsAvailable,
+              ownerAuditHistory:
+                normalApplication && ownerAuditHistoryAvailable && isOwner,
               participantFounderInterest:
                 normalApplication && participantFounderInterestAvailable,
               participantInvestmentInterests:
@@ -299,6 +311,7 @@ export function createApplicationWorker(
         participantPackageAcknowledgment !== undefined ||
         ownerIndicationModerationAvailable ||
         ownerReviewExportsAvailable ||
+        ownerAuditHistoryAvailable ||
         participantFounderInterestAvailable ||
         participantInvestmentInterestsAvailable ||
         campaignEditorAvailable ||
@@ -311,6 +324,7 @@ export function createApplicationWorker(
               ownerOAuthProof,
               participantRegistration,
               participantProfile,
+              ownerAuditHistory,
               participantFounderInterest ?? null,
               {
                 owner: ownerPackage,
@@ -321,6 +335,7 @@ export function createApplicationWorker(
                 ownerPackageAvailable,
                 ownerIndicationModerationAvailable,
                 ownerReviewExportsAvailable,
+                ownerAuditHistoryAvailable,
                 participantFounderInterestAvailable,
                 participantInvestmentInterestsAvailable,
                 campaignEditorAvailable,
@@ -364,6 +379,7 @@ type InjectedRouteAvailability = Readonly<{
   ownerPackageAvailable: boolean;
   ownerIndicationModerationAvailable: boolean;
   ownerReviewExportsAvailable: boolean;
+  ownerAuditHistoryAvailable: boolean;
   participantFounderInterestAvailable: boolean;
   participantInvestmentInterestsAvailable: boolean;
   campaignEditorAvailable: boolean;
@@ -383,6 +399,7 @@ function createInjectedRouteDispatcher(
   ownerOAuthProof: OwnerOAuthProofRouteDependencies | null,
   participantRegistration: ParticipantRegistrationRouteDependencies | null,
   participantProfile: ParticipantProfileRouteDependencies | null,
+  ownerAuditHistory: OwnerAuditHistoryRouteDependencies | undefined,
   participantFounderInterest: FounderInterestRouteDependencies | null,
   packageRoutes: ResolvedPackageRoutes,
   available: InjectedRouteAvailability,
@@ -441,6 +458,9 @@ function createInjectedRouteDispatcher(
               dependencies.ownerReviewExports,
             )]
           : []),
+        ...(ownerAuditHistory
+          ? [createOwnerAuditHistoryRouteHandler(ownerAuditHistory)]
+          : []),
         ...(campaignWorkspace
           ? [
               createOwnerInitialSetupRouteHandler({
@@ -468,6 +488,7 @@ function createInjectedRouteDispatcher(
         managePackage: available.ownerPackageAvailable,
         indicationModeration: available.ownerIndicationModerationAvailable,
         reviewExports: available.ownerReviewExportsAvailable,
+        auditHistory: available.ownerAuditHistoryAvailable,
         campaignEditor: available.campaignEditorAvailable,
         campaignSetup: available.campaignSetupAvailable,
         aittadbConnection: available.ownerOAuthProofAvailable,
@@ -864,6 +885,19 @@ function randomOperationId(namespace: string): StorageOperationId {
   return parsed.value;
 }
 
+function runtimeOwnerAuditHistory(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+): OwnerAuditHistoryRouteDependencies | undefined {
+  if (runtime === null) return undefined;
+  try {
+    return Object.freeze({
+      audit: runtime.repositoryFactory.ownerAuditEvents(),
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 async function resolveApplicationRuntime(
   dependencies: ApplicationWorkerDependencies,
   env: InvestorAppEnv,
@@ -905,6 +939,7 @@ function withRuntimeConfiguration(
     ownerPackageWorkspace: boolean;
     ownerIndicationModeration: boolean;
     ownerReviewExports: boolean;
+    ownerAuditHistory: boolean;
     participantFounderInterest: boolean;
     participantInvestmentInterests: boolean;
     ownerCampaignEditor: boolean;

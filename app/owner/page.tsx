@@ -10,12 +10,14 @@ import {
 } from "../../http/runtime-campaign";
 import {
   hasOwnerAittaDBConnection,
+  hasOwnerAuditHistory,
   hasOwnerCampaignEditorCapability,
   hasOwnerCampaignSetupCapability,
   hasOwnerIndicationModeration,
   hasOwnerPackageWorkspace,
   hasOwnerReviewExports,
   OWNER_AITTADB_CONNECTION_HEADER,
+  OWNER_AUDIT_HISTORY_HEADER,
   OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER,
   OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER,
   OWNER_INDICATION_MODERATION_HEADER,
@@ -54,6 +56,9 @@ export default async function OwnerHome() {
   const reviewExportsAvailable = hasOwnerReviewExports(
     requestHeaders.get(OWNER_REVIEW_EXPORTS_HEADER),
   );
+  const auditHistoryAvailable = hasOwnerAuditHistory(
+    requestHeaders.get(OWNER_AUDIT_HISTORY_HEADER),
+  );
   const setupState = campaign ? "Configured" : "Setup required";
   const publicationState = campaign
     ? campaign.published
@@ -84,6 +89,9 @@ export default async function OwnerHome() {
           ) : null}
           {reviewExportsAvailable ? (
             <Link href="/owner/exports">Review exports</Link>
+          ) : null}
+          {auditHistoryAvailable ? (
+            <Link href="/owner/audit-events">Audit events</Link>
           ) : null}
           <a href={chatGPTSignOutPath("/")}>Sign out</a>
         </nav>

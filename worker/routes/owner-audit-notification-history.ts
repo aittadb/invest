@@ -27,6 +27,7 @@ import {
 } from "../../http/mutation-security.ts";
 import type {
   AtomicManualNotificationActivityRepository,
+  AuditEventReader,
   AuditRepository,
 } from "../../repositories/in-memory-audit-notification-repositories.ts";
 import type {
@@ -47,7 +48,6 @@ type Representation = "html" | "hypermedia-json";
 type Activity = "template-copied" | "sent-marked";
 
 type HistoryRoute =
-  | Readonly<{ kind: "audit-collection" }>
   | Readonly<{ kind: "notification-collection" }>
   | Readonly<{ kind: "notification-detail"; notificationId: string }>
   | Readonly<{
@@ -65,6 +65,20 @@ export type OwnerAuditNotificationRouteDependencies = Readonly<{
   now?: () => Date;
 }>;
 
+export type OwnerAuditHistoryRouteDependencies = Readonly<{
+  audit: AuditEventReader;
+}>;
+
+/** Composes only the persistent read-only audit resource. */
+export function createOwnerAuditHistoryRouteHandler(
+  dependencies: OwnerAuditHistoryRouteDependencies,
+): ApplicationRouteHandler {
+  return async (context) => {
+    if (context.url.pathname !== AUDIT_PATH) return null;
+    return ownerAuditCollectionResponse(context, dependencies.audit, false);
+  };
+}
+
 export function createOwnerAuditNotificationHistoryRouteHandler(
   dependencies: OwnerAuditNotificationRouteDependencies,
 ): ApplicationRouteHandler {
@@ -74,6 +88,9 @@ export function createOwnerAuditNotificationHistoryRouteHandler(
   const now = dependencies.now ?? (() => new Date());
 
   return async (context) => {
+    if (context.url.pathname === AUDIT_PATH) {
+      return ownerAuditCollectionResponse(context, dependencies.audit, true);
+    }
     const route = parseRoute(context.url);
     if (route === null) return null;
 
@@ -122,17 +139,6 @@ export function createOwnerAuditNotificationHistoryRouteHandler(
         return methodNotAllowedResponse(representation, context.resourceUrl);
       }
 
-      if (route.kind === "audit-collection") {
-        const pageRequest = parsePageRequest(context.url);
-        const document = createOwnerAuditCollectionDocument(
-          context.resourceUrl,
-          await dependencies.audit.list(pageRequest),
-          pageRequest.limit,
-        );
-        return representation === "hypermedia-json"
-          ? hypermediaResponse(document)
-          : htmlResponse(renderAuditCollection(document));
-      }
       if (route.kind === "notification-collection") {
         const pageRequest = parsePageRequest(context.url);
         const document = createOwnerNotificationCollectionDocument(
@@ -168,6 +174,57 @@ export function createOwnerAuditNotificationHistoryRouteHandler(
       );
     }
   };
+}
+
+async function ownerAuditCollectionResponse(
+  context: ApplicationRouteContext,
+  audit: AuditEventReader,
+  manualNotificationsAvailable: boolean,
+): Promise<Response> {
+  const negotiated = negotiateRepresentation(
+    context.request.headers.get("accept"),
+  );
+  if (negotiated.kind === "not-acceptable") {
+    return notAcceptableResponse(context.resourceUrl);
+  }
+  const representation = negotiated.kind;
+  if (context.actor === null) {
+    return authenticationRequiredResponse(
+      representation,
+      context.resourceUrl,
+    );
+  }
+  if (!context.isOwner) {
+    return errorResponse(
+      representation,
+      context.resourceUrl,
+      404,
+      "not_found",
+      "The requested resource was not found.",
+    );
+  }
+  if (context.request.method !== "GET") {
+    return methodNotAllowedResponse(representation, context.resourceUrl);
+  }
+
+  try {
+    const pageRequest = parsePageRequest(context.url);
+    const document = createOwnerAuditCollectionDocument(
+      context.resourceUrl,
+      await audit.list(pageRequest),
+      pageRequest.limit,
+      { manualNotificationsAvailable },
+    );
+    return representation === "hypermedia-json"
+      ? hypermediaResponse(document)
+      : htmlResponse(renderAuditCollection(document));
+  } catch (error) {
+    return mappedFailureResponse(
+      representation,
+      context.resourceUrl,
+      error,
+    );
+  }
 }
 
 async function mutateNotification(
@@ -247,7 +304,6 @@ async function detailResponse(
 }
 
 function parseRoute(url: URL): HistoryRoute | null {
-  if (url.pathname === AUDIT_PATH) return { kind: "audit-collection" };
   if (url.pathname === NOTIFICATION_PATH) {
     return { kind: "notification-collection" };
   }
@@ -317,13 +373,26 @@ function parsePageRequest(
     throw new StorageFailure("INVALID_REQUEST");
   }
   const cursor = cursors[0];
-  if (cursor !== undefined && (cursor.length === 0 || cursor.length > 512)) {
+  if (
+    cursor !== undefined &&
+    (cursor.length === 0 || cursor.length > 512 || hasControlCharacter(cursor))
+  ) {
     throw new StorageFailure("INVALID_REQUEST");
   }
   return {
     limit,
     ...(cursor === undefined ? {} : { cursor: cursor as StorageCursor }),
   };
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint !== undefined && (codePoint <= 31 || codePoint === 127)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function assertNoQuery(url: URL): void {
@@ -551,12 +620,15 @@ function renderAuditCollection(document: OwnerAuditCollectionDocument): string {
   const rows = document.data.items.length === 0
     ? `<p class="history-empty">No audit events have been recorded.</p>`
     : `<ol class="history-list">${document.data.items.map((item) =>
-      `<li><article><div><p>${escapeHtml(auditDetailLabel(item.detail))}</p><h2>${escapeHtml(item.detail.kind)}</h2></div><dl><div><dt>Occurred</dt><dd><time datetime="${escapeAttribute(item.occurred_at)}">${escapeHtml(item.occurred_at)}</time></dd></div><div><dt>Actor</dt><dd>${escapeHtml(item.actor.type)}</dd></div></dl></article></li>`
+      `<li><article><div><p>${escapeHtml(auditDetailLabel(item.detail))}</p><h2>${escapeHtml(item.detail.kind)}</h2></div><dl><div><dt>Event</dt><dd>${escapeHtml(item.id)}</dd></div><div><dt>Occurred</dt><dd><time datetime="${escapeAttribute(item.occurred_at)}">${escapeHtml(item.occurred_at)}</time></dd></div><div><dt>Actor</dt><dd>${escapeHtml(item.actor.type)}${item.actor.subject === undefined ? "" : `: ${escapeHtml(item.actor.subject)}`}</dd></div></dl></article></li>`
     ).join("")}</ol>`;
   const next = document.links.find((link) => link.rel.includes("next"));
+  const notifications = document.links.find((link) =>
+    link.rel.includes("manual-notifications")
+  );
   return page(
     "Audit events",
-    `<main class="history-main"><div class="history-title"><div><p class="history-kicker">Owner activity</p><h1>Audit events</h1></div><a href="/owner/manual-notifications">Manual notifications</a></div>${rows}${next ? `<a class="history-next" href="${escapeAttribute(next.href)}">Next page</a>` : ""}</main>`,
+    `<main class="history-main"><div class="history-title"><div><p class="history-kicker">Owner activity</p><h1>Audit events</h1></div>${notifications ? `<a href="${escapeAttribute(notifications.href)}">Manual notifications</a>` : ""}</div>${rows}${next ? `<a class="history-next" href="${escapeAttribute(next.href)}">Next page</a>` : ""}</main>`,
   );
 }
 
@@ -612,10 +684,10 @@ function renderActivityForm(
 
 function auditDetailLabel(detail: OwnerAuditEventItemDetail): string {
   if (detail.kind === "resource-transition") {
-    return `${detail.resource_type}: ${detail.transition}`;
+    return `${detail.resource_type} ${detail.resource_id}: ${detail.transition}`;
   }
   if (detail.kind === "export-created") return detail.export_type;
-  return detail.activity;
+  return `${detail.activity}: ${detail.notification_id}`;
 }
 
 type OwnerAuditEventItemDetail =

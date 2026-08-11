@@ -15,6 +15,7 @@ import type { ParticipantRequestRepositoryScope } from "../repositories/storage-
 import type { ParticipantRegistrationRepository } from "../repositories/in-memory-participant-repository.ts";
 import type { OwnerCampaignEditorRepository } from "../services/owner-campaign-editor.ts";
 import type { OwnerPackageWorkspaceService } from "../services/owner-package-workspace.ts";
+import type { AuditEventReader } from "../repositories/in-memory-audit-notification-repositories.ts";
 import type {
   AtomicParticipantInvestmentInterestMutationPort,
   ParticipantInvestmentInterestReader,
@@ -31,6 +32,7 @@ export type ApplicationRepositoryFactory = Readonly<{
   campaignRepository(): AtomicCampaignAuditRepository;
   publicCampaignReader(): PublicCampaignPresentationReader;
   ownerPackageWorkspace(): OwnerPackageWorkspaceService;
+  ownerAuditEvents(): AuditEventReader;
   participantRequest(
     account: ParticipantAccount,
   ): ParticipantRequestRepositoryScope;

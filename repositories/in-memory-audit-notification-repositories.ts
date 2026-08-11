@@ -21,6 +21,7 @@ import {
   type Timestamp,
 } from "../domain/foundation.ts";
 import {
+  MAX_STORAGE_PAGE_SIZE,
   StorageFailure,
   assertStorageListBoundary,
   parseStorageCollection,
@@ -85,11 +86,31 @@ export type AuditEventPage = Readonly<{
   nextCursor: StorageCursor | null;
 }>;
 
+export const MAX_OWNER_AUDIT_CURSOR_LENGTH = 512;
+
+/** Read-only audit capability exposed to owner resources and exports. */
+export interface AuditEventReader {
+  list(request: AuditListRequest): Promise<AuditEventPage>;
+}
+
 /** Append-only, owner-private audit persistence boundary. */
-export interface AuditRepository {
+export interface AuditRepository extends AuditEventReader {
   append(intent: unknown): Promise<AuditAppendResult>;
   get(id: unknown): Promise<AuditEvent | null>;
-  list(request: AuditListRequest): Promise<AuditEventPage>;
+}
+
+/** Persistent audit reader over one credential-bound production adapter. */
+export class StorageAuditEventReader implements AuditEventReader {
+  readonly #storage: Pick<StorageAdapter, "list">;
+
+  constructor(storage: Pick<StorageAdapter, "list">) {
+    this.#storage = requiredAuditStorageReader(storage);
+    Object.freeze(this);
+  }
+
+  list(request: AuditListRequest): Promise<AuditEventPage> {
+    return listAuditEvents(this.#storage, request);
+  }
 }
 
 /**
@@ -244,20 +265,7 @@ export class DevelopmentInMemoryAuditRepository
   }
 
   async list(request: AuditListRequest): Promise<AuditEventPage> {
-    const storageRequest = {
-      collection: AUDIT_EVENTS,
-      limit: request.limit,
-      ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
-    };
-    assertStorageListBoundary(storageRequest);
-    const page = await this.#storage.list(storageRequest);
-
-    return Object.freeze({
-      items: Object.freeze(page.items.map((stored) =>
-        decodeAuditEvent(stored, stored.key)
-      )),
-      nextCursor: page.nextCursor,
-    });
+    return listAuditEvents(this.#storage, request);
   }
 }
 
@@ -610,31 +618,211 @@ function auditDetailDocument(detail: AuditEventDetail): StorageDocument {
   };
 }
 
-function decodeAuditEvent(record: StorageRecord, expectedKey: StorageKey): AuditEvent {
+async function listAuditEvents(
+  storage: Pick<StorageAdapter, "list">,
+  request: AuditListRequest,
+): Promise<AuditEventPage> {
+  const normalized = normalizeAuditListRequest(request);
+  const storageRequest = Object.freeze({
+    collection: AUDIT_EVENTS,
+    limit: normalized.limit,
+    ...(normalized.cursor === undefined ? {} : { cursor: normalized.cursor }),
+  });
+  assertStorageListBoundary(storageRequest);
+  let storedPage: unknown;
+  try {
+    storedPage = await storage.list(storageRequest);
+  } catch (error) {
+    if (error instanceof StorageFailure) throw error;
+    unavailable();
+  }
+  const page = exactAuditStoragePage(storedPage, normalized);
+  const seen = new Set<string>();
+  const items = page.items.map((stored) => {
+    const event = decodeAuditEvent(stored, null);
+    if (seen.has(event.id)) unavailable();
+    seen.add(event.id);
+    return event;
+  });
+
+  return Object.freeze({
+    items: Object.freeze(items),
+    nextCursor: page.nextCursor,
+  });
+}
+
+function normalizeAuditListRequest(
+  request: AuditListRequest,
+): AuditListRequest {
+  const source = exactDataRecord(request, 2);
+  if (source === null) invalidRequest();
+  const hasCursor = Object.hasOwn(source, "cursor");
+  if (!hasExactDataKeys(source, hasCursor ? ["limit", "cursor"] : ["limit"])) {
+    invalidRequest();
+  }
   if (
-    storageKeyString(record.key) !== storageKeyString(expectedKey) ||
-    record.revision !== 1
+    !Number.isSafeInteger(source.limit) ||
+    (source.limit as number) < 1 ||
+    (source.limit as number) > MAX_STORAGE_PAGE_SIZE
+  ) {
+    invalidRequest();
+  }
+  if (hasCursor && !isBoundedAuditCursor(source.cursor)) invalidRequest();
+  return Object.freeze({
+    limit: source.limit as number,
+    ...(hasCursor ? { cursor: source.cursor as StorageCursor } : {}),
+  });
+}
+
+function exactAuditStoragePage(
+  value: unknown,
+  request: AuditListRequest,
+): Readonly<{
+  items: readonly StorageRecord[];
+  nextCursor: StorageCursor | null;
+}> {
+  const source = exactDataRecord(value, 2);
+  if (
+    source === null ||
+    !hasExactDataKeys(source, ["items", "nextCursor"])
+  ) unavailable();
+  const items = exactDenseArray(source.items, request.limit);
+  const nextCursor = source.nextCursor;
+  if (
+    nextCursor !== null && !isBoundedAuditCursor(nextCursor) ||
+    nextCursor !== null && nextCursor === request.cursor ||
+    nextCursor !== null && items.length === 0
+  ) unavailable();
+  return Object.freeze({
+    items: items as readonly StorageRecord[],
+    nextCursor: nextCursor as StorageCursor | null,
+  });
+}
+
+function decodeAuditEvent(
+  record: StorageRecord,
+  expectedKey: StorageKey | null,
+): AuditEvent {
+  const envelope = exactDataRecord(record, 3);
+  const keySource = envelope === null
+    ? null
+    : exactDataRecord(envelope.key, 2);
+  if (
+    envelope === null ||
+    keySource === null ||
+    !hasExactDataKeys(envelope, ["key", "revision", "value"]) ||
+    !hasExactDataKeys(keySource, ["collection", "id"])
+  ) unavailable();
+  const parsedKey = parseStorageKey(keySource.collection, keySource.id);
+  if (!parsedKey.ok || parsedKey.value.collection !== AUDIT_EVENTS) unavailable();
+  if (
+    expectedKey !== null &&
+      storageKeyString(parsedKey.value) !== storageKeyString(expectedKey) ||
+    envelope.revision !== 1
   ) {
     unavailable();
   }
-  const source = objectRecord(record.value);
+  const source = exactDataRecord(envelope.value, 3);
   if (
     source === null ||
-    !hasExactKeys(source, AUDIT_DOCUMENT_KEYS) ||
+    !hasExactDataKeys(source, [...AUDIT_DOCUMENT_KEYS]) ||
     source.kind !== "audit-event" ||
     source.schemaVersion !== AUDIT_SCHEMA_VERSION
   ) {
     unavailable();
   }
+  const closedEvent = closedAuditEvent(source.event);
   const parsed = parseAuditAppendIntent({
     type: "append-audit-event",
-    event: source.event,
+    event: closedEvent,
   });
   if (!parsed.ok) unavailable();
-  if (storageKeyString(auditEventKey(parsed.value.event.id)) !== storageKeyString(expectedKey)) {
+  if (
+    storageKeyString(auditEventKey(parsed.value.event.id)) !==
+      storageKeyString(parsedKey.value) ||
+    canonicalJson(auditEventDocument(parsed.value.event)) !==
+      canonicalJson(closedEvent)
+  ) {
     unavailable();
   }
   return parsed.value.event;
+}
+
+function closedAuditEvent(value: unknown): StorageDocument {
+  const source = exactDataRecord(value, 5);
+  if (
+    source === null ||
+    !hasExactDataKeys(source, [
+      "id",
+      "operationId",
+      "occurredAt",
+      "actor",
+      "detail",
+    ])
+  ) unavailable();
+  return Object.freeze({
+    id: requiredJsonPrimitive(source.id),
+    operationId: requiredJsonPrimitive(source.operationId),
+    occurredAt: requiredJsonPrimitive(source.occurredAt),
+    actor: closedAuditActor(source.actor),
+    detail: closedAuditDetail(source.detail),
+  });
+}
+
+function closedAuditActor(value: unknown): StorageDocument {
+  const source = exactDataRecord(value, 2);
+  if (source === null) unavailable();
+  if (source.type === "system") {
+    if (!hasExactDataKeys(source, ["type"])) unavailable();
+    return Object.freeze({ type: "system" });
+  }
+  if (
+    (source.type !== "participant" && source.type !== "owner") ||
+    !hasExactDataKeys(source, ["type", "subject"])
+  ) unavailable();
+  return Object.freeze({
+    type: source.type,
+    subject: requiredJsonPrimitive(source.subject),
+  });
+}
+
+function closedAuditDetail(value: unknown): StorageDocument {
+  const source = exactDataRecord(value, 4);
+  if (source === null) unavailable();
+  if (source.kind === "resource-transition") {
+    const resource = exactDataRecord(source.resource, 2);
+    if (
+      !hasExactDataKeys(source, ["kind", "resource", "transition"]) ||
+      resource === null ||
+      !hasExactDataKeys(resource, ["type", "id"])
+    ) unavailable();
+    return Object.freeze({
+      kind: "resource-transition",
+      resource: Object.freeze({
+        type: requiredJsonPrimitive(resource.type),
+        id: requiredJsonPrimitive(resource.id),
+      }),
+      transition: requiredJsonPrimitive(source.transition),
+    });
+  }
+  if (source.kind === "export-created") {
+    if (!hasExactDataKeys(source, ["kind", "exportType"])) unavailable();
+    return Object.freeze({
+      kind: "export-created",
+      exportType: requiredJsonPrimitive(source.exportType),
+    });
+  }
+  if (source.kind === "manual-notification") {
+    if (
+      !hasExactDataKeys(source, ["kind", "notificationId", "activity"])
+    ) unavailable();
+    return Object.freeze({
+      kind: "manual-notification",
+      notificationId: requiredJsonPrimitive(source.notificationId),
+      activity: requiredJsonPrimitive(source.activity),
+    });
+  }
+  unavailable();
 }
 
 function notificationDocument(snapshot: ManualNotificationSnapshot): StorageDocument {
@@ -915,6 +1103,122 @@ function requiredExpectedRevision(value: unknown): number {
 
 function isPositiveSafeInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 1;
+}
+
+function requiredAuditStorageReader(
+  value: Pick<StorageAdapter, "list">,
+): Pick<StorageAdapter, "list"> {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    typeof value.list !== "function"
+  ) {
+    throw new Error("Invalid audit reader configuration.");
+  }
+  return value;
+}
+
+function exactDataRecord(
+  value: unknown,
+  maximumKeys: number,
+): Readonly<Record<string, unknown>> | null {
+  try {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return null;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const source = value as Record<string, unknown>;
+    const keys = Reflect.ownKeys(source);
+    if (
+      keys.length > maximumKeys ||
+      keys.some((key) => typeof key !== "string")
+    ) return null;
+    const result: Record<string, unknown> = Object.create(null) as Record<
+      string,
+      unknown
+    >;
+    for (const key of keys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(source, key);
+      if (
+        descriptor === undefined ||
+        !descriptor.enumerable ||
+        !("value" in descriptor)
+      ) return null;
+      result[key] = descriptor.value;
+    }
+    return Object.freeze(result);
+  } catch {
+    return null;
+  }
+}
+
+function hasExactDataKeys(
+  source: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+): boolean {
+  const keys = Object.keys(source);
+  return keys.length === expected.length &&
+    keys.every((key) => expected.includes(key));
+}
+
+function exactDenseArray(
+  value: unknown,
+  maximumLength: number,
+): readonly unknown[] {
+  try {
+    if (
+      !Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype ||
+      value.length > maximumLength
+    ) unavailable();
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== value.length + 1 || keys.at(-1) !== "length") {
+      unavailable();
+    }
+    const result: unknown[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (keys[index] !== String(index)) unavailable();
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (
+        descriptor === undefined ||
+        !descriptor.enumerable ||
+        !("value" in descriptor)
+      ) unavailable();
+      result.push(descriptor.value);
+    }
+    return Object.freeze(result);
+  } catch (error) {
+    if (error instanceof StorageFailure) throw error;
+    unavailable();
+  }
+}
+
+function requiredJsonPrimitive(
+  value: unknown,
+): string | number | boolean | null {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    typeof value === "number" && Number.isFinite(value)
+  ) return value;
+  unavailable();
+}
+
+function isBoundedAuditCursor(value: unknown): value is StorageCursor {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > MAX_OWNER_AUDIT_CURSOR_LENGTH
+  ) return false;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint !== undefined && (codePoint <= 31 || codePoint === 127)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | null {

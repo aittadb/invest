@@ -55,6 +55,10 @@ import {
   type ParticipantRepository,
 } from "./in-memory-participant-repository.ts";
 import { StorageParticipantInvestmentInterestRepository } from "./storage-participant-investment-repository.ts";
+import {
+  StorageAuditEventReader,
+  type AuditEventReader,
+} from "./in-memory-audit-notification-repositories.ts";
 
 const REPLAY_SCHEMA_VERSION = 1;
 const REPLAY_COLLECTION = storageCollection("browser-mutation-replays");
@@ -132,6 +136,7 @@ export class StorageApplicationRepositoryFactory {
   readonly #campaignRepository: AtomicCampaignAuditRepository;
   readonly #publicCampaignReader: PublicCampaignPresentationReader;
   readonly #ownerPackageWorkspace: RepositoryOwnerPackageWorkspaceService;
+  readonly #ownerAuditEvents: AuditEventReader;
   readonly #participantRequest: (
     account: ParticipantAccount,
   ) => ParticipantRequestRepositoryScope;
@@ -148,6 +153,7 @@ export class StorageApplicationRepositoryFactory {
       packageVersions,
       { now: clock },
     );
+    this.#ownerAuditEvents = new StorageAuditEventReader(adapter);
     this.#participantRequest = (account) =>
       createParticipantRequestRepositoryScope(adapter, account);
     this.#participantRepositoryFor = (account) =>
@@ -176,6 +182,10 @@ export class StorageApplicationRepositoryFactory {
 
   ownerPackageWorkspace(): RepositoryOwnerPackageWorkspaceService {
     return this.#ownerPackageWorkspace;
+  }
+
+  ownerAuditEvents(): AuditEventReader {
+    return this.#ownerAuditEvents;
   }
 
   participantRequest(

@@ -190,6 +190,22 @@ and the closed resource-transition, export-class, or notification-activity
 detail. It has no field for export contents, notification templates, arbitrary
 notes, credentials, or internal causes.
 
+The hosted resource reads the immutable `audit-events` collection through the
+credential-bound AittaDB adapter. It accepts only exact data-only schema-v1
+records at revision one whose key matches the parsed event identifier. Unknown
+event kinds, extra private fields, hostile accessors, malformed records,
+oversized pages, duplicate events, and unusable continuation cursors all fail
+through one fixed non-disclosing unavailable response; none is interpreted as
+trusted evidence. A fresh Worker continues from the opaque next-page link.
+
+Audit history is composed independently from manual-notification history. Until
+the latter has its own persistent capability, neither the audit document nor
+its HTML navigation advertises `/owner/manual-notifications`. The configured
+owner receives the same event identifiers, times, actors, and closed detail in
+HTML and version `0.1` hypermedia JSON; anonymous callers receive the sign-in
+transition and other authenticated callers receive the non-disclosing missing
+surface.
+
 `GET /owner/manual-notifications` pages bounded private notification summaries.
 `GET /owner/manual-notifications/{notification-id}` exposes the selected
 template, its copy history, and its independent sent marker to the configured

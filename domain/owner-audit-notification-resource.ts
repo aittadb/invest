@@ -136,6 +136,9 @@ export function createOwnerAuditCollectionDocument(
   requestUrl: string,
   page: OwnerAuditEventPage,
   pageSize: number,
+  options: Readonly<{ manualNotificationsAvailable?: boolean }> = {
+    manualNotificationsAvailable: true,
+  },
 ): OwnerAuditCollectionDocument {
   const self = new URL(requestUrl);
   return deepFreeze({
@@ -143,9 +146,17 @@ export function createOwnerAuditCollectionDocument(
     type: "owner-audit-event-collection",
     id: "owner-audit-events",
     data: { items: page.items.map(projectAuditEvent) },
-    links: collectionLinks(self, page.nextCursor, pageSize, [
-      { rel: ["manual-notifications"], href: new URL("/owner/manual-notifications", self).href },
-    ]),
+    links: collectionLinks(
+      self,
+      page.nextCursor,
+      pageSize,
+      options.manualNotificationsAvailable === false
+        ? []
+        : [{
+            rel: ["manual-notifications"],
+            href: new URL("/owner/manual-notifications", self).href,
+          }],
+    ),
     actions: [],
   });
 }

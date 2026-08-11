@@ -36,6 +36,7 @@ import {
 import type {
   AuditAppendResult,
   AuditEventPage,
+  AuditEventReader,
   AuditListRequest,
   AuditedManualNotificationActivityRequest,
   AuditedManualNotificationMutationResult,
@@ -43,6 +44,7 @@ import type {
   ManualNotificationSnapshot,
 } from "../repositories/in-memory-audit-notification-repositories.ts";
 import {
+  createOwnerAuditHistoryRouteHandler,
   createOwnerAuditNotificationHistoryRouteHandler,
 } from "../worker/routes/owner-audit-notification-history.ts";
 import type {
@@ -55,6 +57,129 @@ const INTERNAL_ORIGIN = "https://worker.internal";
 const OWNER_SUBJECT = "oidc:configured-owner";
 const OWNER_EMAIL = "owner@example.com";
 const CSRF_TOKEN = "owner_csrf_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const PRIVATE_FAILURE = "private backend audit detail";
+
+test("persistent audit-only route keeps HTML and hypermedia equivalent", async () => {
+  const audit = new FakeAuditRepository();
+  audit.events.push(
+    auditEvent(
+      "audit:event-persistent",
+      "audit:operation-persistent",
+      "resource-transition",
+    ),
+  );
+  const handler = createOwnerAuditHistoryRouteHandler({ audit });
+  const request = async (path: string, accept: string) => {
+    const raw = new Request(new URL(path, INTERNAL_ORIGIN), {
+      headers: identityHeaders(accept, "owner"),
+    });
+    const response = await handler(routeContext(raw, "owner"));
+    assert.ok(response);
+    return response;
+  };
+
+  const jsonResponse = await request(
+    "/owner/audit-events?page_size=1",
+    "application/json",
+  );
+  assert.equal(jsonResponse.status, 200);
+  const document = await jsonResponse.json() as OwnerAuditCollectionDocument;
+  assert.equal(document.data.items[0]?.id, "audit:event-persistent");
+  assert.equal(
+    document.data.items[0]?.actor.subject,
+    OWNER_SUBJECT,
+  );
+  assert.equal(
+    document.links.some((link) => link.rel.includes("manual-notifications")),
+    false,
+  );
+  assert.equal(document.actions.length, 0);
+
+  const htmlResponse = await request(
+    "/owner/audit-events?page_size=1",
+    "text/html",
+  );
+  const html = await htmlResponse.text();
+  assert.equal(htmlResponse.status, 200);
+  assert.match(html, /audit:event-persistent/u);
+  assert.match(html, new RegExp(OWNER_SUBJECT, "u"));
+  assert.match(html, /resource:campaign/u);
+  assert.doesNotMatch(html, /Manual notifications/u);
+  assert.equal(htmlResponse.headers.get("cache-control"), "no-store");
+
+  const home = createOwnerHomeDocument(
+    `${APP_ORIGIN}/owner`,
+    { displayName: "Owner", email: OWNER_EMAIL },
+    null,
+    { auditHistory: true },
+  );
+  assert.ok(home.links.some((link) => link.rel.includes("audit-events")));
+  assert.equal(
+    home.links.some((link) => link.rel.includes("manual-notifications")),
+    false,
+  );
+});
+
+test("persistent audit route bounds input, authorization, and private failures", async () => {
+  const audit = new FakeAuditRepository();
+  const handler = createOwnerAuditHistoryRouteHandler({ audit });
+  const invoke = async (
+    path: string,
+    actor: "owner" | "foreign" | "anonymous",
+    accept = "application/json",
+    method = "GET",
+  ) => {
+    const raw = new Request(new URL(path, INTERNAL_ORIGIN), {
+      method,
+      headers: identityHeaders(accept, actor),
+    });
+    const response = await handler(routeContext(raw, actor));
+    assert.ok(response);
+    return response;
+  };
+
+  for (const path of [
+    "/owner/audit-events?page_size=101",
+    "/owner/audit-events?page_size=01",
+    "/owner/audit-events?cursor=",
+    "/owner/audit-events?cursor=line%0Abreak",
+    `/owner/audit-events?cursor=${"x".repeat(513)}`,
+    "/owner/audit-events?page_size=1&page_size=2",
+    "/owner/audit-events?private=value",
+  ]) {
+    const response = await invoke(path, "owner");
+    assert.equal(response.status, 400, path);
+  }
+  assert.equal(audit.lastListLimits.length, 0);
+
+  assert.equal((await invoke("/owner/audit-events", "anonymous")).status, 401);
+  assert.equal((await invoke("/owner/audit-events", "foreign")).status, 404);
+  assert.equal(
+    (await invoke("/owner/audit-events", "owner", "application/json", "POST"))
+      .status,
+    405,
+  );
+  assert.equal(audit.lastListLimits.length, 0);
+
+  const failing: AuditEventReader = {
+    async list() {
+      throw new StorageFailure("UNAVAILABLE", {
+        cause: new Error(PRIVATE_FAILURE),
+      });
+    },
+  };
+  const failureHandler = createOwnerAuditHistoryRouteHandler({ audit: failing });
+  for (const accept of ["application/json", "text/html"]) {
+    const raw = new Request(`${INTERNAL_ORIGIN}/owner/audit-events`, {
+      headers: identityHeaders(accept, "owner"),
+    });
+    const response = await failureHandler(routeContext(raw, "owner"));
+    assert.ok(response);
+    const body = await response.text();
+    assert.equal(response.status, 503);
+    assert.doesNotMatch(body, new RegExp(PRIVATE_FAILURE, "u"));
+  }
+});
 
 test("owner audit and notification collections are finite, canonical, and non-disclosing", async () => {
   const fixture = await routeFixture();

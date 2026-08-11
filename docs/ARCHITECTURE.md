@@ -306,17 +306,27 @@ An adapter instance is already bound to one backend credential and grant set. Fo
 
 Manual notification templates remain private and bounded. Copy evidence means only that an owner copied a template, while a separate owner-entered marker records reported delivery outside the app. Neither state implies automated email delivery, and public errors use fixed projections that omit credentials, notes, template content, and internal causes.
 
-`DevelopmentInMemoryAuditRepository` appends one immutable allowlisted event per retry-stable operation and exposes finite adapter pagination. `DevelopmentInMemoryManualNotificationRepository` atomically compare-and-sets one private current notification with each immutable revision under one operation ID. Copy evidence appends independently from the single owner-entered sent marker, so neither action implies the other.
+`DevelopmentInMemoryAuditRepository` appends one immutable allowlisted event per retry-stable operation. `StorageAuditEventReader` is the narrower production read capability: it pages the same immutable collection through a credential-bound `StorageAdapter`, validates the exact page envelope and every closed schema-v1 record, and returns no append, key-read, transaction, adapter, or credential surface. It rejects oversized, duplicate, looping, unknown, accessor-backed, noncanonical, and corrupt evidence through a fixed `UNAVAILABLE` failure. `DevelopmentInMemoryManualNotificationRepository` atomically compare-and-sets one private current notification with each immutable revision under one operation ID. Copy evidence appends independently from the single owner-entered sent marker, so neither action implies the other.
 
 Notification keys are one-way derived, stored records are reconstructed through the bounded domain transitions, and every prior revision is verified before current state is returned. Audit detail cannot retain export contents or arbitrary fields, while notification templates never enter public failure projections. These repositories are deterministic development proof, not production storage.
 
-The owner activity route composes two read surfaces over those repositories:
-bounded audit-event and manual-notification collections, plus one notification
-detail containing its finite copy evidence and optional sent marker. The detail
-resource is the single source for native forms and hypermedia actions. It
-advertises only transitions currently available, supplies CSRF discovery for
-both representations, accepts exact feature fields, and uses the canonical
-deployment origin for every link and redirect.
+The application repository factory exposes the persistent audit reader as one
+named backend-only capability. The hosted Worker composes it into the
+owner-authorized `/owner/audit-events` resource and advertises only that audit
+link in owner navigation. HTML and hypermedia use one projected collection and
+canonical deployment URLs. Authentication and owner authorization run before
+the reader, while page, cursor, storage, and evidence failures use bounded
+fixed responses with no backend cause or private detail. Worker reconstruction
+creates a new reader over the same AittaDB collection and opaque cursor.
+
+The existing combined development owner-activity route also supports the
+manual-notification collection and one notification detail containing finite
+copy evidence and an optional sent marker. That detail remains the single
+source for native forms and hypermedia actions. It advertises only transitions
+currently available, supplies CSRF discovery for both representations, accepts
+exact feature fields, and uses the canonical deployment origin for every link
+and redirect. Production notification composition remains a separate bounded
+capability.
 
 Copy and sent mutations require the explicit
 `atomic-notification-audit` capability. Each transition compare-and-sets the

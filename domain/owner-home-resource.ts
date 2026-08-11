@@ -29,6 +29,8 @@ export type OwnerHomeCapabilities = Readonly<{
   campaignEditor?: boolean;
   founderApplicationReview?: boolean;
   aggregateReconciliation?: boolean;
+  auditHistory?: boolean;
+  /** Compatibility capability until notification persistence is composed. */
   auditNotificationHistory?: boolean;
   managePackage?: boolean;
   indicationModeration?: boolean;
@@ -43,6 +45,10 @@ export function createOwnerHomeDocument(
   capabilities: OwnerHomeCapabilities = {},
 ): OwnerHomeDocument {
   const absolute = (href: string) => new URL(href, requestUrl).href;
+  const auditHistoryAvailable = capabilities.auditHistory === true ||
+    capabilities.auditNotificationHistory === true;
+  const notificationHistoryAvailable =
+    capabilities.auditNotificationHistory === true;
   const packageLinks = capabilities.managePackage
     ? [{ rel: ["information-package"], href: absolute("/owner/package") }]
     : [];
@@ -99,17 +105,17 @@ export function createOwnerHomeDocument(
           href: absolute("/owner/aggregate-reconciliation"),
         }]
         : []),
-      ...(capabilities.auditNotificationHistory
-        ? [
-          {
+      ...(auditHistoryAvailable
+        ? [{
             rel: ["audit-events"],
             href: absolute("/owner/audit-events"),
-          },
-          {
+          }]
+        : []),
+      ...(notificationHistoryAvailable
+        ? [{
             rel: ["manual-notifications"],
             href: absolute("/owner/manual-notifications"),
-          },
-        ]
+          }]
         : []),
       ...(capabilities.indicationModeration
         ? [{
@@ -148,25 +154,25 @@ export function createOwnerHomeDocument(
         type: "text/html",
         fields: [],
       },
-      ...(capabilities.auditNotificationHistory
-        ? [
-          {
+      ...(auditHistoryAvailable
+        ? [{
             name: "review-audit-events",
             title: "Review audit events",
             href: absolute("/owner/audit-events"),
             method: "GET" as const,
             type: "text/html" as const,
             fields: [],
-          },
-          {
+          }]
+        : []),
+      ...(notificationHistoryAvailable
+        ? [{
             name: "review-manual-notifications",
             title: "Review manual notifications",
             href: absolute("/owner/manual-notifications"),
             method: "GET" as const,
             type: "text/html" as const,
             fields: [],
-          },
-        ]
+          }]
         : []),
       ...(capabilities.indicationModeration
         ? [{
