@@ -1,6 +1,7 @@
 import {
   parseAmountAggregateConfiguration,
   type AmountConfiguration,
+  type CurrencyCode,
 } from "../domain/amount-aggregate-configuration.ts";
 import {
   parseAuditAppendIntent,
@@ -266,10 +267,15 @@ export class StorageParticipantInvestmentInterestRepository
     );
     const indication = await applyIndication(indications, prepared.command);
     if (indication.replayed) conflict();
+    const operationCurrency = requiredIndicationCurrency(indication.snapshot);
+    if (
+      prepared.command.kind !== "withdraw" &&
+      operationCurrency !== this.#amount.currency
+    ) precondition();
 
     const aggregateBefore = await new DevelopmentInMemoryAggregateRepository(
       staged,
-      this.#amount.currency,
+      operationCurrency,
     ).readStored();
     const aggregate = await prepareAtomicAggregateContribution(staged, {
       operationId,
@@ -277,7 +283,7 @@ export class StorageParticipantInvestmentInterestRepository
       contribution: projectInvestmentIndicationForAggregation(
         indication.snapshot,
       ),
-    }, this.#amount.currency);
+    }, operationCurrency);
     await staged.stage(aggregate.mutations);
 
     if (prepared.command.kind === "create") {
@@ -318,9 +324,9 @@ export class StorageParticipantInvestmentInterestRepository
     const receipt = decodeOperationReceipt(
       receiptRecord,
       receiptKey,
-      this.#amount,
     );
     requireMatchingReceipt(receipt, prepared);
+    if (receipt.aggregate.currency !== operationCurrency) unavailable();
     verifyPreparedAuditAppend(
       prepared.audit,
       transaction.records.at(-2),
@@ -344,12 +350,13 @@ export class StorageParticipantInvestmentInterestRepository
     );
     const record = await this.#storage.read(receiptKey);
     if (record === null) return null;
-    const receipt = decodeOperationReceipt(record, receiptKey, this.#amount);
+    const receipt = decodeOperationReceipt(record, receiptKey);
     requireMatchingReceipt(receipt, prepared);
-
     const indication = await this.#indications
       .readPreparedParticipantMutation(prepared.indication);
     if (indication === null) unavailable();
+    const operationCurrency = requiredIndicationCurrency(indication.snapshot);
+    if (receipt.aggregate.currency !== operationCurrency) unavailable();
     let aggregate;
     try {
       aggregate = await readAtomicAggregateContributionReplay(
@@ -361,7 +368,7 @@ export class StorageParticipantInvestmentInterestRepository
             indication.snapshot,
           ),
         },
-        this.#amount.currency,
+        receipt.aggregate.currency,
       );
     } catch (error) {
       if (error instanceof StorageFailure) unavailable();
@@ -545,7 +552,6 @@ function operationReceiptMutation(
 function decodeOperationReceipt(
   record: StorageRecord | null | undefined,
   expectedKey: StorageKey,
-  amount: AmountConfiguration,
 ): StoredOperationReceipt {
   if (!record) unavailable();
   const envelope = exactStoredRecordEnvelope(record, expectedKey);
@@ -562,7 +568,7 @@ function decodeOperationReceipt(
     source.indicationId,
   );
   const auditEventId = parseStableId<"audit-event">(source.auditEventId);
-  const aggregate = decodeAggregate(source.aggregate, amount);
+  const aggregate = decodeAggregate(source.aggregate);
   if (
     !indicationId.ok ||
     !auditEventId.ok ||
@@ -895,22 +901,51 @@ function canonicalJsonValue(
 
 function decodeAggregate(
   value: unknown,
-  amount: AmountConfiguration,
 ): StoredInvestmentAggregateSnapshot {
   const source = exactRecord(value, AGGREGATE_KEYS);
   const totalAmount = parseMinorUnits(source.totalAmount);
+  const currency = requiredStoredCurrency(source.currency);
   if (
     !nonNegativeInteger(source.revision) ||
     !totalAmount.ok ||
-    source.currency !== amount.currency ||
     !nonNegativeInteger(source.contributingIndicationCount)
   ) unavailable();
   return Object.freeze({
     revision: source.revision,
     totalAmount: totalAmount.value,
-    currency: amount.currency,
+    currency,
     contributingIndicationCount: source.contributingIndicationCount,
   });
+}
+
+function requiredStoredCurrency(value: unknown): CurrencyCode {
+  const parsed = parseAmountAggregateConfiguration({
+    amount: {
+      currency: value,
+      minimum: 0,
+      increment: 1,
+      maximum: null,
+    },
+    publicAggregate: { visibility: "hidden" },
+  });
+  if (!parsed.ok) unavailable();
+  return parsed.value.amount.currency;
+}
+
+function requiredIndicationCurrency(
+  indication: InvestmentIndication,
+): CurrencyCode {
+  const parsed = parseAmountAggregateConfiguration({
+    amount: {
+      currency: indication.fields.currency,
+      minimum: 0,
+      increment: 1,
+      maximum: null,
+    },
+    publicAggregate: { visibility: "hidden" },
+  });
+  if (!parsed.ok) unavailable();
+  return parsed.value.amount.currency;
 }
 
 function aggregateDocument(

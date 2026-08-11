@@ -1,5 +1,6 @@
 import {
   parseAmountAggregateConfiguration,
+  parseConfiguredAmount,
   type AmountConfiguration,
 } from "../domain/amount-aggregate-configuration.ts";
 import {
@@ -342,6 +343,7 @@ export function createParticipantInvestmentInterestService(
 
   const commitAtomic = async (
     command: AtomicParticipantInvestmentInterestCommand,
+    historicalCurrencyAllowed: boolean,
   ): Promise<AtomicParticipantInvestmentInterestResult> => {
     let result: AtomicParticipantInvestmentInterestResult;
     try {
@@ -354,6 +356,7 @@ export function createParticipantInvestmentInterestService(
       result,
       command.auditIntent.event,
       amountConfiguration,
+      historicalCurrencyAllowed,
     );
   };
 
@@ -370,16 +373,18 @@ export function createParticipantInvestmentInterestService(
           indication.kind === "personal" &&
           indication.lifecycle.status === "active",
       );
+      const hasCapacity = indications.length < MAX_PARTICIPANT_INTERESTS;
       return Object.freeze({
         indications,
         amountConfiguration,
         acknowledgmentCurrent,
         canCreatePersonal:
+          hasCapacity &&
           acknowledgmentCurrent &&
           permissions.createPersonal &&
           !activePersonal,
         canCreateCompany:
-          acknowledgmentCurrent && permissions.createCompany,
+          hasCapacity && acknowledgmentCurrent && permissions.createCompany,
       });
     },
 
@@ -394,6 +399,10 @@ export function createParticipantInvestmentInterestService(
       const acknowledgmentCurrent = acknowledgmentIsCurrent(context);
       const active = indication.lifecycle.status === "active";
       const withdrawn = indication.lifecycle.status === "withdrawn";
+      const fieldsMeetCurrentAmountPolicy = indicationFieldsMeetAmountPolicy(
+        indication,
+        amountConfiguration,
+      );
       return Object.freeze({
         indication,
         amountConfiguration,
@@ -402,6 +411,7 @@ export function createParticipantInvestmentInterestService(
         canWithdraw: active,
         canReactivate:
           withdrawn &&
+          fieldsMeetCurrentAmountPolicy &&
           acknowledgmentCurrent &&
           (indication.kind === "personal"
             ? permissions.reactivatePersonal
@@ -439,7 +449,7 @@ export function createParticipantInvestmentInterestService(
         request,
         acknowledgmentContext,
         auditIntent,
-      }));
+      }), metadata.replayKnown);
       return requireOwnedActiveResult(
         result.indication,
         actorSubject,
@@ -475,7 +485,7 @@ export function createParticipantInvestmentInterestService(
         request,
         acknowledgmentContext,
         auditIntent,
-      }));
+      }), metadata.replayKnown);
       return requireOwnedActiveResult(
         result.indication,
         actorSubject,
@@ -506,7 +516,7 @@ export function createParticipantInvestmentInterestService(
         kind: "withdraw",
         request,
         auditIntent,
-      }));
+      }), true);
       return requireOwnedWithdrawnResult(
         result.indication,
         actorSubject,
@@ -521,6 +531,9 @@ export function createParticipantInvestmentInterestService(
       const metadata = await mutationMetadata(input.operationId, current);
       if (!metadata.replayKnown) {
         if (current.lifecycle.status !== "withdrawn") preconditionFailed();
+        if (!indicationFieldsMeetAmountPolicy(current, amountConfiguration)) {
+          preconditionFailed();
+        }
         const permissions = await loadPermissions();
         if (
           (current.kind === "personal" && !permissions.reactivatePersonal) ||
@@ -548,7 +561,7 @@ export function createParticipantInvestmentInterestService(
         request,
         acknowledgmentContext,
         auditIntent,
-      }));
+      }), metadata.replayKnown);
       return requireOwnedActiveResult(
         result.indication,
         actorSubject,
@@ -644,6 +657,7 @@ function requireAtomicMutationResult(
   value: unknown,
   expectedAudit: AuditEvent,
   amountConfiguration: AmountConfiguration,
+  historicalCurrencyAllowed: boolean,
 ): AtomicParticipantInvestmentInterestResult {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     unavailable();
@@ -672,6 +686,11 @@ function requireAtomicMutationResult(
   ) {
     unavailable();
   }
+  const indicationCurrency = requiredResultCurrency(indication);
+  if (
+    !historicalCurrencyAllowed &&
+    indicationCurrency !== amountConfiguration.currency
+  ) unavailable();
 
   const aggregate = source.aggregate as StoredInvestmentAggregateSnapshot;
   if (
@@ -683,7 +702,7 @@ function requireAtomicMutationResult(
     ]) ||
     !isNonNegativeSafeInteger(aggregate.revision) ||
     !isNonNegativeSafeInteger(aggregate.totalAmount) ||
-    aggregate.currency !== amountConfiguration.currency ||
+    aggregate.currency !== indicationCurrency ||
     !isNonNegativeSafeInteger(aggregate.contributingIndicationCount)
   ) {
     unavailable();
@@ -698,6 +717,30 @@ function requireAtomicMutationResult(
   if (!sameAuditEvent(auditEvent, expectedAudit)) unavailable();
 
   return Object.freeze({ indication, aggregate, auditEvent });
+}
+
+function indicationFieldsMeetAmountPolicy(
+  indication: InvestmentIndication,
+  amountConfiguration: AmountConfiguration,
+): boolean {
+  return indication.fields.currency === amountConfiguration.currency &&
+    parseConfiguredAmount(indication.fields.amount, amountConfiguration).ok;
+}
+
+function requiredResultCurrency(
+  indication: IndicationMutationResult,
+): string {
+  const parsed = parseAmountAggregateConfiguration({
+    amount: {
+      currency: indication.snapshot.fields?.currency,
+      minimum: 0,
+      increment: 1,
+      maximum: null,
+    },
+    publicAggregate: { visibility: "hidden" },
+  });
+  if (!parsed.ok) unavailable();
+  return parsed.value.amount.currency;
 }
 
 function sameAuditEvent(left: AuditEvent, right: AuditEvent): boolean {

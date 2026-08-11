@@ -208,6 +208,85 @@ test("atomic exact retries survive amount-policy evolution before current valida
   assert.equal(recordsIn(state, "audit-events").length, 1);
 });
 
+test("historical currency preserves withdrawal and exact retries after policy evolution", async () => {
+  const state = new MemoryStorageState();
+  const context = await currentContext(ALICE, "storage-currency-evolution");
+  const input = Object.freeze({
+    operationId: "investment-operation:storage-currency-evolution-create",
+    fields: personalFields({ amount: 1_250 }),
+  });
+  const originalRepository = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  const original = await serviceFor(
+    originalRepository,
+    ALICE,
+    context,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  ).create(input);
+
+  const evolvedAmount = amountConfiguration({
+    currency: "usd",
+    minimum: 5_000,
+    increment: 1_000,
+    maximum: 20_000,
+  });
+  const evolvedService = serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      evolvedAmount,
+    ),
+    ALICE,
+    context,
+    () => new Date("2026-08-12T11:00:00.000Z"),
+    evolvedAmount,
+  );
+  const createReplay = await evolvedService.create(input);
+  assert.equal(createReplay.replayed, true);
+  assert.deepEqual(createReplay.snapshot, original.snapshot);
+
+  const withdrawalInput = Object.freeze({
+    operationId: "investment-operation:storage-currency-evolution-withdraw",
+    indicationId: original.snapshot.id,
+    expectedRevision: 1,
+  });
+  const withdrawn = await evolvedService.withdraw(withdrawalInput);
+  assert.equal(withdrawn.replayed, false);
+  assert.equal(withdrawn.snapshot.lifecycle.status, "withdrawn");
+  assert.equal(withdrawn.snapshot.fields.currency, AMOUNT.currency);
+  assertAggregate(state, 2, 0, 0);
+
+  const restarted = serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      evolvedAmount,
+    ),
+    ALICE,
+    context,
+    () => new Date("2026-08-12T12:00:00.000Z"),
+    evolvedAmount,
+  );
+  const withdrawalReplay = await restarted.withdraw(withdrawalInput);
+  assert.equal(withdrawalReplay.replayed, true);
+  assert.deepEqual(withdrawalReplay.snapshot, withdrawn.snapshot);
+
+  const blockedReactivation = await captureStorageFailure(() =>
+    restarted.reactivate({
+      operationId:
+        "investment-operation:storage-currency-evolution-reactivate",
+      indicationId: original.snapshot.id,
+      expectedRevision: 2,
+    })
+  );
+  assert.equal(blockedReactivation.code, "PRECONDITION_FAILED");
+  assert.equal(recordsIn(state, "audit-events").length, 2);
+  assert.equal(recordsIn(state, "participant-investment-operations").length, 2);
+});
+
 test("atomic exact retries survive normalizer evolution without semantic substitution", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
