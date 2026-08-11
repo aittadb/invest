@@ -1042,7 +1042,37 @@ test("public projection reads expose only published presentation state", async (
     setup: explicitSetup(),
   }));
   const publicCampaign = await publicReader.readPublishedCampaign();
+  const parsedSetup = parseCampaignSetup(explicitSetup());
+  assert(parsedSetup.ok);
   assert.deepEqual(publicCampaign, syntheticPublicCampaign);
+  assert.deepEqual(await publicReader.readPublishedProjection(), {
+    revision: 1,
+    publicCampaign: syntheticPublicCampaign,
+    amountAggregate: parsedSetup.value.amountAggregate,
+  });
+  const privateRecord = [...state.records.values()].find((record) =>
+    record.key.collection === "campaign-setup-current"
+  );
+  const publicRecord = [...state.records.values()].find((record) =>
+    record.key.collection === "campaign-public-presentation"
+  );
+  assert(privateRecord);
+  assert(publicRecord);
+  assert.equal(
+    (privateRecord.value as { schemaVersion?: unknown }).schemaVersion,
+    4,
+  );
+  assert.equal(
+    (publicRecord.value as { schemaVersion?: unknown }).schemaVersion,
+    5,
+  );
+  assert.deepEqual(Object.keys(publicRecord.value).sort(), [
+    "amountAggregate",
+    "kind",
+    "publicCampaign",
+    "revision",
+    "schemaVersion",
+  ]);
   assert.equal(
     JSON.stringify(publicCampaign).includes(
       explicitSetup().campaignPolicy.notices.legalBoundary,
@@ -1074,6 +1104,44 @@ test("public projection reads expose only published presentation state", async (
     transition: "unpublished",
   });
   assert.equal(await publicReader.readPublishedCampaign(), null);
+});
+
+test("public presentation schema failures do not alter private setup evolution", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true);
+  const owner = new DevelopmentInMemoryCampaignRepository(adapter);
+  const publicReader = new DevelopmentInMemoryPublicCampaignPresentationReader(
+    adapter,
+  );
+  await owner.saveSetup(saveRequest({
+    operationId: "campaign-operation:public-schema",
+    recordedAt: FIRST_SAVE,
+    expectedRevision: null,
+    setup: explicitSetup(),
+  }));
+
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "campaign-public-presentation"
+  );
+  assert(entry);
+  const [key, record] = entry;
+  state.records.set(key, freezeRecord({
+    key: record.key,
+    revision: record.revision,
+    value: { ...record.value, schemaVersion: 4 },
+  }));
+
+  const failure = await captureStorageFailure(() =>
+    publicReader.readPublishedProjection()
+  );
+  assert.equal(failure.code, "UNAVAILABLE");
+  assert.equal((await owner.readSetup())?.revision, 1);
+  assert.equal(
+    (([...state.records.values()].find((candidate) =>
+      candidate.key.collection === "campaign-setup-current"
+    )?.value ?? {}) as { schemaVersion?: unknown }).schemaVersion,
+    4,
+  );
 });
 
 test("audited campaign transition labels are enforced before any atomic side effect", async () => {

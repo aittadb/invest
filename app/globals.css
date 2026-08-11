@@ -367,12 +367,60 @@ summary {
 }
 
 .participation-band,
+.aggregate-band,
 .product-band,
 .process-band,
 .risk-band,
 .faq-band,
 .closing-band {
   padding: 78px 0;
+}
+
+.aggregate-band {
+  padding-top: 46px;
+  padding-bottom: 46px;
+  border-bottom: 1px solid var(--line);
+  background: var(--white);
+}
+
+.aggregate-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, auto);
+  gap: 56px;
+  align-items: center;
+}
+
+.aggregate-layout h2 {
+  margin: 0;
+  font-size: 1.7rem;
+  line-height: 1.2;
+}
+
+.aggregate-layout > div:first-child > p:last-child {
+  max-width: 680px;
+  margin: 12px 0 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.aggregate-total {
+  min-width: 0;
+  padding-left: 40px;
+  border-left: 1px solid var(--line);
+  text-align: right;
+}
+
+.aggregate-total strong {
+  display: block;
+  font-size: 2rem;
+  line-height: 1.1;
+}
+
+.aggregate-total p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.45;
 }
 
 .participation-band,
@@ -924,6 +972,7 @@ footer {
   }
 
   .product-layout,
+  .aggregate-layout,
   .risk-layout,
   .faq-layout,
   .owner-status,
@@ -931,6 +980,14 @@ footer {
   .participant-package {
     grid-template-columns: 1fr;
     gap: 42px;
+  }
+
+  .aggregate-total {
+    padding-top: 28px;
+    padding-left: 0;
+    border-top: 1px solid var(--line);
+    border-left: 0;
+    text-align: left;
   }
 
   .process-list {
@@ -1039,6 +1096,7 @@ footer {
   }
 
   .participation-band,
+  .aggregate-band,
   .product-band,
   .process-band,
   .risk-band,

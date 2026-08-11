@@ -9,6 +9,7 @@ import {
   PARTICIPANT_HOME_PATH,
   PRIVATE_PACKAGE_PATH,
 } from "./participant-navigation.ts";
+import type { SanitizedPublicInvestmentAggregate } from "./investment-aggregate.ts";
 
 export type { HypermediaAction } from "./hypermedia-action.ts";
 
@@ -33,10 +34,29 @@ export type PublicCampaignDocument = Readonly<{
     product_summary: string | null;
     invitation: string | null;
     participation_paths: readonly ("investor" | "founder")[];
+    aggregate_interest: PublicAggregateInterestDocument | null;
     interest_is_binding: false;
   }>;
   links: readonly HypermediaLink[];
   actions: readonly HypermediaAction[];
+}>;
+
+export type PublicAggregateInterestDocument = Readonly<{
+  amount_minor_units: number;
+  currency: string;
+  label: string;
+  qualifier: string;
+  verification: Readonly<{
+    self_declared: true;
+    verified: false;
+    binding: false;
+  }>;
+  oversubscription: Readonly<{
+    status: "below_target" | "target_reached" | "oversubscribed";
+    target_amount_minor_units: number;
+    remaining_amount_minor_units: number;
+    amount_over_target_minor_units: number;
+  }> | null;
 }>;
 
 export function createPublicCampaignDocument(
@@ -45,6 +65,7 @@ export function createPublicCampaignDocument(
   capabilities: Readonly<{
     manageCampaign?: boolean;
     participant?: Readonly<{ privatePackage: boolean }>;
+    publicAggregate?: SanitizedPublicInvestmentAggregate | null;
   }> = {},
 ): PublicCampaignDocument {
   const absolute = (href: string) => new URL(href, requestUrl).href;
@@ -93,6 +114,7 @@ export function createPublicCampaignDocument(
         product_summary: null,
         invitation: null,
         participation_paths: [],
+        aggregate_interest: null,
         interest_is_binding: false,
       },
       links: [
@@ -135,6 +157,9 @@ export function createPublicCampaignDocument(
       participation_paths: configuration.participation.paths.map(
         (path) => path.kind,
       ),
+      aggregate_interest: publicAggregateDocument(
+        capabilities.publicAggregate ?? null,
+      ),
       interest_is_binding: false,
     },
     links: [
@@ -147,6 +172,33 @@ export function createPublicCampaignDocument(
     ],
     actions: [...visitorActions, ...authenticatedActions, ...manageAction],
   };
+}
+
+function publicAggregateDocument(
+  aggregate: SanitizedPublicInvestmentAggregate | null,
+): PublicAggregateInterestDocument | null {
+  if (aggregate === null) return null;
+  return Object.freeze({
+    amount_minor_units: aggregate.amount,
+    currency: aggregate.currency,
+    label: aggregate.label,
+    qualifier: aggregate.qualifier,
+    verification: Object.freeze({
+      self_declared: true as const,
+      verified: false as const,
+      binding: false as const,
+    }),
+    oversubscription: aggregate.oversubscription === null
+      ? null
+      : Object.freeze({
+          status: aggregate.oversubscription.status,
+          target_amount_minor_units: aggregate.oversubscription.targetAmount,
+          remaining_amount_minor_units:
+            aggregate.oversubscription.remainingAmount,
+          amount_over_target_minor_units:
+            aggregate.oversubscription.amountOverTarget,
+        }),
+  });
 }
 
 function action(name: string, title: string, href: string): HypermediaAction {

@@ -15,6 +15,7 @@ import {
   parseTimestamp,
 } from "../domain/foundation.ts";
 import { createPackageVersion } from "../domain/package-content.ts";
+import type { SanitizedPublicInvestmentAggregate } from "../domain/investment-aggregate.ts";
 import {
   parseParticipantAccount,
   registerParticipantProfile,
@@ -123,6 +124,31 @@ test("public and participant documents project only authorized capabilities", ()
   const visitor = createPublicCampaignDocument(
     "https://campaign.example/",
     syntheticPublicCampaign,
+    {
+      publicAggregate: {
+        amount: 12_500,
+        currency: "EUR",
+        label: "Indicated interest",
+        qualifier: "Current self-declared interest.",
+        oversubscription: null,
+      } as SanitizedPublicInvestmentAggregate,
+    },
+  );
+  assert.deepEqual(visitor.data.aggregate_interest, {
+    amount_minor_units: 12_500,
+    currency: "EUR",
+    label: "Indicated interest",
+    qualifier: "Current self-declared interest.",
+    verification: {
+      self_declared: true,
+      verified: false,
+      binding: false,
+    },
+    oversubscription: null,
+  });
+  assert.doesNotMatch(
+    JSON.stringify(visitor.data.aggregate_interest),
+    /participant|company|note|count|moderation|backend/iu,
   );
   assert.equal(
     new URL(visitor.actions[0]?.href ?? "https://campaign.example/")

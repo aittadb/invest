@@ -1,4 +1,5 @@
 import type { PublicCampaignConfiguration } from "../domain/public-campaign-configuration.ts";
+import type { SanitizedPublicInvestmentAggregate } from "../domain/investment-aggregate.ts";
 import type {
   AuthorizedParticipantAccess,
 } from "../domain/participant-home-resource.ts";
@@ -64,10 +65,12 @@ export type ApplicationRouteContext = Readonly<{
   isOwner: boolean;
   participantAccess: AuthorizedParticipantAccess | null;
   campaign: PublicCampaignConfiguration | null;
+  publicAggregate?: SanitizedPublicInvestmentAggregate | null;
   renderApplication(
     options?: Readonly<{
       request?: Request;
       campaign?: PublicCampaignConfiguration | null;
+      publicAggregate?: SanitizedPublicInvestmentAggregate | null;
       preview?: RuntimeCampaignPreview | null;
     }>,
   ): Promise<Response>;

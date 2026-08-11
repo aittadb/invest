@@ -59,6 +59,10 @@ import {
   StorageAuditEventReader,
   type AuditEventReader,
 } from "./in-memory-audit-notification-repositories.ts";
+import {
+  StoragePublicCampaignStateReader,
+  type PublicCampaignStateReader,
+} from "./storage-public-campaign-state-reader.ts";
 
 const REPLAY_SCHEMA_VERSION = 1;
 const REPLAY_COLLECTION = storageCollection("browser-mutation-replays");
@@ -135,6 +139,7 @@ export class StorageApplicationRepositoryFactory {
   readonly #claimBrowserMutationReplay: BrowserMutationReplayClaimer;
   readonly #campaignRepository: AtomicCampaignAuditRepository;
   readonly #publicCampaignReader: PublicCampaignPresentationReader;
+  readonly #publicCampaignStateReader: PublicCampaignStateReader;
   readonly #ownerPackageWorkspace: RepositoryOwnerPackageWorkspaceService;
   readonly #ownerAuditEvents: AuditEventReader;
   readonly #participantRequest: (
@@ -165,6 +170,9 @@ export class StorageApplicationRepositoryFactory {
     this.#publicCampaignReader = new StoragePublicCampaignPresentationReader(
       adapter,
     );
+    this.#publicCampaignStateReader = new StoragePublicCampaignStateReader(
+      adapter,
+    );
     Object.freeze(this);
   }
 
@@ -178,6 +186,10 @@ export class StorageApplicationRepositoryFactory {
 
   publicCampaignReader(): PublicCampaignPresentationReader {
     return this.#publicCampaignReader;
+  }
+
+  publicCampaignStateReader(): PublicCampaignStateReader {
+    return this.#publicCampaignStateReader;
   }
 
   ownerPackageWorkspace(): RepositoryOwnerPackageWorkspaceService {

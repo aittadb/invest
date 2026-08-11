@@ -27,6 +27,11 @@ import {
   PARTICIPANT_ACCESS_HEADER,
 } from "../http/runtime-participant.ts";
 import {
+  publicAggregateFromRuntimeHeader,
+  PUBLIC_AGGREGATE_HEADER,
+} from "../http/runtime-public-aggregate.ts";
+import type { SanitizedPublicInvestmentAggregate } from "../domain/investment-aggregate.ts";
+import {
   authorizeParticipantAccess,
   type ParticipantAuthorizationState,
 } from "../domain/participant-home-resource.ts";
@@ -573,6 +578,102 @@ test("an injected public campaign reader controls the public resource and fails 
   assert.equal(failedDocument.data.published, false);
   assert.equal(failedDocument.data.name, null);
   assert.doesNotMatch(JSON.stringify(failedDocument), /Northstar|private backend/u);
+});
+
+test("public HTML and hypermedia share one sanitized aggregate projection", async () => {
+  const rendered: Request[] = [];
+  let unavailable = false;
+  const aggregate = Object.freeze({
+    amount: 12_500,
+    currency: "EUR",
+    label: "Indicated interest",
+    qualifier: "Current self-declared interest.",
+    oversubscription: null,
+  }) as SanitizedPublicInvestmentAggregate;
+  const worker = createApplicationWorker({
+    fetchApplication: async (request) => {
+      rendered.push(request);
+      return new Response("rendered");
+    },
+    fetchOptimizedImage: async () => new Response("image"),
+    publicCampaignStateReader: {
+      readPublishedState: async () => {
+        if (unavailable) throw new Error("private aggregate backend detail");
+        return Object.freeze({
+          campaign: syntheticPublicCampaign,
+          aggregate,
+        });
+      },
+    },
+  });
+  const env = testEnvironment();
+
+  const json = await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: { Accept: "application/vnd.aittadb-invest+json; version=0.1" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(json.status, 200);
+  const document = await json.json();
+  assert.deepEqual(document.data.aggregate_interest, {
+    amount_minor_units: 12_500,
+    currency: "EUR",
+    label: "Indicated interest",
+    qualifier: "Current self-declared interest.",
+    verification: {
+      self_declared: true,
+      verified: false,
+      binding: false,
+    },
+    oversubscription: null,
+  });
+  assert.doesNotMatch(
+    JSON.stringify(document),
+    /private-subject|company note|contributing_indication_count/iu,
+  );
+
+  const html = await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: {
+        Accept: "text/html",
+        [PUBLIC_AGGREGATE_HEADER]: btoa(JSON.stringify({
+          participantSubject: "private-subject",
+        })),
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(await html.text(), "rendered");
+  assert.equal(rendered.length, 1);
+  assert.deepEqual(
+    publicAggregateFromRuntimeHeader(
+      rendered[0]?.headers.get(PUBLIC_AGGREGATE_HEADER),
+    ),
+    aggregate,
+  );
+  assert.doesNotMatch(
+    rendered[0]?.headers.get(PUBLIC_AGGREGATE_HEADER) ?? "",
+    /private-subject/iu,
+  );
+
+  unavailable = true;
+  const failed = await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: { Accept: "application/vnd.aittadb-invest+json; version=0.1" },
+    }),
+    env,
+    executionContext,
+  );
+  const failedDocument = await failed.json();
+  assert.equal(failedDocument.data.published, false);
+  assert.equal(failedDocument.data.aggregate_interest, null);
+  assert.doesNotMatch(
+    JSON.stringify(failedDocument),
+    /private aggregate backend detail|Indicated interest/iu,
+  );
 });
 
 test("the Worker resolves participant state from the trusted actor and replaces spoofed state", async () => {

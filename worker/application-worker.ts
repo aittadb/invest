@@ -35,11 +35,16 @@ import { withRuntimeCapabilities } from "../http/runtime-capabilities.ts";
 import { withRuntimeCampaign } from "../http/runtime-campaign.ts";
 import { withRuntimeOwner } from "../http/runtime-owner.ts";
 import { withRuntimeParticipantAccess } from "../http/runtime-participant.ts";
+import { withRuntimePublicAggregate } from "../http/runtime-public-aggregate.ts";
 import {
   withRuntimeCampaignPreview,
   type RuntimeCampaignPreview,
 } from "../http/runtime-preview.ts";
 import type { PublicCampaignPresentationReader } from "../repositories/in-memory-campaign-repository.ts";
+import type {
+  PublicCampaignStateReader,
+  PublishedPublicCampaignState,
+} from "../repositories/storage-public-campaign-state-reader.ts";
 import type { ParticipantRequestRepositoryScope } from "../repositories/storage-application-repository-factory.ts";
 import type { ParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
 import {
@@ -138,6 +143,7 @@ export type ApplicationWorkerDependencies = Readonly<{
     env: InvestorAppEnv,
   ) => Promise<ApplicationRuntimeDeploymentCapability | null | undefined>;
   publicCampaignReader?: PublicCampaignPresentationReader;
+  publicCampaignStateReader?: PublicCampaignStateReader;
   campaignWorkspace?: CampaignWorkspaceDeploymentCapability;
   resolveCampaignWorkspace?: () =>
     CampaignWorkspaceDeploymentCapability | null | undefined;
@@ -212,12 +218,17 @@ export function createApplicationWorker(
       const campaignWorkspace = dependencies.dispatchRoute === undefined
         ? resolveCampaignWorkspace(dependencies, applicationRuntime, appOrigin)
         : null;
-      const publicCampaign = await resolvePublicCampaign(
+      const publicState = await resolvePublicCampaignState(
+        request.method === "GET" && url.pathname === "/"
+          ? resolvePublicCampaignStateReader(dependencies, applicationRuntime)
+          : undefined,
         campaignWorkspace?.publicReader ?? dependencies.publicCampaignReader,
         hasHostedAittaDBApplicationRuntimeValues(env)
           ? undefined
           : env.CAMPAIGN_CONFIG_JSON,
       );
+      const publicCampaign = publicState?.campaign ?? null;
+      const publicAggregate = publicState?.aggregate ?? null;
       const campaign = isOwner && isOwnerPath(url.pathname) && campaignWorkspace
         ? await resolveOwnerCampaign(campaignWorkspace, publicCampaign)
         : publicCampaign;
@@ -285,6 +296,11 @@ export function createApplicationWorker(
             Object.hasOwn(options, "campaign")
               ? options.campaign ?? null
               : campaign,
+            normalApplication
+              ? Object.hasOwn(options, "publicAggregate")
+                ? options.publicAggregate ?? null
+                : publicAggregate
+              : null,
             {
               ownerPackageWorkspace:
                 normalApplication && ownerPackageAvailable && isOwner,
@@ -366,6 +382,7 @@ export function createApplicationWorker(
         isOwner,
         participantAccess,
         campaign,
+        publicAggregate,
         renderApplication,
       });
       if (routeResponse) return routeResponse;
@@ -961,6 +978,7 @@ function withRuntimeConfiguration(
   env: InvestorAppEnv,
   participantAccess: AuthorizedParticipantAccess | null,
   campaign: PublicCampaignConfiguration | null,
+  publicAggregate: PublishedPublicCampaignState["aggregate"],
   capabilities: Readonly<{
     ownerPackageWorkspace: boolean;
     ownerIndicationModeration: boolean;
@@ -978,12 +996,15 @@ function withRuntimeConfiguration(
   return withRuntimeCampaignPreview(
     withRuntimeCapabilities(
       withRuntimeParticipantAccess(
-        withRuntimeCampaign(
-          withRuntimeOwner(
-            withAppOrigin(request, env.APP_BASE_URL),
-            preview === null ? env.OWNER_EMAIL : undefined,
+        withRuntimePublicAggregate(
+          withRuntimeCampaign(
+            withRuntimeOwner(
+              withAppOrigin(request, env.APP_BASE_URL),
+              preview === null ? env.OWNER_EMAIL : undefined,
+            ),
+            campaign === null ? undefined : JSON.stringify(campaign),
           ),
-          campaign === null ? undefined : JSON.stringify(campaign),
+          publicAggregate,
         ),
         participantAccess,
       ),
@@ -1005,6 +1026,49 @@ async function resolvePublicCampaign(
   } catch {
     return null;
   }
+}
+
+function resolvePublicCampaignStateReader(
+  dependencies: ApplicationWorkerDependencies,
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+): PublicCampaignStateReader | undefined {
+  if (dependencies.publicCampaignStateReader !== undefined) {
+    return dependencies.publicCampaignStateReader;
+  }
+  if (
+    runtime === null ||
+    dependencies.publicCampaignReader !== undefined ||
+    dependencies.campaignWorkspace !== undefined ||
+    dependencies.resolveCampaignWorkspace !== undefined
+  ) {
+    return undefined;
+  }
+  try {
+    return runtime.repositoryFactory.publicCampaignStateReader();
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolvePublicCampaignState(
+  stateReader: PublicCampaignStateReader | undefined,
+  campaignReader: PublicCampaignPresentationReader | undefined,
+  bootstrapConfiguration: string | undefined,
+): Promise<PublishedPublicCampaignState | null> {
+  if (stateReader !== undefined) {
+    try {
+      return await stateReader.readPublishedState();
+    } catch {
+      return null;
+    }
+  }
+  const campaign = await resolvePublicCampaign(
+    campaignReader,
+    bootstrapConfiguration,
+  );
+  return campaign === null
+    ? null
+    : Object.freeze({ campaign, aggregate: null });
 }
 
 async function resolveOwnerCampaign(

@@ -224,7 +224,10 @@ test("hosted campaign setup, editing, publication, restart, and concurrency stay
   const publicDocument = await publicCampaign.json();
   assert.equal(publicDocument.data.published, true);
   assert.equal(publicDocument.data.name, setup.publicCampaign.name);
+  assert.equal(publicDocument.data.aggregate_interest, null);
   assert.deepEqual(service.readKeys, [
+    "campaign-public-presentation/configured-campaign",
+    "investment-aggregate-states/current-investment-aggregate",
     "campaign-public-presentation/configured-campaign",
   ]);
   assertPrivateMaterialAbsent(JSON.stringify(publicDocument));

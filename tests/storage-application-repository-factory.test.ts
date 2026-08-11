@@ -173,6 +173,7 @@ test("factory exposes only named application repository capabilities", async () 
   const campaignRepository = factory.campaignRepository();
   const publicCampaignReader = factory.publicCampaignReader();
   const ownerAuditEvents = factory.ownerAuditEvents();
+  const publicCampaignStateReader = factory.publicCampaignStateReader();
   const subject = parseActorSubject("issuer.invalid/participant:factory");
   const account = parseParticipantAccount({
     subject: "issuer.invalid/participant:factory",
@@ -195,6 +196,7 @@ test("factory exposes only named application repository capabilities", async () 
     "browserMutationReplayClaimer",
     "campaignRepository",
     "publicCampaignReader",
+    "publicCampaignStateReader",
     "ownerPackageWorkspace",
     "ownerAuditEvents",
     "participantRequest",
@@ -211,6 +213,10 @@ test("factory exposes only named application repository capabilities", async () 
   );
   assert.equal(factory.ownerAuditEvents(), ownerAuditEvents);
   assert.equal(
+    factory.publicCampaignStateReader(),
+    publicCampaignStateReader,
+  );
+  assert.equal(
     campaignRepository.mutationConsistency,
     "atomic-campaign-audit",
   );
@@ -219,10 +225,12 @@ test("factory exposes only named application repository capabilities", async () 
   ]);
   assert.deepEqual(Reflect.ownKeys(publicCampaignReader), []);
   assert.deepEqual(Reflect.ownKeys(ownerAuditEvents), []);
+  assert.deepEqual(Reflect.ownKeys(publicCampaignStateReader), []);
   assert.deepEqual(Object.values(campaignRepository), [
     "atomic-campaign-audit",
   ]);
   assert.deepEqual(Object.values(publicCampaignReader), []);
+  assert.deepEqual(Object.values(publicCampaignStateReader), []);
   assertNoGenericStorageSurface(campaignRepository, storage);
   assertNoGenericStorageSurface(publicCampaignReader, storage);
   assert.equal(typeof ownerAuditEvents.list, "function");
@@ -231,6 +239,7 @@ test("factory exposes only named application repository capabilities", async () 
     assert.equal(property in ownerAuditEvents, false, property);
   }
   assert.equal(Object.values(ownerAuditEvents).includes(storage), false);
+  assertNoGenericStorageSurface(publicCampaignStateReader, storage);
   assert.equal("storage" in factory, false);
   assert.equal("create" in factory, false);
   const participantRequest = factory.participantRequest(account.value);

@@ -26,6 +26,7 @@ export const handlePublicRoutes: ApplicationRouteHandler = async (context) => {
                 context.participantAccess.currentPackage !== null,
             }
           : undefined,
+        publicAggregate: context.publicAggregate ?? null,
       }),
     );
   }

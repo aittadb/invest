@@ -8,6 +8,7 @@ let workerPromise;
 async function loadWorker(
   participantAuthorizationState,
   participantRouteDependencies,
+  publicCampaignState,
 ) {
   if (!workerPromise) {
     const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -17,7 +18,8 @@ async function loadWorker(
   const workerModule = await workerPromise;
   if (
     participantAuthorizationState === undefined &&
-    participantRouteDependencies === undefined
+    participantRouteDependencies === undefined &&
+    publicCampaignState === undefined
   ) {
     return workerModule.default;
   }
@@ -30,6 +32,13 @@ async function loadWorker(
           },
         }),
     ...participantRouteDependencies,
+    ...(publicCampaignState === undefined
+      ? {}
+      : {
+          publicCampaignStateReader: {
+            readPublishedState: async () => publicCampaignState,
+          },
+        }),
   });
 }
 
@@ -41,10 +50,12 @@ async function render(
   campaignConfiguration = syntheticPublicCampaign,
   participantAuthorizationState,
   participantRouteDependencies,
+  publicCampaignState,
 ) {
   const worker = await loadWorker(
     participantAuthorizationState,
     participantRouteDependencies,
+    publicCampaignState,
   );
   const serializedCampaign =
     typeof campaignConfiguration === "string"
@@ -96,6 +107,139 @@ test("server-renders a runtime-configured signed-out campaign", async () => {
     /Initial implementation scaffold|Product areas to build next|Repository contract|ChatGPT Sites application|features to build/i,
   );
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
+});
+
+test("server-renders the same sanitized public aggregate without private facts", async () => {
+  const publicCampaignState = {
+    campaign: syntheticPublicCampaign,
+    aggregate: {
+      amount: 12_500,
+      currency: "EUR",
+      label: "Indicated interest",
+      qualifier: "Current self-declared interest.",
+      oversubscription: {
+        status: "oversubscribed",
+        targetAmount: 10_000,
+        remainingAmount: 0,
+        amountOverTarget: 2_500,
+      },
+    },
+  };
+  const response = await render(
+    { accept: "text/html" },
+    "http://localhost/",
+    undefined,
+    undefined,
+    syntheticPublicCampaign,
+    undefined,
+    undefined,
+    publicCampaignState,
+  );
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /class="aggregate-band"/u);
+  assert.match(html, /Indicated interest/u);
+  assert.match(html, /Current self-declared interest\./u);
+  assert.match(html, /Self-declared\. Unverified\. Non-binding\./u);
+  assert.match(html, /EUR[^<]*125\.00/u);
+  assert.match(
+    html,
+    /EUR[^<]*100\.00 target\. EUR[^<]*25\.00 above target\./u,
+  );
+  assert.doesNotMatch(
+    html,
+    /participant-subject|company note|contributing indication count|backend detail/iu,
+  );
+
+  const hypermedia = await render(
+    { accept: "application/vnd.aittadb-invest+json; version=0.1" },
+    "http://localhost/",
+    undefined,
+    undefined,
+    syntheticPublicCampaign,
+    undefined,
+    undefined,
+    publicCampaignState,
+  );
+  const document = await hypermedia.json();
+  assert.deepEqual(document.data.aggregate_interest, {
+    amount_minor_units: 12_500,
+    currency: "EUR",
+    label: "Indicated interest",
+    qualifier: "Current self-declared interest.",
+    verification: {
+      self_declared: true,
+      verified: false,
+      binding: false,
+    },
+    oversubscription: {
+      status: "oversubscribed",
+      target_amount_minor_units: 10_000,
+      remaining_amount_minor_units: 0,
+      amount_over_target_minor_units: 2_500,
+    },
+  });
+  assert.doesNotMatch(
+    JSON.stringify(document),
+    /participant-subject|company note|contributing indication count|backend detail/iu,
+  );
+});
+
+test("HTML and hypermedia omit disabled or zero public aggregate projection", async () => {
+  const publicCampaignState = {
+    campaign: syntheticPublicCampaign,
+    aggregate: null,
+  };
+  const html = await (
+    await render(
+      { accept: "text/html" },
+      "http://localhost/",
+      undefined,
+      undefined,
+      syntheticPublicCampaign,
+      undefined,
+      undefined,
+      publicCampaignState,
+    )
+  ).text();
+  assert.doesNotMatch(html, /class="aggregate-band"/u);
+
+  const hypermedia = await render(
+    { accept: "application/vnd.aittadb-invest+json; version=0.1" },
+    "http://localhost/",
+    undefined,
+    undefined,
+    syntheticPublicCampaign,
+    undefined,
+    undefined,
+    publicCampaignState,
+  );
+  assert.equal((await hypermedia.json()).data.aggregate_interest, null);
+});
+
+test("server rendering preserves maximum-safe integer minor units exactly", async () => {
+  const html = await (
+    await render(
+      { accept: "text/html" },
+      "http://localhost/",
+      undefined,
+      undefined,
+      syntheticPublicCampaign,
+      undefined,
+      undefined,
+      {
+        campaign: syntheticPublicCampaign,
+        aggregate: {
+          amount: Number.MAX_SAFE_INTEGER,
+          currency: "EUR",
+          label: "Exact indicated interest",
+          qualifier: "Current self-declared interest.",
+          oversubscription: null,
+        },
+      },
+    )
+  ).text();
+  assert.match(html, /EUR 90,071,992,547,409\.91/u);
 });
 
 test("HTML metadata uses the configured runtime origin", async () => {

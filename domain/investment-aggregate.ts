@@ -19,6 +19,7 @@ import {
 } from "./foundation.ts";
 import {
   createSanitizedPublicAggregateDisplay,
+  parseAmountAggregateConfiguration,
   type AmountAggregateConfiguration,
   type CurrencyCode,
   type SanitizedPublicAggregateDisplay,
@@ -112,6 +113,19 @@ const CORRECTION_CONFIRMATION_KEYS = new Set([
   "expectedStoredContributingIndicationCount",
   "expectedCalculatedAmount",
   "expectedCalculatedContributingIndicationCount",
+]);
+const PUBLIC_AGGREGATE_KEYS = new Set([
+  "amount",
+  "currency",
+  "label",
+  "qualifier",
+  "oversubscription",
+]);
+const PUBLIC_OVERSUBSCRIPTION_KEYS = new Set([
+  "status",
+  "targetAmount",
+  "remainingAmount",
+  "amountOverTarget",
 ]);
 
 /** Strip an indication down to the facts the aggregate calculation consumes. */
@@ -325,6 +339,70 @@ export function createSanitizedPublicInvestmentAggregate(
   );
 }
 
+/** Parse the exact public aggregate shape at a serialization boundary. */
+export function parseSanitizedPublicInvestmentAggregate(
+  value: unknown,
+): ValidationResult<SanitizedPublicInvestmentAggregate> {
+  const source = record(value);
+  if (source === null || !hasExactKeys(source, PUBLIC_AGGREGATE_KEYS)) {
+    return invalid({ code: "invalid_type", path: "aggregate" });
+  }
+  const amount = parseMinorUnits(source.amount, { minimum: 1 });
+  if (!amount.ok) return amount;
+  const configuration = parseAmountAggregateConfiguration({
+    amount: {
+      currency: source.currency,
+      minimum: 0,
+      increment: 1,
+      maximum: null,
+    },
+    publicAggregate: {
+      visibility: "non_zero",
+      label: source.label,
+      qualifier: source.qualifier,
+    },
+  });
+  if (!configuration.ok) {
+    return invalid({ code: "invalid_rule", path: "aggregate" });
+  }
+  const display = configuration.value.publicAggregate;
+  if (display.visibility !== "non_zero") {
+    return invalid({ code: "invalid_rule", path: "aggregate" });
+  }
+
+  let oversubscription: PublicOversubscriptionDisplayData | null = null;
+  if (source.oversubscription !== null) {
+    const progress = record(source.oversubscription);
+    if (
+      progress === null ||
+      !hasExactKeys(progress, PUBLIC_OVERSUBSCRIPTION_KEYS)
+    ) {
+      return invalid({ code: "invalid_type", path: "oversubscription" });
+    }
+    const expected = createPublicOversubscriptionDisplayData(
+      amount.value,
+      progress.targetAmount,
+    );
+    if (
+      !expected.ok ||
+      expected.value.status !== progress.status ||
+      expected.value.remainingAmount !== progress.remainingAmount ||
+      expected.value.amountOverTarget !== progress.amountOverTarget
+    ) {
+      return invalid({ code: "invalid_rule", path: "oversubscription" });
+    }
+    oversubscription = expected.value;
+  }
+
+  return valid(Object.freeze({
+    amount: amount.value,
+    currency: configuration.value.amount.currency,
+    label: display.label,
+    qualifier: display.qualifier,
+    oversubscription,
+  }));
+}
+
 function normalizeContribution(
   contribution: InvestmentAggregateContribution,
   currency: CurrencyCode,
@@ -505,4 +583,12 @@ function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function hasExactKeys(
+  source: Record<string, unknown>,
+  expected: ReadonlySet<string>,
+): boolean {
+  const keys = Object.keys(source);
+  return keys.length === expected.size && keys.every((key) => expected.has(key));
 }

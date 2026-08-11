@@ -4,6 +4,7 @@ import handler from "vinext/server/app-router-entry";
 
 import { createApplicationWorker } from "./application-worker.ts";
 import type { ParticipantAccessStateReader } from "../domain/participant-home-resource.ts";
+import type { PublicCampaignStateReader } from "../repositories/storage-public-campaign-state-reader.ts";
 import { createHostedApplicationRuntimeResolver } from "./hosted-application-composition.ts";
 import { createHostedOwnerOAuthProofResolver } from "./hosted-oauth-composition.ts";
 import type {
@@ -24,6 +25,7 @@ export function createInvestorAppWorker(
     participantProfile?: ParticipantProfileRouteDependencies;
     participantFounderInterest?: FounderInterestRouteDependencies;
     participantInvestmentInterests?: InvestmentInterestRouteDependencies;
+    publicCampaignStateReader?: PublicCampaignStateReader;
   }> = {},
 ) {
   return createApplicationWorker({
@@ -50,6 +52,7 @@ export function createInvestorAppWorker(
     participantProfile: dependencies.participantProfile,
     participantFounderInterest: dependencies.participantFounderInterest,
     participantInvestmentInterests: dependencies.participantInvestmentInterests,
+    publicCampaignStateReader: dependencies.publicCampaignStateReader,
     resolveApplicationRuntime: createHostedApplicationRuntimeResolver(),
     resolveOwnerOAuthProof: createHostedOwnerOAuthProofResolver(),
   });

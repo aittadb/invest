@@ -51,6 +51,18 @@ The public campaign resource currently has this shape:
     "status": "open",
     "status_label": "Pre-registration open",
     "participation_paths": ["investor", "founder"],
+    "aggregate_interest": {
+      "amount_minor_units": 125000,
+      "currency": "EUR",
+      "label": "Indicated interest",
+      "qualifier": "Current self-declared interest.",
+      "verification": {
+        "self_declared": true,
+        "verified": false,
+        "binding": false
+      },
+      "oversubscription": null
+    },
     "interest_is_binding": false
   },
   "links": [
@@ -73,6 +85,10 @@ The public campaign resource currently has this shape:
 ```
 
 `data` contains the state visible to the current caller. Links use stable semantic `rel` values and server-supplied targets. Actions use stable semantic names and describe only transitions available now.
+
+`aggregate_interest` is `null` when the published policy hides totals or the current total is zero. When present, it is built only from the published display policy and atomic current aggregate, uses integer minor units, and carries explicit self-declared, unverified, and non-binding flags. It never contains identities, companies, notes, indication counts, moderation state, storage revisions, or backend detail. HTML renders the same amount, configured label and qualifier, and verification semantics, using integer quotient and remainder formatting rather than floating-point currency conversion.
+
+The public campaign and aggregate policy are read from one independently versioned public-presentation record. A concurrent policy publication is retried against its new revision so campaign copy and aggregate labels cannot be mixed across revisions. Aggregate storage corruption omits `aggregate_interest`; unavailable or unstable public presentation returns the ordinary unavailable campaign resource, with no backend error detail in either representation.
 
 ## Participant Resources
 
