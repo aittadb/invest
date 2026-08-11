@@ -279,8 +279,13 @@ history, template, actor, copy, and sent records. A notification has at most 66
 revisions: its template, 64 copy facts, and one sent fact. Detail reconstruction
 therefore performs at most 67 storage reads including current state, and rejects
 missing, reordered, owner-discontinuous, oversized, accessor-backed, or corrupt
-history through one fixed unavailable surface. Collection reads validate their
-bounded current records without multiplying that detail-history traversal.
+history through one fixed unavailable surface. A collection item is projected
+only after its current snapshot equals the strictly decoded immutable terminal
+revision at the exact notification-and-revision key. A maximum 25-item page uses
+one bounded list plus exactly 25 direct terminal-record reads, so its direct-read
+ceiling is 25 and its total adapter-operation ceiling is 26 without multiplying
+the complete detail-history traversal. Missing, malformed, crossed, duplicate,
+or current-only divergent terminal evidence fails closed.
 
 HTML and version `0.1` hypermedia JSON come from the same collection or detail
 resource. Detail representations expose the same notification, purpose,

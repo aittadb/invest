@@ -407,6 +407,16 @@ Anonymous callers receive `401`; authenticated non-owners receive the generic
 and notification availability use separate server-replaced renderer headers, so
 browser-supplied headers cannot advertise either feature.
 
+The manual-notification collection performs one bounded current-record list and
+then reads the exact immutable terminal revision for every returned item. Strict
+key, revision, and canonical snapshot equality must hold before projection. A
+maximum 25-item page therefore performs exactly 25 direct record reads after one
+list call; a shorter page performs one read per item. Missing, malformed,
+crossed, duplicate, or current-only divergent terminal evidence returns the fixed
+unavailable surface. Opaque continuation remains valid after Worker
+reconstruction because neither integrity evidence nor cursor state is retained
+in process memory.
+
 The one shared mutation session is configured to the largest currently composed
 form as an absolute ceiling and explicitly permits only the founder route's
 repeated secondary-contribution field. Setup, editor, package, acknowledgment,

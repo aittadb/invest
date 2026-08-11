@@ -17,7 +17,10 @@ import {
   MUTATION_CSRF_HEADER,
 } from "../http/mutation-security.ts";
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
-import { StorageManualNotificationRepository } from "../repositories/in-memory-audit-notification-repositories.ts";
+import {
+  MAX_OWNER_NOTIFICATION_PAGE_RECORD_READS,
+  StorageManualNotificationRepository,
+} from "../repositories/in-memory-audit-notification-repositories.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
 import type {
   InvestorAppEnv,
@@ -270,6 +273,82 @@ test("hosted owner notification activity survives response loss and Worker resta
   assert.match(html, /href="https:\/\/invest\.example\.test\/owner\/audit-events"/u);
   assert.match(html, /href="\/">View campaign<\/a>/u);
   assert.doesNotMatch(html, /service-secret|access-token|storage-runtime/iu);
+});
+
+test("hosted notification collection verifies a maximum page across Worker restart", async () => {
+  const service = storageService();
+  const repository = notificationRepository(service);
+  for (
+    let index = 0;
+    index <= MAX_OWNER_NOTIFICATION_PAGE_RECORD_READS;
+    index += 1
+  ) {
+    await repository.create({
+      operationId: `notification-operation:hosted-page-create-${index}`,
+      template: {
+        id: `notification:hosted-page-${index}`,
+        purposeId: "moderation-status-update",
+        recipientSubject: PARTICIPANT_SUBJECT,
+        relatedResource: {
+          type: "investment-indication",
+          id: `indication:hosted-page-${index}`,
+        },
+        subjectLine: `Private status update ${index}`,
+        body: PRIVATE_BODY,
+        generatedAt: "2026-08-11T09:00:00.000Z",
+        generatedBy: { type: "owner", subject: OWNER_SUBJECT },
+      },
+    });
+  }
+  const env = environment();
+  const randomBytes = deterministicRandomBytes(181);
+  const firstWorker = hostedWorker(service, NOW, randomBytes);
+  const readsBeforeFirst = notificationReadCount(service);
+  const firstResponse = await firstWorker.fetch(
+    ownerRequest(
+      `/owner/manual-notifications?page_size=${MAX_OWNER_NOTIFICATION_PAGE_RECORD_READS}`,
+    ),
+    env,
+    executionContext,
+  );
+  assert.equal(firstResponse.status, 200);
+  const first = await firstResponse.json() as OwnerNotificationCollectionDocument;
+  assert.equal(first.data.items.length, MAX_OWNER_NOTIFICATION_PAGE_RECORD_READS);
+  assert.equal(
+    notificationReadCount(service) - readsBeforeFirst,
+    MAX_OWNER_NOTIFICATION_PAGE_RECORD_READS,
+  );
+  const next = first.links.find((link) => link.rel.includes("next"));
+  assert.ok(next);
+
+  const restartedWorker = hostedWorker(
+    service,
+    new Date(NOW.valueOf() + 60_000),
+    randomBytes,
+  );
+  const nextUrl = new URL(next.href);
+  const readsBeforeSecond = notificationReadCount(service);
+  const secondResponse = await restartedWorker.fetch(
+    ownerRequest(`${nextUrl.pathname}${nextUrl.search}`),
+    env,
+    executionContext,
+  );
+  assert.equal(secondResponse.status, 200);
+  const second = await secondResponse.json() as
+    OwnerNotificationCollectionDocument;
+  assert.equal(second.data.items.length, 1);
+  assert.equal(
+    notificationReadCount(service) - readsBeforeSecond,
+    1,
+  );
+  assert.equal(
+    new Set([...first.data.items, ...second.data.items].map(({ id }) => id)).size,
+    MAX_OWNER_NOTIFICATION_PAGE_RECORD_READS + 1,
+  );
+  assert.equal(
+    second.links.some((link) => link.rel.includes("next")),
+    false,
+  );
 });
 
 test("hosted terminal notification retry is exact, scoped, and one-use", async () => {

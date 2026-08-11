@@ -71,6 +71,9 @@ export const MAX_MANUAL_NOTIFICATION_REVISIONS =
 export const MAX_MANUAL_NOTIFICATION_STORAGE_READS =
   1 + MAX_MANUAL_NOTIFICATION_REVISIONS;
 export const MAX_OWNER_NOTIFICATION_PAGE_SIZE = 25;
+/** One exact immutable terminal-revision read per listed current record. */
+export const MAX_OWNER_NOTIFICATION_PAGE_RECORD_READS =
+  MAX_OWNER_NOTIFICATION_PAGE_SIZE;
 export const MAX_OWNER_NOTIFICATION_CURSOR_LENGTH = 512;
 
 export type AuditAppendResult = Readonly<{
@@ -370,18 +373,51 @@ export class StorageManualNotificationRepository
       unavailable();
     }
     const page = exactNotificationStoragePage(storedPage, normalized);
-    const seen = new Set<string>();
-    const items = await Promise.all(page.items.map(async (stored) => {
-      const snapshot = await decodeNotificationSnapshot(
+    const currentItems = await Promise.all(page.items.map((stored) =>
+      decodeNotificationSnapshot(
         stored,
         null,
         "current",
         null,
         null,
-      );
+      )
+    ));
+    const seen = new Set<string>();
+    const terminalKeys: StorageKey[] = [];
+    for (const snapshot of currentItems) {
       if (seen.has(snapshot.record.template.id)) unavailable();
       seen.add(snapshot.record.template.id);
-      return snapshot;
+      terminalKeys.push(await notificationHistoryKey(
+        snapshot.record.template.id,
+        snapshot.revision,
+      ));
+    }
+    const seenTerminalKeys = new Set<string>();
+    for (const key of terminalKeys) {
+      const serialized = storageKeyString(key);
+      if (seenTerminalKeys.has(serialized)) unavailable();
+      seenTerminalKeys.add(serialized);
+    }
+    const items = await Promise.all(currentItems.map(async (current, index) => {
+      const terminalKey = terminalKeys[index];
+      if (terminalKey === undefined) unavailable();
+      const storedTerminal = await readNotificationStorage(
+        this.#storage,
+        terminalKey,
+      );
+      if (storedTerminal === null) unavailable();
+      const terminal = await decodeNotificationSnapshot(
+        storedTerminal,
+        terminalKey,
+        "history",
+        current.record.template.id,
+        current.revision,
+      );
+      if (
+        canonicalJson(notificationSnapshotDocument(current)) !==
+          canonicalJson(notificationSnapshotDocument(terminal))
+      ) unavailable();
+      return terminal;
     }));
 
     return Object.freeze({

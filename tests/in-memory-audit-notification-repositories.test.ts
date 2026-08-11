@@ -23,6 +23,7 @@ import {
   DevelopmentInMemoryManualNotificationRepository,
   MAX_MANUAL_NOTIFICATION_STORAGE_READS,
   MAX_OWNER_NOTIFICATION_CURSOR_LENGTH,
+  MAX_OWNER_NOTIFICATION_PAGE_RECORD_READS,
   MAX_OWNER_NOTIFICATION_PAGE_SIZE,
   type AuditRepository,
   type ManualNotificationRepository,
@@ -770,6 +771,133 @@ test("manual notification collection rejects corrupt finite pages", async () => 
   );
 });
 
+test("manual notification collection proves each current item against terminal history", async () => {
+  const divergentState = new MemoryStorageState();
+  const divergentStorage = new DeterministicMemoryStorageAdapter(
+    divergentState,
+    true,
+  );
+  const divergent = new DevelopmentInMemoryManualNotificationRepository(
+    divergentStorage,
+  );
+  await divergent.create({
+    operationId: "notification-operation:divergent-current-create",
+    template: templateInput("notification:divergent-current"),
+  });
+  const currentEntry = [...divergentState.records.entries()].find(
+    ([, record]) => record.key.collection === "manual-notifications",
+  );
+  assert.ok(currentEntry);
+  const [currentStorageKey, current] = currentEntry;
+  const currentValue = cloneDocument(current.value);
+  const currentRecord = (currentValue as Record<string, unknown>).record as
+    Record<string, unknown>;
+  const currentTemplate = currentRecord.template as Record<string, unknown>;
+  currentTemplate.subjectLine = "Divergent mutable summary";
+  divergentState.records.set(currentStorageKey, freezeRecord({
+    key: current.key,
+    revision: current.revision,
+    value: currentValue,
+  }));
+  await expectStorageFailure(() => divergent.list({ limit: 1 }), "UNAVAILABLE");
+
+  const malformedState = new MemoryStorageState();
+  const malformedStorage = new DeterministicMemoryStorageAdapter(
+    malformedState,
+    true,
+  );
+  const malformed = new DevelopmentInMemoryManualNotificationRepository(
+    malformedStorage,
+  );
+  await malformed.create({
+    operationId: "notification-operation:malformed-terminal-create",
+    template: templateInput("notification:malformed-terminal"),
+  });
+  const malformedTerminalEntry = [...malformedState.records.entries()].find(
+    ([, record]) => record.key.collection === "manual-notification-history",
+  );
+  assert.ok(malformedTerminalEntry);
+  const [malformedTerminalKey, malformedTerminal] = malformedTerminalEntry;
+  malformedState.records.set(malformedTerminalKey, freezeRecord({
+    key: malformedTerminal.key,
+    revision: malformedTerminal.revision,
+    value: {
+      ...malformedTerminal.value,
+      privateUnexpectedValue: "must not be projected",
+    },
+  }));
+  await expectStorageFailure(() => malformed.list({ limit: 1 }), "UNAVAILABLE");
+
+  const crossedState = new MemoryStorageState();
+  const crossedStorage = new DeterministicMemoryStorageAdapter(crossedState, true);
+  const crossed = new DevelopmentInMemoryManualNotificationRepository(
+    crossedStorage,
+  );
+  for (const suffix of ["a", "b"] as const) {
+    await crossed.create({
+      operationId: `notification-operation:crossed-terminal-create-${suffix}`,
+      template: templateInput(`notification:crossed-terminal-${suffix}`),
+    });
+  }
+  const crossedTerminalEntries = [...crossedState.records.entries()].filter(
+    ([, record]) => record.key.collection === "manual-notification-history",
+  );
+  assert.equal(crossedTerminalEntries.length, 2);
+  const firstTerminal = crossedTerminalEntries[0];
+  const secondTerminal = crossedTerminalEntries[1];
+  assert.ok(firstTerminal);
+  assert.ok(secondTerminal);
+  crossedState.records.set(secondTerminal[0], firstTerminal[1]);
+  await expectStorageFailure(() => crossed.list({ limit: 2 }), "UNAVAILABLE");
+});
+
+test("manual notification collection keeps its exact page read ceiling across restart", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const writer = new DevelopmentInMemoryManualNotificationRepository(storage);
+  for (let index = 0; index <= MAX_OWNER_NOTIFICATION_PAGE_SIZE; index += 1) {
+    await writer.create({
+      operationId: `notification-operation:bounded-page-create-${index}`,
+      template: templateInput(`notification:bounded-page-${index}`),
+    });
+  }
+
+  const firstCounted = new CountingReadAdapter(storage);
+  const firstRepository = new DevelopmentInMemoryManualNotificationRepository(
+    firstCounted,
+  );
+  const first = await firstRepository.list({
+    limit: MAX_OWNER_NOTIFICATION_PAGE_SIZE,
+  });
+  assert.equal(first.items.length, MAX_OWNER_NOTIFICATION_PAGE_SIZE);
+  assert.notEqual(first.nextCursor, null);
+  assert.equal(firstCounted.lists, 1);
+  assert.equal(
+    firstCounted.reads,
+    MAX_OWNER_NOTIFICATION_PAGE_RECORD_READS,
+  );
+
+  const restartedCounted = new CountingReadAdapter(storage);
+  const restarted = new DevelopmentInMemoryManualNotificationRepository(
+    restartedCounted,
+  );
+  assert.ok(first.nextCursor);
+  const second = await restarted.list({
+    limit: MAX_OWNER_NOTIFICATION_PAGE_SIZE,
+    cursor: first.nextCursor,
+  });
+  assert.equal(second.items.length, 1);
+  assert.equal(second.nextCursor, null);
+  assert.equal(restartedCounted.lists, 1);
+  assert.equal(restartedCounted.reads, 1);
+  assert.equal(
+    new Set([...first.items, ...second.items].map(({ record }) =>
+      record.template.id
+    )).size,
+    MAX_OWNER_NOTIFICATION_PAGE_SIZE + 1,
+  );
+});
+
 test("manual notification writes require an exact closed transaction result", async () => {
   const malformedResults: readonly unknown[] = [
     { replayed: false, records: [] },
@@ -1174,6 +1302,7 @@ class CommitThenFailOnceAdapter implements StorageAdapter {
 class CountingReadAdapter implements StorageAdapter {
   readonly #delegate: StorageAdapter;
   reads = 0;
+  lists = 0;
 
   constructor(delegate: StorageAdapter) {
     this.#delegate = delegate;
@@ -1185,6 +1314,7 @@ class CountingReadAdapter implements StorageAdapter {
   }
 
   list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    this.lists += 1;
     return this.#delegate.list(request);
   }
 
