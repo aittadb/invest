@@ -18,6 +18,7 @@ import type {
 
 export const PARTICIPANT_INVESTMENT_MUTATION_CONSISTENCY =
   "atomic-indication-aggregate-audit" as const;
+export const MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS = 4;
 
 /** Subject-bound reads stay independent from the stronger mutation capability. */
 export interface ParticipantInvestmentInterestReader {

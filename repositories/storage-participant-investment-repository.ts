@@ -63,6 +63,7 @@ import {
   type PreparedParticipantIndicationReplay,
 } from "./in-memory-indication-repository.ts";
 import {
+  MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS,
   PARTICIPANT_INVESTMENT_MUTATION_CONSISTENCY,
   type AtomicParticipantInvestmentInterestCommand,
   type AtomicParticipantInvestmentInterestMutationPort,
@@ -242,6 +243,28 @@ export class StorageParticipantInvestmentInterestRepository
       this.#amount,
       this.#parsingOptions,
     );
+    const capacity = await readParticipantCapacity(
+      staged,
+      indications,
+      this.#subject,
+    );
+    if (capacity.activeCount > MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS) {
+      unavailable();
+    }
+    if (
+      (prepared.command.kind === "create" ||
+        prepared.command.kind === "reactivate") &&
+      capacity.activeCount >= MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS
+    ) {
+      conflict();
+    }
+    if (prepared.command.kind === "create") {
+      if (capacity.index.ids.includes(prepared.indication.id)) conflict();
+      if (capacity.index.ids.length >= MAX_OWNED_INDICATIONS) conflict();
+    } else if (!capacity.index.ids.includes(prepared.indication.id)) {
+      unavailable();
+    }
+
     const indication = await applyIndication(indications, prepared.command);
     if (indication.replayed) conflict();
 
@@ -258,24 +281,21 @@ export class StorageParticipantInvestmentInterestRepository
     }, this.#amount.currency);
     await staged.stage(aggregate.mutations);
 
-    if (prepared.command.kind === "create") {
-      const index = await readParticipantIndex(staged, this.#subject);
-      if (index.ids.includes(indication.snapshot.id)) conflict();
-      if (index.ids.length >= MAX_OWNED_INDICATIONS) conflict();
-      const ids = Object.freeze(
-        [...index.ids, indication.snapshot.id].sort(compareIds),
-      );
+    if (
+      prepared.command.kind === "create" ||
+      prepared.command.kind === "withdraw" ||
+      prepared.command.kind === "reactivate"
+    ) {
+      const ids = prepared.command.kind === "create"
+        ? Object.freeze(
+          [...capacity.index.ids, indication.snapshot.id].sort(compareIds),
+        )
+        : capacity.index.ids;
       await staged.stage([await participantIndexMutation(
         this.#subject,
-        index,
+        capacity.index,
         ids,
       )]);
-    } else {
-      await requireIndexedIndication(
-        staged,
-        this.#subject,
-        indication.snapshot.id,
-      );
     }
 
     const receiptKey = await operationReceiptKey(operationId);
@@ -575,6 +595,30 @@ async function readParticipantIndex(
     }),
     ids: Object.freeze(ids),
   });
+}
+
+async function readParticipantCapacity(
+  storage: Pick<StorageAdapter, "read">,
+  indications: Pick<
+    DevelopmentInMemoryIndicationRepository,
+    "readCurrentParticipantProjection"
+  >,
+  subject: ActorSubject,
+): Promise<Readonly<{ index: ParticipantIndex; activeCount: number }>> {
+  const index = await readParticipantIndex(storage, subject);
+  let activeCount = 0;
+  for (const id of index.ids) {
+    const indication = await indications.readCurrentParticipantProjection(id);
+    if (
+      indication === null ||
+      indication.id !== id ||
+      indication.participantSubject !== subject
+    ) {
+      unavailable();
+    }
+    if (indication.lifecycle.status === "active") activeCount += 1;
+  }
+  return Object.freeze({ index, activeCount });
 }
 
 async function participantIndexMutation(

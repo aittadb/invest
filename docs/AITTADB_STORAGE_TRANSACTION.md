@@ -62,6 +62,15 @@ transaction bytes, and cursor length. A client rejects declarations above its
 own safety ceilings of 262,144 record bytes, 1,048,576 transaction bytes, and
 2,048 cursor characters.
 
+Application workflows must budget their own worst-case atomic operation within
+the 25-mutation limit. Investor App therefore limits one participant to four
+active investment indications while retaining up to 100 owned historical
+records. Withdrawn and rejected records do not consume an active slot. The
+participant index is compare-and-set on participant creation, withdrawal, and
+reactivation, so the bound remains valid under concurrent requests and leaves
+room for a later account-deletion transaction to withdraw the complete active
+set atomically.
+
 The machine-readable `transaction_shape` declares:
 
 - a stable operation ID between 1 and 128 characters;

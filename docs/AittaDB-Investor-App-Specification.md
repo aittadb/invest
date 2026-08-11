@@ -142,6 +142,8 @@ The form collects:
 
 The app enforces one active company indication per normalized country and identifier pair. Duplicate rejection must not reveal who controls the existing record.
 
+One participant can have at most four active indications across personal and company records. Withdrawn and rejected historical indications do not consume this active limit.
+
 ### UC-INV-004: Edit Indication
 
 The participant can edit permitted fields on their own indication. Every change creates immutable history and updates aggregate totals consistently.

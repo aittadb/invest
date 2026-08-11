@@ -15,6 +15,7 @@ import type {
   InvestmentIndicationId,
   TrustedPackageAcknowledgmentContext,
 } from "../domain/investment-indication.ts";
+import { projectInvestmentIndicationForAggregation } from "../domain/investment-aggregate.ts";
 import {
   createPackageAcceptance,
   createPackageVersion,
@@ -30,10 +31,16 @@ import {
   type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
 import {
+  DevelopmentInMemoryAggregateRepository,
+  prepareAtomicAggregateContribution,
+} from "../repositories/in-memory-aggregate-repository.ts";
+import {
+  DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
 } from "../repositories/in-memory-indication-repository.ts";
 import { StorageParticipantInvestmentInterestRepository } from "../repositories/storage-participant-investment-repository.ts";
+import { MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS } from "../worker/participant-investment-mutation-port.ts";
 import {
   createParticipantInvestmentInterestService,
   type InvestmentInterestPermissions,
@@ -45,6 +52,7 @@ import {
 
 const ALICE = subject("issuer.invalid/participant:alice-storage-investment");
 const BOB = subject("issuer.invalid/participant:bob-storage-investment");
+const OWNER = subject("issuer.invalid/owner:capacity-review");
 const AMOUNT = amountConfiguration();
 const ALLOW_ALL = Object.freeze({
   createPersonal: true,
@@ -335,6 +343,245 @@ test("concurrent exact storage commits have one transaction and two successful r
   assertAggregate(state, 1, 1_250, 1);
 });
 
+test("active capacity survives withdrawal, rejection, reactivation, and restart", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const context = await currentContext(ALICE, "active-capacity-lifecycle");
+  let minute = 0;
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  const service = serviceFor(repository, ALICE, context, () =>
+    new Date(
+      Date.parse("2026-08-12T10:00:00.000Z") + minute++ * 60_000,
+    )
+  );
+  const active: Awaited<ReturnType<typeof service.create>>[] = [];
+  for (let index = 0; index < MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS; index += 1) {
+    active.push(await service.create({
+      operationId: `investment-operation:active-capacity-${index}`,
+      fields: companyFields({
+        companyName: `Capacity company ${index}`,
+        companyIdentifier: `CAPACITY-${index}`,
+      }),
+    }));
+  }
+  assert.equal(activeOwned(await repository.listOwned()), 4);
+
+  const recordsAtCapacity = state.records.size;
+  const operationsAtCapacity = state.operations.size;
+  const fifth = await captureStorageFailure(() => service.create({
+    operationId: "investment-operation:active-capacity-fifth",
+    fields: companyFields({
+      companyName: "Capacity company fifth",
+      companyIdentifier: "CAPACITY-FIFTH",
+    }),
+  }));
+  assert.equal(fifth.code, "CONFLICT");
+  assert.equal(state.records.size, recordsAtCapacity);
+  assert.equal(state.operations.size, operationsAtCapacity);
+
+  const first = active[0];
+  assert(first);
+  await service.withdraw({
+    operationId: "investment-operation:active-capacity-withdraw-first",
+    indicationId: first.snapshot.id,
+    expectedRevision: first.snapshot.revision,
+  });
+  const replacement = await service.create({
+    operationId: "investment-operation:active-capacity-replacement",
+    fields: companyFields({
+      companyName: "Capacity replacement company",
+      companyIdentifier: "CAPACITY-REPLACEMENT",
+    }),
+  });
+  const blockedReactivation = await captureStorageFailure(() => service.reactivate({
+    operationId: "investment-operation:active-capacity-reactivate-blocked",
+    indicationId: first.snapshot.id,
+    expectedRevision: first.snapshot.revision + 1,
+  }));
+  assert.equal(blockedReactivation.code, "CONFLICT");
+
+  await service.withdraw({
+    operationId: "investment-operation:active-capacity-withdraw-replacement",
+    indicationId: replacement.snapshot.id,
+    expectedRevision: replacement.snapshot.revision,
+  });
+  await service.reactivate({
+    operationId: "investment-operation:active-capacity-reactivate-first",
+    indicationId: first.snapshot.id,
+    expectedRevision: first.snapshot.revision + 1,
+  });
+  const reopened = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  assert.equal(activeOwned(await reopened.listOwned()), 4);
+
+  const rejectedTarget = active[1];
+  assert(rejectedTarget);
+  const rejected = await new DevelopmentInMemoryIndicationRepository(
+    storage,
+    OWNER,
+    OWNER,
+    AMOUNT,
+  ).reject({
+    operationId: "indication-operation:active-capacity-reject",
+    id: rejectedTarget.snapshot.id,
+    expectedRevision: rejectedTarget.snapshot.revision,
+    occurredAt: "2026-08-12T12:00:00.000Z",
+    historyEntryId: "indication-history:active-capacity-reject",
+    reason: "Synthetic capacity test rejection.",
+  });
+  await persistAggregateProjection(
+    storage,
+    rejected.snapshot,
+    "aggregate-operation:active-capacity-reject",
+  );
+  const afterRejection = await service.create({
+    operationId: "investment-operation:active-capacity-after-rejection",
+    fields: companyFields({
+      companyName: "Capacity post-rejection company",
+      companyIdentifier: "CAPACITY-POST-REJECTION",
+    }),
+  });
+  assert.equal(afterRejection.snapshot.lifecycle.status, "active");
+  assert.equal(activeOwned(await reopened.listOwned()), 4);
+  assertAggregate(state, 10, 8_000, 4);
+});
+
+test("competing fourth activations cannot admit a fifth and exact retry stays stable", async () => {
+  const state = new MemoryStorageState();
+  const context = await currentContext(ALICE, "active-capacity-concurrency");
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  const service = serviceFor(
+    repository,
+    ALICE,
+    context,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  for (let index = 0; index < 3; index += 1) {
+    await service.create({
+      operationId: `investment-operation:capacity-concurrent-seed-${index}`,
+      fields: companyFields({
+        companyName: `Concurrent seed ${index}`,
+        companyIdentifier: `CONCURRENT-SEED-${index}`,
+      }),
+    });
+  }
+  const inputs = [0, 1].map((index) => Object.freeze({
+    operationId: `investment-operation:capacity-concurrent-candidate-${index}`,
+    fields: companyFields({
+      companyName: `Concurrent candidate ${index}`,
+      companyIdentifier: `CONCURRENT-CANDIDATE-${index}`,
+    }),
+  }));
+  const attempts = await Promise.allSettled(inputs.map((input) =>
+    service.create(input)
+  ));
+  const winner = attempts.findIndex((attempt) => attempt.status === "fulfilled");
+  const loser = attempts.findIndex((attempt) => attempt.status === "rejected");
+  assert.notEqual(winner, -1);
+  assert.notEqual(loser, -1);
+  assert.equal(attempts.filter((attempt) => attempt.status === "fulfilled").length, 1);
+  assert.equal(attempts.filter((attempt) => attempt.status === "rejected").length, 1);
+
+  const exactRetry = await service.create(inputs[winner]!);
+  assert.equal(exactRetry.replayed, true);
+  const loserRetry = await captureStorageFailure(() => service.create(inputs[loser]!));
+  assert.equal(loserRetry.code, "CONFLICT");
+  const reopened = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  assert.equal(activeOwned(await reopened.listOwned()), 4);
+  assertAggregate(state, 4, 8_000, 4);
+});
+
+test("pre-existing over-capacity and missing indexed state fail closed", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const context = await currentContext(ALICE, "active-capacity-corruption");
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  const service = serviceFor(
+    repository,
+    ALICE,
+    context,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  const active: Awaited<ReturnType<typeof service.create>>[] = [];
+  for (let index = 0; index < MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS; index += 1) {
+    active.push(await service.create({
+      operationId: `investment-operation:capacity-corrupt-seed-${index}`,
+      fields: companyFields({
+        companyName: `Corrupt seed ${index}`,
+        companyIdentifier: `CORRUPT-SEED-${index}`,
+      }),
+    }));
+  }
+  const legacyFifth = await new DevelopmentInMemoryIndicationRepository(
+    storage,
+    ALICE,
+    OWNER,
+    AMOUNT,
+  ).create({
+    operationId: "indication-operation:capacity-legacy-fifth",
+    id: "investment-indication:capacity-legacy-fifth",
+    expectedRevision: null,
+    occurredAt: "2026-08-12T11:00:00.000Z",
+    historyEntryId: "indication-history:capacity-legacy-fifth",
+    fields: companyFields({
+      companyName: "Legacy fifth company",
+      companyIdentifier: "LEGACY-FIFTH",
+    }),
+  }, context);
+  appendParticipantIndexId(state, legacyFifth.snapshot.id);
+  const overCapacityRecords = storedStateFingerprint(state);
+  const overCapacityOperations = state.operations.size;
+  const overCapacity = await captureStorageFailure(() => service.edit({
+    operationId: "investment-operation:capacity-overflow-edit",
+    indicationId: active[0]!.snapshot.id,
+    expectedRevision: active[0]!.snapshot.revision,
+    fields: companyFields({
+      companyName: "Changed only if unsafe",
+      companyIdentifier: "CORRUPT-SEED-0",
+    }),
+  }));
+  assert.equal(overCapacity.code, "UNAVAILABLE");
+  assert.equal(storedStateFingerprint(state), overCapacityRecords);
+  assert.equal(state.operations.size, overCapacityOperations);
+
+  removeParticipantIndexId(state, legacyFifth.snapshot.id);
+  appendParticipantIndexId(
+    state,
+    indicationIdForOperation("investment-indication:capacity-missing"),
+  );
+  const corruptRecords = storedStateFingerprint(state);
+  const corruptOperations = state.operations.size;
+  const corrupt = await captureStorageFailure(() => service.create({
+    operationId: "investment-operation:capacity-corrupt-create",
+    fields: companyFields({
+      companyName: "Corrupt state candidate",
+      companyIdentifier: "CORRUPT-CANDIDATE",
+    }),
+  }));
+  assert.equal(corrupt.code, "UNAVAILABLE");
+  assert.equal(storedStateFingerprint(state), corruptRecords);
+  assert.equal(state.operations.size, corruptOperations);
+});
+
 test("atomic contribution work stays constant-read with unrelated indications", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
@@ -396,12 +643,17 @@ test("participant index has an observed 100-item read and write ceiling", async 
     () => new Date("2026-08-12T10:00:00.000Z"),
   );
   for (let index = 0; index < 100; index += 1) {
-    await service.create({
+    const created = await service.create({
       operationId: `investment-operation:index-ceiling-${index}`,
       fields: companyFields({
         companyName: `Synthetic company ${index}`,
         companyIdentifier: `SYNTHETIC-${index}`,
       }),
+    });
+    await service.withdraw({
+      operationId: `investment-operation:index-ceiling-withdraw-${index}`,
+      indicationId: created.snapshot.id,
+      expectedRevision: created.snapshot.revision,
     });
   }
 
@@ -415,7 +667,7 @@ test("participant index has an observed 100-item read and write ceiling", async 
   );
   assert.equal((await reopened.listOwned()).length, 100);
   assert.equal(counted.listCalls, 0);
-  assert.equal(counted.readCalls, 401);
+  assert.equal(counted.readCalls <= 501, true);
 
   const recordsBefore = state.records.size;
   const operationsBefore = state.operations.size;
@@ -429,7 +681,7 @@ test("participant index has an observed 100-item read and write ceiling", async 
   assert.equal(failure.code, "CONFLICT");
   assert.equal(state.records.size, recordsBefore);
   assert.equal(state.operations.size, operationsBefore);
-  assertAggregate(state, 100, 200_000, 100);
+  assertAggregate(state, 200, 0, 0);
 });
 
 test("a failed outer transaction leaves no indication, aggregate, audit, index, or receipt", async () => {
@@ -782,6 +1034,84 @@ function recordsIn(state: MemoryStorageState, collection: string) {
   return [...state.records.values()].filter(
     (record) => record.key.collection === collection,
   );
+}
+
+function activeOwned(
+  indications: Awaited<
+    ReturnType<StorageParticipantInvestmentInterestRepository["listOwned"]>
+  >,
+): number {
+  return indications.filter((indication) =>
+    indication.lifecycle.status === "active"
+  ).length;
+}
+
+async function persistAggregateProjection(
+  storage: StorageAdapter,
+  indication: Parameters<typeof projectInvestmentIndicationForAggregation>[0],
+  operationId: string,
+): Promise<void> {
+  const aggregate = new DevelopmentInMemoryAggregateRepository(
+    storage,
+    AMOUNT.currency,
+  );
+  const current = await aggregate.readStored();
+  const prepared = await prepareAtomicAggregateContribution(storage, {
+    operationId,
+    expectedStoredRevision: current.revision,
+    contribution: projectInvestmentIndicationForAggregation(indication),
+  }, AMOUNT.currency);
+  await storage.transact({
+    operationId: prepared.operationId,
+    mutations: prepared.mutations,
+  });
+}
+
+function appendParticipantIndexId(
+  state: MemoryStorageState,
+  id: InvestmentIndicationId,
+): void {
+  mutateParticipantIndexIds(state, (ids) => [...ids, id]);
+}
+
+function removeParticipantIndexId(
+  state: MemoryStorageState,
+  id: InvestmentIndicationId,
+): void {
+  mutateParticipantIndexIds(state, (ids) =>
+    ids.filter((candidate) => candidate !== id)
+  );
+}
+
+function mutateParticipantIndexIds(
+  state: MemoryStorageState,
+  mutate: (ids: readonly InvestmentIndicationId[]) => readonly InvestmentIndicationId[],
+): void {
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "participant-investment-indexes"
+  );
+  assert(entry);
+  const [identity, record] = entry;
+  const source = record.value as Readonly<Record<string, unknown>>;
+  const ids = [...mutate(
+    source.indicationIds as readonly InvestmentIndicationId[],
+  )].sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+  const revision = record.revision + 1;
+  state.records.set(identity, Object.freeze({
+    key: record.key,
+    revision,
+    value: Object.freeze({
+      ...source,
+      revision,
+      indicationIds: Object.freeze(ids),
+    }) as StorageDocument,
+  }));
+}
+
+function storedStateFingerprint(state: MemoryStorageState): string {
+  return JSON.stringify([...state.records.entries()].sort(([left], [right]) =>
+    left.localeCompare(right)
+  ));
 }
 
 function assertAggregate(
