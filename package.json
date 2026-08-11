@@ -16,7 +16,7 @@
     "plan:check": "node scripts/check-plan.mjs",
     "instances:check": "node scripts/check-instance-boundaries.mjs",
     "runtime-secrets:check": "node scripts/check-runtime-secret-boundaries.mjs",
-    "sites:package": "node scripts/require-active-hosting.mjs && npm run build",
+    "sites:package": "node scripts/require-active-hosting.mjs && npm run build && npm run runtime-secrets:check",
     "validate": "npm run agents:check && npm run plan:check && npm run instances:check && npm run lint && npm run typecheck && npm test"
   },
   "dependencies": {

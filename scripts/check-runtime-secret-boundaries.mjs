@@ -1,10 +1,18 @@
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
 import { fileURLToPath } from "node:url";
-import { extname, join, relative } from "node:path";
+import { extname, isAbsolute, join, relative, resolve } from "node:path";
 
 const PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const PRODUCTION_ROOTS = [
   "app",
+  "build",
+  "db/migrations",
   "domain",
   "http",
   "repositories",
@@ -14,31 +22,74 @@ const PRODUCTION_ROOTS = [
 ];
 const BUILD_ROOT = "dist";
 const ENV_EXAMPLE = ".env.example";
+const ACTIVE_HOSTING_PATH = ".openai/hosting.json";
+const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES = 5_000;
+const MAX_ARCHIVE_LIST_BYTES = 4 * 1024 * 1024;
 
-// Tests may inject these exact values. They must never reach production source
-// or generated artifacts. Keep the scanner itself outside the scanned roots.
+// Tests inject these exact values through runtime-only configuration. They must
+// never reach release inputs, generated artifacts, or response material. Keep
+// this scanner outside the production roots that receive the fixed values.
 const SYNTHETIC_CANARIES = Object.freeze([
   Object.freeze({
     kind: "credential",
-    value: "TASK067_SyntheticCredential_Canary_7w9L3vX2",
+    value: "TASK111_SyntheticCredential_Canary_7w9L3vX2",
   }),
   Object.freeze({
-    kind: "token",
-    value: "TASK067.SyntheticToken.Canary.4nQ8xL2pV7sK9mR5",
+    kind: "bearer token",
+    value: "TASK111.SyntheticBearerToken.Canary.4nQ8xL2pV7sK9mR5",
   }),
   Object.freeze({
-    kind: "key",
-    value: "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6s",
+    kind: "client secret",
+    value: "TASK111_SyntheticClientSecret_8pL4rN7vK2xQ5mC9",
+  }),
+  Object.freeze({
+    kind: "mutation key",
+    value: "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s",
+  }),
+  Object.freeze({
+    kind: "owner review key",
+    value: "r7vsr7vsr7vsr7vsr7vsr7vsr7vsr7vsr7vsr7vsr7w",
+  }),
+  Object.freeze({
+    kind: "production identity",
+    value: "Task111-Private-Owner@Identity.Example.Test",
+  }),
+  Object.freeze({
+    kind: "private environment value",
+    value: "https://task111-private-runtime.example.test",
   }),
 ]);
 
-const ACTIVE_INSTANCE_PATTERNS = Object.freeze([
+const ACTIVE_ARTIFACT_PATTERNS = Object.freeze([
   Object.freeze({ label: "aittadb.com hostname", pattern: /aittadb\.com/giu }),
   Object.freeze({ label: "chatgpt.site hostname", pattern: /chatgpt\.site/giu }),
   Object.freeze({ label: "iki.fi identity", pattern: /@iki\.fi/giu }),
   Object.freeze({
     label: "heusalagroup.fi identity",
     pattern: /@heusalagroup\.fi/giu,
+  }),
+]);
+const PRIVATE_REPOSITORY_IDENTITY_PATTERNS = Object.freeze([
+  Object.freeze({ label: "iki.fi identity", pattern: /@iki\.fi/giu }),
+  Object.freeze({
+    label: "heusalagroup.fi identity",
+    pattern: /@heusalagroup\.fi/giu,
+  }),
+]);
+const HIGH_CONFIDENCE_CREDENTIAL_PATTERNS = Object.freeze([
+  Object.freeze({
+    label: "known credential format",
+    pattern:
+      /(?:github_pat_[A-Za-z0-9_]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|sk-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{16,}|AKIA[0-9A-Z]{16})/gu,
+  }),
+  Object.freeze({
+    label: "private key material",
+    pattern: /-----BEGIN (?:EC |OPENSSH |PGP |RSA )?PRIVATE KEY-----/gu,
+  }),
+  Object.freeze({
+    label: "credential-bearing URL",
+    pattern: /https?:\/\/[^\s/:@]+:[^\s/@]+@[^\s/]+/gu,
   }),
 ]);
 
@@ -50,12 +101,16 @@ const TEXT_EXTENSIONS = new Set([
   ".json",
   ".jsx",
   ".map",
+  ".md",
   ".mjs",
+  ".sql",
   ".svg",
   ".ts",
   ".tsx",
   ".txt",
   ".xml",
+  ".yaml",
+  ".yml",
 ]);
 const LITERAL_ASSIGNMENT =
   /([A-Za-z_$][\w$-]{0,127})\s*(?::|=(?!=))\s*(["'`])((?:\\[\s\S]|(?!\2)[^\\\r\n])*)\2/gu;
@@ -65,22 +120,29 @@ const ENVIRONMENT_DEFAULT =
   /(?:process\.env|import\.meta\.env|environment|env)(?:\.([A-Za-z_$][\w$]*)|\s*\[\s*(["'])([A-Za-z_$][\w$]*)\2\s*\])\s*(?:\?\?|\|\|)\s*(["'`])((?:\\[\s\S]|(?!\4)[^\\\r\n])*)\4/gu;
 
 const findings = [];
-const scannedFiles = [];
+const findingKeys = new Set();
+const scannedFiles = new Set();
+const options = parseArguments(process.argv.slice(2));
+const suppliedCanaries = loadSuppliedCanaries();
 
-for (const root of PRODUCTION_ROOTS) {
-  scanTree(root);
-}
-if (existsSync(join(PROJECT_ROOT, BUILD_ROOT))) {
-  scanTree(BUILD_ROOT);
-}
+try {
+  if (options.scanPath !== null) {
+    scanExternalPath(options.scanPath, suppliedCanaries);
+  } else {
+    scanTrackedRepository(suppliedCanaries);
+    for (const root of PRODUCTION_ROOTS) scanTree(root, SYNTHETIC_CANARIES);
+    if (existsSync(join(PROJECT_ROOT, BUILD_ROOT))) {
+      scanTree(BUILD_ROOT, [...SYNTHETIC_CANARIES, ...suppliedCanaries]);
+    }
+    scanEnvironmentExample();
+  }
 
-const envExamplePath = join(PROJECT_ROOT, ENV_EXAMPLE);
-if (!existsSync(envExamplePath)) {
-  addFinding(ENV_EXAMPLE, 0, "missing inert runtime example");
-} else {
-  const envText = readFileSync(envExamplePath, "utf8");
-  scanExactBoundaries(ENV_EXAMPLE, envText);
-  scanEnvironmentExample(envText);
+  const archivePath = options.archivePath ?? process.env.SITES_ARCHIVE_PATH ?? null;
+  if (archivePath !== null && archivePath !== "") {
+    scanArchive(resolve(archivePath), [...SYNTHETIC_CANARIES, ...suppliedCanaries]);
+  }
+} catch {
+  addFinding("release-boundary", 0, "inspection failed closed");
 }
 
 if (findings.length > 0) {
@@ -91,24 +153,199 @@ if (findings.length > 0) {
   process.exitCode = 1;
 } else {
   console.log(
-    `Runtime secret boundary is clean (${scannedFiles.length} production files and ${ENV_EXAMPLE})`,
+    `Runtime secret boundary is clean (${scannedFiles.size} release files and ${ENV_EXAMPLE})`,
   );
 }
 
-function scanTree(root) {
-  const absoluteRoot = join(PROJECT_ROOT, root);
-  if (!existsSync(absoluteRoot)) return;
+function parseArguments(argumentsList) {
+  let scanPath = null;
+  let archivePath = null;
+  for (let index = 0; index < argumentsList.length; index += 1) {
+    const argument = argumentsList[index];
+    if (argument === "--scan-path" && scanPath === null) {
+      scanPath = requiredArgument(argumentsList[index + 1]);
+      index += 1;
+    } else if (argument === "--archive" && archivePath === null) {
+      archivePath = requiredArgument(argumentsList[index + 1]);
+      index += 1;
+    } else {
+      throw new Error("Invalid scanner arguments.");
+    }
+  }
+  return Object.freeze({ scanPath, archivePath });
+}
 
-  for (const absolutePath of filesBelow(absoluteRoot)) {
-    const projectPath = portablePath(relative(PROJECT_ROOT, absolutePath));
+function requiredArgument(value) {
+  if (typeof value !== "string" || value === "") {
+    throw new Error("Missing scanner argument.");
+  }
+  return value;
+}
+
+function loadSuppliedCanaries() {
+  const path = process.env.INVEST_SECRET_SCAN_VALUES_FILE;
+  if (path === undefined || path === "") return Object.freeze([]);
+  const parsed = JSON.parse(readFileSync(resolve(path), "utf8"));
+  if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 32) {
+    throw new Error("Invalid supplied canary file.");
+  }
+  const seen = new Set();
+  return Object.freeze(parsed.map((entry) => {
+    if (
+      entry === null ||
+      typeof entry !== "object" ||
+      Object.getPrototypeOf(entry) !== Object.prototype ||
+      Object.keys(entry).sort().join(",") !== "kind,value" ||
+      typeof entry.kind !== "string" ||
+      !/^[a-z][a-z0-9 _-]{0,63}$/u.test(entry.kind) ||
+      typeof entry.value !== "string" ||
+      entry.value.length < 12 ||
+      entry.value.length > 2_048 ||
+      seen.has(entry.value)
+    ) {
+      throw new Error("Invalid supplied canary file.");
+    }
+    seen.add(entry.value);
+    return Object.freeze({ kind: entry.kind, value: entry.value });
+  }));
+}
+
+function scanTrackedRepository(externalCanaries) {
+  const output = execFileSync("git", ["ls-files", "-z"], {
+    cwd: PROJECT_ROOT,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  for (const projectPath of output.split("\0").filter(Boolean).sort()) {
+    if (isSensitiveTrackedPath(projectPath)) {
+      addFinding(projectPath, 0, "tracks deployment-private runtime material");
+    }
+    const absolutePath = join(PROJECT_ROOT, projectPath);
     const bytes = readFileSync(absolutePath);
     const text = bytes.toString("utf8");
-    scannedFiles.push(projectPath);
-    scanExactBoundaries(projectPath, text);
-    if (isTextFile(absolutePath, bytes)) {
+    scannedFiles.add(projectPath);
+    scanExactCanaries(projectPath, text, externalCanaries);
+    scanPatterns(projectPath, text, PRIVATE_REPOSITORY_IDENTITY_PATTERNS,
+      "contains private");
+    if (!projectPath.startsWith("tests/")) {
+      scanPatterns(projectPath, text, HIGH_CONFIDENCE_CREDENTIAL_PATTERNS,
+        "contains");
+    }
+    if (isReleaseInputPath(projectPath) && isTextFile(projectPath, bytes)) {
+      if (projectPath !== "scripts/check-runtime-secret-boundaries.mjs") {
+        scanExactCanaries(projectPath, text, SYNTHETIC_CANARIES);
+        scanPatterns(projectPath, text, ACTIVE_ARTIFACT_PATTERNS,
+          "contains active");
+      }
       scanCommittedSecretAssignments(projectPath, text);
     }
   }
+}
+
+function isSensitiveTrackedPath(path) {
+  const basename = path.split("/").at(-1) ?? path;
+  return path === ACTIVE_HOSTING_PATH ||
+    (/^\.env(?:\.|$)/u.test(basename) && path !== ENV_EXAMPLE) ||
+    /^\.dev\.vars(?:\.|$)/u.test(basename) ||
+    /(?:^|\/)(?:credentials?|secrets?)(?:\.[^/]*)?$/iu.test(path) ||
+    /\.(?:key|p12|pfx|pem)$/iu.test(path);
+}
+
+function isReleaseInputPath(path) {
+  return PRODUCTION_ROOTS.some((root) => path === root || path.startsWith(`${root}/`)) ||
+    path.startsWith("scripts/") ||
+    /^\.(?:openai\/hosting\.example\.json|env\.example)$/u.test(path) ||
+    /^(?:eslint\.config\.mjs|next-env\.d\.ts|package(?:-lock)?\.json|postcss\.config\.mjs|tsconfig\.json|vinext\.config\.ts)$/u.test(
+      path,
+    );
+}
+
+function scanTree(root, canaries) {
+  const absoluteRoot = join(PROJECT_ROOT, root);
+  if (!existsSync(absoluteRoot)) return;
+  for (const absolutePath of filesBelow(absoluteRoot)) {
+    const projectPath = portablePath(relative(PROJECT_ROOT, absolutePath));
+    scanReleaseFile(projectPath, readFileSync(absolutePath), canaries);
+  }
+}
+
+function scanExternalPath(path, canaries) {
+  const absolutePath = resolve(path);
+  const stats = statSync(absolutePath);
+  if (stats.isFile()) {
+    scanReleaseFile(portablePath(relative(PROJECT_ROOT, absolutePath)),
+      readFileSync(absolutePath), [...SYNTHETIC_CANARIES, ...canaries]);
+    return;
+  }
+  if (!stats.isDirectory()) throw new Error("Unsupported scan path.");
+  for (const file of filesBelow(absolutePath)) {
+    scanReleaseFile(portablePath(relative(absolutePath, file)), readFileSync(file),
+      [...SYNTHETIC_CANARIES, ...canaries]);
+  }
+}
+
+function scanReleaseFile(path, bytes, canaries) {
+  const text = bytes.toString("utf8");
+  scannedFiles.add(path);
+  scanExactCanaries(path, text, canaries);
+  scanPatterns(path, text, ACTIVE_ARTIFACT_PATTERNS, "contains active");
+  scanPatterns(path, text, HIGH_CONFIDENCE_CREDENTIAL_PATTERNS, "contains");
+  if (isTextFile(path, bytes)) scanCommittedSecretAssignments(path, text);
+}
+
+function scanArchive(archivePath, canaries) {
+  const archiveStats = statSync(archivePath);
+  if (!archiveStats.isFile() || archiveStats.size > MAX_ARCHIVE_BYTES) {
+    throw new Error("Invalid archive.");
+  }
+  const entries = execFileSync("tar", ["-tzf", archivePath], {
+    encoding: "utf8",
+    maxBuffer: MAX_ARCHIVE_LIST_BYTES,
+  }).split("\n").filter(Boolean);
+  const verbose = execFileSync("tar", ["-tvzf", archivePath], {
+    encoding: "utf8",
+    maxBuffer: MAX_ARCHIVE_LIST_BYTES,
+  }).split("\n").filter(Boolean);
+  if (
+    entries.length < 1 ||
+    entries.length > MAX_ARCHIVE_ENTRIES ||
+    entries.length !== verbose.length
+  ) {
+    throw new Error("Invalid archive.");
+  }
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (!isSafeArchiveEntry(entry)) {
+      addFinding("sites-archive", 0, "contains an unsafe archive entry");
+      continue;
+    }
+    const kind = verbose[index]?.at(0);
+    if (entry.endsWith("/")) {
+      if (kind !== "d") addFinding(`archive:${entry}`, 0, "has an unsafe type");
+      continue;
+    }
+    if (kind !== "-") {
+      addFinding(`archive:${entry}`, 0, "has an unsafe type");
+      continue;
+    }
+    const bytes = execFileSync("tar", ["-xOzf", archivePath, entry], {
+      encoding: "buffer",
+      maxBuffer: MAX_ARCHIVE_BYTES,
+    });
+    scanReleaseFile(`archive:${entry}`, bytes, canaries);
+  }
+}
+
+function isSafeArchiveEntry(entry) {
+  if (
+    entry === "" ||
+    isAbsolute(entry) ||
+    entry.includes("\\") ||
+    entry.startsWith("-") ||
+    !entry.startsWith("dist/") && entry !== "dist"
+  ) return false;
+  const parts = entry.split("/");
+  return parts.every((part) => part !== ".." && part !== ".");
 }
 
 function filesBelow(directory) {
@@ -117,33 +354,68 @@ function filesBelow(directory) {
     (left, right) => left.name.localeCompare(right.name),
   )) {
     const path = join(directory, entry.name);
-    if (entry.isDirectory()) {
-      files.push(...filesBelow(path));
-    } else if (entry.isFile()) {
-      files.push(path);
-    }
+    if (entry.isDirectory()) files.push(...filesBelow(path));
+    else if (entry.isFile()) files.push(path);
+    else addFinding(portablePath(relative(PROJECT_ROOT, path)), 0,
+      "contains an unsupported filesystem entry");
   }
   return files;
 }
 
-function scanExactBoundaries(path, text) {
-  for (const canary of SYNTHETIC_CANARIES) {
+function scanEnvironmentExample() {
+  const envExamplePath = join(PROJECT_ROOT, ENV_EXAMPLE);
+  if (!existsSync(envExamplePath)) {
+    addFinding(ENV_EXAMPLE, 0, "missing inert runtime example");
+    return;
+  }
+  const envText = readFileSync(envExamplePath, "utf8");
+  scannedFiles.add(ENV_EXAMPLE);
+  scanExactCanaries(ENV_EXAMPLE, envText, SYNTHETIC_CANARIES);
+  scanPatterns(ENV_EXAMPLE, envText, ACTIVE_ARTIFACT_PATTERNS,
+    "contains active");
+  const lines = envText.split(/\r?\n/u);
+  for (let offset = 0, index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const match = line.match(
+      /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/u,
+    );
+    if (match) {
+      const [, name, rawValue] = match;
+      const value = unquoteEnvironmentValue(rawValue.trim());
+      if (
+        isSecretBearingName(name) &&
+        value !== "" &&
+        !isInertExampleValue(value)
+      ) {
+        addFinding(ENV_EXAMPLE, offset,
+          `contains an active-looking value for ${name}`, envText);
+      } else if (
+        !isInertExampleValue(value) &&
+        looksHighConfidenceSecret(value)
+      ) {
+        addFinding(ENV_EXAMPLE, offset,
+          `contains an active-looking secret value in ${name}`, envText);
+      }
+    }
+    offset += line.length + 1;
+  }
+}
+
+function scanExactCanaries(path, text, canaries) {
+  for (const canary of canaries) {
     let index = text.indexOf(canary.value);
     while (index !== -1) {
-      addFinding(path, index, `contains synthetic ${canary.kind} canary`, text);
+      addFinding(path, index, `contains supplied ${canary.kind}`, text);
       index = text.indexOf(canary.value, index + canary.value.length);
     }
   }
+}
 
-  for (const activeInstance of ACTIVE_INSTANCE_PATTERNS) {
-    activeInstance.pattern.lastIndex = 0;
-    for (const match of text.matchAll(activeInstance.pattern)) {
-      addFinding(
-        path,
-        match.index,
-        `contains active ${activeInstance.label}`,
-        text,
-      );
+function scanPatterns(path, text, patterns, prefix) {
+  for (const boundary of patterns) {
+    boundary.pattern.lastIndex = 0;
+    for (const match of text.matchAll(boundary.pattern)) {
+      addFinding(path, match.index, `${prefix} ${boundary.label}`, text);
     }
   }
 }
@@ -183,43 +455,6 @@ function scanCommittedSecretAssignments(path, text) {
   }
 }
 
-function scanEnvironmentExample(text) {
-  const lines = text.split(/\r?\n/u);
-  for (let offset = 0, index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const match = line.match(
-      /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/u,
-    );
-    if (match) {
-      const [, name, rawValue] = match;
-      const value = unquoteEnvironmentValue(rawValue.trim());
-      if (
-        isSecretBearingName(name) &&
-        value !== "" &&
-        !isInertExampleValue(value)
-      ) {
-        addFinding(
-          ENV_EXAMPLE,
-          offset,
-          `contains an active-looking value for ${name}`,
-          text,
-        );
-      } else if (
-        !isInertExampleValue(value) &&
-        looksHighConfidenceSecret(value)
-      ) {
-        addFinding(
-          ENV_EXAMPLE,
-          offset,
-          `contains an active-looking secret value in ${name}`,
-          text,
-        );
-      }
-    }
-    offset += line.length + 1;
-  }
-}
-
 function isSecretBearingName(name) {
   const normalized = name.replace(/[^A-Za-z0-9]/gu, "").toLowerCase();
   return normalized === "secret" ||
@@ -249,8 +484,9 @@ function looksCommitted(name, rawValue) {
 }
 
 function isGeneratedFrameworkNonce(path, name, value) {
-  return path.startsWith("dist/server/") &&
-    path.endsWith("vinext-server.json") &&
+  const releasePath = path.startsWith("archive:") ? path.slice(8) : path;
+  return releasePath.startsWith("dist/server/") &&
+    releasePath.endsWith("vinext-server.json") &&
     name === "prerenderSecret" &&
     /^[A-Fa-f0-9]{64}$/u.test(value);
 }
@@ -269,9 +505,7 @@ function looksHighConfidenceSecret(value) {
     /^(?:eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?|sk-[A-Za-z0-9_-]{16,}|github_pat_[A-Za-z0-9_]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{16,}|AKIA[0-9A-Z]{16})$/u.test(
       value,
     )
-  ) {
-    return true;
-  }
+  ) return true;
   if (/^[A-Fa-f0-9]{32,}$/u.test(value)) return true;
   if (/^[A-Za-z0-9_-]{24,}={0,2}$/u.test(value)) {
     return characterClassCount(value) >= 2 || uniqueRatio(value) >= 0.35;
@@ -323,6 +557,9 @@ function isTextFile(path, bytes) {
 }
 
 function addFinding(path, index, rule, text = "") {
+  const key = `${path}\0${index}\0${rule}`;
+  if (findingKeys.has(key)) return;
+  findingKeys.add(key);
   const prefix = text.slice(0, Math.max(index, 0));
   const lines = prefix.split("\n");
   findings.push(Object.freeze({

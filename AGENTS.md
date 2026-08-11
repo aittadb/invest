@@ -123,6 +123,7 @@ README must state experimental status, FSL-1.1-MIT source availability with two-
 - Lint: `npm run lint`
 - Agent instruction budget: `npm run agents:check`
 - Plan dependency graph: `npm run plan:check`
+- Runtime and release secret boundary: `npm run runtime-secrets:check`
 - Local validation: `npm run validate`
 - Sites package build: `npm run sites:package`
 

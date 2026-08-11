@@ -1,0 +1,162 @@
+import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+  mkdirSync,
+  mkdtempSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+const PROJECT_ROOT = new URL("..", import.meta.url).pathname;
+const SCANNER = join(PROJECT_ROOT, "scripts/check-runtime-secret-boundaries.mjs");
+const CANARIES = Object.freeze([
+  "TASK111_SyntheticCredential_Canary_7w9L3vX2",
+  "TASK111.SyntheticBearerToken.Canary.4nQ8xL2pV7sK9mR5",
+  "TASK111_SyntheticClientSecret_8pL4rN7vK2xQ5mC9",
+  "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s",
+  "r7vsr7vsr7vsr7vsr7vsr7vsr7vsr7vsr7vsr7vsr7w",
+  "Task111-Private-Owner@Identity.Example.Test",
+  "https://task111-private-runtime.example.test",
+]);
+
+test("scanner rejects sentinels in every release representation without echoing them", () => {
+  const directory = mkdtempSync(join(tmpdir(), "invest-secret-representations-"));
+  const fixtures = [
+    ["worker.js.map", JSON.stringify({ sourcesContent: [CANARIES[0]] })],
+    ["manifest.json", JSON.stringify({ private_value: CANARIES[1] })],
+    ["0001.sql", `-- ${CANARIES[2]}\nSELECT 1;`],
+    ["response.html", `<p>${CANARIES[3]}</p>`],
+    ["response.json", JSON.stringify({ error: CANARIES[4] })],
+    ["review.csv", `field\n${CANARIES[5]}\n`],
+    ["redirect.txt", `location: ${CANARIES[6]}\n`],
+    ["csp.txt", `content-security-policy: default-src '${CANARIES[0]}'\n`],
+    ["fixed-error.txt", `503 temporarily_unavailable ${CANARIES[1]}\n`],
+  ];
+
+  for (const [name, content] of fixtures) {
+    const path = join(directory, name);
+    writeFileSync(path, content, "utf8");
+    const result = runScanner(["--scan-path", path]);
+    assert.equal(result.status, 1, `${name} must fail the release scan`);
+    assert.match(output(result), /Runtime secret boundary failed/u);
+    assertNoCanary(output(result));
+  }
+});
+
+test("scanner accepts clean release representations", () => {
+  const directory = mkdtempSync(join(tmpdir(), "invest-secret-clean-"));
+  for (const name of [
+    "worker.js.map",
+    "manifest.json",
+    "0001.sql",
+    "response.html",
+    "response.json",
+    "review.csv",
+    "redirect.txt",
+    "csp.txt",
+    "fixed-error.txt",
+  ]) {
+    writeFileSync(join(directory, name), "synthetic clean release material\n", "utf8");
+  }
+  const result = runScanner(["--scan-path", directory]);
+  assert.equal(result.status, 0, output(result));
+  assert.match(result.stdout, /Runtime secret boundary is clean/u);
+});
+
+test("scanner consumes external private values without retaining or echoing them", () => {
+  const directory = mkdtempSync(join(tmpdir(), "invest-secret-supplied-"));
+  const sentinel = `task111-external-${process.pid}-${Date.now()}-private-value`;
+  const sentinelFile = join(directory, "sentinels.json");
+  const leakedFile = join(directory, "artifact.js");
+  const cleanFile = join(directory, "clean.js");
+  writeFileSync(
+    sentinelFile,
+    JSON.stringify([{ kind: "acceptance client value", value: sentinel }]),
+    "utf8",
+  );
+  writeFileSync(leakedFile, `export const value = ${JSON.stringify(sentinel)};\n`, "utf8");
+  writeFileSync(cleanFile, "export const value = 'clean';\n", "utf8");
+  const environment = {
+    ...process.env,
+    INVEST_SECRET_SCAN_VALUES_FILE: sentinelFile,
+  };
+
+  const rejected = runScanner(["--scan-path", leakedFile], environment);
+  assert.equal(rejected.status, 1);
+  assert.equal(output(rejected).includes(sentinel), false);
+  const accepted = runScanner(["--scan-path", cleanFile], environment);
+  assert.equal(accepted.status, 0, output(accepted));
+});
+
+test("scanner verifies complete Sites archive contents and rejects unsafe entry types", () => {
+  const directory = mkdtempSync(join(tmpdir(), "invest-secret-archive-"));
+  const cleanStage = join(directory, "clean");
+  const leakedStage = join(directory, "leaked");
+  const linkedStage = join(directory, "linked");
+  const cleanArchive = join(directory, "clean.tar.gz");
+  const leakedArchive = join(directory, "leaked.tar.gz");
+  const linkedArchive = join(directory, "linked.tar.gz");
+  const probe = join(directory, "probe.txt");
+  writeFileSync(probe, "clean probe\n", "utf8");
+
+  stageArchive(cleanStage, "export default {};\n");
+  stageArchive(leakedStage, `export default ${JSON.stringify(CANARIES[2])};\n`);
+  stageArchive(linkedStage, "export default {};\n");
+  symlinkSync("server/index.js", join(linkedStage, "dist", "linked-worker.js"));
+  createArchive(cleanStage, cleanArchive);
+  createArchive(leakedStage, leakedArchive);
+  createArchive(linkedStage, linkedArchive);
+
+  const clean = runScanner(["--scan-path", probe, "--archive", cleanArchive]);
+  assert.equal(clean.status, 0, output(clean));
+  const leaked = runScanner(["--scan-path", probe, "--archive", leakedArchive]);
+  assert.equal(leaked.status, 1);
+  assertNoCanary(output(leaked));
+  const linked = runScanner(["--scan-path", probe, "--archive", linkedArchive]);
+  assert.equal(linked.status, 1);
+  assert.match(output(linked), /unsafe type/u);
+});
+
+function stageArchive(stage, worker) {
+  mkdirSync(join(stage, "dist", "server"), { recursive: true });
+  mkdirSync(join(stage, "dist", ".openai", "drizzle"), { recursive: true });
+  writeFileSync(join(stage, "dist", "server", "index.js"), worker, "utf8");
+  writeFileSync(
+    join(stage, "dist", "server", "vinext-server.json"),
+    JSON.stringify({ prerenderSecret: "a".repeat(64) }),
+    "utf8",
+  );
+  writeFileSync(
+    join(stage, "dist", ".openai", "hosting.json"),
+    JSON.stringify({ project_id: "appgprj_synthetic", d1: null, r2: null }),
+    "utf8",
+  );
+  writeFileSync(
+    join(stage, "dist", ".openai", "drizzle", "0001.sql"),
+    "SELECT 1;\n",
+    "utf8",
+  );
+}
+
+function createArchive(stage, archive) {
+  execFileSync("tar", ["-czf", archive, "-C", stage, "dist"]);
+}
+
+function runScanner(argumentsList, environment = process.env) {
+  return spawnSync(process.execPath, [SCANNER, ...argumentsList], {
+    cwd: PROJECT_ROOT,
+    encoding: "utf8",
+    env: environment,
+  });
+}
+
+function output(result) {
+  return `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+}
+
+function assertNoCanary(value) {
+  for (const canary of CANARIES) assert.equal(value.includes(canary), false);
+}

@@ -8,6 +8,10 @@ The public repository must contain no secrets or private campaign data. Never co
 
 Checked-in example configuration contains only inert placeholders. Keep real values in ignored local files or hosted secret/configuration stores.
 
+`npm run runtime-secrets:check` scans every tracked repository file, every release input, the complete generated `dist` tree, and the inert environment example. It rejects deployment-private files, private owner identities, known credential formats, committed secret assignments, and synthetic credential, token, key, identity, and private-environment sentinels. Supply exact acceptance values only through a mode-restricted temporary JSON file named by `INVEST_SECRET_SCAN_VALUES_FILE`; the scanner reports only category and location and must never print a matched value. Delete that temporary file after the proof.
+
+Set `SITES_ARCHIVE_PATH` to the exact generated Sites archive to inspect every regular entry under `dist/`, including the Worker, source maps, manifests, migrations, HTML, JSON, styles, and static downloads. Absolute, traversing, linked, device, and other unsafe archive entries fail closed. The opaque Sites `project_id` is required deployment routing metadata and may appear only in the ignored active binding and generated archive; it is not a credential or runtime application value. Runtime environment entries and their values must not enter either artifact.
+
 If exposure is suspected, do not echo or paste the value. Escalate privately with only its category, path, and commit. Rotation, revocation, or history rewrite requires explicit maintainer approval.
 
 ## Application Security Boundary
