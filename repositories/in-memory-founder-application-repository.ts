@@ -49,7 +49,8 @@ const APPLICATION_FIELDS = storageCollection("founder-application-fields");
 const APPLICATION_POLICY_REVISIONS = storageCollection(
   "founder-application-policy-revisions",
 );
-const FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION = 1;
+const LEGACY_FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION = 1;
+const FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION = 2;
 
 export const MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES = 65_536;
 export const MAX_FOUNDER_APPLICATION_STORAGE_TRANSACTION_BYTES = 1_048_576;
@@ -124,13 +125,17 @@ const FIELDS_PAYLOAD_KEYS = new Set([
   "contributionAreaIds",
   "fields",
 ]);
-const POLICY_REVISION_DOCUMENT_KEYS = [
+const LEGACY_POLICY_REVISION_DOCUMENT_KEYS = [
   "kind",
   "schemaVersion",
   "applicationId",
   "applicantSubject",
   "applicationRevision",
   "campaignSetupRevision",
+] as const;
+const POLICY_REVISION_DOCUMENT_KEYS = [
+  ...LEGACY_POLICY_REVISION_DOCUMENT_KEYS,
+  "participantProfileRevision",
 ] as const;
 
 export type FounderApplicationMutationResult<
@@ -183,16 +188,19 @@ export interface FounderApplicationRepository {
 
 export type FounderApplicationPolicyRevisionCheck = (
   revision: number,
-) => StorageCheckMutation;
+) => StorageCheckMutation | Promise<StorageCheckMutation>;
 export type FounderApplicationPolicyRevisionEvidenceVerifier = (
   record: unknown,
   revision: number,
-) => void;
+) => void | Promise<void>;
 
 export type StorageFounderApplicationRepositoryOptions = Readonly<{
   policyRevisionCheck?: FounderApplicationPolicyRevisionCheck;
   verifyPolicyRevisionCheck?: FounderApplicationPolicyRevisionEvidenceVerifier;
   writePolicyRevision?: number;
+  participantProfileRevisionCheck?: FounderApplicationPolicyRevisionCheck;
+  verifyParticipantProfileRevisionCheck?: FounderApplicationPolicyRevisionEvidenceVerifier;
+  writeParticipantProfileRevision?: number;
 }>;
 
 export type FounderApplicationReviewItem = Readonly<{
@@ -314,7 +322,17 @@ type PreparedMutation = Readonly<{
 type PreparedPolicyRevision = Readonly<{
   key: StorageKey;
   value: StorageDocument;
-  check: StorageCheckMutation;
+  checks: readonly PreparedPolicyRevisionCheck[];
+}>;
+
+type PreparedPolicyRevisionCheck = Readonly<{
+  mutation: StorageCheckMutation;
+  verifyEvidence: FounderApplicationPolicyRevisionEvidenceVerifier;
+}>;
+
+type PolicyRevisionEvidence = Readonly<{
+  campaignSetupRevision: number;
+  participantProfileRevision: number | null;
 }>;
 
 /**
@@ -335,6 +353,13 @@ export class StorageFounderApplicationRepository
     | FounderApplicationPolicyRevisionEvidenceVerifier
     | null;
   readonly #writePolicyRevision: number | null;
+  readonly #participantProfileRevisionCheck:
+    | FounderApplicationPolicyRevisionCheck
+    | null;
+  readonly #verifyParticipantProfileRevisionCheck:
+    | FounderApplicationPolicyRevisionEvidenceVerifier
+    | null;
+  readonly #writeParticipantProfileRevision: number | null;
 
   constructor(
     storage: StorageAdapter,
@@ -356,6 +381,14 @@ export class StorageFounderApplicationRepository
     this.#writePolicyRevision = options.writePolicyRevision === undefined
       ? null
       : requiredPolicyRevision(options.writePolicyRevision);
+    this.#participantProfileRevisionCheck =
+      options.participantProfileRevisionCheck ?? null;
+    this.#verifyParticipantProfileRevisionCheck =
+      options.verifyParticipantProfileRevisionCheck ?? null;
+    this.#writeParticipantProfileRevision =
+      options.writeParticipantProfileRevision === undefined
+        ? null
+        : requiredPolicyRevision(options.writeParticipantProfileRevision);
     if (
       (this.#policyRevisionCheck !== null &&
         typeof this.#policyRevisionCheck !== "function") ||
@@ -363,18 +396,20 @@ export class StorageFounderApplicationRepository
         typeof this.#verifyPolicyRevisionCheck !== "function") ||
       (this.#policyRevisionCheck === null) !==
         (this.#verifyPolicyRevisionCheck === null) ||
-      (this.#writePolicyRevision !== null && this.#policyRevisionCheck === null)
+      (this.#participantProfileRevisionCheck !== null &&
+        typeof this.#participantProfileRevisionCheck !== "function") ||
+      (this.#verifyParticipantProfileRevisionCheck !== null &&
+        typeof this.#verifyParticipantProfileRevisionCheck !== "function") ||
+      (this.#participantProfileRevisionCheck === null) !==
+        (this.#verifyParticipantProfileRevisionCheck === null) ||
+      (this.#writePolicyRevision !== null && this.#policyRevisionCheck === null) ||
+      (this.#participantProfileRevisionCheck !== null &&
+        this.#policyRevisionCheck === null) ||
+      (this.#writeParticipantProfileRevision !== null &&
+        (this.#participantProfileRevisionCheck === null ||
+          this.#writePolicyRevision === null))
     ) {
       invalidRequest();
-    }
-    if (
-      this.#writePolicyRevision !== null &&
-      this.#policyRevisionCheck !== null
-    ) {
-      requiredPolicyRevisionCheck(
-        this.#policyRevisionCheck,
-        this.#writePolicyRevision,
-      );
     }
   }
 
@@ -688,12 +723,12 @@ export class StorageFounderApplicationRepository
               expectedRevision: null,
               value: prepared.policy.value,
             },
-            prepared.policy.check,
+            ...prepared.policy.checks.map((check) => check.mutation),
           ]),
     ];
     if (
       mutations.length > MAX_STORAGE_TRANSACTION_MUTATIONS ||
-      mutations.length > 4 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS
+      mutations.length > 5 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS
     ) {
       unavailable();
     }
@@ -728,7 +763,6 @@ export class StorageFounderApplicationRepository
       verifyExactRecord(result.records[index + 2], chunk.key, 1, chunk.value);
     }
     if (prepared.policy !== null) {
-      if (this.#verifyPolicyRevisionCheck === null) unavailable();
       const policyIndex = 2 + prepared.fieldsChunks.length;
       verifyExactRecord(
         result.records[policyIndex],
@@ -736,11 +770,13 @@ export class StorageFounderApplicationRepository
         1,
         prepared.policy.value,
       );
-      verifyRevisionCheckRecord(
-        result.records[policyIndex + 1],
-        prepared.policy.check,
-        this.#verifyPolicyRevisionCheck,
-      );
+      for (const [index, check] of prepared.policy.checks.entries()) {
+        await verifyRevisionCheckRecord(
+          result.records[policyIndex + 1 + index],
+          check.mutation,
+          check.verifyEvidence,
+        );
+      }
     }
 
     return mutationResult(prepared.application, result.replayed);
@@ -755,12 +791,19 @@ export class StorageFounderApplicationRepository
     if (this.#writePolicyRevision === null) {
       throw new StorageFailure("PRECONDITION_FAILED");
     }
+    if (this.#verifyPolicyRevisionCheck === null) unavailable();
     return preparePolicyRevision(
       subject,
       id,
       applicationRevision,
-      this.#writePolicyRevision,
+      Object.freeze({
+        campaignSetupRevision: this.#writePolicyRevision,
+        participantProfileRevision: this.#writeParticipantProfileRevision,
+      }),
       this.#policyRevisionCheck,
+      this.#verifyPolicyRevisionCheck,
+      this.#participantProfileRevisionCheck,
+      this.#verifyParticipantProfileRevisionCheck,
     );
   }
 
@@ -777,19 +820,23 @@ export class StorageFounderApplicationRepository
     );
     const record = await this.#storage.read(key);
     if (record === null) return null;
-    const campaignRevision = decodePolicyRevision(
+    const evidence = decodePolicyRevision(
       record,
       key,
       subject,
       id,
       applicationRevision,
     );
+    if (this.#verifyPolicyRevisionCheck === null) unavailable();
     return preparePolicyRevision(
       subject,
       id,
       applicationRevision,
-      campaignRevision,
+      evidence,
       this.#policyRevisionCheck,
+      this.#verifyPolicyRevisionCheck,
+      this.#participantProfileRevisionCheck,
+      this.#verifyParticipantProfileRevisionCheck,
     );
   }
 }
@@ -1717,36 +1764,79 @@ async function preparePolicyRevision(
   subject: ActorSubject,
   id: FounderApplicationId,
   applicationRevision: number,
-  campaignRevision: number,
-  checkForRevision: FounderApplicationPolicyRevisionCheck,
+  evidence: PolicyRevisionEvidence,
+  checkCampaignRevision: FounderApplicationPolicyRevisionCheck,
+  verifyCampaignRevision: FounderApplicationPolicyRevisionEvidenceVerifier,
+  checkParticipantProfileRevision:
+    | FounderApplicationPolicyRevisionCheck
+    | null,
+  verifyParticipantProfileRevision:
+    | FounderApplicationPolicyRevisionEvidenceVerifier
+    | null,
 ): Promise<PreparedPolicyRevision> {
   const parsedApplicationRevision = requiredApplicationRevision(
     applicationRevision,
   );
-  const parsedCampaignRevision = requiredPolicyRevision(campaignRevision);
+  const parsedCampaignRevision = requiredPolicyRevision(
+    evidence.campaignSetupRevision,
+  );
+  const parsedParticipantProfileRevision =
+    evidence.participantProfileRevision === null
+      ? null
+      : requiredPolicyRevision(evidence.participantProfileRevision);
   const key = await applicationPolicyRevisionKey(
     subject,
     id,
     parsedApplicationRevision,
   );
-  const check = requiredPolicyRevisionCheck(
-    checkForRevision,
+  const campaignCheck = await requiredPolicyRevisionCheck(
+    checkCampaignRevision,
     parsedCampaignRevision,
   );
-  if (storageKeyString(key) === storageKeyString(check.key)) unavailable();
+  const checks: PreparedPolicyRevisionCheck[] = [{
+    mutation: campaignCheck,
+    verifyEvidence: verifyCampaignRevision,
+  }];
+  if (parsedParticipantProfileRevision !== null) {
+    if (
+      checkParticipantProfileRevision === null ||
+      verifyParticipantProfileRevision === null
+    ) {
+      unavailable();
+    }
+    checks.push({
+      mutation: await requiredPolicyRevisionCheck(
+        checkParticipantProfileRevision,
+        parsedParticipantProfileRevision,
+      ),
+      verifyEvidence: verifyParticipantProfileRevision,
+    });
+  }
+  const checkKeys = checks.map((check) => storageKeyString(check.mutation.key));
+  if (
+    checkKeys.includes(storageKeyString(key)) ||
+    new Set(checkKeys).size !== checkKeys.length
+  ) {
+    unavailable();
+  }
   const value = Object.freeze({
     kind: "founder-application-policy-revision",
-    schemaVersion: FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION,
+    schemaVersion: parsedParticipantProfileRevision === null
+      ? LEGACY_FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION
+      : FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION,
     applicationId: id,
     applicantSubject: subject,
     applicationRevision: parsedApplicationRevision,
     campaignSetupRevision: parsedCampaignRevision,
+    ...(parsedParticipantProfileRevision === null
+      ? {}
+      : { participantProfileRevision: parsedParticipantProfileRevision }),
   });
   requireBoundedRecord(value);
   return Object.freeze({
     key,
     value,
-    check,
+    checks: Object.freeze(checks.map((check) => Object.freeze(check))),
   });
 }
 
@@ -1756,14 +1846,23 @@ function decodePolicyRevision(
   expectedSubject: ActorSubject,
   expectedId: FounderApplicationId,
   expectedApplicationRevision: number,
-): number {
+): PolicyRevisionEvidence {
   const envelope = exactDataObject(record, ["key", "revision", "value"]);
   const key = envelope === null
     ? null
     : exactDataObject(envelope.key, ["collection", "id"]);
-  const source = envelope === null
+  const currentSource = envelope === null
     ? null
     : exactDataObject(envelope.value, [...POLICY_REVISION_DOCUMENT_KEYS]);
+  const legacySource = envelope === null || currentSource !== null
+    ? null
+    : exactDataObject(envelope.value, [
+        ...LEGACY_POLICY_REVISION_DOCUMENT_KEYS,
+      ]);
+  const source = currentSource ?? legacySource;
+  const expectedSchemaVersion = currentSource === null
+    ? LEGACY_FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION
+    : FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION;
   if (
     envelope === null ||
     key === null ||
@@ -1772,18 +1871,29 @@ function decodePolicyRevision(
     key.id !== expectedKey.id ||
     envelope.revision !== 1 ||
     source.kind !== "founder-application-policy-revision" ||
-    source.schemaVersion !== FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION ||
+    source.schemaVersion !== expectedSchemaVersion ||
     source.applicationId !== expectedId ||
     source.applicantSubject !== expectedSubject ||
     source.applicationRevision !== expectedApplicationRevision ||
     !Number.isSafeInteger(source.campaignSetupRevision) ||
     (source.campaignSetupRevision as number) < 1 ||
+    (currentSource !== null &&
+      (!Number.isSafeInteger(currentSource.participantProfileRevision) ||
+        (currentSource.participantProfileRevision as number) < 1)) ||
     jsonByteLength(envelope.value) >
       MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES
   ) {
     unavailable();
   }
-  return requiredPolicyRevision(source.campaignSetupRevision);
+  const participantProfileRevision = currentSource === null
+    ? null
+    : requiredPolicyRevision(currentSource.participantProfileRevision);
+  return Object.freeze({
+    campaignSetupRevision: requiredPolicyRevision(
+      source.campaignSetupRevision,
+    ),
+    participantProfileRevision,
+  });
 }
 
 function parseCreateEnvelope(
@@ -2083,11 +2193,11 @@ function verifyExactRecord(
   }
 }
 
-function verifyRevisionCheckRecord(
+async function verifyRevisionCheckRecord(
   record: unknown,
   check: StorageCheckMutation,
   verifyEvidence: FounderApplicationPolicyRevisionEvidenceVerifier,
-): void {
+): Promise<void> {
   const envelope = exactDataObject(record, ["key", "revision", "value"]);
   const key = envelope === null
     ? null
@@ -2103,19 +2213,19 @@ function verifyRevisionCheckRecord(
     unavailable();
   }
   try {
-    verifyEvidence(record, check.expectedRevision);
+    await verifyEvidence(record, check.expectedRevision);
   } catch {
     unavailable();
   }
 }
 
-function requiredPolicyRevisionCheck(
+async function requiredPolicyRevisionCheck(
   factory: FounderApplicationPolicyRevisionCheck,
   revision: number,
-): StorageCheckMutation {
+): Promise<StorageCheckMutation> {
   let candidate: unknown;
   try {
-    candidate = factory(revision);
+    candidate = await factory(revision);
   } catch {
     invalidRequest();
   }

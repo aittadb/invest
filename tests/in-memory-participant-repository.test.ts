@@ -1514,13 +1514,15 @@ test("adapter failures preserve only fixed failure codes and discard causes", as
   assert.equal(JSON.stringify(writeFailure).includes("private adapter value"), false);
 });
 
-test("participant module exports only repositories and writes only participant records", async () => {
+test("participant module exports only repositories and profile checks, and writes only participant records", async () => {
   const participantModule = await import(
     "../repositories/in-memory-participant-repository.ts"
   );
   assert.deepEqual(Object.keys(participantModule).sort(), [
     "DevelopmentInMemoryParticipantRepository",
     "StorageParticipantRepository",
+    "participantProfileRevisionCheck",
+    "verifyParticipantProfileRevisionCheckRecord",
   ]);
 
   const state = new MemoryStorageState();
@@ -1551,6 +1553,26 @@ test("participant module exports only repositories and writes only participant r
       "private-participant-profile-revisions",
       "private-participant-profiles",
     ],
+  );
+  assert.equal(state.operations.size, 2);
+
+  const currentRecord = [...state.records.values()].find(
+    (record) => record.key.collection === "private-participant-profiles",
+  );
+  assert(currentRecord);
+  const profileCheck = await participantModule.participantProfileRevisionCheck(
+    aliceAccount().subject,
+    2,
+  );
+  assert.deepEqual(profileCheck, {
+    type: "check",
+    key: currentRecord.key,
+    expectedRevision: 2,
+  });
+  await participantModule.verifyParticipantProfileRevisionCheckRecord(
+    currentRecord,
+    aliceAccount().subject,
+    2,
   );
   assert.equal(state.operations.size, 2);
 });

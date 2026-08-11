@@ -63,6 +63,8 @@ import {
 import { StorageOwnerIndicationReviewCollectionRepository } from "./in-memory-indication-repository.ts";
 import {
   StorageParticipantRepository,
+  participantProfileRevisionCheck,
+  verifyParticipantProfileRevisionCheckRecord,
   type ParticipantRegistrationRepository,
   type ParticipantRepository,
 } from "./in-memory-participant-repository.ts";
@@ -140,6 +142,7 @@ export type ParticipantFounderApplicationRepositories = Readonly<{
   policyBoundApplications(
     contributionAreaChoices: readonly ContributionAreaChoice[],
     campaignSetupRevision: number,
+    participantProfileRevision?: number,
   ): FounderApplicationRepository;
 }>;
 
@@ -380,6 +383,7 @@ function createParticipantRequestRepositoryScope(
       const applications = (
         contributionAreaChoices: readonly ContributionAreaChoice[],
         campaignSetupRevision?: number,
+        participantProfileRevision?: number,
       ): FounderApplicationRepository =>
         new StorageFounderApplicationRepository(
           mutationStorage,
@@ -388,9 +392,20 @@ function createParticipantRequestRepositoryScope(
           {
             policyRevisionCheck: campaignSetupRevisionCheck,
             verifyPolicyRevisionCheck: verifyCampaignSetupRevisionCheckRecord,
+            participantProfileRevisionCheck: (revision) =>
+              participantProfileRevisionCheck(account.subject, revision),
+            verifyParticipantProfileRevisionCheck: (record, revision) =>
+              verifyParticipantProfileRevisionCheckRecord(
+                record,
+                account.subject,
+                revision,
+              ),
             ...(campaignSetupRevision === undefined
               ? {}
               : { writePolicyRevision: campaignSetupRevision }),
+            ...(participantProfileRevision === undefined
+              ? {}
+              : { writeParticipantProfileRevision: participantProfileRevision }),
           },
         );
       return Object.freeze({
@@ -406,7 +421,13 @@ function createParticipantRequestRepositoryScope(
         policyBoundApplications: (
           contributionAreaChoices: readonly ContributionAreaChoice[],
           campaignSetupRevision: number,
-        ) => applications(contributionAreaChoices, campaignSetupRevision),
+          participantProfileRevision?: number,
+        ) =>
+          applications(
+            contributionAreaChoices,
+            campaignSetupRevision,
+            participantProfileRevision,
+          ),
       });
     },
   });

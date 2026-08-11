@@ -313,8 +313,9 @@ each sample. The selected capability then owns its own finite route budget:
 package one, acknowledgment eight, profile 23, or founder 854 reads. The founder
 budget covers four maximum 209-read application materializations, four
 retry/recovery reads, and two maximum seven-read private campaign-setup
-materializations, including final policy sampling, a conflicted mutation, and
-the returned resource projection. After the first route read, another route
+materializations, including final campaign/profile policy sampling, a conflicted
+mutation, and the returned resource projection. The profile assertion reuses the
+sampled current revision as a transaction check and adds no read. After the first route read, another route
 budget cannot be selected. The 1,405 global ceiling is the authorization maximum
 plus the largest route budget; either that ceiling or the selected route's
 smaller ceiling rejects the next read before adapter access. Public
@@ -459,11 +460,12 @@ Founder coverage adds configured-choice projection, create/retry/edit/stale/
 independence, malformed and oversized hosted bodies, authentication-before-
 method disclosure, equivalent HTML and hypermedia state/actions, and
 reconstruction through a fresh Worker. One-shot hosted transaction races close
-the phase after create's final sample and replace contribution choices after
-edit's final sample; each check failure leaves every founder current, history,
-field, and policy-revision collection unchanged. Recovery with the same
-operation and exact replay after another policy change and Worker restart are
-also covered. The
+the phase or change country, declared interest, and deletion state after
+create's final sample, and replace contribution choices after edit's final
+sample; each check failure leaves every founder current, history, field,
+policy-revision, audit, and founder-operation effect unchanged. Recovery with
+the same operation and exact replay after campaign/profile evolution and Worker
+restart are also covered. The
 synthetic hosted services implement and enforce the discovered AittaDB
 read/list/transaction controls rather than bypassing the adapter. Source
 and built-artifact scans complement `npm run instances:check`, which rejects

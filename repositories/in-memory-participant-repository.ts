@@ -27,6 +27,7 @@ import {
   parseStorageKey,
   parseStorageOperationId,
   type StorageAdapter,
+  type StorageCheckMutation,
   type StorageCollection,
   type StorageDocument,
   type StorageKey,
@@ -108,6 +109,39 @@ export type ParticipantProfileSnapshot = Readonly<{
   revision: number;
   snapshot: ParticipantProfile;
 }>;
+
+/** Exact current-profile assertion used by atomic eligibility-dependent writes. */
+export async function participantProfileRevisionCheck(
+  subject: unknown,
+  revision: unknown,
+): Promise<StorageCheckMutation> {
+  const parsedSubject = parseActorSubject(subject);
+  if (!parsedSubject.ok) invalidRequest();
+  const expectedRevision = requiredRevision(revision);
+  return Object.freeze({
+    type: "check",
+    key: await participantProfileKey(parsedSubject.value),
+    expectedRevision,
+  });
+}
+
+/** Validate unchanged current-profile evidence returned for a positive check. */
+export async function verifyParticipantProfileRevisionCheckRecord(
+  record: unknown,
+  subject: unknown,
+  expectedRevision: unknown,
+): Promise<void> {
+  const parsedSubject = parseActorSubject(subject);
+  if (!parsedSubject.ok) invalidRequest();
+  const revision = requiredRevision(expectedRevision);
+  const key = await participantProfileKey(parsedSubject.value);
+  const current = decodeCurrentParticipantRecord(
+    record,
+    key,
+    parsedSubject.value,
+  );
+  if (current === null || current.revision !== revision) unavailable();
+}
 
 /** A replay-aware mutation result and any application-level follow-up intents. */
 export type ParticipantProfileMutationResult = ParticipantProfileSnapshot &

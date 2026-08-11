@@ -13,6 +13,7 @@ import {
   parseStableId,
   type ActorSubject,
 } from "../domain/foundation.ts";
+import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   StorageFailure,
   assertStorageListBoundary,
@@ -46,6 +47,12 @@ import {
   campaignSetupRevisionCheck,
   verifyCampaignSetupRevisionCheckRecord,
 } from "../repositories/in-memory-campaign-repository.ts";
+import {
+  StorageParticipantRepository,
+  participantProfileRevisionCheck,
+  verifyParticipantProfileRevisionCheckRecord,
+} from "../repositories/in-memory-participant-repository.ts";
+import { testParticipantRegistrationNoticeEvidence } from "./support/participant-registration-notice-evidence.ts";
 
 const ALICE_SUBJECT = actorSubject("issuer.invalid/subject:alice");
 const BOB_SUBJECT = actorSubject("issuer.invalid/subject:bob");
@@ -797,6 +804,194 @@ test("founder policy checks roll back writes while exact replay and withdrawal r
   assert.equal(
     recordsIn(state, "founder-application-policy-revisions").length,
     1,
+  );
+});
+
+test("founder creation atomically binds participant eligibility evidence across races and exact retries", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true);
+  const account = parseParticipantAccount({
+    subject: ALICE_SUBJECT,
+    accountEmailLabel: "alice@example.test",
+  });
+  assert(account.ok);
+  const participant = new StorageParticipantRepository(adapter, account.value);
+  await participant.register({
+    operationId: "participant-operation:founder-policy-register",
+    expectedRevision: null,
+    registeredAt: "2026-08-10T08:00:00.000Z",
+    registration: {
+      displayName: "Alice Founder",
+      country: "FI",
+      declaredInterest: "founder",
+      participationContext: "individual",
+      processEmailNoticeAcknowledged: true,
+      marketingConsent: false,
+    },
+    noticeEvidence: testParticipantRegistrationNoticeEvidence(),
+  });
+
+  const campaignKey = campaignSetupRevisionCheck(1).key;
+  const setCampaignRevision = (revision: number): void => {
+    state.records.set(storageKeyString(campaignKey), freezeRecord({
+      key: campaignKey,
+      revision,
+      value: {
+        kind: "campaign-setup-revision",
+        schemaVersion: 4,
+        revision,
+        recordedAt: "2026-08-10T09:00:00.000Z",
+        operationId: `campaign-operation:founder-profile-policy-${revision}`,
+        setupHash: `sha256:${"0".repeat(64)}`,
+        setupBytes: 1,
+        setupChunks: 1,
+      },
+    }));
+  };
+  const policyOptions = Object.freeze({
+    policyRevisionCheck: campaignSetupRevisionCheck,
+    verifyPolicyRevisionCheck: verifyCampaignSetupRevisionCheckRecord,
+    participantProfileRevisionCheck: (revision: number) =>
+      participantProfileRevisionCheck(ALICE_SUBJECT, revision),
+    verifyParticipantProfileRevisionCheck: (record: unknown, revision: number) =>
+      verifyParticipantProfileRevisionCheckRecord(
+        record,
+        ALICE_SUBJECT,
+        revision,
+      ),
+  });
+  const create = createRequest();
+  setCampaignRevision(1);
+
+  const sampledProfileOne = repository(
+    adapter,
+    ALICE_SUBJECT,
+    contributionAreaChoices,
+    {
+      ...policyOptions,
+      writePolicyRevision: 1,
+      writeParticipantProfileRevision: 1,
+    },
+  );
+  await participant.update({
+    operationId: "participant-operation:founder-policy-ineligible",
+    expectedRevision: 1,
+    updatedAt: "2026-08-10T08:10:00.000Z",
+    changes: { declaredInterest: "investor" },
+  });
+  const beforeStaleProfile = founderRecords(state);
+  await rejectsStorage(
+    () => sampledProfileOne.create(create),
+    "PRECONDITION_FAILED",
+  );
+  assert.deepEqual(founderRecords(state), beforeStaleProfile);
+  assert.equal(state.operations.has(create.operationId as string), false);
+
+  const restoredProfile = await participant.update({
+    operationId: "participant-operation:founder-policy-restored",
+    expectedRevision: 2,
+    updatedAt: "2026-08-10T08:20:00.000Z",
+    changes: { declaredInterest: "founder" },
+  });
+  assert.equal(restoredProfile.revision, 3);
+  const observed = new ObservedStorageAdapter(adapter);
+  const created = await repository(
+    observed,
+    ALICE_SUBJECT,
+    contributionAreaChoices,
+    {
+      ...policyOptions,
+      writePolicyRevision: 1,
+      writeParticipantProfileRevision: 3,
+    },
+  ).create(create);
+  assert.equal(created.replayed, false);
+  assert.ok(observed.reads <= MAX_FOUNDER_APPLICATION_STORAGE_READS);
+
+  const receipts = recordsIn(state, "founder-application-policy-revisions");
+  assert.equal(receipts.length, 1);
+  const receipt = receipts[0];
+  assert(receipt);
+  assert.deepEqual(receipt.value, {
+    kind: "founder-application-policy-revision",
+    schemaVersion: 2,
+    applicationId: APPLICATION_ID,
+    applicantSubject: ALICE_SUBJECT,
+    applicationRevision: 1,
+    campaignSetupRevision: 1,
+    participantProfileRevision: 3,
+  });
+
+  const receiptStorageKey = storageKeyString(receipt.key);
+  state.records.set(receiptStorageKey, freezeRecord({
+    key: receipt.key,
+    revision: receipt.revision,
+    value: { ...receipt.value, participantProfileRevision: "malformed" },
+  }));
+  await rejectsStorage(
+    () =>
+      repository(
+        adapter,
+        ALICE_SUBJECT,
+        contributionAreaChoices,
+        policyOptions,
+      ).create(create),
+    "UNAVAILABLE",
+  );
+  state.records.set(receiptStorageKey, receipt);
+
+  for (const corruptionIndex of [-2, -1]) {
+    const malformedEvidence = new MalformedTransactionResultStorageAdapter(
+      adapter,
+      (result) =>
+        corruptTransactionRecord(
+          result,
+          result.records.length + corruptionIndex,
+          (record) => {
+            const value = record.value as MutableRecord;
+            value.kind = "malformed-policy-check-evidence";
+          },
+        ),
+    );
+    await rejectsStorage(
+      () =>
+        repository(
+          malformedEvidence,
+          ALICE_SUBJECT,
+          contributionAreaChoices,
+          policyOptions,
+        ).create(create),
+      "UNAVAILABLE",
+    );
+  }
+
+  setCampaignRevision(2);
+  const evolvedProfile = await participant.update({
+    operationId: "participant-operation:founder-policy-evolved",
+    expectedRevision: 3,
+    updatedAt: "2026-08-10T08:30:00.000Z",
+    changes: { declaredInterest: "investor", country: "US" },
+  });
+  assert.equal(evolvedProfile.revision, 4);
+  const deletionRequested = await participant.requestAccountDeletion({
+    operationId: "participant-operation:founder-policy-deletion-evolved",
+    expectedRevision: 4,
+    requestedAt: "2026-08-10T08:40:00.000Z",
+  });
+  assert.equal(deletionRequested.revision, 5);
+  observed.resetReads();
+  const replay = await repository(
+    observed,
+    ALICE_SUBJECT,
+    contributionAreaChoices,
+    policyOptions,
+  ).create({ ...create, occurredAt: "2026-08-10T10:01:00.000Z" });
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.snapshot, created.snapshot);
+  assert.ok(observed.reads <= MAX_FOUNDER_APPLICATION_STORAGE_READS);
+  assert.deepEqual(
+    recordsIn(state, "founder-application-policy-revisions")[0]?.value,
+    receipt.value,
   );
 });
 

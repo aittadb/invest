@@ -1901,8 +1901,18 @@ test("hosted founder create atomically rejects phase closure after its final pol
     recordsIn(service, "founder-application-policy-revisions").length,
     1,
   );
+  const committedReceipt = cloneSyntheticRecord(
+    recordsIn(service, "founder-application-policy-revisions")[0]!,
+  );
+  assert.equal(committedReceipt.value.schemaVersion, 2);
+  assert.equal(committedReceipt.value.participantProfileRevision, 1);
 
   await configureHostedFounderCampaign(service, "closed");
+  await updateHostedParticipantProfile(
+    service,
+    { declaredInterest: "investor", country: "US" },
+    "participant-operation:founder-create-retry-profile-evolution",
+  );
   const replayProof = await founderResource(hostedPackageWorker(service), env);
   const replay = await submitFounderMutation(
     hostedPackageWorker(service),
@@ -1920,6 +1930,125 @@ test("hosted founder create atomically rejects phase closure after its final pol
     recordsIn(service, "founder-application-policy-revisions").length,
     1,
   );
+  assert.deepEqual(
+    recordsIn(service, "founder-application-policy-revisions")[0],
+    committedReceipt,
+  );
+});
+
+test("hosted founder create atomically rejects participant eligibility changes after its final sample", async (t) => {
+  const scenarios = [
+    {
+      name: "country",
+      mutate: (service: SyntheticAittaDBService) =>
+        updateHostedParticipantProfile(
+          service,
+          { country: "US" },
+          "participant-operation:founder-create-country-race",
+        ),
+    },
+    {
+      name: "declared interest",
+      mutate: (service: SyntheticAittaDBService) =>
+        updateHostedParticipantProfile(
+          service,
+          { declaredInterest: "investor" },
+          "participant-operation:founder-create-interest-race",
+        ),
+    },
+    {
+      name: "deletion request",
+      mutate: async (service: SyntheticAittaDBService) => {
+        const repository = hostedParticipantRepository(service);
+        const current = await repository.current();
+        assert(current);
+        const result = await repository.requestAccountDeletion({
+          operationId: "participant-operation:founder-create-deletion-race",
+          expectedRevision: current.revision,
+          requestedAt: "2026-08-10T11:00:00.000Z",
+        });
+        assert.equal(result.revision, current.revision + 1);
+        assert.equal(result.snapshot.accountDeletionRequest.state, "requested");
+      },
+    },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const service = new SyntheticAittaDBService();
+      const env = configuredEnvironment({ OWNER_EMAIL });
+      await configureHostedFounderCampaign(service);
+      await registerHostedParticipant(
+        service,
+        PARTICIPANT_SUBJECT,
+        PARTICIPANT_EMAIL,
+        "Founder participant",
+        `participant-operation:founder-create-${scenario.name.replaceAll(" ", "-")}`,
+        { declaredInterest: "founder" },
+      );
+
+      const discovered = await founderResource(hostedPackageWorker(service), env);
+      const createBody = actionBody(
+        requiredAction(discovered.document, "create-founder-application"),
+        founderFields({ note: `Atomic ${scenario.name} race submission.` }),
+      );
+      const founderOperationId = String(createBody["operation-id"]);
+      const founderBeforeRace = founderCollectionSnapshot(service);
+      const auditBeforeRace = recordsIn(service, "audit-events").map(
+        cloneSyntheticRecord,
+      );
+      let profileChangedDuringTransaction = false;
+      service.raceNextTransactionContaining("founder-applications", async () => {
+        await scenario.mutate(service);
+        profileChangedDuringTransaction = true;
+      });
+
+      const raced = await submitFounderMutation(
+        hostedPackageWorker(service),
+        env,
+        discovered,
+        "POST",
+        createBody,
+      );
+      assert.equal(raced.status, 412);
+      assert.equal(profileChangedDuringTransaction, true);
+      assert.deepEqual(founderCollectionSnapshot(service), founderBeforeRace);
+      assert.deepEqual(
+        recordsIn(service, "audit-events").map(cloneSyntheticRecord),
+        auditBeforeRace,
+      );
+      assert.equal(service.operations.has(founderOperationId), false);
+      assert.equal(
+        recordsIn(service, "founder-application-policy-revisions").length,
+        0,
+      );
+      assert.equal((await hostedParticipantRepository(service).current())?.revision, 2);
+
+      if (scenario.name === "deletion request") {
+        const unavailable = await hostedPackageWorker(service).fetch(
+          new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+            headers: {
+              accept: "application/json",
+              "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+              "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+            },
+          }),
+          env,
+          executionContext,
+        );
+        assert.equal(unavailable.status, 404);
+      } else {
+        const afterRace = await founderResource(
+          hostedPackageWorker(service),
+          env,
+        );
+        assert.equal(
+          actionNames(afterRace.document).includes("create-founder-application"),
+          false,
+        );
+      }
+    });
+  }
 });
 
 test("hosted founder edit atomically rejects contribution changes after its final policy sample", async () => {
@@ -4977,6 +5106,26 @@ async function updateHostedParticipantInterest(
   });
   assert.equal(result.revision, current.revision + 1);
   assert.equal(result.snapshot.declaredInterest, declaredInterest);
+}
+
+async function updateHostedParticipantProfile(
+  service: SyntheticAittaDBService,
+  changes: Readonly<{
+    country?: string;
+    declaredInterest?: "founder" | "investor" | "both";
+  }>,
+  operationId: string,
+): Promise<void> {
+  const repository = hostedParticipantRepository(service);
+  const current = await repository.current();
+  assert(current);
+  const result = await repository.update({
+    operationId,
+    expectedRevision: current.revision,
+    updatedAt: "2026-08-10T11:00:00.000Z",
+    changes,
+  });
+  assert.equal(result.revision, current.revision + 1);
 }
 
 async function configureHostedFounderCampaign(

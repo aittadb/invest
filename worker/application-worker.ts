@@ -767,16 +767,17 @@ async function runtimeParticipantFounderInterestRoute(
           contributionAreaChoices,
           repository,
           repositoryForCreate: async () => {
-            const revision = await founderCreationPolicyRevision(
+            const revisions = await founderCreationPolicyRevision(
               founder,
               account.value.subject,
               contributionAreaChoices,
             );
-            return revision === null
+            return revisions === null
               ? null
               : founder.policyBoundApplications(
                   contributionAreaChoices,
-                  revision,
+                  revisions.campaignSetupRevision,
+                  revisions.participantProfileRevision,
                 );
           },
           repositoryForEdit: async () => {
@@ -838,7 +839,10 @@ async function founderCreationPolicyRevision(
   repositories: ParticipantFounderApplicationRepositories,
   subject: ActorSubject,
   expectedChoices: readonly ContributionAreaChoice[],
-): Promise<number | null> {
+): Promise<Readonly<{
+  campaignSetupRevision: number;
+  participantProfileRevision: number;
+}> | null> {
   const [campaign, currentParticipant] = await Promise.all([
     repositories.campaign.readSetup(),
     repositories.participant.current(),
@@ -866,7 +870,12 @@ async function founderCreationPolicyRevision(
     );
     return result.ok && result.value;
   });
-  return accepting ? campaign.revision : null;
+  return accepting
+    ? Object.freeze({
+        campaignSetupRevision: campaign.revision,
+        participantProfileRevision: currentParticipant.revision,
+      })
+    : null;
 }
 
 async function founderEditPolicyRevision(
