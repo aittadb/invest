@@ -376,27 +376,28 @@ the backend's exact `replayed` evidence; fixed failures retain no adapter cause.
 
 Manual notification templates remain private and bounded. Copy evidence means only that an owner copied a template, while a separate owner-entered marker records reported delivery outside the app. Neither state implies automated email delivery, and public errors use fixed projections that omit credentials, notes, template content, and internal causes.
 
-`DevelopmentInMemoryAuditRepository` appends one immutable allowlisted event per retry-stable operation. `StorageAuditEventReader` is the narrower production read capability: it pages the same immutable collection through a credential-bound `StorageAdapter`, validates the exact page envelope and every closed schema-v1 record, and returns no append, key-read, transaction, adapter, or credential surface. It rejects oversized, duplicate, looping, unknown, accessor-backed, noncanonical, and corrupt evidence through a fixed `UNAVAILABLE` failure. `DevelopmentInMemoryManualNotificationRepository` atomically compare-and-sets one private current notification with each immutable revision under one operation ID. Copy evidence appends independently from the single owner-entered sent marker, so neither action implies the other.
+`DevelopmentInMemoryAuditRepository` appends one immutable allowlisted event per retry-stable operation. `StorageAuditEventReader` is the narrower production read capability: it pages the same immutable collection through a credential-bound `StorageAdapter`, validates the exact page envelope and every closed schema-v1 record, and returns no append, key-read, transaction, adapter, or credential surface. It rejects oversized, duplicate, looping, unknown, accessor-backed, noncanonical, and corrupt evidence through a fixed `UNAVAILABLE` failure. `StorageManualNotificationRepository` atomically compare-and-sets one private current notification with each immutable revision under one operation ID. Its historical `DevelopmentInMemoryManualNotificationRepository` export is a compatibility alias for deterministic fixtures; neither class retains process memory. Copy evidence appends independently from the single owner-entered sent marker, so neither action implies the other.
 
-Notification keys are one-way derived, stored records are reconstructed through the bounded domain transitions, and every prior revision is verified before current state is returned. Audit detail cannot retain export contents or arbitrary fields, while notification templates never enter public failure projections. These repositories are deterministic development proof, not production storage.
+Notification keys are one-way derived, stored records are reconstructed through the bounded domain transitions, and every prior revision is verified before detail state is returned. One template, 64 copy facts, and one sent fact cap history at 66 revisions and a complete detail at 67 reads including current state. Collection pages contain at most 25 exact current records and do not multiply that history traversal. Audit detail cannot retain export contents or arbitrary fields, while notification templates never enter public failure projections.
 
-The application repository factory exposes the persistent audit reader as one
-named backend-only capability. The hosted Worker composes it into the
-owner-authorized `/owner/audit-events` resource and advertises only that audit
-link in owner navigation. HTML and hypermedia use one projected collection and
-canonical deployment URLs. Authentication and owner authorization run before
-the reader, while page, cursor, storage, and evidence failures use bounded
-fixed responses with no backend cause or private detail. Worker reconstruction
-creates a new reader over the same AittaDB collection and opaque cursor.
+The application repository factory exposes the persistent audit reader and the
+atomic notification activity repository as separate named backend-only
+capabilities. The hosted Worker composes them into the owner-authorized
+`/owner/audit-events` and `/owner/manual-notifications` resources. HTML and
+hypermedia use the same projections and canonical deployment URLs.
+Authentication and owner authorization run before either private repository,
+while page, cursor, storage, and evidence failures use bounded fixed responses
+with no backend cause or private detail. Worker reconstruction opens fresh
+repositories over the same AittaDB records and opaque cursors.
 
-The existing combined development owner-activity route also supports the
-manual-notification collection and one notification detail containing finite
-copy evidence and an optional sent marker. That detail remains the single
+The combined owner-activity route supports the manual-notification collection
+and one notification detail containing finite copy evidence and an optional
+sent marker. That detail remains the single
 source for native forms and hypermedia actions. It advertises only transitions
 currently available, supplies CSRF discovery for both representations, accepts
 exact feature fields, and uses the canonical deployment origin for every link
-and redirect. Production notification composition remains a separate bounded
-capability.
+and redirect. Distinct server-replaced audit and notification headers prevent an
+audit-only composition from advertising notification UI.
 
 Copy and sent mutations require the explicit
 `atomic-notification-audit` capability. Each transition compare-and-sets the
@@ -404,7 +405,10 @@ notification revision and appends its corresponding closed audit event in one
 storage transaction; failure leaves both histories unchanged. The route takes
 trusted owner identity, mutation guard, operation IDs, clock, repositories, and
 CSRF provider as injected dependencies, so reusable source contains no owner,
-hostname, credential, or campaign-specific value.
+hostname, credential, or campaign-specific value. Exact delayed retries recover
+their immutable result and closed audit event without trusting a later clock or
+performing another transaction. Owner-subject continuity suppresses actions and
+fails direct mutation after configured-owner replacement.
 
 ### Owner review exports
 

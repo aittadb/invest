@@ -70,7 +70,9 @@ import {
 } from "./in-memory-participant-repository.ts";
 import { StorageParticipantInvestmentInterestRepository } from "./storage-participant-investment-repository.ts";
 import {
+  StorageManualNotificationRepository,
   StorageAuditEventReader,
+  type AtomicManualNotificationActivityRepository,
   type AuditEventReader,
 } from "./in-memory-audit-notification-repositories.ts";
 import {
@@ -173,6 +175,8 @@ export class StorageApplicationRepositoryFactory {
   readonly #ownerAuditEvents: AuditEventReader;
   readonly #ownerFounderApplicationReviews:
     FounderApplicationReviewCollectionRepository;
+  readonly #ownerManualNotificationActivity:
+    AtomicManualNotificationActivityRepository;
   readonly #participantRequest: (
     account: ParticipantAccount,
   ) => ParticipantRequestRepositoryScope;
@@ -192,6 +196,8 @@ export class StorageApplicationRepositoryFactory {
     this.#ownerAuditEvents = new StorageAuditEventReader(adapter);
     this.#ownerFounderApplicationReviews =
       new StorageFounderApplicationReviewCollectionRepository(adapter);
+    this.#ownerManualNotificationActivity =
+      new StorageManualNotificationRepository(adapter);
     this.#participantRequest = (account) =>
       createParticipantRequestRepositoryScope(adapter, account);
     this.#participantRepositoryFor = (account) =>
@@ -248,6 +254,10 @@ export class StorageApplicationRepositoryFactory {
 
   ownerFounderApplicationReviews(): FounderApplicationReviewCollectionRepository {
     return this.#ownerFounderApplicationReviews;
+  }
+
+  ownerManualNotificationActivity(): AtomicManualNotificationActivityRepository {
+    return this.#ownerManualNotificationActivity;
   }
 
   participantRequest(

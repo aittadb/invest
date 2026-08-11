@@ -8,8 +8,8 @@ token provider, one bounded AittaDB `StorageAdapter`, one backend repository
 factory, and one browser-mutation session per immutable Sites environment.
 
 The runtime now composes named persistent campaign, package, participant-access,
-participant founder-application, and owner founder-review collection
-capabilities over that adapter.
+participant founder-application, owner founder-review collection, owner audit,
+and owner manual-notification capabilities over that adapter.
 `createApplicationWorker` installs
 `/owner/setup`, campaign editing, draft preview, publish/unpublish, owner package
 management, and the exact founder-review collection only in the
@@ -26,14 +26,15 @@ unregistered HTML request then receives a non-cacheable redirect to
 entry action. Closed and unpublished campaigns advertise and accept no new
 registration. Existing records and exact committed retries remain available
 after closure. For either eligible entry or the exact registration path, the
-runtime combines a subject-bound participant repository, the hosted mutation session,
-and versioned evidence derived from the persisted campaign revision and only
-its two registration notices. The next request after registration reconstructs
-the current package and permitted profile and workflow controls from persistent
-state. A deletion-requested entry retains package reading, profile viewing, and
-sign-out while withholding founder and investment actions. Indication,
-aggregate, moderation, export, and coordinated deletion persistence still
-require their own named capabilities.
+runtime combines a subject-bound participant repository, the hosted mutation
+session, and versioned evidence derived from the persisted campaign revision
+and only its two registration notices. The participant repository can recover
+an exact committed retry after a policy update or Worker restart without
+accepting stale evidence for a new registration. The next request after
+registration reconstructs the current package and permitted profile and
+workflow controls from persistent state. A deletion-requested entry retains
+package reading, profile viewing, and sign-out while withholding founder and
+investment actions.
 
 Founder composition opens private campaign policy and a fresh subject-bound
 campaign/profile/application scope only for the exact founder resource after
@@ -51,6 +52,11 @@ The persistent owner-rejection primitive can commit an indication transition,
 aggregate update, audit event, notification template, and retry receipt
 atomically. Hosted moderation still requires the separate route composition
 that assembles the collection, detail, rejection, and mutation-session lanes.
+The already-created private notification records are available through the
+hosted owner collection/detail route, whose copy and owner-entered sent
+transitions append audit evidence atomically. Indication route, export,
+deletion coordination, and profile-route composition retain their own named
+capability boundaries.
 
 This source composition and its deterministic protocol services are not hosted
 acceptance evidence. Activation remains blocked until the configured AittaDB
@@ -138,9 +144,11 @@ redirect and carry the bearer value only to the validated transport target.
 adapter and exposes only named, narrow capability methods for browser-mutation
 replay, the atomic campaign/audit repository, the public campaign projection
 reader, the owner package workspace, the owner-bound indication-review
-collection, the bounded owner founder-review collection, a participant package reader,
-subject-bound package acknowledgment, one participant-access state reader, and
-one participant-bound founder campaign/profile/application scope.
+collection, the bounded owner founder-review collection, the immutable audit
+reader, the atomic manual-notification activity repository, a participant
+package reader, subject-bound package acknowledgment, one participant-access
+state reader, and one participant-bound founder campaign/profile/application
+scope.
 That reader creates fresh profile and acknowledgment repositories for each
 trusted account and combines them only through the bounded projection service.
 The named `participantRepository(account)` capability returns a fresh repository
@@ -367,8 +375,9 @@ records and receipts cannot exhaust the isolated namespace.
 `worker/index.ts` installs one resolver. `createApplicationWorker` resolves it
 fail-closed but does not place the runtime in `ApplicationRouteContext` or pass
 it to public, participant, image, or framework-rendering code. The Worker calls
-the factory's named campaign, package, and founder methods centrally. It installs setup,
-campaign editor, and owner package handlers only inside
+the factory's named campaign, package, founder, audit, and notification methods
+centrally. It installs setup, campaign editor, owner package, audit history, and
+manual-notification handlers only inside
 `createOwnerRouteHandler`, and projects only subject-bound package and founder
 capabilities into the participant route group after trusted participant
 authorization. Registration and profile entry capabilities are likewise
@@ -393,10 +402,15 @@ receive `401`, authenticated owner or foreign callers receive the generic `404`,
 and only the authorized participant receives `405` with `Allow`. These rejected
 methods do not enter browser-proof verification or replay storage.
 
+Anonymous callers receive `401`; authenticated non-owners receive the generic
+`404` surface before a private notification repository read. Audit
+and notification availability use separate server-replaced renderer headers, so
+browser-supplied headers cannot advertise either feature.
+
 The one shared mutation session is configured to the largest currently composed
 form as an absolute ceiling and explicitly permits only the founder route's
 repeated secondary-contribution field. Setup, editor, package, acknowledgment,
-and founder adapters pass their own byte, field, and repeated-field limits to
+founder, and owner-notification adapters pass their own byte, field, and repeated-field limits to
 every verification. Those limits are validated before form proof extraction, so
 the larger setup allowance cannot widen another route. General one-use proofs
 retain their version-1 encrypted cookie. A withdrawn founder resource instead
@@ -408,7 +422,12 @@ decoded campaign presentation. Initial setup accepts at most 1,048,576 wire
 bytes and then enforces a 262,144-byte decoded setup. Successful HTML and JSON
 mutations clear the consumed cookie; every parser, readiness, or storage error
 after successful verification clears the same cookie once. JSON responses that
-advertise another action also issue a fresh encrypted proof.
+advertise another action also issue a fresh encrypted proof. Owner notification
+activity accepts at most 1,024 bytes and exactly two JSON feature fields or
+those fields plus one form CSRF value. Invalid shape and body size fail before
+replay claim. Exact repository retries after a lost response recover the
+original immutable copy or sent fact and audit event; owner rotation, changed
+work, stale revisions, and missing or corrupt history fail closed.
 
 Publication checks combine intrinsic campaign readiness with the immutable
 runtime boolean. The runtime defaults to false and accepts only exact configured

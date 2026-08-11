@@ -11,6 +11,7 @@ import {
 import {
   hasOwnerAittaDBConnection,
   hasOwnerAuditHistory,
+  hasOwnerNotificationHistory,
   hasOwnerCampaignEditorCapability,
   hasOwnerCampaignSetupCapability,
   hasOwnerFounderReview,
@@ -19,6 +20,7 @@ import {
   hasOwnerReviewExports,
   OWNER_AITTADB_CONNECTION_HEADER,
   OWNER_AUDIT_HISTORY_HEADER,
+  OWNER_NOTIFICATION_HISTORY_HEADER,
   OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER,
   OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER,
   OWNER_FOUNDER_REVIEW_HEADER,
@@ -64,6 +66,9 @@ export default async function OwnerHome() {
   const founderReviewAvailable = hasOwnerFounderReview(
     requestHeaders.get(OWNER_FOUNDER_REVIEW_HEADER),
   );
+  const notificationHistoryAvailable = hasOwnerNotificationHistory(
+    requestHeaders.get(OWNER_NOTIFICATION_HISTORY_HEADER),
+  );
   const setupState = campaign ? "Configured" : "Setup required";
   const publicationState = campaign
     ? campaign.published
@@ -100,6 +105,9 @@ export default async function OwnerHome() {
           ) : null}
           {auditHistoryAvailable ? (
             <Link href="/owner/audit-events">Audit events</Link>
+          ) : null}
+          {notificationHistoryAvailable ? (
+            <Link href="/owner/manual-notifications">Manual notifications</Link>
           ) : null}
           <a href={chatGPTSignOutPath("/")}>Sign out</a>
         </nav>

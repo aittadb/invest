@@ -192,10 +192,13 @@ export function createOwnerNotificationDetailResource(
   requestUrl: string,
   snapshot: OwnerNotificationSnapshot,
   issueOperationId: OwnerNotificationOperationIdIssuer,
+  options: Readonly<{ activityAllowed?: boolean }> = { activityAllowed: true },
 ): OwnerNotificationDetailResource {
   const self = new URL(requestUrl);
   const { record } = snapshot;
-  const recordCopy = record.copyEvidence.length < MANUAL_NOTIFICATION_LIMITS.copyEvidence
+  const activityAllowed = options.activityAllowed !== false;
+  const recordCopy = activityAllowed &&
+      record.copyEvidence.length < MANUAL_NOTIFICATION_LIMITS.copyEvidence
     ? activityControl(
         "record-notification-template-copy",
         "Record template copied",
@@ -204,7 +207,7 @@ export function createOwnerNotificationDetailResource(
         issueOperationId(),
       )
     : null;
-  const markSent = record.sentMarker === null
+  const markSent = activityAllowed && record.sentMarker === null
     ? activityControl(
         "mark-notification-sent",
         "Mark as sent",

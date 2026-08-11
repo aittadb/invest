@@ -37,6 +37,8 @@ import {
   type StorageOperationId,
   type StoragePutMutation,
   type StorageRecord,
+  type StorageTransactionRequest,
+  type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
 
 const AUDIT_SCHEMA_VERSION = 1;
@@ -67,6 +69,8 @@ export const MAX_MANUAL_NOTIFICATION_REVISIONS =
 /** One current read followed by every immutable revision read. */
 export const MAX_MANUAL_NOTIFICATION_STORAGE_READS =
   1 + MAX_MANUAL_NOTIFICATION_REVISIONS;
+export const MAX_OWNER_NOTIFICATION_PAGE_SIZE = 25;
+export const MAX_OWNER_NOTIFICATION_CURSOR_LENGTH = 512;
 
 export type AuditAppendResult = Readonly<{
   event: AuditEvent;
@@ -268,7 +272,7 @@ export class DevelopmentInMemoryAuditRepository
   async get(id: unknown): Promise<AuditEvent | null> {
     const eventId = requiredStableId<"audit-event">(id);
     const key = auditEventKey(eventId);
-    const stored = await this.#storage.read(key);
+    const stored = await readNotificationStorage(this.#storage, key);
     return stored === null ? null : decodeAuditEvent(stored, key);
   }
 
@@ -281,18 +285,19 @@ export class DevelopmentInMemoryAuditRepository
  * Deterministic private notification repository. Current records and immutable
  * revisions are both stored so delayed retries can rebuild the original write.
  */
-export class DevelopmentInMemoryManualNotificationRepository
+export class StorageManualNotificationRepository
   implements
     ManualNotificationRepository,
     AtomicManualNotificationActivityRepository
 {
-  readonly storageKind = "development-in-memory" as const;
+  readonly storageKind = "storage-adapter" as const;
   readonly activityConsistency = "atomic-notification-audit" as const;
 
   readonly #storage: StorageAdapter;
 
   constructor(storage: StorageAdapter) {
-    this.#storage = storage;
+    this.#storage = requiredNotificationStorageAdapter(storage);
+    Object.freeze(this);
   }
 
   async create(
@@ -312,7 +317,7 @@ export class DevelopmentInMemoryManualNotificationRepository
   async get(id: unknown): Promise<ManualNotificationSnapshot | null> {
     const notificationId = requiredNotificationId(id);
     const key = await currentNotificationKey(notificationId);
-    const stored = await this.#storage.read(key);
+    const stored = await readNotificationStorage(this.#storage, key);
     if (stored === null) return null;
 
     const snapshot = await decodeNotificationSnapshot(
@@ -329,22 +334,32 @@ export class DevelopmentInMemoryManualNotificationRepository
   async list(
     request: ManualNotificationListRequest,
   ): Promise<ManualNotificationPage> {
-    const storageRequest = {
+    const normalized = normalizeNotificationListRequest(request);
+    const storageRequest = Object.freeze({
       collection: CURRENT_NOTIFICATIONS,
-      limit: request.limit,
-      ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
-    };
+      limit: normalized.limit,
+      ...(normalized.cursor === undefined ? {} : { cursor: normalized.cursor }),
+    });
     assertStorageListBoundary(storageRequest);
-    const page = await this.#storage.list(storageRequest);
+    let storedPage: unknown;
+    try {
+      storedPage = await this.#storage.list(storageRequest);
+    } catch (error) {
+      if (error instanceof StorageFailure) throw new StorageFailure(error.code);
+      unavailable();
+    }
+    const page = exactNotificationStoragePage(storedPage, normalized);
+    const seen = new Set<string>();
     const items = await Promise.all(page.items.map(async (stored) => {
       const snapshot = await decodeNotificationSnapshot(
         stored,
-        stored.key,
+        null,
         "current",
         null,
         null,
       );
-      await this.#verifyHistory(snapshot);
+      if (seen.has(snapshot.record.template.id)) unavailable();
+      seen.add(snapshot.record.template.id);
       return snapshot;
     }));
 
@@ -417,7 +432,24 @@ export class DevelopmentInMemoryManualNotificationRepository
     const expectedRevision = requiredExpectedRevision(request.expectedRevision);
     const ownerSubject = requiredOwnerSubject(request.ownerSubject);
     const occurredAt = requiredOccurredAt(request.occurredAt);
-    const base = await this.#readMutationBase(notificationId, expectedRevision);
+    const current = await this.get(notificationId);
+    if (current === null) notFound();
+    if (current.record.template.generatedBy.subject !== ownerSubject) {
+      throw new StorageFailure("PRECONDITION_FAILED");
+    }
+    const recovered = await this.#recoverAuditedActivity(
+      current,
+      notificationId,
+      expectedRevision,
+      ownerSubject,
+      operationId,
+      activity,
+    );
+    if (recovered !== null) return recovered;
+    if (expectedRevision !== current.revision) {
+      throw new StorageFailure("PRECONDITION_FAILED");
+    }
+    const base = current;
     const changed = activity === "template-copied"
       ? recordManualNotificationCopy(base.record, {
           id: await activityEvidenceId<"manual-notification-copy">(
@@ -450,16 +482,137 @@ export class DevelopmentInMemoryManualNotificationRepository
       event: auditEvent,
     });
     if (preparedAudit.operationId !== operationId) unavailable();
-    const result = await this.#write(
-      Object.freeze({
-        revision: expectedRevision + 1,
-        record: changed.value,
-      }),
-      expectedRevision,
-      operationId,
-      preparedAudit,
+    try {
+      const result = await this.#write(
+        Object.freeze({
+          revision: expectedRevision + 1,
+          record: changed.value,
+        }),
+        expectedRevision,
+        operationId,
+        preparedAudit,
+      );
+      return Object.freeze({ ...result, auditEvent });
+    } catch (error) {
+      const failure = error instanceof StorageFailure
+        ? new StorageFailure(error.code)
+        : new StorageFailure("UNAVAILABLE");
+      const latest = await this.get(notificationId);
+      if (latest !== null) {
+        const recovered = await this.#recoverAuditedActivity(
+          latest,
+          notificationId,
+          expectedRevision,
+          ownerSubject,
+          operationId,
+          activity,
+        );
+        if (recovered !== null) return recovered;
+      }
+      throw failure;
+    }
+  }
+
+  async #recoverAuditedActivity(
+    current: ManualNotificationSnapshot,
+    notificationId: ManualNotificationId,
+    expectedRevision: number,
+    ownerSubject: ActorSubject,
+    operationId: StorageOperationId,
+    activity: "template-copied" | "sent-marked",
+  ): Promise<AuditedManualNotificationMutationResult | null> {
+    const resultRevision = expectedRevision + 1;
+    if (resultRevision > current.revision) return null;
+    const evidenceId = activity === "template-copied"
+      ? await activityEvidenceId<"manual-notification-copy">(
+          "notification-copy",
+          operationId,
+        )
+      : await activityEvidenceId<"manual-notification-sent-marker">(
+          "notification-sent",
+          operationId,
+        );
+    const currentEvidence = activity === "template-copied"
+      ? current.record.copyEvidence.find((item) => item.id === evidenceId) ?? null
+      : current.record.sentMarker?.id === evidenceId
+      ? current.record.sentMarker
+      : null;
+    if (currentEvidence === null) {
+      const changedActivityId = activity === "template-copied"
+        ? await activityEvidenceId<"manual-notification-sent-marker">(
+            "notification-sent",
+            operationId,
+          )
+        : await activityEvidenceId<"manual-notification-copy">(
+            "notification-copy",
+            operationId,
+          );
+      const changedActivityExists = activity === "template-copied"
+        ? current.record.sentMarker?.id === changedActivityId
+        : current.record.copyEvidence.some(({ id }) => id === changedActivityId);
+      if (changedActivityExists) throw new StorageFailure("CONFLICT");
+      return null;
+    }
+
+    const resultKey = await notificationHistoryKey(
+      notificationId,
+      resultRevision,
     );
-    return Object.freeze({ ...result, auditEvent });
+    const storedResult = await readNotificationStorage(this.#storage, resultKey);
+    if (storedResult === null) unavailable();
+    const result = await decodeNotificationSnapshot(
+      storedResult,
+      resultKey,
+      "history",
+      notificationId,
+      resultRevision,
+    );
+    const resultEvidence = activity === "template-copied"
+      ? result.record.copyEvidence.at(-1) ?? null
+      : result.record.sentMarker;
+    const evidenceOwner = activity === "template-copied"
+      ? resultEvidence && "copiedBy" in resultEvidence
+        ? resultEvidence.copiedBy.subject
+        : null
+      : resultEvidence && "sentBy" in resultEvidence
+      ? resultEvidence.sentBy.subject
+      : null;
+    const evidenceTime = activity === "template-copied"
+      ? resultEvidence && "copiedAt" in resultEvidence
+        ? resultEvidence.copiedAt
+        : null
+      : resultEvidence && "sentAt" in resultEvidence
+      ? resultEvidence.sentAt
+      : null;
+    if (
+      resultEvidence === null ||
+      resultEvidence.id !== evidenceId ||
+      evidenceOwner !== ownerSubject ||
+      evidenceTime === null
+    ) {
+      throw new StorageFailure("CONFLICT");
+    }
+
+    const auditEvent = await manualNotificationAuditEvent(
+      operationId,
+      notificationId,
+      ownerSubject,
+      evidenceTime,
+      activity,
+    );
+    const auditKey = auditEventKey(auditEvent.id);
+    const storedAudit = await readNotificationStorage(this.#storage, auditKey);
+    if (storedAudit === null) unavailable();
+    const persistedAudit = decodeAuditEvent(storedAudit, auditKey);
+    if (
+      canonicalJson(auditEventDocument(persistedAudit)) !==
+        canonicalJson(auditEventDocument(auditEvent))
+    ) unavailable();
+    return Object.freeze({
+      ...result,
+      replayed: true,
+      auditEvent: persistedAudit,
+    });
   }
 
   async #readMutationBase(
@@ -473,7 +626,7 @@ export class DevelopmentInMemoryManualNotificationRepository
     }
 
     const key = await notificationHistoryKey(id, expectedRevision);
-    const stored = await this.#storage.read(key);
+    const stored = await readNotificationStorage(this.#storage, key);
     if (stored === null) unavailable();
     return decodeNotificationSnapshot(
       stored,
@@ -497,24 +650,29 @@ export class DevelopmentInMemoryManualNotificationRepository
     const currentKey = await currentNotificationKey(id);
     const historyKey = await notificationHistoryKey(id, snapshot.revision);
     const value = notificationDocument(snapshot);
-    const result = await this.#storage.transact({
-      operationId,
-      mutations: [
-        {
+    const mutations: StoragePutMutation[] = [
+      {
           type: "put",
           key: currentKey,
           expectedRevision,
           value,
-        },
-        {
+      },
+      {
           type: "put",
           key: historyKey,
           expectedRevision: null,
           value,
-        },
-        ...(preparedAudit === null ? [] : [preparedAudit.mutation]),
-      ],
+      },
+    ];
+    if (preparedAudit !== null) mutations.push(preparedAudit.mutation);
+    const transaction: StorageTransactionRequest = Object.freeze({
+      operationId,
+      mutations: Object.freeze(mutations),
     });
+    const result = exactNotificationTransactionResult(
+      await transactNotificationStorage(this.#storage, transaction),
+      preparedAudit === null ? 2 : 3,
+    );
     const currentRecord = result.records[0];
     const historyRecord = result.records[1];
     if (!currentRecord || !historyRecord) unavailable();
@@ -556,7 +714,7 @@ export class DevelopmentInMemoryManualNotificationRepository
     let previous: ManualNotificationSnapshot | null = null;
     for (let revision = 1; revision <= snapshot.revision; revision += 1) {
       const key = await notificationHistoryKey(snapshot.record.template.id, revision);
-      const stored = await this.#storage.read(key);
+      const stored = await readNotificationStorage(this.#storage, key);
       if (stored === null) unavailable();
       const historical = await decodeNotificationSnapshot(
         stored,
@@ -588,6 +746,11 @@ export class DevelopmentInMemoryManualNotificationRepository
   }
 }
 
+/** Compatibility name retained for deterministic fixtures. */
+export {
+  StorageManualNotificationRepository as DevelopmentInMemoryManualNotificationRepository,
+};
+
 /** Read one immutable private notification revision for atomic retry recovery. */
 export async function readManualNotificationRevision(
   storage: Pick<StorageAdapter, "read">,
@@ -604,7 +767,7 @@ export async function readManualNotificationRevision(
   const notificationId = requiredNotificationId(id);
   const expectedRevision = requiredExpectedRevision(revision);
   const key = await notificationHistoryKey(notificationId, expectedRevision);
-  const stored = await storage.read(key);
+  const stored = await readNotificationStorage(storage, key);
   return stored === null
     ? null
     : decodeNotificationSnapshot(
@@ -712,6 +875,29 @@ function normalizeAuditListRequest(
   });
 }
 
+function normalizeNotificationListRequest(
+  request: ManualNotificationListRequest,
+): ManualNotificationListRequest {
+  const source = exactDataRecord(request, 2);
+  if (source === null) invalidRequest();
+  const hasCursor = Object.hasOwn(source, "cursor");
+  if (!hasExactDataKeys(source, hasCursor ? ["limit", "cursor"] : ["limit"])) {
+    invalidRequest();
+  }
+  if (
+    !Number.isSafeInteger(source.limit) ||
+    (source.limit as number) < 1 ||
+    (source.limit as number) > MAX_OWNER_NOTIFICATION_PAGE_SIZE
+  ) invalidRequest();
+  if (hasCursor && !isBoundedNotificationCursor(source.cursor)) {
+    invalidRequest();
+  }
+  return Object.freeze({
+    limit: source.limit as number,
+    ...(hasCursor ? { cursor: source.cursor as StorageCursor } : {}),
+  });
+}
+
 function exactAuditStoragePage(
   value: unknown,
   request: AuditListRequest,
@@ -735,6 +921,73 @@ function exactAuditStoragePage(
     items: items as readonly StorageRecord[],
     nextCursor: nextCursor as StorageCursor | null,
   });
+}
+
+function exactNotificationStoragePage(
+  value: unknown,
+  request: ManualNotificationListRequest,
+): Readonly<{
+  items: readonly StorageRecord[];
+  nextCursor: StorageCursor | null;
+}> {
+  const source = exactDataRecord(value, 2);
+  if (
+    source === null ||
+    !hasExactDataKeys(source, ["items", "nextCursor"])
+  ) unavailable();
+  const items = exactDenseArray(source.items, request.limit);
+  const nextCursor = source.nextCursor;
+  if (
+    nextCursor !== null && !isBoundedNotificationCursor(nextCursor) ||
+    nextCursor !== null && nextCursor === request.cursor ||
+    nextCursor !== null && items.length === 0
+  ) unavailable();
+  return Object.freeze({
+    items: items as readonly StorageRecord[],
+    nextCursor: nextCursor as StorageCursor | null,
+  });
+}
+
+function exactNotificationTransactionResult(
+  value: unknown,
+  expectedRecords: number,
+): StorageTransactionResult {
+  const source = exactDataRecord(value, 2);
+  if (
+    source === null ||
+    !hasExactDataKeys(source, ["replayed", "records"]) ||
+    typeof source.replayed !== "boolean"
+  ) unavailable();
+  const records = exactDenseArray(source.records, expectedRecords);
+  if (records.length !== expectedRecords) unavailable();
+  return Object.freeze({
+    replayed: source.replayed,
+    records: records as readonly (StorageRecord | null)[],
+  });
+}
+
+async function readNotificationStorage(
+  storage: Pick<StorageAdapter, "read">,
+  key: StorageKey,
+): Promise<StorageRecord | null> {
+  try {
+    return await storage.read(key);
+  } catch (error) {
+    if (error instanceof StorageFailure) throw new StorageFailure(error.code);
+    unavailable();
+  }
+}
+
+async function transactNotificationStorage(
+  storage: Pick<StorageAdapter, "transact">,
+  request: StorageTransactionRequest,
+): Promise<StorageTransactionResult> {
+  try {
+    return await storage.transact(request);
+  } catch (error) {
+    if (error instanceof StorageFailure) throw new StorageFailure(error.code);
+    unavailable();
+  }
 }
 
 function decodeAuditEvent(
@@ -932,16 +1185,36 @@ function sentMarkerDocument(marker: ManualNotificationSentMarker): StorageDocume
 
 async function decodeNotificationSnapshot(
   stored: StorageRecord,
-  expectedKey: StorageKey,
+  expectedKey: StorageKey | null,
   recordKind: "current" | "history",
   expectedId: ManualNotificationId | null,
   expectedRevision: number | null,
 ): Promise<ManualNotificationSnapshot> {
-  if (storageKeyString(stored.key) !== storageKeyString(expectedKey)) unavailable();
-  const source = objectRecord(stored.value);
+  const envelope = exactDataRecord(stored, 3);
+  const keySource = envelope === null
+    ? null
+    : exactDataRecord(envelope.key, 2);
+  if (
+    envelope === null ||
+    keySource === null ||
+    !hasExactDataKeys(envelope, ["key", "revision", "value"]) ||
+    !hasExactDataKeys(keySource, ["collection", "id"])
+  ) unavailable();
+  const parsedKey = parseStorageKey(keySource.collection, keySource.id);
+  if (!parsedKey.ok) unavailable();
+  const storedKey = parsedKey.value;
+  if (
+    expectedKey !== null &&
+      storageKeyString(storedKey) !== storageKeyString(expectedKey)
+  ) unavailable();
+  if (
+    recordKind === "current" && storedKey.collection !== CURRENT_NOTIFICATIONS ||
+    recordKind === "history" && storedKey.collection !== NOTIFICATION_HISTORY
+  ) unavailable();
+  const source = exactDataRecord(envelope.value, 4);
   if (
     source === null ||
-    !hasExactKeys(source, NOTIFICATION_DOCUMENT_KEYS) ||
+    !hasExactDataKeys(source, [...NOTIFICATION_DOCUMENT_KEYS]) ||
     source.kind !== "manual-notification-record" ||
     source.schemaVersion !== NOTIFICATION_SCHEMA_VERSION ||
     !isPositiveSafeInteger(source.revision) ||
@@ -952,40 +1225,139 @@ async function decodeNotificationSnapshot(
   const revision = source.revision;
   if (
     (expectedRevision !== null && revision !== expectedRevision) ||
-    (recordKind === "current" && stored.revision !== revision) ||
-    (recordKind === "history" && stored.revision !== 1)
+    (recordKind === "current" && envelope.revision !== revision) ||
+    (recordKind === "history" && envelope.revision !== 1)
   ) {
     unavailable();
   }
 
-  const record = reconstructNotificationRecord(source.record);
+  const record = reconstructNotificationRecord(
+    closedNotificationRecord(source.record),
+  );
   if (
     revision !== 1 + record.copyEvidence.length +
       (record.sentMarker === null ? 0 : 1)
   ) unavailable();
+  if (!hasContinuousNotificationOwner(record)) unavailable();
   if (expectedId !== null && record.template.id !== expectedId) unavailable();
   const actualKey = recordKind === "current"
     ? await currentNotificationKey(record.template.id)
     : await notificationHistoryKey(record.template.id, revision);
-  if (storageKeyString(actualKey) !== storageKeyString(expectedKey)) unavailable();
+  if (storageKeyString(actualKey) !== storageKeyString(storedKey)) unavailable();
 
   return Object.freeze({ revision, record });
 }
 
-function reconstructNotificationRecord(value: unknown): ManualNotificationRecord {
-  const source = objectRecord(value);
+function closedNotificationRecord(value: unknown): StorageDocument {
+  const source = exactDataRecord(value, 3);
   if (
     source === null ||
-    !hasExactKeys(source, NOTIFICATION_RECORD_KEYS) ||
-    !Array.isArray(source.copyEvidence)
+    !hasExactDataKeys(source, [...NOTIFICATION_RECORD_KEYS])
+  ) unavailable();
+  const copies = exactDenseArray(
+    source.copyEvidence,
+    MANUAL_NOTIFICATION_LIMITS.copyEvidence,
+  ).map(closedNotificationCopyEvidence);
+  return Object.freeze({
+    template: closedNotificationTemplate(source.template),
+    copyEvidence: Object.freeze(copies),
+    sentMarker: source.sentMarker === null
+      ? null
+      : closedNotificationSentMarker(source.sentMarker),
+  });
+}
+
+function closedNotificationTemplate(value: unknown): StorageDocument {
+  const source = exactDataRecord(value, 8);
+  const related = source === null
+    ? null
+    : exactDataRecord(source.relatedResource, 2);
+  if (
+    source === null ||
+    related === null ||
+    !hasExactDataKeys(source, [
+      "id",
+      "purposeId",
+      "recipientSubject",
+      "relatedResource",
+      "subjectLine",
+      "body",
+      "generatedAt",
+      "generatedBy",
+    ]) ||
+    !hasExactDataKeys(related, ["type", "id"])
+  ) unavailable();
+  return Object.freeze({
+    id: requiredJsonPrimitive(source.id),
+    purposeId: requiredJsonPrimitive(source.purposeId),
+    recipientSubject: requiredJsonPrimitive(source.recipientSubject),
+    relatedResource: Object.freeze({
+      type: requiredJsonPrimitive(related.type),
+      id: requiredJsonPrimitive(related.id),
+    }),
+    subjectLine: requiredJsonPrimitive(source.subjectLine),
+    body: requiredJsonPrimitive(source.body),
+    generatedAt: requiredJsonPrimitive(source.generatedAt),
+    generatedBy: closedNotificationOwnerActor(source.generatedBy),
+  });
+}
+
+function closedNotificationCopyEvidence(value: unknown): StorageDocument {
+  const source = exactDataRecord(value, 3);
+  if (
+    source === null ||
+    !hasExactDataKeys(source, ["id", "copiedAt", "copiedBy"])
+  ) unavailable();
+  return Object.freeze({
+    id: requiredJsonPrimitive(source.id),
+    copiedAt: requiredJsonPrimitive(source.copiedAt),
+    copiedBy: closedNotificationOwnerActor(source.copiedBy),
+  });
+}
+
+function closedNotificationSentMarker(value: unknown): StorageDocument {
+  const source = exactDataRecord(value, 3);
+  if (
+    source === null ||
+    !hasExactDataKeys(source, ["id", "sentAt", "sentBy"])
+  ) unavailable();
+  return Object.freeze({
+    id: requiredJsonPrimitive(source.id),
+    sentAt: requiredJsonPrimitive(source.sentAt),
+    sentBy: closedNotificationOwnerActor(source.sentBy),
+  });
+}
+
+function closedNotificationOwnerActor(value: unknown): StorageDocument {
+  const source = exactDataRecord(value, 2);
+  if (
+    source === null ||
+    !hasExactDataKeys(source, ["type", "subject"]) ||
+    source.type !== "owner"
+  ) unavailable();
+  return Object.freeze({
+    type: "owner",
+    subject: requiredJsonPrimitive(source.subject),
+  });
+}
+
+function reconstructNotificationRecord(value: unknown): ManualNotificationRecord {
+  const source = exactDataRecord(value, 3);
+  if (
+    source === null ||
+    !hasExactDataKeys(source, [...NOTIFICATION_RECORD_KEYS])
   ) {
     unavailable();
   }
+  const copyEvidence = exactDenseArray(
+    source.copyEvidence,
+    MANUAL_NOTIFICATION_LIMITS.copyEvidence,
+  );
   const template = parseManualNotificationTemplate(source.template);
   if (!template.ok) unavailable();
 
   let record = createManualNotificationRecord(template.value);
-  for (const evidence of source.copyEvidence) {
+  for (const evidence of copyEvidence) {
     const copied = recordManualNotificationCopy(record, evidence);
     if (!copied.ok) unavailable();
     record = copied.value;
@@ -1024,6 +1396,16 @@ function isValidNotificationTransition(
     previous.sentMarker === null &&
     next.sentMarker !== null;
   return appendedOneCopy || addedSentMarker;
+}
+
+function hasContinuousNotificationOwner(
+  record: ManualNotificationRecord,
+): boolean {
+  const ownerSubject = record.template.generatedBy.subject;
+  return record.copyEvidence.every((item) =>
+    item.copiedBy.subject === ownerSubject
+  ) && (record.sentMarker === null ||
+    record.sentMarker.sentBy.subject === ownerSubject);
 }
 
 function auditEventKey(id: StableId<"audit-event">): StorageKey {
@@ -1161,6 +1543,23 @@ function requiredAuditStorageReader(
   return value;
 }
 
+function requiredNotificationStorageAdapter(value: unknown): StorageAdapter {
+  try {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      typeof (value as StorageAdapter).read !== "function" ||
+      typeof (value as StorageAdapter).list !== "function" ||
+      typeof (value as StorageAdapter).transact !== "function"
+    ) {
+      throw new Error("Invalid notification repository configuration.");
+    }
+    return value as StorageAdapter;
+  } catch {
+    throw new Error("Invalid notification repository configuration.");
+  }
+}
+
 function exactDataRecord(
   value: unknown,
   maximumKeys: number,
@@ -1263,18 +1662,19 @@ function isBoundedAuditCursor(value: unknown): value is StorageCursor {
   return true;
 }
 
-function objectRecord(value: unknown): Record<string, unknown> | null {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
-}
-
-function hasExactKeys(
-  value: Readonly<Record<string, unknown>>,
-  expected: ReadonlySet<string>,
-): boolean {
-  const keys = Object.keys(value);
-  return keys.length === expected.size && keys.every((key) => expected.has(key));
+function isBoundedNotificationCursor(value: unknown): value is StorageCursor {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > MAX_OWNER_NOTIFICATION_CURSOR_LENGTH
+  ) return false;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint !== undefined && (codePoint <= 31 || codePoint === 127)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function canonicalJson(value: unknown): string {

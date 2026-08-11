@@ -1,4 +1,5 @@
 import { chatGPTSignInPath } from "../../domain/auth-navigation.ts";
+import { parseStableId } from "../../domain/foundation.ts";
 import {
   createOwnerAuditCollectionDocument,
   createOwnerNotificationCollectionDocument,
@@ -18,17 +19,21 @@ import {
   type StorageOperationId,
 } from "../../domain/storage-adapter.ts";
 import { negotiateRepresentation } from "../../http/content-negotiation.ts";
+import type {
+  BrowserMutationPreReplayValidator,
+  BrowserMutationProof,
+} from "../../http/browser-mutation-session.ts";
 import {
   MUTATION_CSRF_HEADER,
   MutationSecurityFailure,
   toPublicMutationSecurityFailure,
-  type BrowserMutationGuard,
   type MutationMediaType,
+  type VerifiedMutationRequest,
 } from "../../http/mutation-security.ts";
-import type {
-  AtomicManualNotificationActivityRepository,
-  AuditEventReader,
-  AuditRepository,
+import {
+  MAX_OWNER_NOTIFICATION_PAGE_SIZE,
+  type AtomicManualNotificationActivityRepository,
+  type AuditEventReader,
 } from "../../repositories/in-memory-audit-notification-repositories.ts";
 import type {
   ApplicationRouteContext,
@@ -43,24 +48,42 @@ const AUDIT_PATH = "/owner/audit-events";
 const NOTIFICATION_PATH = "/owner/manual-notifications";
 const DEFAULT_PAGE_SIZE = 25;
 const MUTATION_FIELDS = new Set(["operation-id", "expected-revision"]);
+export const MAX_OWNER_NOTIFICATION_MUTATION_BYTES = 1_024;
+export const MAX_OWNER_NOTIFICATION_JSON_FIELDS = MUTATION_FIELDS.size;
+export const MAX_OWNER_NOTIFICATION_FORM_FIELDS = MUTATION_FIELDS.size + 1;
+
+export function ownerNotificationMutationFieldLimit(request: Request): number {
+  const contentType = request.headers.get("content-type");
+  const essence = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  return essence === "application/json"
+    ? MAX_OWNER_NOTIFICATION_JSON_FIELDS
+    : MAX_OWNER_NOTIFICATION_FORM_FIELDS;
+}
 
 type Representation = "html" | "hypermedia-json";
 type Activity = "template-copied" | "sent-marked";
 
 type HistoryRoute =
   | Readonly<{ kind: "notification-collection" }>
-  | Readonly<{ kind: "notification-detail"; notificationId: string }>
+  | Readonly<{ kind: "notification-detail"; notificationId: string | null }>
   | Readonly<{
     kind: "notification-activity";
-    notificationId: string;
+    notificationId: string | null;
     activity: Activity;
   }>;
 
 export type OwnerAuditNotificationRouteDependencies = Readonly<{
-  audit: AuditRepository;
+  audit: AuditEventReader;
   notifications: AtomicManualNotificationActivityRepository;
-  verifyMutation: BrowserMutationGuard;
-  csrfToken: (request: Request) => Promise<string | null>;
+  verifyMutation: (
+    request: Request,
+    validateBeforeReplayClaim?: BrowserMutationPreReplayValidator,
+  ) => Promise<
+    VerifiedMutationRequest & Readonly<{ clearCookie?: string }>
+  >;
+  csrfToken: (
+    request: Request,
+  ) => Promise<string | BrowserMutationProof | null>;
   issueOperationId: OwnerNotificationOperationIdIssuer;
   now?: () => Date;
 }>;
@@ -93,24 +116,28 @@ export function createOwnerAuditNotificationHistoryRouteHandler(
     }
     const route = parseRoute(context.url);
     if (route === null) return null;
+    const resourceUrl = safeNotificationResourceUrl(
+      context.resourceUrl,
+      route,
+    );
 
     const negotiated = negotiateRepresentation(
       context.request.headers.get("accept"),
     );
     if (negotiated.kind === "not-acceptable") {
-      return notAcceptableResponse(context.resourceUrl);
+      return notAcceptableResponse(resourceUrl);
     }
     const representation = negotiated.kind;
     if (context.actor === null) {
       return authenticationRequiredResponse(
         representation,
-        context.resourceUrl,
+        resourceUrl,
       );
     }
     if (!context.isOwner) {
       return errorResponse(
         representation,
-        context.resourceUrl,
+        resourceUrl,
         404,
         "not_found",
         "The requested resource was not found.",
@@ -120,14 +147,17 @@ export function createOwnerAuditNotificationHistoryRouteHandler(
     try {
       if (route.kind === "notification-activity") {
         if (context.request.method !== "POST") {
-          return methodNotAllowedResponse(representation, context.resourceUrl);
+          return methodNotAllowedResponse(representation, resourceUrl);
+        }
+        if (route.notificationId === null) {
+          throw new StorageFailure("INVALID_REQUEST");
         }
         if (dependencies.notifications.activityConsistency !==
           "atomic-notification-audit") {
           throw new StorageFailure("UNAVAILABLE");
         }
         return await mutateNotification(
-          context,
+          { ...context, resourceUrl },
           route,
           representation,
           dependencies,
@@ -136,13 +166,20 @@ export function createOwnerAuditNotificationHistoryRouteHandler(
         );
       }
       if (context.request.method !== "GET") {
-        return methodNotAllowedResponse(representation, context.resourceUrl);
+        return methodNotAllowedResponse(representation, resourceUrl);
       }
 
       if (route.kind === "notification-collection") {
-        const pageRequest = parsePageRequest(context.url);
-        const document = createOwnerNotificationCollectionDocument(
+        const pageRequest = parsePageRequest(
+          context.url,
+          MAX_OWNER_NOTIFICATION_PAGE_SIZE,
+        );
+        const collectionUrl = canonicalNotificationCollectionResourceUrl(
           context.resourceUrl,
+          pageRequest,
+        );
+        const document = createOwnerNotificationCollectionDocument(
+          collectionUrl,
           await dependencies.notifications.list(pageRequest),
           pageRequest.limit,
         );
@@ -152,24 +189,32 @@ export function createOwnerAuditNotificationHistoryRouteHandler(
       }
 
       assertNoQuery(context.url);
+      if (route.notificationId === null) {
+        throw new StorageFailure("INVALID_REQUEST");
+      }
       const snapshot = await dependencies.notifications.get(
         route.notificationId,
       );
       if (snapshot === null) throw new StorageFailure("NOT_FOUND");
       return detailResponse(
-        context,
+        { ...context, resourceUrl },
         representation,
         createOwnerNotificationDetailResource(
-          context.resourceUrl,
+          resourceUrl,
           snapshot,
           issueOperationId,
+          {
+            activityAllowed:
+              snapshot.record.template.generatedBy.subject ===
+                context.actor.userId,
+          },
         ),
         dependencies.csrfToken,
       );
     } catch (error) {
       return mappedFailureResponse(
         representation,
-        context.resourceUrl,
+        resourceUrl,
         error,
       );
     }
@@ -236,55 +281,82 @@ async function mutateNotification(
   now: () => Date,
 ): Promise<Response> {
   assertNoQuery(context.url);
-  const verified = await dependencies.verifyMutation(context.request);
-  if (
-    verified.method !== "POST" ||
-    verified.actor.type !== "owner" ||
-    verified.actor.subject !== context.actor?.userId
-  ) {
-    throw new MutationSecurityFailure("REQUEST_REJECTED");
+  if (route.notificationId === null) {
+    return mappedFailureResponse(
+      representation,
+      context.resourceUrl,
+      new StorageFailure("INVALID_REQUEST"),
+    );
   }
-  const mutation = parseMutation(verified.body, verified.mediaType);
-  const request = {
-    operationId: mutation.operationId,
-    notificationId: route.notificationId,
-    expectedRevision: mutation.expectedRevision,
-    ownerSubject: verified.actor.subject,
-    occurredAt: currentTimestamp(now),
-  };
-  if (route.activity === "template-copied") {
-    await dependencies.notifications.recordCopyWithAudit(request);
-  } else {
-    await dependencies.notifications.markSentWithAudit(request);
-  }
+  let clearCookie: string | null = null;
+  try {
+    const verified = await dependencies.verifyMutation(
+      context.request,
+      validNotificationMutationShape,
+    );
+    clearCookie = validSetCookie(verified.clearCookie)
+      ? verified.clearCookie
+      : null;
+    if (
+      verified.method !== "POST" ||
+      verified.actor.type !== "owner" ||
+      verified.actor.subject !== context.actor?.userId
+    ) {
+      throw new MutationSecurityFailure("REQUEST_REJECTED");
+    }
+    const mutation = parseMutation(verified.body, verified.mediaType);
+    const request = {
+      operationId: mutation.operationId,
+      notificationId: route.notificationId,
+      expectedRevision: mutation.expectedRevision,
+      ownerSubject: verified.actor.subject,
+      occurredAt: currentTimestamp(now),
+    };
+    if (route.activity === "template-copied") {
+      await dependencies.notifications.recordCopyWithAudit(request);
+    } else {
+      await dependencies.notifications.markSentWithAudit(request);
+    }
 
-  const detailUrl = new URL(
-    `${NOTIFICATION_PATH}/${encodeURIComponent(route.notificationId)}`,
-    context.resourceUrl,
-  ).href;
-  if (representation === "html") {
-    return new Response(null, {
-      status: 303,
-      headers: {
-        "Cache-Control": "no-store",
-        Location: detailUrl,
-        Vary: "Accept",
-      },
-    });
-  }
+    const detailUrl = new URL(
+      `${NOTIFICATION_PATH}/${encodeURIComponent(route.notificationId)}`,
+      context.resourceUrl,
+    ).href;
+    if (representation === "html") {
+      return withSetCookies(new Response(null, {
+        status: 303,
+        headers: {
+          "Cache-Control": "no-store",
+          Location: detailUrl,
+          Vary: "Accept",
+        },
+      }), [clearCookie]);
+    }
 
-  const current = await dependencies.notifications.get(route.notificationId);
-  if (current === null) throw new StorageFailure("UNAVAILABLE");
-  return detailResponse(
-    { ...context, resourceUrl: detailUrl },
-    representation,
-    createOwnerNotificationDetailResource(
-      detailUrl,
-      current,
-      issueOperationId,
-    ),
-    dependencies.csrfToken,
-  );
+    const current = await dependencies.notifications.get(route.notificationId);
+    if (current === null) throw new StorageFailure("UNAVAILABLE");
+    return detailResponse(
+      { ...context, resourceUrl: detailUrl },
+      representation,
+      createOwnerNotificationDetailResource(
+        detailUrl,
+        current,
+        issueOperationId,
+        {
+          activityAllowed:
+            current.record.template.generatedBy.subject ===
+              verified.actor.subject,
+        },
+      ),
+      dependencies.csrfToken,
+      [clearCookie],
+    );
+  } catch (error) {
+    return withSetCookies(
+      mappedFailureResponse(representation, context.resourceUrl, error),
+      [clearCookie],
+    );
+  }
 }
 
 async function detailResponse(
@@ -292,15 +364,20 @@ async function detailResponse(
   representation: Representation,
   resource: OwnerNotificationDetailResource,
   csrfToken: OwnerAuditNotificationRouteDependencies["csrfToken"],
+  cookies: readonly (string | null)[] = [],
 ): Promise<Response> {
   const hasMutation = resource.recordCopy !== null || resource.markSent !== null;
-  const token = hasMutation
-    ? requiredCsrfToken(await csrfToken(context.request))
+  const proof = hasMutation
+    ? requiredCsrfProof(await csrfToken(context.request))
     : null;
   const response = representation === "hypermedia-json"
     ? hypermediaResponse(resource.document)
-    : htmlResponse(renderNotificationDetail(resource, token));
-  return token === null ? response : withCsrfToken(response, token);
+    : htmlResponse(renderNotificationDetail(resource, proof?.token ?? null));
+  if (proof !== null) response.headers.set(MUTATION_CSRF_HEADER, proof.token);
+  return withSetCookies(response, [
+    ...cookies,
+    proof?.setCookie ?? null,
+  ]);
 }
 
 function parseRoute(url: URL): HistoryRoute | null {
@@ -311,12 +388,9 @@ function parseRoute(url: URL): HistoryRoute | null {
   if (!url.pathname.startsWith(prefix)) return null;
   const segments = url.pathname.slice(prefix.length).split("/");
   if (segments.length < 1 || segments.length > 2 || segments[0] === "") {
-    return null;
+    return { kind: "notification-detail", notificationId: null };
   }
-  const notificationId = decodeSegment(segments[0]);
-  if (notificationId === null) {
-    return { kind: "notification-detail", notificationId: "invalid" };
-  }
+  const notificationId = decodeNotificationId(segments[0]);
   if (segments.length === 1) {
     return { kind: "notification-detail", notificationId };
   }
@@ -334,15 +408,18 @@ function parseRoute(url: URL): HistoryRoute | null {
       activity: "sent-marked",
     };
   }
-  return null;
+  return { kind: "notification-detail", notificationId: null };
 }
 
-function decodeSegment(value: string | undefined): string | null {
+function decodeNotificationId(value: string | undefined): string | null {
   if (value === undefined || value.length === 0 || value.length > 384) {
     return null;
   }
   try {
-    return decodeURIComponent(value);
+    const parsed = parseStableId<"manual-notification">(
+      decodeURIComponent(value),
+    );
+    return parsed.ok ? parsed.value : null;
   } catch {
     return null;
   }
@@ -350,6 +427,7 @@ function decodeSegment(value: string | undefined): string | null {
 
 function parsePageRequest(
   url: URL,
+  maximumPageSize = 100,
 ): Readonly<{ limit: number; cursor?: StorageCursor }> {
   const keys = [...url.searchParams.keys()];
   if (keys.some((key) => key !== "page_size" && key !== "cursor")) {
@@ -367,7 +445,7 @@ function parsePageRequest(
   if (
     !Number.isSafeInteger(limit) ||
     limit < 1 ||
-    limit > 100 ||
+    limit > maximumPageSize ||
     (serializedPageSize !== undefined && String(limit) !== serializedPageSize)
   ) {
     throw new StorageFailure("INVALID_REQUEST");
@@ -383,6 +461,42 @@ function parsePageRequest(
     limit,
     ...(cursor === undefined ? {} : { cursor: cursor as StorageCursor }),
   };
+}
+
+function safeNotificationResourceUrl(
+  requestUrl: string,
+  route: HistoryRoute,
+): string {
+  const safe = new URL(requestUrl);
+  if (route.kind === "notification-collection") {
+    safe.pathname = NOTIFICATION_PATH;
+  } else {
+    const id = encodeURIComponent(route.notificationId ?? "invalid");
+    const suffix = route.kind === "notification-detail"
+      ? ""
+      : route.activity === "template-copied"
+      ? "/copies"
+      : "/sent-marker";
+    safe.pathname = `${NOTIFICATION_PATH}/${id}${suffix}`;
+  }
+  safe.search = "";
+  safe.hash = "";
+  return safe.href;
+}
+
+function canonicalNotificationCollectionResourceUrl(
+  requestUrl: string,
+  request: Readonly<{ limit: number; cursor?: StorageCursor }>,
+): string {
+  const incoming = new URL(requestUrl);
+  const canonical = new URL(NOTIFICATION_PATH, incoming.origin);
+  if (incoming.searchParams.has("page_size")) {
+    canonical.searchParams.set("page_size", String(request.limit));
+  }
+  if (request.cursor !== undefined) {
+    canonical.searchParams.set("cursor", request.cursor);
+  }
+  return canonical.href;
 }
 
 function hasControlCharacter(value: string): boolean {
@@ -436,6 +550,17 @@ function parseMutation(
   });
 }
 
+function validNotificationMutationShape(
+  request: VerifiedMutationRequest,
+): boolean {
+  try {
+    parseMutation(request.body, request.mediaType);
+    return request.method === "POST";
+  } catch {
+    return false;
+  }
+}
+
 function checkedOperationIssuer(
   issueOperationId: OwnerNotificationOperationIdIssuer,
 ): OwnerNotificationOperationIdIssuer {
@@ -465,21 +590,44 @@ function currentTimestamp(now: () => Date): string {
   return value.toISOString();
 }
 
-function requiredCsrfToken(value: unknown): string {
-  if (
-    typeof value !== "string" ||
-    value.length < 32 ||
-    value.length > 256 ||
-    !/^[A-Za-z0-9_-]+$/.test(value)
-  ) {
-    throw new StorageFailure("UNAVAILABLE");
-  }
-  return value;
+function validCsrfToken(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length >= 32 &&
+    value.length <= 256 &&
+    /^[A-Za-z0-9_-]+$/u.test(value);
 }
 
-function withCsrfToken(response: Response, token: string): Response {
+function requiredCsrfProof(
+  value: string | BrowserMutationProof | null,
+): Readonly<{ token: string; setCookie: string | null }> {
+  if (typeof value === "string") {
+    if (!validCsrfToken(value)) throw new StorageFailure("UNAVAILABLE");
+    return Object.freeze({ token: value, setCookie: null });
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !validCsrfToken(value.token) ||
+    !validSetCookie(value.setCookie)
+  ) throw new StorageFailure("UNAVAILABLE");
+  return Object.freeze({ token: value.token, setCookie: value.setCookie });
+}
+
+function validSetCookie(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 4_096 &&
+    !/[\r\n]/u.test(value);
+}
+
+function withSetCookies(
+  response: Response,
+  cookies: readonly (string | null)[],
+): Response {
+  const selected = cookies.filter(validSetCookie);
+  if (selected.length === 0) return response;
   const headers = new Headers(response.headers);
-  headers.set(MUTATION_CSRF_HEADER, token);
+  for (const cookie of selected) headers.append("Set-Cookie", cookie);
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,

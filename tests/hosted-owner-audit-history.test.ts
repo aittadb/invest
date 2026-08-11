@@ -7,7 +7,10 @@ import {
   parseStorageKey,
   parseStorageOperationId,
 } from "../domain/storage-adapter.ts";
-import { OWNER_AUDIT_HISTORY_HEADER } from "../http/runtime-capabilities.ts";
+import {
+  OWNER_AUDIT_HISTORY_HEADER,
+  OWNER_NOTIFICATION_HISTORY_HEADER,
+} from "../http/runtime-capabilities.ts";
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
 import { DevelopmentInMemoryAuditRepository } from "../repositories/in-memory-audit-notification-repositories.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
@@ -57,7 +60,7 @@ test("hosted owner pages persistent AittaDB audit history across Workers", async
   assert.equal(first.actions.length, 0);
   assert.equal(
     first.links.some((link) => link.rel.includes("manual-notifications")),
-    false,
+    true,
   );
   assert.equal(
     first.links.find((link) => link.rel.includes("owner"))?.href,
@@ -92,10 +95,8 @@ test("hosted owner pages persistent AittaDB audit history across Workers", async
   assert.match(html, /audit-event:01/u);
   assert.match(html, new RegExp(OWNER_SUBJECT, "u"));
   assert.match(html, /campaign:public/u);
-  assert.doesNotMatch(
-    html,
-    /Manual notifications|storage-runtime|service-secret|access-token/iu,
-  );
+  assert.match(html, /Manual notifications/u);
+  assert.doesNotMatch(html, /storage-runtime|service-secret|access-token/iu);
 
   const homeResponse = await restartedWorker.fetch(
     ownerRequest("/owner"),
@@ -107,7 +108,7 @@ test("hosted owner pages persistent AittaDB audit history across Workers", async
   assert.ok(home.links.some((link) => link.rel.includes("audit-events")));
   assert.equal(
     home.links.some((link) => link.rel.includes("manual-notifications")),
-    false,
+    true,
   );
 
   const renderedHome = await restartedWorker.fetch(
@@ -115,7 +116,7 @@ test("hosted owner pages persistent AittaDB audit history across Workers", async
     env,
     executionContext,
   );
-  assert.equal(await renderedHome.text(), "available");
+  assert.equal(await renderedHome.text(), "available:available");
 });
 
 test("hosted audit route rejects malformed and unauthorized requests without disclosure", async () => {
@@ -210,7 +211,10 @@ test("hosted audit reader treats unknown stored evidence as unavailable", async 
 function hostedWorker(service: SyntheticAittaDBStorageService) {
   return createApplicationWorker({
     fetchApplication: async (request) =>
-      new Response(request.headers.get(OWNER_AUDIT_HISTORY_HEADER) ?? "missing"),
+      new Response([
+        request.headers.get(OWNER_AUDIT_HISTORY_HEADER) ?? "missing",
+        request.headers.get(OWNER_NOTIFICATION_HISTORY_HEADER) ?? "missing",
+      ].join(":")),
     fetchOptimizedImage: async () => new Response("image"),
     resolveApplicationRuntime: createHostedApplicationRuntimeResolver({
       fetch: service.fetch,

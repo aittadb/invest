@@ -249,21 +249,33 @@ trusted evidence. Adapter failure codes retain their fixed meaning while
 backend causes are discarded. A fresh Worker continues from the opaque
 next-page link.
 
-Audit history is composed independently from manual-notification history. Until
-the latter has its own persistent capability, neither the audit document nor
-its HTML navigation advertises `/owner/manual-notifications`. The configured
-owner receives the same event identifiers, times, actors, closed detail, owner
-navigation, campaign navigation, and continuation in HTML and version `0.1`
-hypermedia JSON; anonymous callers receive the sign-in transition and other
-authenticated callers receive the non-disclosing missing surface.
+Audit history and manual-notification history remain separate named repository
+capabilities. The production factory supplies both over the credential-bound
+AittaDB adapter, so hosted audit and owner-home resources advertise
+`/owner/manual-notifications`; an explicitly injected audit-only deployment does
+not. Separate server-replaced capability headers drive the rendered owner links
+and are not authorization. The configured owner receives equivalent event
+identifiers, times, actors, closed detail, owner navigation, campaign navigation,
+and continuation in HTML and version `0.1` hypermedia JSON. Anonymous callers
+receive the sign-in transition and other authenticated callers receive the
+non-disclosing missing surface before notification storage is opened.
 
-`GET /owner/manual-notifications` pages bounded private notification summaries.
+`GET /owner/manual-notifications` pages at most 25 bounded private notification
+summaries and accepts only an optional opaque cursor of at most 512 characters.
 `GET /owner/manual-notifications/{notification-id}` exposes the selected
 template, its copy history, and its independent sent marker to the configured
 owner. The detail advertises `record-notification-template-copy` while the copy
 history limit permits another entry, and advertises `mark-notification-sent`
 only until a sent marker exists. Both are `POST` actions carrying hidden,
 server-issued `operation-id` and `expected-revision` fields.
+
+The production repository accepts only closed data-only current, immutable
+history, template, actor, copy, and sent records. A notification has at most 66
+revisions: its template, 64 copy facts, and one sent fact. Detail reconstruction
+therefore performs at most 67 storage reads including current state, and rejects
+missing, reordered, owner-discontinuous, oversized, accessor-backed, or corrupt
+history through one fixed unavailable surface. Collection reads validate their
+bounded current records without multiplying that detail-history traversal.
 
 HTML and version `0.1` hypermedia JSON come from the same collection or detail
 resource. When a detail has a mutation, both representations return a validated
@@ -272,7 +284,20 @@ designated response header. Mutation bodies accept exactly the advertised
 fields after transport values are removed. A copy action and sent action commit
 their notification revision and distinct allowlisted audit event through the
 same atomic repository capability; the route fails closed if that capability is
-not present.
+not present. JSON accepts at most two feature fields, native forms at most those
+two plus the CSRF transport field, and either representation is capped at 1,024
+wire bytes. Shape and size failures occur before durable proof claim. Once a
+proof is claimed, its cookie is cleared on every later response and a new proof
+is issued only when the resulting detail still advertises an action.
+
+The template's generating owner subject remains the activity owner for this
+version. A replacement configured owner may read the private history but sees no
+copy or sent action, and direct mutation fails its precondition. An exact retry
+uses the original operation ID and expected revision to recover the immutable
+notification and audit evidence after a lost response or Worker restart,
+retaining the original server timestamp without another transaction. A changed
+retry conflicts, a stale new operation fails its revision precondition, and a
+failed transaction changes neither history.
 
 ## Participant Investment Interest
 

@@ -79,7 +79,11 @@ import {
 } from "./routes/owner-indication-moderation.ts";
 import {
   createOwnerAuditHistoryRouteHandler,
+  createOwnerAuditNotificationHistoryRouteHandler,
+  MAX_OWNER_NOTIFICATION_MUTATION_BYTES,
+  ownerNotificationMutationFieldLimit,
   type OwnerAuditHistoryRouteDependencies,
+  type OwnerAuditNotificationRouteDependencies,
 } from "./routes/owner-audit-notification-history.ts";
 import { createOwnerCampaignEditorRouteHandler } from "./routes/owner-campaign-editor.ts";
 import { createOwnerFounderReviewCollectionRouteHandler } from "./routes/owner-founder-review.ts";
@@ -134,6 +138,7 @@ export type ApplicationWorkerDependencies = Readonly<{
   ownerReviewExports?: OwnerReviewExportRouteDependencies;
   ownerAuditHistory?: OwnerAuditHistoryRouteDependencies;
   ownerFounderReview?: FounderApplicationReviewCollectionRepository;
+  ownerAuditNotificationHistory?: OwnerAuditNotificationRouteDependencies;
   participantFounderInterest?: FounderInterestRouteDependencies;
   participantInvestmentInterests?: InvestmentInterestRouteDependencies;
   participantProfile?: ParticipantProfileRouteDependencies;
@@ -209,11 +214,27 @@ export function createApplicationWorker(
       const ownerReviewExportsAvailable =
         dependencies.dispatchRoute === undefined &&
         dependencies.ownerReviewExports !== undefined;
-      const ownerAuditHistory = dependencies.dispatchRoute === undefined
+      const ownerAuditNotificationHistory =
+        dependencies.dispatchRoute === undefined
+          ? dependencies.ownerAuditNotificationHistory ??
+            (dependencies.ownerAuditHistory === undefined
+              ? runtimeOwnerAuditNotificationHistory(
+                  applicationRuntime,
+                  actor,
+                  isOwner,
+                  resourceUrl,
+                )
+              : undefined)
+          : undefined;
+      const ownerAuditHistory = dependencies.dispatchRoute === undefined &&
+          ownerAuditNotificationHistory === undefined
         ? dependencies.ownerAuditHistory ??
           runtimeOwnerAuditHistory(applicationRuntime)
         : undefined;
-      const ownerAuditHistoryAvailable = ownerAuditHistory !== undefined;
+      const ownerNotificationHistoryAvailable =
+        ownerAuditNotificationHistory !== undefined;
+      const ownerAuditHistoryAvailable =
+        ownerNotificationHistoryAvailable || ownerAuditHistory !== undefined;
       const ownerFounderReview = dependencies.dispatchRoute === undefined
         ? dependencies.ownerFounderReview ??
           runtimeOwnerFounderReview(applicationRuntime)
@@ -323,6 +344,8 @@ export function createApplicationWorker(
                 normalApplication && ownerAuditHistoryAvailable && isOwner,
               ownerFounderReview:
                 normalApplication && ownerFounderReviewAvailable && isOwner,
+              ownerNotificationHistory:
+                normalApplication && ownerNotificationHistoryAvailable && isOwner,
               participantFounderInterest:
                 normalApplication && participantFounderInterestAvailable,
               participantInvestmentInterests:
@@ -366,6 +389,7 @@ export function createApplicationWorker(
               participantProfile,
               ownerAuditHistory,
               ownerFounderReview,
+              ownerAuditNotificationHistory,
               participantFounderInterest ?? null,
               {
                 owner: ownerPackage,
@@ -381,6 +405,7 @@ export function createApplicationWorker(
                 ownerReviewExportsAvailable,
                 ownerAuditHistoryAvailable,
                 ownerFounderReviewAvailable,
+                ownerNotificationHistoryAvailable,
                 participantFounderInterestAvailable,
                 participantInvestmentInterestsAvailable,
                 campaignEditorAvailable,
@@ -429,6 +454,7 @@ type InjectedRouteAvailability = Readonly<{
   ownerReviewExportsAvailable: boolean;
   ownerAuditHistoryAvailable: boolean;
   ownerFounderReviewAvailable: boolean;
+  ownerNotificationHistoryAvailable: boolean;
   participantFounderInterestAvailable: boolean;
   participantInvestmentInterestsAvailable: boolean;
   campaignEditorAvailable: boolean;
@@ -452,6 +478,8 @@ function createInjectedRouteDispatcher(
   ownerFounderReview:
     | FounderApplicationReviewCollectionRepository
     | undefined,
+  ownerAuditNotificationHistory:
+    OwnerAuditNotificationRouteDependencies | undefined,
   participantFounderInterest: FounderInterestRouteDependencies | null,
   packageRoutes: ResolvedPackageRoutes,
   available: InjectedRouteAvailability,
@@ -512,7 +540,11 @@ function createInjectedRouteDispatcher(
               dependencies.ownerReviewExports,
             )]
           : []),
-        ...(ownerAuditHistory
+        ...(ownerAuditNotificationHistory
+          ? [createOwnerAuditNotificationHistoryRouteHandler(
+              ownerAuditNotificationHistory,
+            )]
+          : ownerAuditHistory
           ? [createOwnerAuditHistoryRouteHandler(ownerAuditHistory)]
           : []),
         ...(ownerFounderReview
@@ -549,6 +581,7 @@ function createInjectedRouteDispatcher(
         reviewExports: available.ownerReviewExportsAvailable,
         auditHistory: available.ownerAuditHistoryAvailable,
         founderApplicationReview: available.ownerFounderReviewAvailable,
+        auditNotificationHistory: available.ownerNotificationHistoryAvailable,
         campaignEditor: available.campaignEditorAvailable,
         campaignSetup: available.campaignSetupAvailable,
         aittadbConnection: available.ownerOAuthProofAvailable,
@@ -1035,6 +1068,45 @@ function runtimeOwnerFounderReview(
   }
 }
 
+function runtimeOwnerAuditNotificationHistory(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  resourceUrl: string,
+): OwnerAuditNotificationRouteDependencies | undefined {
+  if (runtime === null) return undefined;
+  try {
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = actor !== null && isOwner
+      ? Object.freeze({ type: "owner" as const, subject: actor.userId })
+      : null;
+    const session = runtime.mutationSession;
+    return Object.freeze({
+      audit: runtime.repositoryFactory.ownerAuditEvents(),
+      notifications:
+        runtime.repositoryFactory.ownerManualNotificationActivity(),
+      verifyMutation: (request, validateBeforeReplayClaim) =>
+        session.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          {
+            maxBodyBytes: MAX_OWNER_NOTIFICATION_MUTATION_BYTES,
+            maxFields: ownerNotificationMutationFieldLimit(request),
+            repeatedFormFields: [],
+            validateBeforeReplayClaim,
+          },
+        ),
+      csrfToken: (request) => session.issue(request, identity, appOrigin),
+      issueOperationId: () =>
+        randomOperationId("manual-notification-activity"),
+      now: runtime.now,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 async function resolveApplicationRuntime(
   dependencies: ApplicationWorkerDependencies,
   env: InvestorAppEnv,
@@ -1079,6 +1151,7 @@ function withRuntimeConfiguration(
     ownerReviewExports: boolean;
     ownerAuditHistory: boolean;
     ownerFounderReview: boolean;
+    ownerNotificationHistory: boolean;
     participantFounderInterest: boolean;
     participantInvestmentInterests: boolean;
     participantProfileSelfService: boolean;
