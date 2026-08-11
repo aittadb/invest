@@ -396,8 +396,11 @@ sent marker. That detail remains the single
 source for native forms and hypermedia actions. It advertises only transitions
 currently available, supplies CSRF discovery for both representations, accepts
 exact feature fields, and uses the canonical deployment origin for every link
-and redirect. Distinct server-replaced audit and notification headers prevent an
-audit-only composition from advertising notification UI.
+and redirect. Notification, purpose, related-resource, copy-evidence, and
+sent-evidence identifiers plus available audit and campaign navigation are
+projected equivalently in HTML and JSON. Distinct server-replaced audit and
+notification headers prevent an audit-only composition from advertising
+notification UI.
 
 Copy and sent mutations require the explicit
 `atomic-notification-audit` capability. Each transition compare-and-sets the
@@ -405,9 +408,15 @@ notification revision and appends its corresponding closed audit event in one
 storage transaction; failure leaves both histories unchanged. The route takes
 trusted owner identity, mutation guard, operation IDs, clock, repositories, and
 CSRF provider as injected dependencies, so reusable source contains no owner,
-hostname, credential, or campaign-specific value. Exact delayed retries recover
-their immutable result and closed audit event without trusting a later clock or
-performing another transaction. Owner-subject continuity suppresses actions and
+hostname, credential, or campaign-specific value. Exact delayed retries read the
+requested immutable result and its predecessor and recover only when that
+transition introduced the operation-derived activity evidence and matching
+closed audit event. A changed expected revision therefore cannot pair an old
+operation audit with a later notification revision. Recovery does not trust a
+later clock or perform another transaction. Hosted composition explicitly uses
+persistent proof-claim verification and requires a valid cleanup instruction
+before mutation; the explicit legacy mode preserves only the historical
+non-claiming verifier contract. Owner-subject continuity suppresses actions and
 fails direct mutation after configured-owner replacement.
 
 ### Owner review exports

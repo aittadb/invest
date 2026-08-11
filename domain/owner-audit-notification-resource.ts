@@ -252,6 +252,7 @@ export function createOwnerNotificationDetailResource(
         { rel: ["collection"], href: new URL("/owner/manual-notifications", self).href },
         { rel: ["audit-events"], href: new URL("/owner/audit-events", self).href },
         { rel: ["owner"], href: new URL("/owner", self).href },
+        { rel: ["campaign"], href: new URL("/", self).href },
       ],
       actions: actions.map((item) => item.hypermedia),
     },

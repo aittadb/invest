@@ -425,9 +425,14 @@ after successful verification clears the same cookie once. JSON responses that
 advertise another action also issue a fresh encrypted proof. Owner notification
 activity accepts at most 1,024 bytes and exactly two JSON feature fields or
 those fields plus one form CSRF value. Invalid shape and body size fail before
-replay claim. Exact repository retries after a lost response recover the
-original immutable copy or sent fact and audit event; owner rotation, changed
-work, stale revisions, and missing or corrupt history fail closed.
+replay claim. Hosted owner-notification composition uses persistent proof-claim
+verification. A successful claim must return one valid cleanup instruction;
+missing or malformed cleanup fails before activity persistence and cannot issue
+a replacement proof. Exact repository retries after a lost response recover the
+original immutable copy or sent fact and audit event only when the requested
+result revision's transition introduced that operation evidence. A changed
+expected revision cannot adopt a later activity revision; owner rotation,
+changed work, stale revisions, and missing or corrupt history fail closed.
 
 Publication checks combine intrinsic campaign readiness with the immutable
 runtime boolean. The runtime defaults to false and accepts only exact configured

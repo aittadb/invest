@@ -522,7 +522,6 @@ export class StorageManualNotificationRepository
     activity: "template-copied" | "sent-marked",
   ): Promise<AuditedManualNotificationMutationResult | null> {
     const resultRevision = expectedRevision + 1;
-    if (resultRevision > current.revision) return null;
     const evidenceId = activity === "template-copied"
       ? await activityEvidenceId<"manual-notification-copy">(
           "notification-copy",
@@ -553,6 +552,9 @@ export class StorageManualNotificationRepository
       if (changedActivityExists) throw new StorageFailure("CONFLICT");
       return null;
     }
+    if (resultRevision > current.revision) {
+      throw new StorageFailure("CONFLICT");
+    }
 
     const resultKey = await notificationHistoryKey(
       notificationId,
@@ -567,6 +569,26 @@ export class StorageManualNotificationRepository
       notificationId,
       resultRevision,
     );
+    const previousRevision = resultRevision - 1;
+    const previousKey = await notificationHistoryKey(
+      notificationId,
+      previousRevision,
+    );
+    const storedPrevious = await readNotificationStorage(
+      this.#storage,
+      previousKey,
+    );
+    if (storedPrevious === null) unavailable();
+    const previous = await decodeNotificationSnapshot(
+      storedPrevious,
+      previousKey,
+      "history",
+      notificationId,
+      previousRevision,
+    );
+    if (!isValidNotificationTransition(previous.record, result.record)) {
+      unavailable();
+    }
     const resultEvidence = activity === "template-copied"
       ? result.record.copyEvidence.at(-1) ?? null
       : result.record.sentMarker;
@@ -588,7 +610,13 @@ export class StorageManualNotificationRepository
       resultEvidence === null ||
       resultEvidence.id !== evidenceId ||
       evidenceOwner !== ownerSubject ||
-      evidenceTime === null
+      evidenceTime === null ||
+      !activityEvidenceIntroduced(
+        previous.record,
+        result.record,
+        evidenceId,
+        activity,
+      )
     ) {
       throw new StorageFailure("CONFLICT");
     }
@@ -1396,6 +1424,19 @@ function isValidNotificationTransition(
     previous.sentMarker === null &&
     next.sentMarker !== null;
   return appendedOneCopy || addedSentMarker;
+}
+
+function activityEvidenceIntroduced(
+  previous: ManualNotificationRecord,
+  result: ManualNotificationRecord,
+  evidenceId: string,
+  activity: "template-copied" | "sent-marked",
+): boolean {
+  if (activity === "template-copied") {
+    return previous.copyEvidence.every(({ id }) => id !== evidenceId) &&
+      result.copyEvidence.at(-1)?.id === evidenceId;
+  }
+  return previous.sentMarker === null && result.sentMarker?.id === evidenceId;
 }
 
 function hasContinuousNotificationOwner(

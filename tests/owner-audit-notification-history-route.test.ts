@@ -280,6 +280,13 @@ test("notification copy and sent markers use separate guarded atomic actions", a
     document.actions.map((action) => action.name).sort(),
     ["mark-notification-sent", "record-notification-template-copy"],
   );
+  assert.equal(document.data.purpose_id, "purpose:notification:activity");
+  assert.equal(
+    document.data.related_resource.id,
+    "resource:notification:activity",
+  );
+  assert.ok(document.links.some((link) => link.rel.includes("audit-events")));
+  assert.ok(document.links.some((link) => link.rel.includes("campaign")));
 
   const htmlResponse = await fixture.request(
     "/owner/manual-notifications/notification%3Aactivity",
@@ -290,6 +297,10 @@ test("notification copy and sent markers use separate guarded atomic actions", a
   assert.equal(htmlResponse.headers.get(MUTATION_CSRF_HEADER), CSRF_TOKEN);
   assert.deepEqual(actionNamesFromHtml(html), actionNamesFromDocument(document));
   assert.match(html, new RegExp(`name="${MUTATION_CSRF_FIELD}" value="${CSRF_TOKEN}"`));
+  assert.match(html, /purpose:notification:activity/u);
+  assert.match(html, /resource:notification:activity/u);
+  assert.match(html, /href="https:\/\/instance\.example\/owner\/audit-events"/u);
+  assert.match(html, /href="\/">View campaign<\/a>/u);
 
   const copyAction = requiredAction(document, "record-notification-template-copy");
   const rejected = await fixture.submit(copyAction, {
@@ -344,6 +355,17 @@ test("notification copy and sent markers use separate guarded atomic actions", a
     ["template-copied", "sent-marked"],
   );
 
+  const finalHtmlResponse = await fixture.request(
+    "/owner/manual-notifications/notification%3Aactivity",
+    { accept: "text/html", actor: "owner" },
+  );
+  const finalHtml = await finalHtmlResponse.text();
+  const copyEvidence = document.data.copy_history[0];
+  assert.ok(copyEvidence);
+  assert.match(finalHtml, new RegExp(copyEvidence.id, "u"));
+  assert.ok(document.data.sent_marker);
+  assert.match(finalHtml, new RegExp(document.data.sent_marker.id, "u"));
+
   const staleSent = await fixture.submit(sentAction);
   assert.equal(staleSent.status, 412);
   assert.equal(fixture.notifications.current("notification:activity")?.revision, 3);
@@ -354,6 +376,99 @@ test("notification copy and sent markers use separate guarded atomic actions", a
   );
   assert.equal(denied.status, 404);
   assert.doesNotMatch(await denied.text(), /Private notice|Private template body/u);
+});
+
+test("persistent verification requires one valid proof cleanup instruction", async () => {
+  for (const [name, clearCookie] of [
+    ["missing", undefined],
+    ["malformed", "invalid\nclear-cookie"],
+  ] as const) {
+    const audit = new FakeAuditRepository();
+    const notifications = new FakeNotificationRepository(audit);
+    notifications.seed(
+      notificationRecord(`notification:cleanup-${name}`, "Private cleanup notice"),
+    );
+    const csrfHash = await hashCsrfToken(CSRF_TOKEN);
+    const guard = createBrowserMutationGuard({
+      allowedOrigins: [APP_ORIGIN],
+      now: () => new Date("2026-08-09T12:00:00.000Z"),
+      resolveSession: async () => ({
+        actor: { type: "owner", subject: actorSubject(OWNER_SUBJECT) },
+        expiresAt: timestamp("2026-08-09T13:00:00.000Z"),
+        csrf: {
+          tokenHash: csrfHash,
+          expiresAt: timestamp("2026-08-09T12:30:00.000Z"),
+        },
+      }),
+    });
+    let proofIssues = 0;
+    const handler = createOwnerAuditNotificationHistoryRouteHandler({
+      audit,
+      notifications,
+      mutationVerificationMode: "persistent-claim",
+      verifyMutation: async (request, validateBeforeReplayClaim) => {
+        const verified = await guard(request);
+        assert.equal(validateBeforeReplayClaim?.(verified), true);
+        return clearCookie === undefined
+          ? verified
+          : Object.freeze({ ...verified, clearCookie });
+      },
+      csrfToken: async () => {
+        proofIssues += 1;
+        return Object.freeze({
+          token: CSRF_TOKEN,
+          expiresAt: timestamp("2026-08-09T12:30:00.000Z"),
+          setCookie:
+            "__Host-owner-notification-proof=proof; Path=/; Secure; HttpOnly; SameSite=Lax",
+        });
+      },
+      issueOperationId: () => operationId(`notification-action:cleanup-${name}`),
+      now: () => new Date("2026-08-09T12:01:00.000Z"),
+    });
+    const path = `/owner/manual-notifications/${encodeURIComponent(
+      `notification:cleanup-${name}`,
+    )}`;
+    const discoveryRequest = new Request(new URL(path, INTERNAL_ORIGIN), {
+      headers: identityHeaders("application/json", "owner"),
+    });
+    const discoveryResponse = await handler(
+      routeContext(discoveryRequest, "owner"),
+    );
+    assert.ok(discoveryResponse);
+    const document = await discoveryResponse.json() as
+      OwnerNotificationDetailDocument;
+    const action = requiredAction(
+      document,
+      "record-notification-template-copy",
+    );
+    const body = new URLSearchParams();
+    for (const field of action.fields) {
+      const value = field.value ?? field.default;
+      assert.notEqual(value, undefined);
+      body.set(field.name, String(value));
+    }
+    body.set(MUTATION_CSRF_FIELD, CSRF_TOKEN);
+    const mutationRequest = new Request(action.href, {
+      method: "POST",
+      headers: {
+        ...identityHeaders("application/json", "owner"),
+        "content-type": "application/x-www-form-urlencoded",
+        origin: APP_ORIGIN,
+      },
+      body,
+    });
+    const response = await handler(routeContext(mutationRequest, "owner"));
+    assert.ok(response);
+    assert.equal(response.status, 503, name);
+    assert.equal(response.headers.get("set-cookie"), null, name);
+    assert.equal(proofIssues, 1, name);
+    assert.equal(
+      notifications.current(`notification:cleanup-${name}`)?.revision,
+      1,
+      name,
+    );
+    assert.equal(audit.events.length, 0, name);
+  }
 });
 
 async function routeFixture() {
@@ -377,6 +492,7 @@ async function routeFixture() {
   const handler = createOwnerAuditNotificationHistoryRouteHandler({
     audit,
     notifications,
+    mutationVerificationMode: "legacy-non-claiming",
     verifyMutation: guard,
     csrfToken: async () => CSRF_TOKEN,
     issueOperationId: () => operationId(`notification-action:${++operation}`),

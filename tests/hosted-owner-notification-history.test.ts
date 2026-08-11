@@ -174,9 +174,52 @@ test("hosted owner notification activity survives response loss and Worker resta
   assert.equal(sentDetail.data.revision, 3);
   assert.equal(sentDetail.data.delivery_state, "marked-sent");
   assert.equal(sentDetail.data.copy_history.length, 1);
+  assert.ok(sentDetail.links.some((link) => link.rel.includes("audit-events")));
+  assert.ok(sentDetail.links.some((link) => link.rel.includes("campaign")));
   assert.equal(
     sentDetail.actions.some(({ name }) => name === "mark-notification-sent"),
     false,
+  );
+
+  const changedRetryDiscovery = await restartedWorker.fetch(
+    ownerRequest(`/owner/manual-notifications/${encodeURIComponent(NOTIFICATION_ID)}`),
+    env,
+    executionContext,
+  );
+  const changedRetryProof = mutationProof(changedRetryDiscovery);
+  const changedRetry = await submitJson(
+    restartedWorker,
+    copy.href,
+    { ...copyBody, "expected-revision": 2 },
+    changedRetryProof,
+    env,
+  );
+  assert.equal(changedRetry.status, 409);
+  assert.match(changedRetry.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+
+  const exactRetryDiscovery = await restartedWorker.fetch(
+    ownerRequest(`/owner/manual-notifications/${encodeURIComponent(NOTIFICATION_ID)}`),
+    env,
+    executionContext,
+  );
+  const exactRetryProof = mutationProof(exactRetryDiscovery);
+  const delayedExactRetry = await submitJson(
+    restartedWorker,
+    copy.href,
+    copyBody,
+    exactRetryProof,
+    env,
+  );
+  assert.equal(delayedExactRetry.status, 200);
+  const delayedCurrent = await delayedExactRetry.json() as
+    OwnerNotificationDetailDocument;
+  assert.equal(delayedCurrent.data.revision, 3);
+  assert.equal(delayedCurrent.data.copy_history.length, 1);
+  assert.ok(delayedCurrent.data.sent_marker);
+  assert.equal(
+    service.transactionOperationIds.filter((value) => value === failedOperation)
+      .length,
+    1,
   );
 
   const readsBeforeFinalDetail = notificationReadCount(service);
@@ -219,6 +262,12 @@ test("hosted owner notification activity survives response loss and Worker resta
   assert.match(html, new RegExp(PRIVATE_SUBJECT, "u"));
   assert.match(html, new RegExp(PRIVATE_BODY, "u"));
   assert.match(html, /Revision 3|Marked sent/u);
+  assert.match(html, /moderation-status-update/u);
+  assert.match(html, /indication:hosted-private/u);
+  assert.match(html, new RegExp(sentDetail.data.copy_history[0]?.id ?? "missing", "u"));
+  assert.match(html, new RegExp(sentDetail.data.sent_marker?.id ?? "missing", "u"));
+  assert.match(html, /href="https:\/\/invest\.example\.test\/owner\/audit-events"/u);
+  assert.match(html, /href="\/">View campaign<\/a>/u);
   assert.doesNotMatch(html, /service-secret|access-token|storage-runtime/iu);
 });
 

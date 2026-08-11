@@ -169,9 +169,14 @@ dd {
   line-height: 1.55;
 }
 
-.history-back {
-  display: inline-block;
+.history-detail-nav {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px 24px;
   margin-bottom: 34px;
+  font-size: 0.84rem;
+  font-weight: 740;
 }
 
 .history-title--detail {
@@ -245,6 +250,10 @@ dd {
 }
 
 .history-evidence li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px 24px;
   padding: 12px 0;
   color: var(--history-muted);
   font-size: 0.8rem;

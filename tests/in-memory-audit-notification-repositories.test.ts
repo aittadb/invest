@@ -483,6 +483,62 @@ test("manual notification activity recovers a committed response loss exactly on
   );
 });
 
+test("notification retries bind one operation to its introducing revision", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const repository = new DevelopmentInMemoryManualNotificationRepository(storage);
+  await repository.create({
+    operationId: "notification-operation:revision-binding-create",
+    template: templateInput("notification:revision-binding"),
+  });
+  const copyRequest = {
+    operationId: "notification-operation:revision-binding-copy-a",
+    notificationId: "notification:revision-binding",
+    expectedRevision: 1,
+    ownerSubject: OWNER.subject,
+    occurredAt: COPIED_AT,
+  };
+  const copied = await repository.recordCopyWithAudit(copyRequest);
+  assert.equal(copied.revision, 2);
+  await repository.markSentWithAudit({
+    operationId: "notification-operation:revision-binding-sent-b",
+    notificationId: "notification:revision-binding",
+    expectedRevision: 2,
+    ownerSubject: OWNER.subject,
+    occurredAt: SENT_AT,
+  });
+
+  const reopened = new DevelopmentInMemoryManualNotificationRepository(storage);
+  const [exact, changed] = await Promise.all([
+    reopened.recordCopyWithAudit({
+      ...copyRequest,
+      occurredAt: "2026-04-01T09:30:00.000Z",
+    }),
+    captureStorageFailure(() =>
+      new DevelopmentInMemoryManualNotificationRepository(storage)
+        .recordCopyWithAudit({
+          ...copyRequest,
+          expectedRevision: 2,
+          occurredAt: "2026-04-01T09:31:00.000Z",
+        })
+    ),
+  ]);
+  assert.equal(exact.replayed, true);
+  assert.equal(exact.revision, 2);
+  assert.equal(exact.record.sentMarker, null);
+  assert.equal(changed.code, "CONFLICT");
+
+  const current = await reopened.get("notification:revision-binding");
+  assert.equal(current?.revision, 3);
+  assert.equal(current?.record.copyEvidence.length, 1);
+  assert.equal(current?.record.sentMarker?.sentAt, SENT_AT);
+  assert.equal(
+    (await new DevelopmentInMemoryAuditRepository(storage).list({ limit: 10 }))
+      .items.length,
+    2,
+  );
+});
+
 test("overlapping exact notification activity returns two stable successes", async () => {
   const state = new MemoryStorageState();
   const storage = new DeterministicMemoryStorageAdapter(state, true);

@@ -51,6 +51,9 @@ const MUTATION_FIELDS = new Set(["operation-id", "expected-revision"]);
 export const MAX_OWNER_NOTIFICATION_MUTATION_BYTES = 1_024;
 export const MAX_OWNER_NOTIFICATION_JSON_FIELDS = MUTATION_FIELDS.size;
 export const MAX_OWNER_NOTIFICATION_FORM_FIELDS = MUTATION_FIELDS.size + 1;
+export type OwnerNotificationMutationVerificationMode =
+  | "persistent-claim"
+  | "legacy-non-claiming";
 
 export function ownerNotificationMutationFieldLimit(request: Request): number {
   const contentType = request.headers.get("content-type");
@@ -75,6 +78,7 @@ type HistoryRoute =
 export type OwnerAuditNotificationRouteDependencies = Readonly<{
   audit: AuditEventReader;
   notifications: AtomicManualNotificationActivityRepository;
+  mutationVerificationMode: OwnerNotificationMutationVerificationMode;
   verifyMutation: (
     request: Request,
     validateBeforeReplayClaim?: BrowserMutationPreReplayValidator,
@@ -210,6 +214,7 @@ export function createOwnerAuditNotificationHistoryRouteHandler(
           },
         ),
         dependencies.csrfToken,
+        dependencies.mutationVerificationMode,
       );
     } catch (error) {
       return mappedFailureResponse(
@@ -294,9 +299,10 @@ async function mutateNotification(
       context.request,
       validNotificationMutationShape,
     );
-    clearCookie = validSetCookie(verified.clearCookie)
-      ? verified.clearCookie
-      : null;
+    clearCookie = requiredMutationClearCookie(
+      verified.clearCookie,
+      dependencies.mutationVerificationMode,
+    );
     if (
       verified.method !== "POST" ||
       verified.actor.type !== "owner" ||
@@ -349,6 +355,7 @@ async function mutateNotification(
         },
       ),
       dependencies.csrfToken,
+      dependencies.mutationVerificationMode,
       [clearCookie],
     );
   } catch (error) {
@@ -364,11 +371,15 @@ async function detailResponse(
   representation: Representation,
   resource: OwnerNotificationDetailResource,
   csrfToken: OwnerAuditNotificationRouteDependencies["csrfToken"],
+  verificationMode: OwnerNotificationMutationVerificationMode,
   cookies: readonly (string | null)[] = [],
 ): Promise<Response> {
   const hasMutation = resource.recordCopy !== null || resource.markSent !== null;
   const proof = hasMutation
-    ? requiredCsrfProof(await csrfToken(context.request))
+    ? requiredCsrfProof(
+        await csrfToken(context.request),
+        verificationMode,
+      )
     : null;
   const response = representation === "hypermedia-json"
     ? hypermediaResponse(resource.document)
@@ -599,8 +610,9 @@ function validCsrfToken(value: unknown): value is string {
 
 function requiredCsrfProof(
   value: string | BrowserMutationProof | null,
+  verificationMode: OwnerNotificationMutationVerificationMode,
 ): Readonly<{ token: string; setCookie: string | null }> {
-  if (typeof value === "string") {
+  if (verificationMode === "legacy-non-claiming" && typeof value === "string") {
     if (!validCsrfToken(value)) throw new StorageFailure("UNAVAILABLE");
     return Object.freeze({ token: value, setCookie: null });
   }
@@ -611,6 +623,22 @@ function requiredCsrfProof(
     !validSetCookie(value.setCookie)
   ) throw new StorageFailure("UNAVAILABLE");
   return Object.freeze({ token: value.token, setCookie: value.setCookie });
+}
+
+function requiredMutationClearCookie(
+  value: unknown,
+  verificationMode: OwnerNotificationMutationVerificationMode,
+): string | null {
+  if (verificationMode === "legacy-non-claiming") {
+    if (value !== undefined) {
+      throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+    }
+    return null;
+  }
+  if (!validSetCookie(value)) {
+    throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+  }
+  return value;
 }
 
 function validSetCookie(value: unknown): value is string {
@@ -801,6 +829,9 @@ function renderNotificationDetail(
   csrfToken: string | null,
 ): string {
   const { data } = resource.document;
+  const audit = resource.document.links.find((link) =>
+    link.rel.includes("audit-events")
+  );
   const actions = [resource.recordCopy, resource.markSent]
     .filter((value): value is OwnerNotificationControl => value !== null)
     .map((control) => renderActivityForm(control.form, csrfToken))
@@ -808,14 +839,17 @@ function renderNotificationDetail(
   const copies = data.copy_history.length === 0
     ? `<p class="history-empty">No template copies have been recorded.</p>`
     : `<ol class="history-evidence">${data.copy_history.map((item) =>
-      `<li><time datetime="${escapeAttribute(item.copied_at)}">${escapeHtml(item.copied_at)}</time></li>`
+      `<li><span>${escapeHtml(item.id)}</span><time datetime="${escapeAttribute(item.copied_at)}">${escapeHtml(item.copied_at)}</time></li>`
     ).join("")}</ol>`;
   const sent = data.sent_marker === null
     ? "Not marked sent"
     : `Marked sent at ${escapeHtml(data.sent_marker.sent_at)}`;
+  const sentEvidence = data.sent_marker === null
+    ? "Not recorded"
+    : escapeHtml(data.sent_marker.id);
   return page(
     data.subject_line,
-    `<main class="history-main"><a class="history-back" href="/owner/manual-notifications">Manual notifications</a><div class="history-title history-title--detail"><div><p class="history-kicker">${escapeHtml(sent)}</p><h1>${escapeHtml(data.subject_line)}</h1></div><span>Revision ${data.revision}</span></div><dl class="history-metadata"><div><dt>Recipient subject</dt><dd>${escapeHtml(data.recipient_subject)}</dd></div><div><dt>Related resource</dt><dd>${escapeHtml(data.related_resource.type)}</dd></div><div><dt>Generated</dt><dd>${escapeHtml(data.generated_at)}</dd></div></dl><section class="history-template" aria-labelledby="notification-body"><h2 id="notification-body">Message template</h2><pre>${escapeHtml(data.body)}</pre></section><div class="history-actions">${actions}</div><section class="history-copy-log"><h2>Copy history</h2>${copies}</section></main>`,
+    `<main class="history-main"><nav class="history-detail-nav" aria-label="Notification history"><a href="/owner/manual-notifications">Manual notifications</a>${audit ? `<a href="${escapeAttribute(audit.href)}">Audit events</a>` : ""}</nav><div class="history-title history-title--detail"><div><p class="history-kicker">${escapeHtml(sent)}</p><h1>${escapeHtml(data.subject_line)}</h1></div><span>Revision ${data.revision}</span></div><dl class="history-metadata"><div><dt>Notification ID</dt><dd>${escapeHtml(resource.document.id)}</dd></div><div><dt>Purpose ID</dt><dd>${escapeHtml(data.purpose_id)}</dd></div><div><dt>Recipient subject</dt><dd>${escapeHtml(data.recipient_subject)}</dd></div><div><dt>Related resource</dt><dd>${escapeHtml(data.related_resource.type)}: ${escapeHtml(data.related_resource.id)}</dd></div><div><dt>Generated</dt><dd>${escapeHtml(data.generated_at)}</dd></div><div><dt>Sent evidence</dt><dd>${sentEvidence}</dd></div></dl><section class="history-template" aria-labelledby="notification-body"><h2 id="notification-body">Message template</h2><pre>${escapeHtml(data.body)}</pre></section><div class="history-actions">${actions}</div><section class="history-copy-log"><h2>Copy history</h2>${copies}</section></main>`,
   );
 }
 

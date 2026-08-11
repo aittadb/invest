@@ -278,26 +278,36 @@ history through one fixed unavailable surface. Collection reads validate their
 bounded current records without multiplying that detail-history traversal.
 
 HTML and version `0.1` hypermedia JSON come from the same collection or detail
-resource. When a detail has a mutation, both representations return a validated
-CSRF proof: native forms receive a hidden field and JSON clients receive the
-designated response header. Mutation bodies accept exactly the advertised
-fields after transport values are removed. A copy action and sent action commit
-their notification revision and distinct allowlisted audit event through the
-same atomic repository capability; the route fails closed if that capability is
-not present. JSON accepts at most two feature fields, native forms at most those
-two plus the CSRF transport field, and either representation is capped at 1,024
-wire bytes. Shape and size failures occur before durable proof claim. Once a
-proof is claimed, its cookie is cleared on every later response and a new proof
-is issued only when the resulting detail still advertises an action.
+resource. Detail representations expose the same notification, purpose,
+related-resource, copy-evidence, and sent-evidence identifiers and the same
+available audit and campaign navigation. When a detail has a mutation, both
+representations return a validated CSRF proof: native forms receive a hidden
+field and JSON clients receive the designated response header. Mutation bodies
+accept exactly the advertised fields after transport values are removed. A copy
+action and sent action commit their notification revision and distinct
+allowlisted audit event through the same atomic repository capability; the route
+fails closed if that capability is not present. JSON accepts at most two feature
+fields, native forms at most those two plus the CSRF transport field, and either
+representation is capped at 1,024 wire bytes. Shape and size failures occur
+before durable proof claim. Once a persistent proof is claimed, verification
+must supply its valid cleanup cookie; a missing or malformed cleanup fails
+before activity persistence and does not issue a replacement proof. The cookie
+is cleared on every later response, and a new proof is issued only when the
+resulting detail still advertises an action. An explicitly selected legacy
+non-claiming verifier may instead use the historical string-proof contract and
+must not return a cleanup cookie.
 
 The template's generating owner subject remains the activity owner for this
 version. A replacement configured owner may read the private history but sees no
 copy or sent action, and direct mutation fails its precondition. An exact retry
 uses the original operation ID and expected revision to recover the immutable
-notification and audit evidence after a lost response or Worker restart,
-retaining the original server timestamp without another transaction. A changed
-retry conflicts, a stale new operation fails its revision precondition, and a
-failed transaction changes neither history.
+notification and audit evidence after a lost response or Worker restart. The
+repository verifies both the requested result revision and its predecessor so
+the operation's evidence must have been introduced by that exact transition;
+evidence merely retained by a later activity revision cannot satisfy recovery.
+The original server timestamp is retained without another transaction. A
+changed retry conflicts, a stale new operation fails its revision precondition,
+and a failed transaction changes neither history.
 
 ## Participant Investment Interest
 

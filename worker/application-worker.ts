@@ -1085,6 +1085,7 @@ function runtimeOwnerAuditNotificationHistory(
       audit: runtime.repositoryFactory.ownerAuditEvents(),
       notifications:
         runtime.repositoryFactory.ownerManualNotificationActivity(),
+      mutationVerificationMode: "persistent-claim" as const,
       verifyMutation: (request, validateBeforeReplayClaim) =>
         session.verifyMutation(
           request,
