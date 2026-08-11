@@ -953,16 +953,33 @@ test("configured owner can page and inspect opaque founder review records", asyn
   assert.equal(new Set(allItems.map((item) => item.reviewId)).size, 2);
   for (const item of allItems) {
     assert.match(item.reviewId, /^founder-review:[0-9a-f]{64}$/);
-    assert.equal(item.reviewId.includes(item.application.applicantSubject), false);
+    assert.equal(item.reviewId.includes(ALICE_SUBJECT), false);
+    assert.equal(item.reviewId.includes(BOB_SUBJECT), false);
+    assert.deepEqual(Object.keys(item), [
+      "reviewId",
+      "status",
+      "primaryContributionAreaId",
+      "updatedAt",
+      "revision",
+    ]);
     assert.equal(Object.isFrozen(item), true);
   }
+  const detailed = await Promise.all(
+    allItems.map((item) => owner.get(item.reviewId)),
+  );
+  const aliceDetail = detailed.find(
+    (item) => item?.application.id === APPLICATION_ID,
+  );
   const aliceReview = allItems.find(
-    (item) => item.application.id === APPLICATION_ID,
+    (item) => item.reviewId === aliceDetail?.reviewId,
   );
   assert.notEqual(aliceReview, undefined);
-  if (aliceReview === undefined) return;
-  assert.deepEqual(await owner.get(aliceReview.reviewId), aliceReview);
-  assert.deepEqual(aliceReview.application, aliceApplication.snapshot);
+  assert.notEqual(aliceDetail, undefined);
+  if (aliceReview === undefined || aliceDetail === null || aliceDetail === undefined) {
+    return;
+  }
+  assert.deepEqual(await owner.get(aliceReview.reviewId), aliceDetail);
+  assert.deepEqual(aliceDetail.application, aliceApplication.snapshot);
 
   for (const actor of [BOB_SUBJECT, null]) {
     const foreign = new DevelopmentInMemoryFounderApplicationReviewRepository(

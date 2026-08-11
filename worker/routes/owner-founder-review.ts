@@ -11,7 +11,12 @@ import {
 import { StorageFailure, type StorageCursor } from "../../domain/storage-adapter.ts";
 import { negotiateRepresentation } from "../../http/content-negotiation.ts";
 import type {
+  FounderApplicationReviewCollectionRepository,
   FounderApplicationReviewRepository,
+} from "../../repositories/in-memory-founder-application-repository.ts";
+import {
+  MAX_FOUNDER_APPLICATION_REVIEW_CURSOR_CHARACTERS,
+  MAX_FOUNDER_APPLICATION_REVIEW_PAGE_SIZE,
 } from "../../repositories/in-memory-founder-application-repository.ts";
 import type { ApplicationRouteHandler } from "../contracts.ts";
 import {
@@ -19,83 +24,110 @@ import {
   notAcceptableResponse,
 } from "./responses.ts";
 
-const COLLECTION_PATH = "/owner/founder-applications";
+export const OWNER_FOUNDER_REVIEW_COLLECTION_PATH =
+  "/owner/founder-applications";
 const DEFAULT_PAGE_SIZE = 25;
+
+export function createOwnerFounderReviewCollectionRouteHandler(
+  repository: FounderApplicationReviewCollectionRepository,
+): ApplicationRouteHandler {
+  return createFounderReviewHandler(repository, null);
+}
 
 export function createOwnerFounderReviewRouteHandler(
   repository: FounderApplicationReviewRepository,
 ): ApplicationRouteHandler {
+  return createFounderReviewHandler(repository, repository);
+}
+
+function createFounderReviewHandler(
+  collection: FounderApplicationReviewCollectionRepository,
+  detail: FounderApplicationReviewRepository | null,
+): ApplicationRouteHandler {
   return async (context) => {
-    const route = parseRoute(context.url);
+    const route = parseRoute(context.url, detail !== null);
     if (route === null) return null;
+    const safeResourceUrl = safeFounderReviewResourceUrl(
+      context.resourceUrl,
+      route,
+    );
 
     const representation = negotiateRepresentation(
       context.request.headers.get("accept"),
     );
     if (representation.kind === "not-acceptable") {
-      return notAcceptableResponse(context.resourceUrl);
-    }
-    if (context.request.method !== "GET") {
-      return errorResponse(
-        representation.kind,
-        context.resourceUrl,
-        405,
-        "method_not_allowed",
-        "This resource is read-only.",
-      );
+      return privateResponse(notAcceptableResponse(safeResourceUrl));
     }
     if (context.actor === null) {
       return authenticationRequiredResponse(
         representation.kind,
-        context.resourceUrl,
+        safeResourceUrl,
       );
     }
     if (!context.isOwner) {
       return errorResponse(
         representation.kind,
-        context.resourceUrl,
+        safeResourceUrl,
         404,
         "not_found",
         "The requested resource was not found.",
+      );
+    }
+    if (context.request.method !== "GET") {
+      return errorResponse(
+        representation.kind,
+        safeResourceUrl,
+        405,
+        "method_not_allowed",
+        "This resource is read-only.",
       );
     }
 
     try {
       if (route.kind === "collection") {
         const request = parsePageRequest(context.url);
-        const document = createOwnerFounderReviewCollectionDocument(
+        const resourceUrl = canonicalCollectionResourceUrl(
           context.resourceUrl,
-          await repository.list(request),
+          request,
+        );
+        const document = createOwnerFounderReviewCollectionDocument(
+          resourceUrl,
+          await collection.list(request),
           request.limit,
+          detail !== null,
         );
         return representation.kind === "hypermedia-json"
-          ? hypermediaResponse(document)
+          ? privateResponse(hypermediaResponse(document))
           : htmlResponse(renderCollection(document));
       }
 
-      const item = await repository.get(route.reviewId);
+      if (detail === null) return null;
+      if (context.url.search !== "") {
+        throw new StorageFailure("INVALID_REQUEST");
+      }
+      const item = await detail.get(route.reviewId);
       if (item === null) {
         return errorResponse(
           representation.kind,
-          context.resourceUrl,
+          safeResourceUrl,
           404,
           "not_found",
           "The requested resource was not found.",
         );
       }
       const document = createOwnerFounderReviewDetailDocument(
-        context.resourceUrl,
+        safeResourceUrl,
         item,
       );
       return representation.kind === "hypermedia-json"
-        ? hypermediaResponse(document)
+        ? privateResponse(hypermediaResponse(document))
         : htmlResponse(renderDetail(document));
     } catch (error) {
       const invalid = error instanceof StorageFailure &&
         error.code === "INVALID_REQUEST";
       return errorResponse(
         representation.kind,
-        context.resourceUrl,
+        safeResourceUrl,
         invalid ? 400 : 503,
         invalid ? "invalid_request" : "temporarily_unavailable",
         invalid
@@ -110,9 +142,15 @@ type FounderReviewRoute =
   | Readonly<{ kind: "collection" }>
   | Readonly<{ kind: "detail"; reviewId: string }>;
 
-function parseRoute(url: URL): FounderReviewRoute | null {
-  if (url.pathname === COLLECTION_PATH) return { kind: "collection" };
-  const prefix = `${COLLECTION_PATH}/`;
+function parseRoute(
+  url: URL,
+  detailAvailable: boolean,
+): FounderReviewRoute | null {
+  if (url.pathname === OWNER_FOUNDER_REVIEW_COLLECTION_PATH) {
+    return { kind: "collection" };
+  }
+  if (!detailAvailable) return null;
+  const prefix = `${OWNER_FOUNDER_REVIEW_COLLECTION_PATH}/`;
   if (!url.pathname.startsWith(prefix)) return null;
   const encoded = url.pathname.slice(prefix.length);
   if (encoded.length === 0 || encoded.includes("/")) return null;
@@ -128,9 +166,15 @@ function parseRoute(url: URL): FounderReviewRoute | null {
 function parsePageRequest(
   url: URL,
 ): Readonly<{ limit: number; cursor?: StorageCursor }> {
+  const queryNames = [...url.searchParams.keys()];
   const pageSizeValues = url.searchParams.getAll("page_size");
   const cursorValues = url.searchParams.getAll("cursor");
-  if (pageSizeValues.length > 1 || cursorValues.length > 1) {
+  if (
+    queryNames.some((name) => name !== "page_size" && name !== "cursor") ||
+    pageSizeValues.length > 1 ||
+    cursorValues.length > 1 ||
+    (cursorValues.length === 1 && pageSizeValues.length !== 1)
+  ) {
     throw new StorageFailure("INVALID_REQUEST");
   }
   const serializedPageSize = pageSizeValues[0];
@@ -140,20 +184,66 @@ function parsePageRequest(
   if (
     !Number.isSafeInteger(limit) ||
     limit < 1 ||
-    limit > 100 ||
+    limit > MAX_FOUNDER_APPLICATION_REVIEW_PAGE_SIZE ||
     (serializedPageSize !== undefined &&
       String(limit) !== serializedPageSize)
   ) {
     throw new StorageFailure("INVALID_REQUEST");
   }
   const cursor = cursorValues[0];
-  if (cursor !== undefined && (cursor.length === 0 || cursor.length > 512)) {
+  if (
+    cursor !== undefined &&
+    (cursor.length === 0 ||
+      cursor.length > MAX_FOUNDER_APPLICATION_REVIEW_CURSOR_CHARACTERS ||
+      hasControlCharacter(cursor))
+  ) {
     throw new StorageFailure("INVALID_REQUEST");
   }
   return {
     limit,
     ...(cursor === undefined ? {} : { cursor: cursor as StorageCursor }),
   };
+}
+
+function safeFounderReviewResourceUrl(
+  requestUrl: string,
+  route: FounderReviewRoute,
+): string {
+  const safe = new URL(requestUrl);
+  safe.pathname = route.kind === "collection"
+    ? OWNER_FOUNDER_REVIEW_COLLECTION_PATH
+    : `${OWNER_FOUNDER_REVIEW_COLLECTION_PATH}/${
+      encodeURIComponent(route.reviewId)
+    }`;
+  safe.search = "";
+  safe.hash = "";
+  return safe.href;
+}
+
+function canonicalCollectionResourceUrl(
+  requestUrl: string,
+  request: Readonly<{ limit: number; cursor?: StorageCursor }>,
+): string {
+  const incoming = new URL(requestUrl);
+  const canonical = new URL(
+    OWNER_FOUNDER_REVIEW_COLLECTION_PATH,
+    incoming.origin,
+  );
+  if (incoming.searchParams.has("page_size")) {
+    canonical.searchParams.set("page_size", String(request.limit));
+  }
+  if (request.cursor !== undefined) {
+    canonical.searchParams.set("cursor", request.cursor);
+  }
+  return canonical.href;
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const point = character.codePointAt(0);
+    if (point !== undefined && (point <= 31 || point === 127)) return true;
+  }
+  return false;
 }
 
 function authenticationRequiredResponse(
@@ -170,7 +260,7 @@ function authenticationRequiredResponse(
       401,
     );
   }
-  return hypermediaResponse({
+  return privateResponse(hypermediaResponse({
     api_version: INVESTOR_APP_API_VERSION,
     type: "error",
     id: "authentication-required",
@@ -187,7 +277,7 @@ function authenticationRequiredResponse(
       type: "text/html",
       fields: [],
     }],
-  }, 401);
+  }, 401));
 }
 
 function errorResponse(
@@ -206,14 +296,14 @@ function errorResponse(
       status,
     );
   }
-  return hypermediaResponse({
+  return privateResponse(hypermediaResponse({
     api_version: INVESTOR_APP_API_VERSION,
     type: "error",
     id: code,
     data: { code, message },
     links: [{ rel: ["self"], href: new URL(requestUrl).href }],
     actions: [],
-  }, status);
+  }, status));
 }
 
 function renderCollection(
@@ -226,7 +316,10 @@ function renderCollection(
         candidate.rel.includes("item") &&
         candidate.href.endsWith(encodeURIComponent(item.review_id))
       );
-      return `<li><article><p>${escapeHtml(item.status)}</p><h2>${escapeHtml(item.primary_contribution_area_id)}</h2><dl><dt>Updated</dt><dd>${escapeHtml(item.updated_at)}</dd><dt>Revision</dt><dd>${item.revision}</dd></dl><a href="${escapeAttribute(link?.href ?? "#")}">Review application</a></article></li>`;
+      const detailLink = link === undefined
+        ? ""
+        : `<a href="${escapeAttribute(link.href)}">Review application</a>`;
+      return `<li><article><p>${escapeHtml(item.status)}</p><h2>${escapeHtml(item.primary_contribution_area_id)}</h2><dl><dt>Reference</dt><dd><code>${escapeHtml(item.review_id)}</code></dd><dt>Updated</dt><dd>${escapeHtml(item.updated_at)}</dd><dt>Revision</dt><dd>${item.revision}</dd></dl>${detailLink}</article></li>`;
     }).join("")}</ol>`;
   const next = document.links.find((link) => link.rel.includes("next"));
   return page(
@@ -262,8 +355,24 @@ function htmlResponse(body: string, status = 200): Response {
       "Cache-Control": "no-store",
       "Content-Security-Policy": "default-src 'none'; style-src 'self'; img-src 'self' https:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
       "Content-Type": "text/html; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
       Vary: "Accept",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
     },
+  });
+}
+
+function privateResponse(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("Cache-Control", "no-store");
+  headers.set("Referrer-Policy", "no-referrer");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("X-Frame-Options", "DENY");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
 }
 

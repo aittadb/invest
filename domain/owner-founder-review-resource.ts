@@ -5,19 +5,26 @@ import {
   type HypermediaLink,
 } from "./public-campaign-resource.ts";
 
+export type OwnerFounderReviewCollectionItem = Readonly<{
+  reviewId: string;
+  status: FounderApplication["status"];
+  primaryContributionAreaId: string;
+  updatedAt: string;
+  revision: number;
+}>;
+
+export type OwnerFounderReviewPage = Readonly<{
+  items: readonly OwnerFounderReviewCollectionItem[];
+  nextCursor: string | null;
+}>;
+
 export type OwnerFounderReviewItem = Readonly<{
   reviewId: string;
   application: FounderApplication;
 }>;
 
-export type OwnerFounderReviewPage = Readonly<{
-  items: readonly OwnerFounderReviewItem[];
-  nextCursor: string | null;
-}>;
-
 export type OwnerFounderReviewSummary = Readonly<{
   review_id: string;
-  application_id: string;
   status: FounderApplication["status"];
   primary_contribution_area_id: string;
   updated_at: string;
@@ -70,15 +77,18 @@ export function createOwnerFounderReviewCollectionDocument(
   requestUrl: string,
   page: OwnerFounderReviewPage,
   pageSize: number,
+  detailAvailable: boolean,
 ): OwnerFounderReviewCollectionDocument {
   const self = new URL(requestUrl);
   const links: HypermediaLink[] = [
     { rel: ["self"], href: self.href },
     { rel: ["owner"], href: new URL("/owner", self).href },
-    ...page.items.map((item) => ({
-      rel: ["item"],
-      href: reviewHref(self, item.reviewId),
-    })),
+    ...(detailAvailable
+      ? page.items.map((item) => ({
+          rel: ["item"],
+          href: reviewHref(self, item.reviewId),
+        }))
+      : []),
   ];
   if (page.nextCursor !== null) {
     const next = new URL(self);
@@ -150,16 +160,14 @@ export function createOwnerFounderReviewDetailDocument(
 }
 
 function projectSummary(
-  item: OwnerFounderReviewItem,
+  item: OwnerFounderReviewCollectionItem,
 ): OwnerFounderReviewSummary {
   return {
     review_id: item.reviewId,
-    application_id: item.application.id,
-    status: item.application.status,
-    primary_contribution_area_id:
-      item.application.fields.primaryContributionAreaId,
-    updated_at: item.application.updatedAt,
-    revision: item.application.revision,
+    status: item.status,
+    primary_contribution_area_id: item.primaryContributionAreaId,
+    updated_at: item.updatedAt,
+    revision: item.revision,
   };
 }
 

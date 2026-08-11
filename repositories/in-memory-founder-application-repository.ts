@@ -59,6 +59,11 @@ export const MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS =
     (1 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS);
 export const MAX_FOUNDER_APPLICATION_STORAGE_READS =
   3 + 2 * MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS;
+export const MAX_FOUNDER_APPLICATION_REVIEW_PAGE_SIZE = 25;
+export const MAX_FOUNDER_APPLICATION_REVIEW_CURSOR_CHARACTERS = 2_048;
+export const MAX_FOUNDER_APPLICATION_REVIEW_PAGE_RECORD_READS =
+  MAX_FOUNDER_APPLICATION_REVIEW_PAGE_SIZE *
+  MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS;
 
 const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const CURRENT_DOCUMENT_KEYS = new Set([
@@ -168,21 +173,35 @@ export type FounderApplicationReviewItem = Readonly<{
   application: FounderApplication;
 }>;
 
+export type FounderApplicationReviewCollectionItem = Readonly<{
+  reviewId: string;
+  status: FounderApplication["status"];
+  primaryContributionAreaId: string;
+  updatedAt: Timestamp;
+  revision: number;
+}>;
+
 export type FounderApplicationReviewListRequest = Readonly<{
   limit: number;
   cursor?: StorageCursor;
 }>;
 
 export type FounderApplicationReviewPage = Readonly<{
-  items: readonly FounderApplicationReviewItem[];
+  items: readonly FounderApplicationReviewCollectionItem[];
   nextCursor: StorageCursor | null;
 }>;
 
-/** Configured-owner read contract over all current founder applications. */
-export interface FounderApplicationReviewRepository {
+/** Owner collection contract over all current founder applications. */
+export interface FounderApplicationReviewCollectionRepository {
   list(
     request: FounderApplicationReviewListRequest,
   ): Promise<FounderApplicationReviewPage>;
+}
+
+/** Development contract that also retains the pending detail lookup. */
+export interface FounderApplicationReviewRepository
+  extends FounderApplicationReviewCollectionRepository
+{
   get(reviewId: unknown): Promise<FounderApplicationReviewItem | null>;
 }
 
@@ -238,6 +257,10 @@ type StoredCurrent = Readonly<{
   operationFingerprint: string;
   applicationId: FounderApplicationId;
   applicantSubject: ActorSubject;
+  status: FounderApplication["status"];
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  withdrawnAt: Timestamp | null;
   revision: number;
   fields: StoredFieldsReference;
   document: StorageDocument;
@@ -617,6 +640,52 @@ export class StorageFounderApplicationRepository
   }
 }
 
+/** Persistent, bounded collection projection over current founder records. */
+export class StorageFounderApplicationReviewCollectionRepository
+implements FounderApplicationReviewCollectionRepository {
+  readonly #storage: StorageAdapter;
+
+  constructor(storage: StorageAdapter) {
+    this.#storage = requiredStorageAdapter(storage);
+    Object.freeze(this);
+  }
+
+  async list(
+    request: FounderApplicationReviewListRequest,
+  ): Promise<FounderApplicationReviewPage> {
+    try {
+      const parsed = parseFounderReviewListRequest(request);
+      const storageRequest = Object.freeze({
+        collection: CURRENT_APPLICATIONS,
+        limit: parsed.limit,
+        ...(parsed.cursor === undefined ? {} : { cursor: parsed.cursor }),
+      });
+      assertStorageListBoundary(storageRequest);
+      const page = exactFounderReviewStoragePage(
+        await this.#storage.list(storageRequest),
+        parsed,
+      );
+      const items = await Promise.all(
+        page.items.map((record) =>
+          decodeFounderApplicationReviewCollectionItem(this.#storage, record)
+        ),
+      );
+      return Object.freeze({
+        items: Object.freeze(items),
+        nextCursor: page.nextCursor,
+      });
+    } catch (error) {
+      if (
+        error instanceof StorageFailure &&
+        error.code === "INVALID_REQUEST"
+      ) {
+        throw new StorageFailure("INVALID_REQUEST");
+      }
+      throw new StorageFailure("UNAVAILABLE");
+    }
+  }
+}
+
 /**
  * Development owner-review projection over the same adapter records.
  * Opaque review IDs keep applicant subjects out of owner navigation URLs.
@@ -658,11 +727,11 @@ implements FounderApplicationReviewRepository {
     };
     assertStorageListBoundary(storageRequest);
     const page = await this.#storage.list(storageRequest);
-    const items = await Promise.all(
+    const reviewItems = await Promise.all(
       page.items.map((record) => this.#decodeReviewItem(record)),
     );
     return Object.freeze({
-      items: Object.freeze(items),
+      items: Object.freeze(reviewItems.map(projectFounderReviewCollectionItem)),
       nextCursor: page.nextCursor,
     });
   }
@@ -705,6 +774,130 @@ implements FounderApplicationReviewRepository {
       application: stored.application,
     });
   }
+}
+
+function parseFounderReviewListRequest(
+  value: unknown,
+): FounderApplicationReviewListRequest {
+  const source = exactDataObject(value, ["limit"]) ??
+    exactDataObject(value, ["limit", "cursor"]);
+  if (
+    source === null ||
+    !Number.isSafeInteger(source.limit) ||
+    (source.limit as number) < 1 ||
+    (source.limit as number) > MAX_FOUNDER_APPLICATION_REVIEW_PAGE_SIZE
+  ) {
+    invalidRequest();
+  }
+  const cursor = Object.hasOwn(source, "cursor")
+    ? requiredFounderReviewCursor(source.cursor)
+    : undefined;
+  return Object.freeze({
+    limit: source.limit as number,
+    ...(cursor === undefined ? {} : { cursor }),
+  });
+}
+
+function exactFounderReviewStoragePage(
+  value: unknown,
+  request: FounderApplicationReviewListRequest,
+): Readonly<{
+  items: readonly StorageRecord[];
+  nextCursor: StorageCursor | null;
+}> {
+  const source = exactDataObject(value, ["items", "nextCursor"]);
+  const candidates = source === null
+    ? null
+    : exactBoundedArrayValues(source.items, request.limit);
+  if (source === null || candidates === null) unavailable();
+
+  const items = candidates.map(exactFounderReviewStorageRecord);
+  let priorId: string | null = null;
+  for (const item of items) {
+    if (
+      item.key.collection !== CURRENT_APPLICATIONS ||
+      (priorId !== null && priorId >= item.key.id)
+    ) {
+      unavailable();
+    }
+    priorId = item.key.id;
+  }
+
+  const nextCursor = source.nextCursor === null
+    ? null
+    : storedFounderReviewCursor(source.nextCursor);
+  if (
+    nextCursor !== null &&
+    (items.length === 0 || nextCursor === request.cursor)
+  ) {
+    unavailable();
+  }
+  return Object.freeze({ items: Object.freeze(items), nextCursor });
+}
+
+function exactFounderReviewStorageRecord(value: unknown): StorageRecord {
+  const source = exactDataObject(value, ["key", "revision", "value"]);
+  const keySource = source === null
+    ? null
+    : exactDataObject(source.key, ["collection", "id"]);
+  const parsedKey = keySource === null
+    ? null
+    : parseStorageKey(keySource.collection, keySource.id);
+  if (
+    source === null ||
+    parsedKey === null ||
+    !parsedKey.ok ||
+    !Number.isSafeInteger(source.revision) ||
+    (source.revision as number) < 1 ||
+    objectRecord(source.value) === null
+  ) {
+    unavailable();
+  }
+  return Object.freeze({
+    key: Object.freeze({ ...parsedKey.value }),
+    revision: source.revision as number,
+    value: source.value as StorageDocument,
+  });
+}
+
+async function decodeFounderApplicationReviewCollectionItem(
+  storage: StorageAdapter,
+  record: StorageRecord,
+): Promise<FounderApplicationReviewCollectionItem> {
+  const coordinates = storedApplicationCoordinates(record.value);
+  const key = await currentApplicationKey(coordinates.subject, coordinates.id);
+  const current = decodeStoredCurrent(
+    record,
+    key,
+    coordinates.subject,
+    coordinates.id,
+  );
+  const fields = await readStoredFields(
+    storage,
+    coordinates.subject,
+    coordinates.id,
+    current.fields,
+  );
+  return Object.freeze({
+    reviewId: await founderReviewId(coordinates.subject, coordinates.id),
+    status: current.status,
+    primaryContributionAreaId: fields.fields.primaryContributionAreaId,
+    updatedAt: current.updatedAt,
+    revision: current.revision,
+  });
+}
+
+function projectFounderReviewCollectionItem(
+  item: FounderApplicationReviewItem,
+): FounderApplicationReviewCollectionItem {
+  return Object.freeze({
+    reviewId: item.reviewId,
+    status: item.application.status,
+    primaryContributionAreaId:
+      item.application.fields.primaryContributionAreaId,
+    updatedAt: item.application.updatedAt,
+    revision: item.application.revision,
+  });
 }
 
 async function loadCurrentApplication(
@@ -920,12 +1113,26 @@ function decodeStoredCurrent(
   const operationFingerprint = storedFingerprint(source.operationFingerprint);
   const applicationId = storedApplicationId(source.applicationId);
   const applicantSubject = storedActorSubject(source.applicantSubject);
+  const status = storedFounderApplicationStatus(source.status);
+  const createdAt = storedTimestamp(source.createdAt);
+  const updatedAt = storedTimestamp(source.updatedAt);
+  const withdrawnAt = source.withdrawnAt === null
+    ? null
+    : storedTimestamp(source.withdrawnAt);
   const revision = storedRevision(source.revision);
   const fields = storedFieldsReference(source.fields);
   if (
     applicationId !== expectedId ||
     applicantSubject !== expectedSubject ||
-    record.revision !== revision
+    record.revision !== revision ||
+    Date.parse(updatedAt) < Date.parse(createdAt) ||
+    (status === "received" && withdrawnAt !== null) ||
+    (status === "withdrawn" && withdrawnAt !== updatedAt) ||
+    (revision === 1 &&
+      (status !== "received" || updatedAt !== createdAt)) ||
+    (status === "received" && fields.revision !== revision) ||
+    (status === "withdrawn" &&
+      (revision < 2 || fields.revision !== revision - 1))
   ) {
     unavailable();
   }
@@ -934,6 +1141,10 @@ function decodeStoredCurrent(
     operationFingerprint,
     applicationId,
     applicantSubject,
+    status,
+    createdAt,
+    updatedAt,
+    withdrawnAt,
     revision,
     fields,
     document: record.value,
@@ -1562,6 +1773,13 @@ function storedTransitionKind(value: unknown): TransitionKind {
   return value;
 }
 
+function storedFounderApplicationStatus(
+  value: unknown,
+): FounderApplication["status"] {
+  if (value !== "received" && value !== "withdrawn") unavailable();
+  return value;
+}
+
 function verifyExactRecord(
   record: unknown,
   expectedKey: StorageKey,
@@ -1857,6 +2075,63 @@ function exactArrayValues(
     return Object.freeze(values);
   } catch {
     return null;
+  }
+}
+
+function exactBoundedArrayValues(
+  value: unknown,
+  maximumLength: number,
+): readonly unknown[] | null {
+  if (!Array.isArray(value) || value.length > maximumLength) return null;
+  return exactArrayValues(value, value.length);
+}
+
+function requiredFounderReviewCursor(value: unknown): StorageCursor {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > MAX_FOUNDER_APPLICATION_REVIEW_CURSOR_CHARACTERS ||
+    hasControlCharacter(value)
+  ) {
+    invalidRequest();
+  }
+  return value as StorageCursor;
+}
+
+function storedFounderReviewCursor(value: unknown): StorageCursor {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > MAX_FOUNDER_APPLICATION_REVIEW_CURSOR_CHARACTERS ||
+    hasControlCharacter(value)
+  ) {
+    unavailable();
+  }
+  return value as StorageCursor;
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const point = character.codePointAt(0);
+    if (point !== undefined && (point <= 31 || point === 127)) return true;
+  }
+  return false;
+}
+
+function requiredStorageAdapter(value: unknown): StorageAdapter {
+  try {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      typeof (value as StorageAdapter).read !== "function" ||
+      typeof (value as StorageAdapter).list !== "function" ||
+      typeof (value as StorageAdapter).transact !== "function"
+    ) {
+      invalidRequest();
+    }
+    return value as StorageAdapter;
+  } catch {
+    invalidRequest();
   }
 }
 

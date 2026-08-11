@@ -205,6 +205,16 @@ Founder history contains at most 16 transitions and reserves its final slot for 
 
 HTML and JSON mutations use the same origin-bound, actor-bound, one-use browser proof. The founder route narrows the shared mutation envelope and is the only route that permits repeated `secondary-contribution-area-ids`. Founder mutations call only the subject-bound founder repository, so an account's investment indications and aggregates are neither prerequisites nor side effects.
 
+## Owner Founder-Application Collection
+
+`GET /owner/founder-applications` is the configured owner's persistent founder-review collection. It accepts no query fields on the first default page, or an exact `page_size` from 1 through 25 and optional opaque `cursor`; a cursor is accepted only together with its page size. Duplicate fields, unknown fields, non-canonical integers, empty or control-bearing cursors, and cursors above 2,048 characters return a generic `400` without reflecting the rejected query.
+
+Each summary contains only `review_id`, `status`, `primary_contribution_area_id`, `updated_at`, and `revision`. The production collection renders the one-way review identifier as a reference but does not advertise an unavailable detail transition. Applicant subjects, internal application IDs, expertise, notes, profile links, field history, storage keys, and credentials do not enter the document, HTML, links, or errors. The collection does not install or imply the founder-review detail resource.
+
+The `self`, `owner`, and optional `next` links in version `0.1` JSON are the same transitions rendered in HTML. Both representations use the same owner authorization, page parser, persistent repository result, and summary allowlist. Anonymous callers receive `401`; authenticated non-owners receive generic `404`; either denial occurs before collection storage access. All responses are private and non-cacheable with no-referrer and content-sniffing protections.
+
+The continuation value is the bounded-storage protocol's opaque cursor, not a subject, record key, offset derived by this application, or client-selected identity. AittaDB binds it to the credential namespace, collection, and page parameters and guarantees that cursor page state contains no principal or physical-key detail. The application performs one finite list per HTTP request, rejects no-progress or empty continuation pages, verifies each bounded current application and current field payload, and can continue a prior cursor after a Worker restart.
+
 ## Owner Investment-Indication Moderation
 
 `GET /owner/investment-indications` exposes a bounded owner-only collection with opaque review identifiers. It accepts only `page_size`, bounded from 1 through 100, and an optional opaque `cursor`. Summary data includes indication kind, lifecycle, amount, currency, revision, update time, and manual-notification state; internal indication identifiers and participant subjects do not enter collection links.

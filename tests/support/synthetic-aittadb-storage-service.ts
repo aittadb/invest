@@ -54,6 +54,7 @@ export class SyntheticAittaDBStorageService {
   readonly #records = new Map<string, StoredRecord>();
   readonly #operations = new Map<string, OperationReceipt>();
   readonly readKeys: string[] = [];
+  readonly listCollections: string[] = [];
   readonly transactionOperationIds: string[] = [];
   tokenRequests = 0;
   discoveryRequests = 0;
@@ -175,6 +176,7 @@ export class SyntheticAittaDBStorageService {
 
   #list(url: URL): Response {
     const collection = url.searchParams.get("collection") ?? "";
+    this.listCollections.push(collection);
     const limit = Number(url.searchParams.get("limit"));
     const cursorValue = url.searchParams.get("cursor");
     const offset = cursorValue === null ? 0 : Number(cursorValue);

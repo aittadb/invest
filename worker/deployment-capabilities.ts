@@ -13,6 +13,7 @@ import type { InvestmentIndicationParsingOptions } from "../domain/investment-in
 import type { ParticipantAccount } from "../domain/participant-profile.ts";
 import type { ParticipantRequestRepositoryScope } from "../repositories/storage-application-repository-factory.ts";
 import type { ParticipantRegistrationRepository } from "../repositories/in-memory-participant-repository.ts";
+import type { FounderApplicationReviewCollectionRepository } from "../repositories/in-memory-founder-application-repository.ts";
 import type { OwnerCampaignEditorRepository } from "../services/owner-campaign-editor.ts";
 import type { OwnerPackageWorkspaceService } from "../services/owner-package-workspace.ts";
 import type { AuditEventReader } from "../repositories/in-memory-audit-notification-repositories.ts";
@@ -35,6 +36,7 @@ export type ApplicationRepositoryFactory = Readonly<{
   publicCampaignStateReader(): PublicCampaignStateReader;
   ownerPackageWorkspace(): OwnerPackageWorkspaceService;
   ownerAuditEvents(): AuditEventReader;
+  ownerFounderApplicationReviews(): FounderApplicationReviewCollectionRepository;
   participantRequest(
     account: ParticipantAccount,
   ): ParticipantRequestRepositoryScope;

@@ -6,6 +6,7 @@ import {
   OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER,
   OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER,
   OWNER_INDICATION_MODERATION_HEADER,
+  OWNER_FOUNDER_REVIEW_HEADER,
   OWNER_PACKAGE_WORKSPACE_HEADER,
   OWNER_REVIEW_EXPORTS_HEADER,
   PARTICIPANT_FOUNDER_INTEREST_HEADER,
@@ -15,6 +16,7 @@ import {
   hasOwnerCampaignEditorCapability,
   hasOwnerCampaignSetupCapability,
   hasOwnerIndicationModeration,
+  hasOwnerFounderReview,
   hasOwnerPackageWorkspace,
   hasOwnerReviewExports,
   hasParticipantFounderInterest,
@@ -31,6 +33,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
       [OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER]: "available",
       [OWNER_INDICATION_MODERATION_HEADER]: "available",
       [OWNER_REVIEW_EXPORTS_HEADER]: "available",
+      [OWNER_FOUNDER_REVIEW_HEADER]: "available",
       [PARTICIPANT_FOUNDER_INTEREST_HEADER]: "available",
       [PARTICIPANT_INVESTMENT_INTERESTS_HEADER]: "available",
       [PARTICIPANT_PROFILE_SELF_SERVICE_HEADER]: "available",
@@ -43,6 +46,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
     ownerCampaignSetup: false,
     ownerIndicationModeration: false,
     ownerReviewExports: false,
+    ownerFounderReview: false,
     participantFounderInterest: false,
     participantInvestmentInterests: false,
     participantProfileSelfService: false,
@@ -59,6 +63,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   );
   assert.equal(unavailable.headers.get(OWNER_INDICATION_MODERATION_HEADER), null);
   assert.equal(unavailable.headers.get(OWNER_REVIEW_EXPORTS_HEADER), null);
+  assert.equal(unavailable.headers.get(OWNER_FOUNDER_REVIEW_HEADER), null);
   assert.equal(unavailable.headers.get(PARTICIPANT_FOUNDER_INTEREST_HEADER), null);
   assert.equal(
     unavailable.headers.get(PARTICIPANT_INVESTMENT_INTERESTS_HEADER),
@@ -74,6 +79,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   assert.equal(hasOwnerCampaignSetupCapability("AVAILABLE"), false);
   assert.equal(hasOwnerIndicationModeration("AVAILABLE"), false);
   assert.equal(hasOwnerReviewExports("AVAILABLE"), false);
+  assert.equal(hasOwnerFounderReview("AVAILABLE"), false);
   assert.equal(hasParticipantFounderInterest("AVAILABLE"), false);
   assert.equal(hasParticipantInvestmentInterests("AVAILABLE"), false);
   assert.equal(hasParticipantProfileSelfService("AVAILABLE"), false);
@@ -85,6 +91,7 @@ test("the Worker replaces client-supplied owner feature availability", () => {
     ownerCampaignSetup: true,
     ownerIndicationModeration: true,
     ownerReviewExports: true,
+    ownerFounderReview: true,
     participantFounderInterest: true,
     participantInvestmentInterests: true,
     participantProfileSelfService: true,
@@ -121,6 +128,12 @@ test("the Worker replaces client-supplied owner feature availability", () => {
   assert.equal(
     hasOwnerReviewExports(
       available.headers.get(OWNER_REVIEW_EXPORTS_HEADER),
+    ),
+    true,
+  );
+  assert.equal(
+    hasOwnerFounderReview(
+      available.headers.get(OWNER_FOUNDER_REVIEW_HEADER),
     ),
     true,
   );

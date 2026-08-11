@@ -49,7 +49,9 @@ import {
   type PackageVersionRepository,
 } from "./in-memory-content-repository.ts";
 import {
+  StorageFounderApplicationReviewCollectionRepository,
   StorageFounderApplicationRepository,
+  type FounderApplicationReviewCollectionRepository,
   type FounderApplicationRepository,
 } from "./in-memory-founder-application-repository.ts";
 import { StorageOwnerIndicationReviewCollectionRepository } from "./in-memory-indication-repository.ts";
@@ -146,6 +148,8 @@ export class StorageApplicationRepositoryFactory {
   readonly #publicCampaignStateReader: PublicCampaignStateReader;
   readonly #ownerPackageWorkspace: RepositoryOwnerPackageWorkspaceService;
   readonly #ownerAuditEvents: AuditEventReader;
+  readonly #ownerFounderApplicationReviews:
+    FounderApplicationReviewCollectionRepository;
   readonly #participantRequest: (
     account: ParticipantAccount,
   ) => ParticipantRequestRepositoryScope;
@@ -163,6 +167,8 @@ export class StorageApplicationRepositoryFactory {
       { now: clock },
     );
     this.#ownerAuditEvents = new StorageAuditEventReader(adapter);
+    this.#ownerFounderApplicationReviews =
+      new StorageFounderApplicationReviewCollectionRepository(adapter);
     this.#participantRequest = (account) =>
       createParticipantRequestRepositoryScope(adapter, account);
     this.#participantRepositoryFor = (account) =>
@@ -215,6 +221,10 @@ export class StorageApplicationRepositoryFactory {
       configuredOwnerSubject,
       tokens,
     );
+  }
+
+  ownerFounderApplicationReviews(): FounderApplicationReviewCollectionRepository {
+    return this.#ownerFounderApplicationReviews;
   }
 
   participantRequest(

@@ -41,6 +41,7 @@ import {
   type RuntimeCampaignPreview,
 } from "../http/runtime-preview.ts";
 import type { PublicCampaignPresentationReader } from "../repositories/in-memory-campaign-repository.ts";
+import type { FounderApplicationReviewCollectionRepository } from "../repositories/in-memory-founder-application-repository.ts";
 import type {
   PublicCampaignStateReader,
   PublishedPublicCampaignState,
@@ -79,6 +80,7 @@ import {
   type OwnerAuditHistoryRouteDependencies,
 } from "./routes/owner-audit-notification-history.ts";
 import { createOwnerCampaignEditorRouteHandler } from "./routes/owner-campaign-editor.ts";
+import { createOwnerFounderReviewCollectionRouteHandler } from "./routes/owner-founder-review.ts";
 import { createOwnerInitialSetupRouteHandler } from "./routes/owner-initial-setup.ts";
 import { createOwnerRouteHandler } from "./routes/owner.ts";
 import {
@@ -128,6 +130,7 @@ export type ApplicationWorkerDependencies = Readonly<{
   ownerIndicationModeration?: OwnerIndicationModerationRouteDependencies;
   ownerReviewExports?: OwnerReviewExportRouteDependencies;
   ownerAuditHistory?: OwnerAuditHistoryRouteDependencies;
+  ownerFounderReview?: FounderApplicationReviewCollectionRepository;
   participantFounderInterest?: FounderInterestRouteDependencies;
   participantInvestmentInterests?: InvestmentInterestRouteDependencies;
   participantProfile?: ParticipantProfileRouteDependencies;
@@ -208,6 +211,11 @@ export function createApplicationWorker(
           runtimeOwnerAuditHistory(applicationRuntime)
         : undefined;
       const ownerAuditHistoryAvailable = ownerAuditHistory !== undefined;
+      const ownerFounderReview = dependencies.dispatchRoute === undefined
+        ? dependencies.ownerFounderReview ??
+          runtimeOwnerFounderReview(applicationRuntime)
+        : undefined;
+      const ownerFounderReviewAvailable = ownerFounderReview !== undefined;
       const participantInvestmentInterestsAvailable =
         dependencies.dispatchRoute === undefined &&
         dependencies.participantInvestmentInterests !== undefined;
@@ -310,6 +318,8 @@ export function createApplicationWorker(
                 normalApplication && ownerReviewExportsAvailable,
               ownerAuditHistory:
                 normalApplication && ownerAuditHistoryAvailable && isOwner,
+              ownerFounderReview:
+                normalApplication && ownerFounderReviewAvailable && isOwner,
               participantFounderInterest:
                 normalApplication && participantFounderInterestAvailable,
               participantInvestmentInterests:
@@ -338,6 +348,7 @@ export function createApplicationWorker(
         ownerIndicationModerationAvailable ||
         ownerReviewExportsAvailable ||
         ownerAuditHistoryAvailable ||
+        ownerFounderReviewAvailable ||
         participantFounderInterestAvailable ||
         participantInvestmentInterestsAvailable ||
         campaignEditorAvailable ||
@@ -351,6 +362,7 @@ export function createApplicationWorker(
               participantRegistration,
               participantProfile,
               ownerAuditHistory,
+              ownerFounderReview,
               participantFounderInterest ?? null,
               {
                 owner: ownerPackage,
@@ -365,6 +377,7 @@ export function createApplicationWorker(
                 ownerIndicationModerationAvailable,
                 ownerReviewExportsAvailable,
                 ownerAuditHistoryAvailable,
+                ownerFounderReviewAvailable,
                 participantFounderInterestAvailable,
                 participantInvestmentInterestsAvailable,
                 campaignEditorAvailable,
@@ -412,6 +425,7 @@ type InjectedRouteAvailability = Readonly<{
   ownerIndicationModerationAvailable: boolean;
   ownerReviewExportsAvailable: boolean;
   ownerAuditHistoryAvailable: boolean;
+  ownerFounderReviewAvailable: boolean;
   participantFounderInterestAvailable: boolean;
   participantInvestmentInterestsAvailable: boolean;
   campaignEditorAvailable: boolean;
@@ -432,6 +446,9 @@ function createInjectedRouteDispatcher(
   participantRegistration: ParticipantRegistrationRouteDependencies | null,
   participantProfile: ParticipantProfileRouteDependencies | null,
   ownerAuditHistory: OwnerAuditHistoryRouteDependencies | undefined,
+  ownerFounderReview:
+    | FounderApplicationReviewCollectionRepository
+    | undefined,
   participantFounderInterest: FounderInterestRouteDependencies | null,
   packageRoutes: ResolvedPackageRoutes,
   available: InjectedRouteAvailability,
@@ -495,6 +512,11 @@ function createInjectedRouteDispatcher(
         ...(ownerAuditHistory
           ? [createOwnerAuditHistoryRouteHandler(ownerAuditHistory)]
           : []),
+        ...(ownerFounderReview
+          ? [createOwnerFounderReviewCollectionRouteHandler(
+              ownerFounderReview,
+            )]
+          : []),
         ...(campaignWorkspace
           ? [
               createOwnerInitialSetupRouteHandler({
@@ -523,6 +545,7 @@ function createInjectedRouteDispatcher(
         indicationModeration: available.ownerIndicationModerationAvailable,
         reviewExports: available.ownerReviewExportsAvailable,
         auditHistory: available.ownerAuditHistoryAvailable,
+        founderApplicationReview: available.ownerFounderReviewAvailable,
         campaignEditor: available.campaignEditorAvailable,
         campaignSetup: available.campaignSetupAvailable,
         aittadbConnection: available.ownerOAuthProofAvailable,
@@ -941,6 +964,17 @@ function runtimeOwnerAuditHistory(
   }
 }
 
+function runtimeOwnerFounderReview(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+): FounderApplicationReviewCollectionRepository | undefined {
+  if (runtime === null) return undefined;
+  try {
+    return runtime.repositoryFactory.ownerFounderApplicationReviews();
+  } catch {
+    return undefined;
+  }
+}
+
 async function resolveApplicationRuntime(
   dependencies: ApplicationWorkerDependencies,
   env: InvestorAppEnv,
@@ -984,6 +1018,7 @@ function withRuntimeConfiguration(
     ownerIndicationModeration: boolean;
     ownerReviewExports: boolean;
     ownerAuditHistory: boolean;
+    ownerFounderReview: boolean;
     participantFounderInterest: boolean;
     participantInvestmentInterests: boolean;
     participantProfileSelfService: boolean;

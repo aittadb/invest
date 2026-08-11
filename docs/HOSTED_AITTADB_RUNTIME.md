@@ -8,10 +8,12 @@ token provider, one bounded AittaDB `StorageAdapter`, one backend repository
 factory, and one browser-mutation session per immutable Sites environment.
 
 The runtime now composes named persistent campaign, package, participant-access,
-and participant founder-application capabilities over that adapter.
+participant founder-application, and owner founder-review collection
+capabilities over that adapter.
 `createApplicationWorker` installs
-`/owner/setup`, campaign editing, draft preview, publish/unpublish, and owner
-package management only in the configured-owner route group. For a signed-in
+`/owner/setup`, campaign editing, draft preview, publish/unpublish, owner package
+management, and the exact founder-review collection only in the
+configured-owner route group. For a signed-in
 non-owner, it derives the trusted `participantAccess` projection from that
 subject's persistent profile, current package, and current acknowledgment gate.
 An unregistered subject stops after the profile read without opening package or
@@ -130,7 +132,7 @@ redirect and carry the bearer value only to the validated transport target.
 adapter and exposes only named, narrow capability methods for browser-mutation
 replay, the atomic campaign/audit repository, the public campaign projection
 reader, the owner package workspace, the owner-bound indication-review
-collection, a participant package reader,
+collection, the bounded owner founder-review collection, a participant package reader,
 subject-bound package acknowledgment, one participant-access state reader, and
 one participant-bound founder-application pair.
 That reader creates fresh profile and acknowledgment repositories for each
@@ -166,6 +168,15 @@ The future composition must import one stable, non-extractable, deployment-only
 AES-GCM key and inject the stateless token boundary; no key material, backend
 cursor, or decrypted current-record key may enter runtime configuration output,
 campaign content, logs, or browser-visible failures.
+
+The owner founder-review capability is a singleton read port with only `list`.
+It exposes neither the adapter nor a detail lookup. Each request lists at most 25
+current founder records, validates each current field payload within a fixed
+300-record-read ceiling, and returns only one-way review identifiers and the
+collection summary allowlist. A new factory can continue an existing AittaDB
+cursor after a Worker restart. AittaDB's validated cursor contract keeps
+principal, namespace, and physical-key data out of that continuation; the
+Worker does not log or decode it.
 
 `StorageCampaignRepository` is production-neutral and retains no state outside
 its supplied adapter. `StorageFounderApplicationRepository` follows the same

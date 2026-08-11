@@ -13,6 +13,7 @@ import {
   hasOwnerAuditHistory,
   hasOwnerCampaignEditorCapability,
   hasOwnerCampaignSetupCapability,
+  hasOwnerFounderReview,
   hasOwnerIndicationModeration,
   hasOwnerPackageWorkspace,
   hasOwnerReviewExports,
@@ -20,6 +21,7 @@ import {
   OWNER_AUDIT_HISTORY_HEADER,
   OWNER_CAMPAIGN_EDITOR_CAPABILITY_HEADER,
   OWNER_CAMPAIGN_SETUP_CAPABILITY_HEADER,
+  OWNER_FOUNDER_REVIEW_HEADER,
   OWNER_INDICATION_MODERATION_HEADER,
   OWNER_PACKAGE_WORKSPACE_HEADER,
   OWNER_REVIEW_EXPORTS_HEADER,
@@ -59,6 +61,9 @@ export default async function OwnerHome() {
   const auditHistoryAvailable = hasOwnerAuditHistory(
     requestHeaders.get(OWNER_AUDIT_HISTORY_HEADER),
   );
+  const founderReviewAvailable = hasOwnerFounderReview(
+    requestHeaders.get(OWNER_FOUNDER_REVIEW_HEADER),
+  );
   const setupState = campaign ? "Configured" : "Setup required";
   const publicationState = campaign
     ? campaign.published
@@ -83,6 +88,9 @@ export default async function OwnerHome() {
           ) : null}
           {indicationModerationAvailable ? (
             <Link href="/owner/investment-indications">Investment indications</Link>
+          ) : null}
+          {founderReviewAvailable ? (
+            <Link href="/owner/founder-applications">Founder applications</Link>
           ) : null}
           {aittadbConnectionAvailable ? (
             <Link href="/owner/aittadb-connection">AittaDB connection</Link>
