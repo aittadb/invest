@@ -2630,6 +2630,79 @@ test("empty account deletion conflicts with a concurrent indication create", asy
   assert.equal(activeOwned(await repository.listOwned()), 1);
 });
 
+test("account deletion witness barriers conflict with direct activation", async (t) => {
+  await t.test("create", async () => {
+    const state = new MemoryStorageState();
+    const storage = new MemoryStorageAdapter(state);
+    await initializeEmptyOwnership(storage, ALICE, "deletion-direct-create-race");
+    const operationId = "participant-operation:deletion-direct-create-race";
+    const staged = new StagedStorageTransaction(storage, operationId);
+    await stageParticipantAccountDeletionInvestmentWithdrawalSet(
+      staged,
+      ALICE,
+      AMOUNT,
+      { operationId, requestedAt: "2026-08-12T12:00:00.000Z" },
+    );
+
+    await new DevelopmentInMemoryIndicationRepository(
+      storage,
+      ALICE,
+      OWNER,
+      AMOUNT,
+    ).create({
+      operationId: "indication-operation:deletion-direct-create-race",
+      id: "investment-indication:deletion-direct-create-race",
+      expectedRevision: null,
+      occurredAt: "2026-08-12T12:01:00.000Z",
+      historyEntryId: "indication-history:deletion-direct-create-race",
+      fields: personalFields(),
+    }, await currentContext(ALICE, "deletion-direct-create-race"));
+    const before = storedStateFingerprint(state);
+    const failure = await captureStorageFailure(() => staged.commit());
+    assert.equal(failure.code, "PRECONDITION_FAILED");
+    assert.equal(storedStateFingerprint(state), before);
+  });
+
+  await t.test("reactivation", async () => {
+    const seeded = await seedAccountDeletionActiveSet(
+      1,
+      "deletion-direct-reactivation-race",
+    );
+    const created = seeded.created[0];
+    assert(created);
+    const withdrawn = await seeded.service.withdraw({
+      operationId: "investment-operation:deletion-direct-reactivation-withdraw",
+      indicationId: created.snapshot.id,
+      expectedRevision: created.snapshot.revision,
+    });
+    const operationId = "participant-operation:deletion-direct-reactivation-race";
+    const staged = new StagedStorageTransaction(seeded.storage, operationId);
+    await stageParticipantAccountDeletionInvestmentWithdrawalSet(
+      staged,
+      ALICE,
+      AMOUNT,
+      { operationId, requestedAt: "2026-08-12T12:02:00.000Z" },
+    );
+
+    await new DevelopmentInMemoryIndicationRepository(
+      seeded.storage,
+      ALICE,
+      OWNER,
+      AMOUNT,
+    ).reactivate({
+      operationId: "indication-operation:deletion-direct-reactivation-race",
+      id: withdrawn.snapshot.id,
+      expectedRevision: withdrawn.snapshot.revision,
+      occurredAt: "2026-08-12T12:03:00.000Z",
+      historyEntryId: "indication-history:deletion-direct-reactivation-race",
+    }, seeded.context);
+    const before = storedStateFingerprint(seeded.state);
+    const failure = await captureStorageFailure(() => staged.commit());
+    assert.equal(failure.code, "PRECONDITION_FAILED");
+    assert.equal(storedStateFingerprint(seeded.state), before);
+  });
+});
+
 test("account-deletion withdrawal staging fails closed on stale durable state", async () => {
   const seeded = await seedAccountDeletionActiveSet(1, "deletion-stale");
   const created = seeded.created[0];
