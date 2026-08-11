@@ -1,4 +1,5 @@
 import {
+  MANUAL_NOTIFICATION_LIMITS,
   createManualNotificationRecord,
   markManualNotificationSent,
   parseAuditAppendIntent,
@@ -59,6 +60,13 @@ const NOTIFICATION_RECORD_KEYS = new Set([
   "copyEvidence",
   "sentMarker",
 ]);
+
+/** Initial template plus every bounded copy fact and the optional sent fact. */
+export const MAX_MANUAL_NOTIFICATION_REVISIONS =
+  2 + MANUAL_NOTIFICATION_LIMITS.copyEvidence;
+/** One current read followed by every immutable revision read. */
+export const MAX_MANUAL_NOTIFICATION_STORAGE_READS =
+  1 + MAX_MANUAL_NOTIFICATION_REVISIONS;
 
 export type AuditAppendResult = Readonly<{
   event: AuditEvent;
@@ -908,7 +916,8 @@ async function decodeNotificationSnapshot(
     !hasExactKeys(source, NOTIFICATION_DOCUMENT_KEYS) ||
     source.kind !== "manual-notification-record" ||
     source.schemaVersion !== NOTIFICATION_SCHEMA_VERSION ||
-    !isPositiveSafeInteger(source.revision)
+    !isPositiveSafeInteger(source.revision) ||
+    source.revision > MAX_MANUAL_NOTIFICATION_REVISIONS
   ) {
     unavailable();
   }
@@ -922,6 +931,10 @@ async function decodeNotificationSnapshot(
   }
 
   const record = reconstructNotificationRecord(source.record);
+  if (
+    revision !== 1 + record.copyEvidence.length +
+      (record.sentMarker === null ? 0 : 1)
+  ) unavailable();
   if (expectedId !== null && record.template.id !== expectedId) unavailable();
   const actualKey = recordKind === "current"
     ? await currentNotificationKey(record.template.id)

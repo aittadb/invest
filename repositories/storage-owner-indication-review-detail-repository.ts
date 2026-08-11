@@ -25,12 +25,28 @@ import {
   ownerIndicationRejectionNotificationId,
   ownerIndicationRejectionNotificationPurposeId,
 } from "../services/owner-indication-notification-identity.ts";
-import { DevelopmentInMemoryManualNotificationRepository } from "./in-memory-audit-notification-repositories.ts";
-import { DevelopmentInMemoryIndicationRepository } from "./in-memory-indication-repository.ts";
+import {
+  DevelopmentInMemoryManualNotificationRepository,
+  MAX_MANUAL_NOTIFICATION_STORAGE_READS,
+} from "./in-memory-audit-notification-repositories.ts";
+import {
+  DevelopmentInMemoryIndicationRepository,
+  MAX_INDICATION_MATERIALIZATION_READS,
+} from "./in-memory-indication-repository.ts";
 
 const MAX_REVIEW_ID_LENGTH = 192;
 const STORAGE_KEY_KEYS = new Set(["collection", "id"]);
 const CURRENT_KEY_PATTERN = /^indication-current:[0-9a-f]{64}$/u;
+
+/**
+ * V1 has no directly linked historical owner-authorization evidence. Activity
+ * therefore remains projectable only under rejecting-owner continuity.
+ */
+export const OWNER_INDICATION_NOTIFICATION_ACTIVITY_POLICY =
+  "rejecting-owner-continuity-v1" as const;
+export const MAX_OWNER_INDICATION_REVIEW_DETAIL_STORAGE_READS =
+  MAX_INDICATION_MATERIALIZATION_READS +
+  MAX_MANUAL_NOTIFICATION_STORAGE_READS;
 
 /** Narrow bridge to the deployment-key-backed opaque review token boundary. */
 export interface OwnerIndicationReviewIdResolver {
@@ -158,10 +174,8 @@ function requireMatchingNotification(
 ): void {
   const template = notification.record.template;
   const rejection = indication.lifecycle.rejection;
-  const permittedActivitySubjects = new Set([
-    rejection.rejectedBy.subject,
-    configuredOwnerSubject,
-  ]);
+  const hasActivity = notification.record.copyEvidence.length > 0 ||
+    notification.record.sentMarker !== null;
   if (
     template.id !== expectedId ||
     template.purposeId !== expectedPurposeId ||
@@ -174,15 +188,15 @@ function requireMatchingNotification(
     template.generatedAt !== rejection.rejectedAt ||
     template.generatedBy.type !== "owner" ||
     template.generatedBy.subject !== rejection.rejectedBy.subject ||
+    hasActivity && configuredOwnerSubject !== rejection.rejectedBy.subject ||
     notification.record.copyEvidence.some((evidence) =>
       evidence.copiedBy.type !== "owner" ||
-      !permittedActivitySubjects.has(evidence.copiedBy.subject)
+      evidence.copiedBy.subject !== rejection.rejectedBy.subject
     ) ||
     notification.record.sentMarker !== null &&
       (notification.record.sentMarker.sentBy.type !== "owner" ||
-        !permittedActivitySubjects.has(
-          notification.record.sentMarker.sentBy.subject,
-        ))
+        notification.record.sentMarker.sentBy.subject !==
+          rejection.rejectedBy.subject)
   ) unavailable();
 }
 
