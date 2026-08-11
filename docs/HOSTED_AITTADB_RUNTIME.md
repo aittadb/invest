@@ -39,6 +39,11 @@ list scan. It is not installed as a hosted owner route until the separate owner
 moderation composition supplies the shared token boundary, collection, detail,
 atomic rejection, and mutation-session capabilities together.
 
+The persistent owner-rejection primitive can commit an indication transition,
+aggregate update, audit event, notification template, and retry receipt
+atomically. Hosted moderation still requires the separate route composition
+that assembles the collection, detail, rejection, and mutation-session lanes.
+
 This source composition and its deterministic protocol services are not hosted
 acceptance evidence. Activation remains blocked until the configured AittaDB
 deployment passes the required storage, authorization, quota, retention, and

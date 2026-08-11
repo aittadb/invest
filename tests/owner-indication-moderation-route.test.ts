@@ -398,6 +398,9 @@ class FakeAtomicModerationRepository
     const replay = this.#operations.get(String(request.operationId));
     if (replay) return Object.freeze({ ...replay, replayed: true });
     if (request.reviewId !== REVIEW_ID) throw new StorageFailure("NOT_FOUND");
+    if (request.indicationId !== this.#item.indication.id) {
+      throw new StorageFailure("NOT_FOUND");
+    }
     if (request.expectedRevision !== this.#item.indication.revision) {
       throw new StorageFailure("PRECONDITION_FAILED");
     }

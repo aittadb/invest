@@ -17,6 +17,7 @@ import {
 } from "../../domain/owner-indication-moderation-resource.ts";
 import {
   INVESTMENT_INDICATION_LIMITS,
+  type InvestmentIndicationId,
 } from "../../domain/investment-indication.ts";
 import { INVESTOR_APP_API_VERSION } from "../../domain/public-campaign-resource.ts";
 import {
@@ -148,8 +149,11 @@ export function createOwnerIndicationModerationRouteHandler(
       }
       const mutation = parseMutation(verified.body, verified.mediaType);
       const occurredAt = currentTimestamp(now);
+      const target = await dependencies.repository.get(route.reviewId);
+      if (target === null) throw new StorageFailure("NOT_FOUND");
       const result = await dependencies.repository.rejectWithEffects({
         reviewId: route.reviewId,
+        indicationId: target.indication.id,
         operationId: mutation.operationId,
         expectedRevision: mutation.expectedRevision,
         reason: mutation.reason,
@@ -164,6 +168,7 @@ export function createOwnerIndicationModerationRouteHandler(
         mutation.expectedRevision,
         mutation.reason,
         occurredAt,
+        target.indication.id,
       );
       const detailUrl = new URL(
         `${OWNER_INDICATIONS_PATH}/${encodeURIComponent(route.reviewId)}`,
@@ -325,6 +330,7 @@ function verifyModerationResult(
   expectedRevision: number,
   reason: string,
   requestedAt: Timestamp,
+  expectedIndicationId: InvestmentIndicationId,
 ): void {
   const indication = result.item.indication;
   const projected = projectInvestmentIndicationForAggregation(indication);
@@ -334,6 +340,7 @@ function verifyModerationResult(
   const history = indication.history.at(-1);
   if (
     result.item.reviewId !== reviewId ||
+    indication.id !== expectedIndicationId ||
     indication.lifecycle.status !== "rejected" ||
     indication.revision !== expectedRevision + 1 ||
     rejection.reason !== reason ||

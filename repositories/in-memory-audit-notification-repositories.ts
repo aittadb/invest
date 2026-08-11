@@ -588,6 +588,34 @@ export class DevelopmentInMemoryManualNotificationRepository
   }
 }
 
+/** Read one immutable private notification revision for atomic retry recovery. */
+export async function readManualNotificationRevision(
+  storage: Pick<StorageAdapter, "read">,
+  id: unknown,
+  revision: unknown,
+): Promise<ManualNotificationSnapshot | null> {
+  if (
+    typeof storage !== "object" ||
+    storage === null ||
+    typeof storage.read !== "function"
+  ) {
+    invalidRequest();
+  }
+  const notificationId = requiredNotificationId(id);
+  const expectedRevision = requiredExpectedRevision(revision);
+  const key = await notificationHistoryKey(notificationId, expectedRevision);
+  const stored = await storage.read(key);
+  return stored === null
+    ? null
+    : decodeNotificationSnapshot(
+      stored,
+      key,
+      "history",
+      notificationId,
+      expectedRevision,
+    );
+}
+
 function auditDocument(event: AuditEvent): StorageDocument {
   return Object.freeze({
     kind: "audit-event",

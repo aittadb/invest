@@ -9,6 +9,7 @@ import type {
 } from "../domain/investment-aggregate.ts";
 import type {
   InvestmentIndication,
+  InvestmentIndicationId,
   RejectedInvestmentIndication,
 } from "../domain/investment-indication.ts";
 import type {
@@ -72,6 +73,7 @@ export interface OwnerIndicationReviewDetailRepository {
 
 export type RejectIndicationWithEffectsRequest = Readonly<{
   reviewId: string;
+  indicationId: InvestmentIndicationId;
   operationId: StorageOperationId;
   expectedRevision: number;
   reason: string;
@@ -92,17 +94,22 @@ export type RejectIndicationWithEffectsResult = Readonly<{
 }>;
 
 /**
- * Strong owner-moderation port. An implementation may advertise reject only
+ * Strong owner rejection port. An implementation may advertise reject only
  * when all four effects share one atomic, idempotent commit boundary.
  */
-export interface AtomicOwnerIndicationModerationRepository
-  extends OwnerIndicationReviewDetailRepository {
+export interface AtomicOwnerIndicationRejectionRepository {
   readonly moderationConsistency:
     "atomic-indication-aggregate-audit-notification";
-  list(
-    request: OwnerIndicationModerationListRequest,
-  ): Promise<OwnerIndicationModerationPage>;
   rejectWithEffects(
     request: RejectIndicationWithEffectsRequest,
   ): Promise<RejectIndicationWithEffectsResult>;
+}
+
+/** Combined route contract assembled from independent read and write lanes. */
+export interface AtomicOwnerIndicationModerationRepository
+  extends AtomicOwnerIndicationRejectionRepository {
+  list(
+    request: OwnerIndicationModerationListRequest,
+  ): Promise<OwnerIndicationModerationPage>;
+  get(reviewId: unknown): Promise<OwnerIndicationModerationItem | null>;
 }
