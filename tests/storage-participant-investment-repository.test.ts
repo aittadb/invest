@@ -2505,7 +2505,7 @@ test("maximum ownership history remains inside the deletion read ceiling", async
   assert.equal(storedStateFingerprint(state), before);
 });
 
-test("account deletion ignores complete withdrawn and rejected ownership", async () => {
+test("account deletion barriers complete withdrawn and rejected ownership", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
   const context = await currentContext(ALICE, "deletion-inactive");
@@ -2573,7 +2573,7 @@ test("account deletion ignores complete withdrawn and rejected ownership", async
     { operationId, requestedAt: "2026-08-12T12:00:00.000Z" },
   );
   assert.deepEqual(result.withdrawals, []);
-  assert.equal(result.mutationCount, 0);
+  assert.equal(result.mutationCount, 2);
   assert.deepEqual(result.aggregate, {
     revision: 0,
     totalAmount: 0,
@@ -2582,6 +2582,52 @@ test("account deletion ignores complete withdrawn and rejected ownership", async
   });
   assert.equal(storedStateFingerprint(state), before);
   assert.equal(state.operations.size, operationsBefore);
+
+  await staged.commit();
+  assert.equal(state.operations.size, operationsBefore + 1);
+  assert.deepEqual(await new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  ).listOwned(), [
+    rejected.snapshot,
+    withdrawn.snapshot,
+  ]);
+});
+
+test("empty account deletion conflicts with a concurrent indication create", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "deletion-empty-race");
+  const operationId = "participant-operation:deletion-empty-race";
+  const staged = new StagedStorageTransaction(storage, operationId);
+  const deletion = await stageParticipantAccountDeletionInvestmentWithdrawalSet(
+    staged,
+    ALICE,
+    AMOUNT,
+    { operationId, requestedAt: "2026-08-12T12:00:00.000Z" },
+  );
+  assert.equal(deletion.mutationCount, 2);
+
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  await serviceFor(
+    repository,
+    ALICE,
+    await currentContext(ALICE, "deletion-empty-race"),
+    () => new Date("2026-08-12T12:01:00.000Z"),
+  ).create({
+    operationId: "investment-operation:deletion-empty-race-create",
+    fields: personalFields(),
+  });
+  const before = storedStateFingerprint(state);
+  const failure = await captureStorageFailure(() => staged.commit());
+  assert.equal(failure.code, "PRECONDITION_FAILED");
+  assert.equal(storedStateFingerprint(state), before);
+  assert.equal(activeOwned(await repository.listOwned()), 1);
 });
 
 test("account-deletion withdrawal staging fails closed on stale durable state", async () => {
@@ -2692,6 +2738,26 @@ test("account-deletion withdrawal staging rejects missing and overflow evidence"
     replaceFirstAggregateContributionAmount(seeded.state, 9_999);
     const before = storedStateFingerprint(seeded.state);
     const operationId = "participant-operation:deletion-corrupt-contribution";
+    const failure = await captureStorageFailure(() =>
+      stageParticipantAccountDeletionInvestmentWithdrawalSet(
+        new StagedStorageTransaction(seeded.storage, operationId),
+        ALICE,
+        AMOUNT,
+        { operationId, requestedAt: "2026-08-12T12:00:00.000Z" },
+      )
+    );
+    assert.equal(failure.code, "UNAVAILABLE");
+    assert.equal(storedStateFingerprint(seeded.state), before);
+  });
+
+  await t.test("inflated complete aggregate snapshot", async () => {
+    const seeded = await seedAccountDeletionActiveSet(
+      1,
+      "deletion-corrupt-aggregate",
+    );
+    replaceAggregateTotal(seeded.state, 9_999);
+    const before = storedStateFingerprint(seeded.state);
+    const operationId = "participant-operation:deletion-corrupt-aggregate";
     const failure = await captureStorageFailure(() =>
       stageParticipantAccountDeletionInvestmentWithdrawalSet(
         new StagedStorageTransaction(seeded.storage, operationId),
@@ -3345,6 +3411,28 @@ function replaceAggregateRevision(
   state.records.set(identity, Object.freeze({
     key: record.key,
     revision,
+    value: value as StorageDocument,
+  }));
+}
+
+function replaceAggregateTotal(
+  state: MemoryStorageState,
+  totalAmount: number,
+): void {
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "investment-aggregate-states"
+  );
+  assert(entry);
+  const [identity, record] = entry;
+  const value = JSON.parse(JSON.stringify(record.value)) as Record<
+    string,
+    unknown
+  >;
+  const snapshot = value.snapshot as Record<string, unknown>;
+  snapshot.totalAmount = totalAmount;
+  state.records.set(identity, Object.freeze({
+    key: record.key,
+    revision: record.revision,
     value: value as StorageDocument,
   }));
 }

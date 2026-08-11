@@ -378,22 +378,6 @@ export async function stageParticipantAccountDeletionInvestmentWithdrawalSet(
       unavailable();
     }
 
-    if (active.length === 0) {
-      const aggregate = await prepareAtomicAggregateWithdrawalSet(
-        boundary,
-        Object.freeze([]),
-        amount.currency,
-      );
-      return Object.freeze({
-        participantSubject: subject,
-        operationId: parsed.operationId,
-        requestedAt: parsed.requestedAt,
-        withdrawals: Object.freeze([]),
-        aggregate: aggregate.stored,
-        mutationCount: 0,
-      });
-    }
-
     const witnessKey = await participantOwnershipWitnessKey(subject);
     const withdrawals: PreparedParticipantAccountDeletionInvestmentWithdrawal[] = [];
     const indicationMutations: StorageMutation[] = [];
@@ -474,7 +458,8 @@ export async function stageParticipantAccountDeletionInvestmentWithdrawalSet(
       ...aggregate.mutations,
     ] satisfies readonly StorageMutation[]);
     if (
-      mutations.length !== 4 * withdrawals.length + 3 ||
+      mutations.length !== 4 * withdrawals.length +
+        (withdrawals.length === 0 ? 2 : 3) ||
       mutations.length > 19 ||
       mutations.length > MAX_STORAGE_TRANSACTION_MUTATIONS ||
       new Set(mutations.map(({ key }) => storageKeyString(key))).size !==

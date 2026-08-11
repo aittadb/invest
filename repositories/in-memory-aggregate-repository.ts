@@ -411,7 +411,9 @@ export async function prepareAtomicAggregateWithdrawalSet(
   }
   if (
     stored.totalAmount < removedAmount ||
-    stored.contributingIndicationCount < contributions.length
+    stored.contributingIndicationCount < contributions.length ||
+    (stored.contributingIndicationCount === contributions.length &&
+      stored.totalAmount !== removedAmount)
   ) {
     unavailable();
   }
