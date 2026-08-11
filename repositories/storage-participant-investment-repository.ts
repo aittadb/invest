@@ -69,10 +69,10 @@ import {
   type AtomicParticipantInvestmentInterestResult,
   type ParticipantInvestmentInterestReader,
 } from "../worker/participant-investment-mutation-port.ts";
+import { MAX_PARTICIPANT_INVESTMENT_INTERESTS } from "../domain/participant-investment-interest-resource.ts";
 
 const PARTICIPANT_INDEX_SCHEMA_VERSION = 1;
 const PARTICIPANT_OPERATION_SCHEMA_VERSION = 2;
-const MAX_OWNED_INDICATIONS = 100;
 const PARTICIPANT_INDEXES = collection("participant-investment-indexes");
 const PARTICIPANT_OPERATIONS = collection("participant-investment-operations");
 const INDEX_DOCUMENT_KEYS = new Set([
@@ -261,7 +261,9 @@ export class StorageParticipantInvestmentInterestRepository
     if (prepared.command.kind === "create") {
       const index = await readParticipantIndex(staged, this.#subject);
       if (index.ids.includes(indication.snapshot.id)) conflict();
-      if (index.ids.length >= MAX_OWNED_INDICATIONS) conflict();
+      if (
+        index.ids.length >= MAX_PARTICIPANT_INVESTMENT_INTERESTS
+      ) conflict();
       const ids = Object.freeze(
         [...index.ids, indication.snapshot.id].sort(compareIds),
       );
@@ -559,7 +561,10 @@ async function readParticipantIndex(
     source.schemaVersion !== PARTICIPANT_INDEX_SCHEMA_VERSION ||
     source.revision !== envelope.revision
   ) unavailable();
-  const values = exactDenseArray(source.indicationIds, MAX_OWNED_INDICATIONS);
+  const values = exactDenseArray(
+    source.indicationIds,
+    MAX_PARTICIPANT_INVESTMENT_INTERESTS,
+  );
   const ids: InvestmentIndicationId[] = [];
   for (const value of values) {
     const parsed = parseStableId<"investment-indication">(value);

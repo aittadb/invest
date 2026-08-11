@@ -44,6 +44,7 @@ import {
 } from "../domain/participant-profile-resource.ts";
 import {
   INVESTMENT_INTEREST_PATH,
+  MAX_PARTICIPANT_INVESTMENT_INTERESTS,
   type InvestmentInterestCollectionDocument,
   type InvestmentInterestItemDocument,
 } from "../domain/participant-investment-interest-resource.ts";
@@ -69,12 +70,15 @@ import {
 } from "../repositories/in-memory-content-repository.ts";
 import { StorageParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
 import {
+  MAX_INVESTMENT_COLLECTION_STORAGE_READS,
   PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT,
   PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT,
   PARTICIPANT_REQUEST_STORAGE_READ_LIMIT,
   StorageApplicationRepositoryFactory,
 } from "../repositories/storage-application-repository-factory.ts";
+import { StorageParticipantInvestmentInterestRepository } from "../repositories/storage-participant-investment-repository.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
+import { createParticipantInvestmentInterestService } from "../worker/investment-interest-service.ts";
 import type {
   InvestorAppEnv,
   WorkerExecutionContext,
@@ -786,8 +790,9 @@ test("participant access keeps nested package retry reads inside one budget", as
 
 test("participant request scope enforces exact maximum route and retry read budgets", async () => {
   assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 551);
-  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 23);
-  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 574);
+  assert.equal(MAX_INVESTMENT_COLLECTION_STORAGE_READS, 512);
+  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 512);
+  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 1_063);
 
   const service = new SyntheticAittaDBService();
   await registerHostedParticipant(
@@ -982,7 +987,9 @@ test("participant request scope enforces exact maximum route and retry read budg
   await combinedAcknowledgments.acknowledgments.latest();
   await combinedAcknowledgments.packages.current();
   assert.equal(combinedReads.count(), 558);
-  for (let index = 0; index < 16; index += 1) {
+  const remainingReads =
+    PARTICIPANT_REQUEST_STORAGE_READ_LIMIT - combinedReads.count();
+  for (let index = 0; index < remainingReads; index += 1) {
     await combinedRequest.participantPackageReader(subject.value).current();
   }
   assert.equal(combinedReads.count(), PARTICIPANT_REQUEST_STORAGE_READ_LIMIT);
@@ -2329,6 +2336,62 @@ test("hosted investment creation and reactivation recheck phase and package poli
   assert.equal(recordsIn(service, "investment-indications").length, 1);
   assert.equal(recordsIn(service, "investment-indication-history").length, 2);
   assert.equal(recordsIn(service, "investment-aggregate-states").length, 1);
+});
+
+test("hosted investment mutation rejects policy heads changed during one request", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedInvestmentFixture(service);
+  const proof = await investmentResource(hostedPackageWorker(service), env);
+  const action = requiredAction(
+    proof.document,
+    "create-personal-investment-interest",
+  );
+  service.interceptReadAfter("campaign-setup-current", 2, async () => {
+    await configureHostedInvestmentCampaign(service, "closed");
+  });
+
+  const response = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    proof,
+    action,
+    actionBody(action, {
+      "operation-id": "investment-operation:hosted-policy-race",
+      "residence-country": "FI",
+      amount: 25_000,
+      "availability-period": "Within twelve months.",
+    }),
+  );
+
+  assert.equal(response.status, 503);
+  assert.equal(recordsIn(service, "investment-indications").length, 0);
+  assert.equal(recordsIn(service, "investment-indication-history").length, 0);
+  assert.equal(recordsIn(service, "investment-aggregate-states").length, 0);
+});
+
+test("hosted maximum investment collection stays inside the shared request budget", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedInvestmentFixture(service);
+  await seedHostedMaximumInvestmentCollection(service);
+
+  const readsBefore = service.readRequests;
+  const response = await hostedPackageWorker(service).fetch(
+    participantRequest(INVESTMENT_INTEREST_PATH),
+    env,
+    executionContext,
+  );
+  assert.equal(response.status, 200);
+  const document = await response.json() as InvestmentInterestCollectionDocument;
+  assert.equal(
+    document.data.indications.length,
+    MAX_PARTICIPANT_INVESTMENT_INTERESTS,
+  );
+  assert.ok(
+    service.readRequests - readsBefore <=
+      PARTICIPANT_REQUEST_STORAGE_READ_LIMIT,
+  );
 });
 
 test("hosted investment state and mutation proofs remain participant-bound and non-disclosing", async () => {
@@ -4487,6 +4550,11 @@ class SyntheticAittaDBService {
     collection: string;
     successfulMatchesRemaining: number;
   }> | null = null;
+  #readInterception: Readonly<{
+    collection: string;
+    successfulMatchesRemaining: number;
+    run(): void | Promise<void>;
+  }> | null = null;
 
   failNextTransactionContaining(collection: string): void {
     this.failTransactionContainingAfter(collection, 0);
@@ -4501,6 +4569,21 @@ class SyntheticAittaDBService {
     this.#transactionFailure = Object.freeze({
       collection,
       successfulMatchesRemaining: successfulMatches,
+    });
+  }
+
+  interceptReadAfter(
+    collection: string,
+    successfulMatches: number,
+    run: () => void | Promise<void>,
+  ): void {
+    assert.ok(collection.length > 0);
+    assert.ok(Number.isSafeInteger(successfulMatches));
+    assert.ok(successfulMatches >= 0);
+    this.#readInterception = Object.freeze({
+      collection,
+      successfulMatchesRemaining: successfulMatches,
+      run,
     });
   }
 
@@ -4550,6 +4633,19 @@ class SyntheticAittaDBService {
       const collection = decodeURIComponent(read[1] ?? "");
       const id = decodeURIComponent(read[2] ?? "");
       this.readCollections.push(collection);
+      const interception = this.#readInterception;
+      if (interception?.collection === collection) {
+        if (interception.successfulMatchesRemaining === 0) {
+          this.#readInterception = null;
+          await interception.run();
+        } else {
+          this.#readInterception = Object.freeze({
+            ...interception,
+            successfulMatchesRemaining:
+              interception.successfulMatchesRemaining - 1,
+          });
+        }
+      }
       const record = this.records.get(`${collection}/${id}`);
       return record === undefined
         ? protocolFailure("not_found")
@@ -5064,6 +5160,73 @@ async function configureHostedInvestmentFixture(
     "primary",
   );
   return packageVersion.snapshot.id;
+}
+
+async function seedHostedMaximumInvestmentCollection(
+  service: SyntheticAittaDBService,
+): Promise<void> {
+  const adapter = hostedStorageAdapter(service);
+  const campaign = await new StorageCampaignRepository(adapter).readSetup();
+  const subject = parseActorSubject(PARTICIPANT_SUBJECT);
+  assert(campaign);
+  assert(subject.ok);
+  const packages = new StoragePackageVersionRepository(adapter);
+  const currentPackage = await packages.current();
+  assert(currentPackage);
+  const latestAcceptance = await new StorageAcknowledgmentRepository(
+    adapter,
+    packages,
+    subject.value,
+  ).latest();
+  assert(latestAcceptance);
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    adapter,
+    subject.value,
+    campaign.setup.amountAggregate.amount,
+  );
+  const interestService = createParticipantInvestmentInterestService({
+    actorSubject: subject.value,
+    amountConfiguration: campaign.setup.amountAggregate.amount,
+    reader: repository,
+    mutations: repository,
+    loadAcknowledgmentContext: () => Object.freeze({
+      currentVersion: currentPackage.snapshot,
+      latestAcceptance: latestAcceptance.snapshot,
+    }),
+    loadPermissions: () => Object.freeze({
+      createPersonal: true,
+      createCompany: true,
+      reactivatePersonal: true,
+      reactivateCompany: true,
+    }),
+    indicationIdForOperation: (operationId) => {
+      const id = parseStableId<"investment-indication">(operationId);
+      if (!id.ok) throw new Error("Invalid maximum-collection operation ID.");
+      return id.value;
+    },
+    now: () => NOW,
+  });
+
+  for (
+    let index = 0;
+    index < MAX_PARTICIPANT_INVESTMENT_INTERESTS;
+    index += 1
+  ) {
+    const suffix = String(index).padStart(3, "0");
+    await interestService.create({
+      operationId: `investment-operation:maximum-collection-${suffix}`,
+      fields: {
+        kind: "company",
+        companyName: `Maximum collection company ${suffix}`,
+        registrationCountry: "FI",
+        companyIdentifier: `SYNTHETIC-${suffix}`,
+        representativeName: `Representative ${suffix}`,
+        representativeAuthorityDeclared: true,
+        amount: 25_000,
+        availabilityPeriod: "Within twelve months.",
+      },
+    });
+  }
 }
 
 async function registerHostedAcceptedInvestor(

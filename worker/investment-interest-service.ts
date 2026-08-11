@@ -38,6 +38,9 @@ import type {
   WithdrawIndicationRequest,
 } from "../repositories/in-memory-indication-repository.ts";
 import {
+  MAX_PARTICIPANT_INVESTMENT_INTERESTS,
+} from "../domain/participant-investment-interest-resource.ts";
+import {
   PARTICIPANT_INVESTMENT_MUTATION_CONSISTENCY,
   type AtomicParticipantInvestmentInterestCommand,
   type AtomicParticipantInvestmentInterestMutationPort,
@@ -45,7 +48,8 @@ import {
   type ParticipantInvestmentInterestReader,
 } from "./participant-investment-mutation-port.ts";
 
-export const MAX_PARTICIPANT_INTERESTS = 100;
+export const MAX_PARTICIPANT_INTERESTS =
+  MAX_PARTICIPANT_INVESTMENT_INTERESTS;
 
 export type InvestmentInterestKind = InvestmentIndication["kind"];
 
