@@ -30,6 +30,7 @@ import {
   parseStorageKey,
   storageKeyString,
   type StorageAdapter,
+  type StorageDocument,
   type StorageKey,
 } from "../domain/storage-adapter.ts";
 import { DevelopmentInMemoryManualNotificationRepository } from "../repositories/in-memory-audit-notification-repositories.ts";
@@ -43,7 +44,12 @@ import {
   type OwnerIndicationReviewIdResolver,
 } from "../repositories/storage-owner-indication-review-detail-repository.ts";
 import { StorageParticipantInvestmentInterestRepository } from "../repositories/storage-participant-investment-repository.ts";
-import { ownerIndicationRejectionNotificationId } from "../services/owner-indication-notification-identity.ts";
+import {
+  OWNER_INDICATION_REJECTION_NOTIFICATION_SUBJECT,
+  ownerIndicationRejectionNotificationBody,
+  ownerIndicationRejectionNotificationId,
+  ownerIndicationRejectionNotificationPurposeId,
+} from "../services/owner-indication-notification-identity.ts";
 import { createParticipantInvestmentInterestService } from "../worker/investment-interest-service.ts";
 import {
   MemoryStorageAdapter,
@@ -51,6 +57,7 @@ import {
 } from "./support/memory-storage-adapter.ts";
 
 const OWNER = subject("issuer.invalid/owner:indication-detail");
+const ROTATED_OWNER = subject("issuer.invalid/owner:rotated-detail");
 const FOREIGN_OWNER = subject("issuer.invalid/owner:foreign-detail");
 const PARTICIPANT = subject("issuer.invalid/participant:indication-detail");
 const AMOUNT = amountConfiguration();
@@ -191,45 +198,131 @@ test("malformed, tampered, missing, crossed, and foreign detail reads disclose n
   }
 });
 
-test("corrupt notification evidence fails closed without scanning or disclosure", async () => {
+test("coherently rewritten notification templates fail closed without scanning", async () => {
+  const rewrites = [
+    { purposeId: "notification-purpose:coherently-rewritten" },
+    { subjectLine: "Coherently rewritten private subject" },
+    { body: "Coherently rewritten private body." },
+  ] as const;
+
+  for (const rewrite of rewrites) {
+    const state = new MemoryStorageState();
+    const rejected = await rejectIndication(
+      state,
+      await seedEditedIndication(state),
+    );
+    const notification = await seedRejectionNotification(state, rejected);
+    rewriteEveryNotificationTemplate(state, rewrite);
+
+    const notifications = new DevelopmentInMemoryManualNotificationRepository(
+      new MemoryStorageAdapter(state),
+    );
+    assert(await notifications.get(notification.record.template.id));
+    const reviewId = await REVIEW_IDS.reviewIdForCurrentKey(
+      await ownerIndicationCurrentStorageKey(rejected.id),
+      OWNER,
+    );
+    const counted = new CountingStorageAdapter(new MemoryStorageAdapter(state));
+    const failure = await captureFailure(() =>
+      detailRepository(counted).get(reviewId)
+    );
+    assert.equal(failure.code, "UNAVAILABLE");
+    assert.doesNotMatch(String(failure), /Coherently|private|rewritten/iu);
+    assert.equal(counted.lists, 0);
+  }
+});
+
+test("foreign notification copy and sent actors fail closed", async () => {
+  for (const activity of ["copy", "sent"] as const) {
+    const state = new MemoryStorageState();
+    const rejected = await rejectIndication(
+      state,
+      await seedEditedIndication(state),
+    );
+    const notification = await seedRejectionNotification(state, rejected);
+    const notifications = new DevelopmentInMemoryManualNotificationRepository(
+      new MemoryStorageAdapter(state),
+    );
+    if (activity === "copy") {
+      await notifications.recordCopy({
+        operationId: "notification-operation:foreign-copy",
+        notificationId: notification.record.template.id,
+        expectedRevision: notification.revision,
+        evidence: {
+          id: "notification-copy:foreign-owner",
+          copiedAt: "2026-08-12T12:10:00.000Z",
+          copiedBy: { type: "owner", subject: FOREIGN_OWNER },
+        },
+      });
+    } else {
+      await notifications.markSent({
+        operationId: "notification-operation:foreign-sent",
+        notificationId: notification.record.template.id,
+        expectedRevision: notification.revision,
+        marker: {
+          id: "notification-sent-marker:foreign-owner",
+          sentAt: "2026-08-12T12:10:00.000Z",
+          sentBy: { type: "owner", subject: FOREIGN_OWNER },
+        },
+      });
+    }
+
+    const reviewId = await REVIEW_IDS.reviewIdForCurrentKey(
+      await ownerIndicationCurrentStorageKey(rejected.id),
+      OWNER,
+    );
+    const failure = await captureFailure(() =>
+      detailRepository(new MemoryStorageAdapter(state)).get(reviewId)
+    );
+    assert.equal(failure.code, "UNAVAILABLE");
+    assert.doesNotMatch(String(failure), /foreign|owner|participant/iu);
+  }
+});
+
+test("rejecting and current owners remain valid notification activity actors after rotation", async () => {
   const state = new MemoryStorageState();
   const rejected = await rejectIndication(
     state,
     await seedEditedIndication(state),
   );
   const notification = await seedRejectionNotification(state, rejected);
-  const current = [...state.records.entries()].find(([, record]) =>
-    record.key.collection === "manual-notifications" &&
-    record.value.record !== undefined
+  const notifications = new DevelopmentInMemoryManualNotificationRepository(
+    new MemoryStorageAdapter(state),
   );
-  assert(current);
-  const [storageIdentity, record] = current;
-  state.records.set(storageIdentity, Object.freeze({
-    ...record,
-    value: Object.freeze({
-      ...record.value,
-      record: Object.freeze({
-        ...(record.value.record as Record<string, unknown>),
-        template: Object.freeze({
-          ...((record.value.record as Record<string, unknown>)
-            .template as Record<string, unknown>),
-          subjectLine: "Corrupt private subject",
-        }),
-      }),
-    }),
-  }));
+  const copied = await notifications.recordCopy({
+    operationId: "notification-operation:rejecting-owner-copy",
+    notificationId: notification.record.template.id,
+    expectedRevision: notification.revision,
+    evidence: {
+      id: "notification-copy:rejecting-owner",
+      copiedAt: "2026-08-12T12:10:00.000Z",
+      copiedBy: { type: "owner", subject: OWNER },
+    },
+  });
+  const sent = await notifications.markSent({
+    operationId: "notification-operation:rotated-owner-sent",
+    notificationId: notification.record.template.id,
+    expectedRevision: copied.revision,
+    marker: {
+      id: "notification-sent-marker:rotated-owner",
+      sentAt: "2026-08-12T12:20:00.000Z",
+      sentBy: { type: "owner", subject: ROTATED_OWNER },
+    },
+  });
   const reviewId = await REVIEW_IDS.reviewIdForCurrentKey(
     await ownerIndicationCurrentStorageKey(rejected.id),
-    OWNER,
+    ROTATED_OWNER,
   );
-  const counted = new CountingStorageAdapter(new MemoryStorageAdapter(state));
-  const failure = await captureFailure(() =>
-    detailRepository(counted).get(reviewId)
-  );
-  assert.equal(failure.code, "UNAVAILABLE");
-  assert.doesNotMatch(String(failure), /Corrupt|private|subject/iu);
-  assert.equal(counted.lists, 0);
-  assert.equal(notification.record.template.recipientSubject, PARTICIPANT);
+
+  const item = await detailRepository(
+    new MemoryStorageAdapter(state),
+    ROTATED_OWNER,
+  ).get(reviewId);
+  assert(item);
+  assert.deepEqual(item.notification, {
+    revision: sent.revision,
+    record: sent.record,
+  });
 });
 
 test("token dependency failures are unavailable and touch no storage", async () => {
@@ -342,19 +435,23 @@ async function seedRejectionNotification(
   const id = await ownerIndicationRejectionNotificationId(
     "investment-operation:owner-detail-reject",
   );
+  const purposeId = await ownerIndicationRejectionNotificationPurposeId(
+    "investment-operation:owner-detail-reject",
+  );
   const resourceId = parseStableId<"audit-resource">(indication.id);
   assert(resourceId.ok);
   const template = parseManualNotificationTemplate({
     id,
-    purposeId: "notification-purpose:owner-detail-rejection",
+    purposeId,
     recipientSubject: indication.participantSubject,
     relatedResource: {
       type: "investment-indication",
       id: resourceId.value,
     },
-    subjectLine: "Update about your investment indication",
-    body:
-      "Your investment indication was rejected.\n\nReason: Outside the current review scope.",
+    subjectLine: OWNER_INDICATION_REJECTION_NOTIFICATION_SUBJECT,
+    body: ownerIndicationRejectionNotificationBody(
+      indication.lifecycle.rejection.reason,
+    ),
     generatedAt: indication.lifecycle.rejectedAt,
     generatedBy: indication.lifecycle.rejection.rejectedBy,
   });
@@ -377,14 +474,46 @@ async function seedRejectionNotification(
 
 function detailRepository(
   storage: StorageAdapter,
+  ownerSubject: ActorSubject = OWNER,
 ): StorageOwnerIndicationReviewDetailRepository {
   return new StorageOwnerIndicationReviewDetailRepository(
     storage,
-    OWNER,
-    OWNER,
+    ownerSubject,
+    ownerSubject,
     AMOUNT,
     REVIEW_IDS,
   );
+}
+
+function rewriteEveryNotificationTemplate(
+  state: MemoryStorageState,
+  rewrite: StorageDocument,
+): void {
+  for (const [identity, stored] of state.records) {
+    if (
+      stored.key.collection !== "manual-notifications" &&
+      stored.key.collection !== "manual-notification-history"
+    ) continue;
+    const record = stored.value.record;
+    assert(record && typeof record === "object" && !Array.isArray(record));
+    const recordDocument = record as StorageDocument;
+    const template = recordDocument.template;
+    assert(
+      template && typeof template === "object" && !Array.isArray(template),
+    );
+    const templateDocument = template as StorageDocument;
+    const rewrittenRecord: StorageDocument = Object.freeze({
+      ...recordDocument,
+      template: Object.freeze({ ...templateDocument, ...rewrite }),
+    });
+    state.records.set(identity, Object.freeze({
+      ...stored,
+      value: Object.freeze({
+        ...stored.value,
+        record: rewrittenRecord,
+      }),
+    }));
+  }
 }
 
 function personalFields(note: string) {

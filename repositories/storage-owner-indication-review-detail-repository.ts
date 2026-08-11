@@ -19,7 +19,12 @@ import type {
   OwnerIndicationNotificationSnapshot,
   OwnerIndicationReviewDetailRepository,
 } from "../services/owner-indication-moderation.ts";
-import { ownerIndicationRejectionNotificationId } from "../services/owner-indication-notification-identity.ts";
+import {
+  OWNER_INDICATION_REJECTION_NOTIFICATION_SUBJECT,
+  ownerIndicationRejectionNotificationBody,
+  ownerIndicationRejectionNotificationId,
+  ownerIndicationRejectionNotificationPurposeId,
+} from "../services/owner-indication-notification-identity.ts";
 import { DevelopmentInMemoryManualNotificationRepository } from "./in-memory-audit-notification-repositories.ts";
 import { DevelopmentInMemoryIndicationRepository } from "./in-memory-indication-repository.ts";
 
@@ -126,9 +131,20 @@ export class StorageOwnerIndicationReviewDetailRepository
     const id = await ownerIndicationRejectionNotificationId(
       terminalOperationId,
     );
+    const purposeId = await ownerIndicationRejectionNotificationPurposeId(
+      terminalOperationId,
+    );
     const notification = await this.#notifications.get(id);
     if (notification === null) unavailable();
-    requireMatchingNotification(rejected, notification);
+    const configuredOwnerSubject = this.#configuredOwnerSubject;
+    if (configuredOwnerSubject === null) unavailable();
+    requireMatchingNotification(
+      rejected,
+      notification,
+      id,
+      purposeId,
+      configuredOwnerSubject,
+    );
     return notification;
   }
 }
@@ -136,16 +152,37 @@ export class StorageOwnerIndicationReviewDetailRepository
 function requireMatchingNotification(
   indication: RejectedInvestmentIndication,
   notification: OwnerIndicationNotificationSnapshot,
+  expectedId: string,
+  expectedPurposeId: string,
+  configuredOwnerSubject: ActorSubject,
 ): void {
   const template = notification.record.template;
   const rejection = indication.lifecycle.rejection;
+  const permittedActivitySubjects = new Set([
+    rejection.rejectedBy.subject,
+    configuredOwnerSubject,
+  ]);
   if (
+    template.id !== expectedId ||
+    template.purposeId !== expectedPurposeId ||
     template.recipientSubject !== indication.participantSubject ||
     template.relatedResource.type !== "investment-indication" ||
     String(template.relatedResource.id) !== String(indication.id) ||
+    template.subjectLine !== OWNER_INDICATION_REJECTION_NOTIFICATION_SUBJECT ||
+    template.body !==
+      ownerIndicationRejectionNotificationBody(rejection.reason) ||
     template.generatedAt !== rejection.rejectedAt ||
     template.generatedBy.type !== "owner" ||
-    template.generatedBy.subject !== rejection.rejectedBy.subject
+    template.generatedBy.subject !== rejection.rejectedBy.subject ||
+    notification.record.copyEvidence.some((evidence) =>
+      evidence.copiedBy.type !== "owner" ||
+      !permittedActivitySubjects.has(evidence.copiedBy.subject)
+    ) ||
+    notification.record.sentMarker !== null &&
+      (notification.record.sentMarker.sentBy.type !== "owner" ||
+        !permittedActivitySubjects.has(
+          notification.record.sentMarker.sentBy.subject,
+        ))
   ) unavailable();
 }
 
