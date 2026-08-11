@@ -142,7 +142,7 @@ The form collects:
 
 The app enforces one active company indication per normalized country and identifier pair. Duplicate rejection must not reveal who controls the existing record.
 
-One participant can have at most four active indications across personal and company records. Withdrawn and rejected historical indications do not consume this active limit.
+One participant can have at most four active indications across personal and company records. Withdrawn and rejected historical indications do not consume this active limit. Persistent ownership materialization requires matching bounded subject-index and ownership-witness evidence; missing, incomplete, corrupt, or continuously changing evidence fails closed without scanning another participant's records.
 
 ### UC-INV-004: Edit Indication
 

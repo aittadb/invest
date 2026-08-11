@@ -24,6 +24,7 @@ import {
 } from "../domain/package-content.ts";
 import {
   StorageFailure,
+  toPublicStorageFailure,
   type StorageAdapter,
   type StorageDocument,
   type StorageRecord,
@@ -38,8 +39,14 @@ import {
   DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
+  MAX_INDICATION_MATERIALIZATION_READS,
+  MAX_OWNED_INVESTMENT_INDICATIONS,
 } from "../repositories/in-memory-indication-repository.ts";
-import { StorageParticipantInvestmentInterestRepository } from "../repositories/storage-participant-investment-repository.ts";
+import {
+  MAX_PARTICIPANT_CAPACITY_READS,
+  MAX_PARTICIPANT_INDEX_SNAPSHOT_READS,
+  StorageParticipantInvestmentInterestRepository,
+} from "../repositories/storage-participant-investment-repository.ts";
 import { MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS } from "../worker/participant-investment-mutation-port.ts";
 import {
   createParticipantInvestmentInterestService,
@@ -506,6 +513,365 @@ test("competing fourth activations cannot admit a fifth and exact retry stays st
   assertAggregate(state, 4, 8_000, 4);
 });
 
+test("missing index or ownership witness fails closed after restart", async (context) => {
+  const cases = [
+    {
+      name: "absent index with an existing active indication",
+      collection: "participant-investment-indexes",
+    },
+    {
+      name: "legacy index without its ownership witness",
+      collection: "investment-indication-ownership-witnesses",
+    },
+  ] as const;
+
+  for (const [caseIndex, candidate] of cases.entries()) {
+    await context.test(candidate.name, async () => {
+      const state = new MemoryStorageState();
+      const storage = new MemoryStorageAdapter(state);
+      const acknowledgment = await currentContext(
+        ALICE,
+        `capacity-missing-pair-${caseIndex}`,
+      );
+      const repository = new StorageParticipantInvestmentInterestRepository(
+        storage,
+        ALICE,
+        AMOUNT,
+      );
+      await serviceFor(
+        repository,
+        ALICE,
+        acknowledgment,
+        () => new Date("2026-08-12T10:00:00.000Z"),
+      ).create({
+        operationId: `investment-operation:capacity-missing-pair-${caseIndex}`,
+        fields: companyFields({
+          companyName: `Private missing-pair company ${caseIndex}`,
+          companyIdentifier: `PRIVATE-MISSING-PAIR-${caseIndex}`,
+        }),
+      });
+      deleteOnlyRecordIn(state, candidate.collection);
+
+      const reopened = new StorageParticipantInvestmentInterestRepository(
+        new MemoryStorageAdapter(state),
+        ALICE,
+        AMOUNT,
+      );
+      const readFailure = await captureStorageFailure(() => reopened.listOwned());
+      assert.equal(readFailure.code, "UNAVAILABLE");
+      const recordsBefore = storedStateFingerprint(state);
+      const operationsBefore = state.operations.size;
+      const failure = await captureStorageFailure(() =>
+        serviceFor(
+          reopened,
+          ALICE,
+          acknowledgment,
+          () => new Date("2026-08-12T11:00:00.000Z"),
+        ).create({
+          operationId:
+            `investment-operation:capacity-missing-pair-retry-${caseIndex}`,
+          fields: companyFields({
+            companyName: "Must remain private and uncommitted",
+            companyIdentifier: `PRIVATE-MISSING-PAIR-RETRY-${caseIndex}`,
+          }),
+        })
+      );
+      assert.equal(failure.code, "UNAVAILABLE");
+      assert.doesNotMatch(
+        JSON.stringify(toPublicStorageFailure(failure)),
+        /PRIVATE-MISSING-PAIR|alice-storage-investment|ownership-witness/iu,
+      );
+      assert.equal(storedStateFingerprint(state), recordsBefore);
+      assert.equal(state.operations.size, operationsBefore);
+    });
+  }
+});
+
+test("a hidden fifth current record and contribution block create and reactivation", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const acknowledgment = await currentContext(ALICE, "capacity-hidden-fifth");
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  const service = serviceFor(
+    repository,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  const initial: Awaited<ReturnType<typeof service.create>>[] = [];
+  for (let index = 0; index < MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS; index += 1) {
+    initial.push(await service.create({
+      operationId: `investment-operation:hidden-fifth-seed-${index}`,
+      fields: companyFields({
+        companyName: `Hidden fifth seed ${index}`,
+        companyIdentifier: `HIDDEN-FIFTH-SEED-${index}`,
+      }),
+    }));
+  }
+  const withdrawnTarget = initial[0];
+  assert(withdrawnTarget);
+  await service.withdraw({
+    operationId: "investment-operation:hidden-fifth-withdraw",
+    indicationId: withdrawnTarget.snapshot.id,
+    expectedRevision: withdrawnTarget.snapshot.revision,
+  });
+  await service.create({
+    operationId: "investment-operation:hidden-fifth-replacement",
+    fields: companyFields({
+      companyName: "Visible fourth active company",
+      companyIdentifier: "VISIBLE-FOURTH-ACTIVE",
+    }),
+  });
+  assert.equal(activeOwned(await repository.listOwned()), 4);
+
+  const hidden = await new DevelopmentInMemoryIndicationRepository(
+    storage,
+    ALICE,
+    OWNER,
+    AMOUNT,
+  ).create({
+    operationId: "indication-operation:hidden-fifth-direct",
+    id: "investment-indication:hidden-fifth-direct",
+    expectedRevision: null,
+    occurredAt: "2026-08-12T11:00:00.000Z",
+    historyEntryId: "indication-history:hidden-fifth-direct",
+    fields: companyFields({
+      companyName: "Private hidden fifth company",
+      companyIdentifier: "PRIVATE-HIDDEN-FIFTH",
+    }),
+  }, acknowledgment);
+  await persistAggregateProjection(
+    storage,
+    hidden.snapshot,
+    "aggregate-operation:hidden-fifth-direct",
+  );
+  assert.equal(
+    participantIdsIn(state, "participant-investment-indexes").length,
+    5,
+  );
+  assert.equal(
+    participantIdsIn(
+      state,
+      "investment-indication-ownership-witnesses",
+    ).length,
+    6,
+  );
+  assertAggregate(state, 7, 10_000, 5);
+
+  const reopened = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  const reopenedService = serviceFor(
+    reopened,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T12:00:00.000Z"),
+  );
+  const recordsBefore = storedStateFingerprint(state);
+  const operationsBefore = state.operations.size;
+  const createFailure = await captureStorageFailure(() => reopenedService.create({
+    operationId: "investment-operation:hidden-fifth-blocked-create",
+    fields: companyFields({
+      companyName: "Private blocked sixth company",
+      companyIdentifier: "PRIVATE-BLOCKED-SIXTH",
+    }),
+  }));
+  const reactivateFailure = await captureStorageFailure(() =>
+    reopenedService.reactivate({
+      operationId: "investment-operation:hidden-fifth-blocked-reactivation",
+      indicationId: withdrawnTarget.snapshot.id,
+      expectedRevision: withdrawnTarget.snapshot.revision + 1,
+    })
+  );
+  for (const failure of [createFailure, reactivateFailure]) {
+    assert.equal(failure.code, "UNAVAILABLE");
+    assert.doesNotMatch(
+      JSON.stringify(toPublicStorageFailure(failure)),
+      /PRIVATE-HIDDEN-FIFTH|PRIVATE-BLOCKED-SIXTH|alice-storage-investment/iu,
+    );
+  }
+  assert.equal(storedStateFingerprint(state), recordsBefore);
+  assert.equal(state.operations.size, operationsBefore);
+});
+
+test("a mixed create and reactivation race admits exactly one fourth active indication", async () => {
+  const state = new MemoryStorageState();
+  const acknowledgment = await currentContext(ALICE, "capacity-mixed-race");
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  const service = serviceFor(
+    repository,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  for (let index = 0; index < 3; index += 1) {
+    await service.create({
+      operationId: `investment-operation:mixed-race-seed-${index}`,
+      fields: companyFields({
+        companyName: `Mixed race seed ${index}`,
+        companyIdentifier: `MIXED-RACE-SEED-${index}`,
+      }),
+    });
+  }
+  const withdrawn = await service.create({
+    operationId: "investment-operation:mixed-race-withdrawn-candidate",
+    fields: companyFields({
+      companyName: "Mixed race withdrawn candidate",
+      companyIdentifier: "MIXED-RACE-WITHDRAWN",
+    }),
+  });
+  await service.withdraw({
+    operationId: "investment-operation:mixed-race-withdraw",
+    indicationId: withdrawn.snapshot.id,
+    expectedRevision: withdrawn.snapshot.revision,
+  });
+  const createInput = Object.freeze({
+    operationId: "investment-operation:mixed-race-create",
+    fields: companyFields({
+      companyName: "Mixed race create candidate",
+      companyIdentifier: "MIXED-RACE-CREATE",
+    }),
+  });
+  const reactivateInput = Object.freeze({
+    operationId: "investment-operation:mixed-race-reactivate",
+    indicationId: withdrawn.snapshot.id,
+    expectedRevision: withdrawn.snapshot.revision + 1,
+  });
+  const attempts = await Promise.allSettled([
+    service.create(createInput),
+    service.reactivate(reactivateInput),
+  ]);
+  assert.equal(
+    attempts.filter((attempt) => attempt.status === "fulfilled").length,
+    1,
+  );
+  assert.equal(
+    attempts.filter((attempt) => attempt.status === "rejected").length,
+    1,
+  );
+  const createWon = attempts[0]?.status === "fulfilled";
+  const winnerRetry = createWon
+    ? await service.create(createInput)
+    : await service.reactivate(reactivateInput);
+  assert.equal(winnerRetry.replayed, true);
+  const loserFailure = await captureStorageFailure(() =>
+    createWon
+      ? service.reactivate(reactivateInput)
+      : service.create(createInput)
+  );
+  assert.equal(loserFailure.code, "CONFLICT");
+  const reopened = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  assert.equal(activeOwned(await reopened.listOwned()), 4);
+  assertAggregate(state, 6, 8_000, 4);
+});
+
+test("a direct reactivation between capacity sampling and create staging blocks the create", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const acknowledgment = await currentContext(ALICE, "capacity-direct-race");
+  const seedRepository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  const seedService = serviceFor(
+    seedRepository,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  const active: Awaited<ReturnType<typeof seedService.create>>[] = [];
+  for (let index = 0; index < 4; index += 1) {
+    active.push(await seedService.create({
+      operationId: `investment-operation:direct-race-seed-${index}`,
+      fields: companyFields({
+        companyName: `Direct race seed ${index}`,
+        companyIdentifier: `DIRECT-RACE-SEED-${index}`,
+      }),
+    }));
+  }
+  const withdrawnTarget = active[0];
+  assert(withdrawnTarget);
+  await seedService.withdraw({
+    operationId: "investment-operation:direct-race-withdraw",
+    indicationId: withdrawnTarget.snapshot.id,
+    expectedRevision: withdrawnTarget.snapshot.revision,
+  });
+
+  let injectedState: string | null = null;
+  let injectedOperations = 0;
+  const racingStorage = new WitnessReadHookStorageAdapter(storage, async () => {
+    const reactivated = await new DevelopmentInMemoryIndicationRepository(
+      storage,
+      ALICE,
+      OWNER,
+      AMOUNT,
+    ).reactivate({
+      operationId: "indication-operation:direct-race-reactivate",
+      id: withdrawnTarget.snapshot.id,
+      expectedRevision: withdrawnTarget.snapshot.revision + 1,
+      occurredAt: "2026-08-12T11:00:00.000Z",
+      historyEntryId: "indication-history:direct-race-reactivate",
+    }, acknowledgment);
+    await persistAggregateProjection(
+      storage,
+      reactivated.snapshot,
+      "aggregate-operation:direct-race-reactivate",
+    );
+    injectedState = storedStateFingerprint(state);
+    injectedOperations = state.operations.size;
+  });
+  const racingRepository = new StorageParticipantInvestmentInterestRepository(
+    racingStorage,
+    ALICE,
+    AMOUNT,
+  );
+  const failure = await captureStorageFailure(() =>
+    serviceFor(
+      racingRepository,
+      ALICE,
+      acknowledgment,
+      () => new Date("2026-08-12T12:00:00.000Z"),
+    ).create({
+      operationId: "investment-operation:direct-race-blocked-create",
+      fields: companyFields({
+        companyName: "Private blocked direct-race company",
+        companyIdentifier: "PRIVATE-DIRECT-RACE-BLOCKED",
+      }),
+    })
+  );
+  assert.equal(failure.code, "UNAVAILABLE");
+  assert.equal(racingStorage.injected, true);
+  assert(injectedState);
+  assert.equal(storedStateFingerprint(state), injectedState);
+  assert.equal(state.operations.size, injectedOperations);
+  assert.doesNotMatch(
+    JSON.stringify(toPublicStorageFailure(failure)),
+    /PRIVATE-DIRECT-RACE-BLOCKED|alice-storage-investment/iu,
+  );
+  const reopened = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  assert.equal(activeOwned(await reopened.listOwned()), 4);
+  assertAggregate(state, 6, 8_000, 4);
+});
+
 test("pre-existing over-capacity and missing indexed state fail closed", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
@@ -623,7 +989,7 @@ test("atomic contribution work stays constant-read with unrelated indications", 
   });
 
   assert.equal(counted.listCalls, 0);
-  assert.equal(counted.readCalls <= 20, true);
+  assert.equal(counted.readCalls, 22);
   assertAggregate(state, 25, 31_250, 25);
 });
 
@@ -667,11 +1033,23 @@ test("participant index has an observed 100-item read and write ceiling", async 
   );
   assert.equal((await reopened.listOwned()).length, 100);
   assert.equal(counted.listCalls, 0);
-  assert.equal(counted.readCalls <= 501, true);
+  assert.equal(counted.readCalls, 403);
+  assert.equal(counted.readCalls <= MAX_PARTICIPANT_CAPACITY_READS, true);
+  assert.equal(
+    MAX_PARTICIPANT_CAPACITY_READS,
+    MAX_PARTICIPANT_INDEX_SNAPSHOT_READS +
+      MAX_OWNED_INVESTMENT_INDICATIONS * MAX_INDICATION_MATERIALIZATION_READS,
+  );
 
   const recordsBefore = state.records.size;
   const operationsBefore = state.operations.size;
-  const failure = await captureStorageFailure(() => service.create({
+  counted.resetReads();
+  const failure = await captureStorageFailure(() => serviceFor(
+    reopened,
+    ALICE,
+    context,
+    () => new Date("2026-08-12T11:00:00.000Z"),
+  ).create({
     operationId: "investment-operation:index-ceiling-overflow",
     fields: companyFields({
       companyName: "Overflow company",
@@ -679,6 +1057,8 @@ test("participant index has an observed 100-item read and write ceiling", async 
     }),
   }));
   assert.equal(failure.code, "CONFLICT");
+  assert.equal(counted.readCalls, 406);
+  assert.equal(counted.readCalls <= 1 + MAX_PARTICIPANT_CAPACITY_READS, true);
   assert.equal(state.records.size, recordsBefore);
   assert.equal(state.operations.size, operationsBefore);
   assertAggregate(state, 200, 0, 0);
@@ -900,6 +1280,30 @@ test("stored operation receipts and participant indexes require closed envelopes
       }),
       replay: false,
     },
+    {
+      name: "ownership witness extra member",
+      collection: "investment-indication-ownership-witnesses",
+      transform: (record) => ({ ...record, privateDetail: "not disclosed" }),
+      replay: false,
+    },
+    {
+      name: "ownership witness IDs accessor",
+      collection: "investment-indication-ownership-witnesses",
+      transform: (record) => ({
+        ...record,
+        value: Object.defineProperty(
+          { ...record.value },
+          "indicationIds",
+          {
+            enumerable: true,
+            get: () => {
+              throw new Error("private ownership getter");
+            },
+          },
+        ),
+      }),
+      replay: false,
+    },
   ];
 
   for (const [index, candidate] of cases.entries()) {
@@ -1034,6 +1438,26 @@ function recordsIn(state: MemoryStorageState, collection: string) {
   return [...state.records.values()].filter(
     (record) => record.key.collection === collection,
   );
+}
+
+function participantIdsIn(
+  state: MemoryStorageState,
+  collection: string,
+): readonly InvestmentIndicationId[] {
+  const record = recordsIn(state, collection)[0];
+  assert(record);
+  return record.value.indicationIds as readonly InvestmentIndicationId[];
+}
+
+function deleteOnlyRecordIn(
+  state: MemoryStorageState,
+  collection: string,
+): void {
+  const entries = [...state.records.entries()].filter(([, record]) =>
+    record.key.collection === collection
+  );
+  assert.equal(entries.length, 1);
+  state.records.delete(entries[0]![0]);
 }
 
 function activeOwned(
@@ -1296,6 +1720,10 @@ class CountingStorageAdapter implements StorageAdapter {
     this.#delegate = delegate;
   }
 
+  resetReads(): void {
+    this.readCalls = 0;
+  }
+
   read: StorageAdapter["read"] = (key) => {
     this.readCalls += 1;
     return this.#delegate.read(key);
@@ -1306,6 +1734,35 @@ class CountingStorageAdapter implements StorageAdapter {
     return this.#delegate.list(request);
   };
 
+  transact: StorageAdapter["transact"] = (request) =>
+    this.#delegate.transact(request);
+}
+
+class WitnessReadHookStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #inject: () => Promise<void>;
+  #witnessReads = 0;
+  injected = false;
+
+  constructor(delegate: StorageAdapter, inject: () => Promise<void>) {
+    this.#delegate = delegate;
+    this.#inject = inject;
+  }
+
+  async read(
+    key: Parameters<StorageAdapter["read"]>[0],
+  ): Promise<StorageRecord | null> {
+    if (key.collection === "investment-indication-ownership-witnesses") {
+      this.#witnessReads += 1;
+      if (this.#witnessReads === 3) {
+        this.injected = true;
+        await this.#inject();
+      }
+    }
+    return this.#delegate.read(key);
+  }
+
+  list: StorageAdapter["list"] = (request) => this.#delegate.list(request);
   transact: StorageAdapter["transact"] = (request) =>
     this.#delegate.transact(request);
 }

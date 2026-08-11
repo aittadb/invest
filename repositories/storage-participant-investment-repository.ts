@@ -56,9 +56,13 @@ import {
   DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
+  MAX_INDICATION_MATERIALIZATION_READS,
+  MAX_OWNED_INVESTMENT_INDICATIONS,
   prepareParticipantIndicationMutation,
   prepareParticipantIndicationReplay,
+  readParticipantIndicationCompletenessWitness,
   type IndicationMutationResult,
+  type ParticipantIndicationCompletenessWitness,
   type PreparedParticipantIndicationMutation,
   type PreparedParticipantIndicationReplay,
 } from "./in-memory-indication-repository.ts";
@@ -73,7 +77,12 @@ import {
 
 const PARTICIPANT_INDEX_SCHEMA_VERSION = 1;
 const PARTICIPANT_OPERATION_SCHEMA_VERSION = 2;
-const MAX_OWNED_INDICATIONS = 100;
+const MAX_PARTICIPANT_INDEX_SNAPSHOT_ATTEMPTS = 2;
+export const MAX_PARTICIPANT_INDEX_SNAPSHOT_READS =
+  3 * MAX_PARTICIPANT_INDEX_SNAPSHOT_ATTEMPTS;
+export const MAX_PARTICIPANT_CAPACITY_READS =
+  MAX_PARTICIPANT_INDEX_SNAPSHOT_READS +
+  MAX_OWNED_INVESTMENT_INDICATIONS * MAX_INDICATION_MATERIALIZATION_READS;
 const PARTICIPANT_INDEXES = collection("participant-investment-indexes");
 const PARTICIPANT_OPERATIONS = collection("participant-investment-operations");
 const INDEX_DOCUMENT_KEYS = new Set([
@@ -105,6 +114,11 @@ const STORAGE_KEY_KEYS = new Set(["collection", "id"]);
 type ParticipantIndex = Readonly<{
   record: StorageRecord | null;
   ids: readonly InvestmentIndicationId[];
+}>;
+
+type CompleteParticipantIndex = Readonly<{
+  index: ParticipantIndex;
+  witness: ParticipantIndicationCompletenessWitness;
 }>;
 
 type PreparedReplayCommand = Readonly<{
@@ -174,7 +188,10 @@ export class StorageParticipantInvestmentInterestRepository
 
   async listOwned(): Promise<readonly InvestmentIndication[]> {
     try {
-      const index = await readParticipantIndex(this.#storage, this.#subject);
+      const { index } = await readCompleteParticipantIndex(
+        this.#storage,
+        this.#subject,
+      );
       const indications: InvestmentIndication[] = [];
       for (const id of index.ids) {
         const indication = await this.#indications
@@ -260,13 +277,30 @@ export class StorageParticipantInvestmentInterestRepository
     }
     if (prepared.command.kind === "create") {
       if (capacity.index.ids.includes(prepared.indication.id)) conflict();
-      if (capacity.index.ids.length >= MAX_OWNED_INDICATIONS) conflict();
+      if (
+        capacity.index.ids.length >= MAX_OWNED_INVESTMENT_INDICATIONS
+      ) conflict();
     } else if (!capacity.index.ids.includes(prepared.indication.id)) {
       unavailable();
     }
 
     const indication = await applyIndication(indications, prepared.command);
     if (indication.replayed) conflict();
+    const nextIndexIds = prepared.command.kind === "create"
+      ? Object.freeze(
+        [...capacity.index.ids, indication.snapshot.id].sort(compareIds),
+      )
+      : capacity.index.ids;
+    const stagedWitness = await readParticipantIndicationCompletenessWitness(
+      staged,
+      this.#subject,
+    );
+    if (
+      stagedWitness.record === null ||
+      stagedWitness.record.revision !==
+        (capacity.witness.record?.revision ?? 0) + 1 ||
+      !sameStrings(stagedWitness.indicationIds, nextIndexIds)
+    ) unavailable();
 
     const aggregateBefore = await new DevelopmentInMemoryAggregateRepository(
       staged,
@@ -286,15 +320,10 @@ export class StorageParticipantInvestmentInterestRepository
       prepared.command.kind === "withdraw" ||
       prepared.command.kind === "reactivate"
     ) {
-      const ids = prepared.command.kind === "create"
-        ? Object.freeze(
-          [...capacity.index.ids, indication.snapshot.id].sort(compareIds),
-        )
-        : capacity.index.ids;
       await staged.stage([await participantIndexMutation(
         this.#subject,
         capacity.index,
-        ids,
+        nextIndexIds,
       )]);
     }
 
@@ -579,7 +608,10 @@ async function readParticipantIndex(
     source.schemaVersion !== PARTICIPANT_INDEX_SCHEMA_VERSION ||
     source.revision !== envelope.revision
   ) unavailable();
-  const values = exactDenseArray(source.indicationIds, MAX_OWNED_INDICATIONS);
+  const values = exactDenseArray(
+    source.indicationIds,
+    MAX_OWNED_INVESTMENT_INDICATIONS,
+  );
   const ids: InvestmentIndicationId[] = [];
   for (const value of values) {
     const parsed = parseStableId<"investment-indication">(value);
@@ -597,6 +629,34 @@ async function readParticipantIndex(
   });
 }
 
+async function readCompleteParticipantIndex(
+  storage: Pick<StorageAdapter, "read">,
+  subject: ActorSubject,
+): Promise<CompleteParticipantIndex> {
+  for (
+    let attempt = 0;
+    attempt < MAX_PARTICIPANT_INDEX_SNAPSHOT_ATTEMPTS;
+    attempt += 1
+  ) {
+    const witnessBefore = await readParticipantIndicationCompletenessWitness(
+      storage,
+      subject,
+    );
+    const index = await readParticipantIndex(storage, subject);
+    const witnessAfter = await readParticipantIndicationCompletenessWitness(
+      storage,
+      subject,
+    );
+    if (!sameWitness(witnessBefore, witnessAfter)) continue;
+    if (
+      (index.record === null) !== (witnessAfter.record === null) ||
+      !sameStrings(index.ids, witnessAfter.indicationIds)
+    ) unavailable();
+    return Object.freeze({ index, witness: witnessAfter });
+  }
+  return unavailable();
+}
+
 async function readParticipantCapacity(
   storage: Pick<StorageAdapter, "read">,
   indications: Pick<
@@ -604,10 +664,14 @@ async function readParticipantCapacity(
     "readCurrentParticipantProjection"
   >,
   subject: ActorSubject,
-): Promise<Readonly<{ index: ParticipantIndex; activeCount: number }>> {
-  const index = await readParticipantIndex(storage, subject);
+): Promise<Readonly<{
+  index: ParticipantIndex;
+  witness: ParticipantIndicationCompletenessWitness;
+  activeCount: number;
+}>> {
+  const complete = await readCompleteParticipantIndex(storage, subject);
   let activeCount = 0;
-  for (const id of index.ids) {
+  for (const id of complete.index.ids) {
     const indication = await indications.readCurrentParticipantProjection(id);
     if (
       indication === null ||
@@ -618,7 +682,7 @@ async function readParticipantCapacity(
     }
     if (indication.lifecycle.status === "active") activeCount += 1;
   }
-  return Object.freeze({ index, activeCount });
+  return Object.freeze({ ...complete, activeCount });
 }
 
 async function participantIndexMutation(
@@ -646,8 +710,19 @@ async function requireIndexedIndication(
   subject: ActorSubject,
   id: InvestmentIndicationId,
 ): Promise<void> {
-  const index = await readParticipantIndex(storage, subject);
+  const { index } = await readCompleteParticipantIndex(storage, subject);
   if (!index.ids.includes(id)) unavailable();
+}
+
+function sameWitness(
+  left: ParticipantIndicationCompletenessWitness,
+  right: ParticipantIndicationCompletenessWitness,
+): boolean {
+  if (left.record === null || right.record === null) {
+    return left.record === null && right.record === null;
+  }
+  return left.record.revision === right.record.revision &&
+    sameStrings(left.indicationIds, right.indicationIds);
 }
 
 class StagedStorageTransaction implements StorageAdapter {

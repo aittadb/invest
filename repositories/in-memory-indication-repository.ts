@@ -78,11 +78,15 @@ const INDICATION_FIELDS = storageCollection("investment-indication-fields");
 const ACTIVE_UNIQUENESS_KEYS = storageCollection(
   "investment-indication-active-keys",
 );
+const OWNERSHIP_WITNESSES = storageCollection(
+  "investment-indication-ownership-witnesses",
+);
 export const MAX_INDICATION_STORAGE_RECORD_BYTES = 65_536;
 export const MAX_INDICATION_STORAGE_TRANSACTION_BYTES = 1_048_576;
 export const MAX_SERIALIZED_INDICATION_FIELDS_BYTES = 65_536;
 export const MAX_INDICATION_CANONICAL_DEPTH = 32;
 export const MAX_INDICATION_CANONICAL_NODES = 4_096;
+export const MAX_OWNED_INVESTMENT_INDICATIONS = 100;
 export const INDICATION_FIELDS_CHUNK_RAW_BYTES = 8_192;
 export const MAX_INDICATION_FIELDS_CHUNKS = Math.ceil(
   MAX_SERIALIZED_INDICATION_FIELDS_BYTES / INDICATION_FIELDS_CHUNK_RAW_BYTES,
@@ -91,9 +95,9 @@ export const MAX_INDICATION_MATERIALIZATION_READS =
   2 + MAX_INVESTMENT_INDICATION_REVISIONS *
     (1 + MAX_INDICATION_FIELDS_CHUNKS);
 export const MAX_INDICATION_STORAGE_READS =
-  1 + 2 * MAX_INDICATION_MATERIALIZATION_READS;
+  2 + 2 * MAX_INDICATION_MATERIALIZATION_READS;
 export const MAX_INDICATION_STORAGE_MUTATIONS =
-  4 + MAX_INDICATION_FIELDS_CHUNKS;
+  5 + MAX_INDICATION_FIELDS_CHUNKS;
 export const MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE = 25;
 export const MAX_OWNER_INDICATION_REVIEW_ITEM_READS =
   2 + MAX_INDICATION_FIELDS_CHUNKS;
@@ -185,6 +189,12 @@ const LEASE_DOCUMENT_KEYS = new Set([
 const OWNER_REVIEW_LIST_REQUEST_KEYS = new Set(["limit"]);
 const OWNER_REVIEW_CURSOR_REQUEST_KEYS = new Set(["limit", "cursor"]);
 const OWNER_REVIEW_PAGE_KEYS = new Set(["items", "nextCursor"]);
+const OWNERSHIP_WITNESS_DOCUMENT_KEYS = new Set([
+  "kind",
+  "schemaVersion",
+  "revision",
+  "indicationIds",
+]);
 
 export type IndicationMutationResult<
   Indication extends InvestmentIndication = InvestmentIndication,
@@ -192,6 +202,11 @@ export type IndicationMutationResult<
   revision: number;
   snapshot: Indication;
   replayed: boolean;
+}>;
+
+export type ParticipantIndicationCompletenessWitness = Readonly<{
+  record: StorageRecord | null;
+  indicationIds: readonly InvestmentIndicationId[];
 }>;
 
 type IndicationMutationRequest = Readonly<{
@@ -441,6 +456,54 @@ type ActiveLease = Readonly<{
   fingerprint: string;
   document: StorageDocument;
 }>;
+
+/** Read the bounded subject-owned ID witness used to prove index completeness. */
+export async function readParticipantIndicationCompletenessWitness(
+  storage: Pick<StorageAdapter, "read">,
+  participantSubject: ActorSubject,
+): Promise<ParticipantIndicationCompletenessWitness> {
+  const subject = requiredActorSubject(participantSubject);
+  const key = await ownershipWitnessKey(subject);
+  const record = await storage.read(key);
+  if (record === null) {
+    return Object.freeze({
+      record: null,
+      indicationIds: Object.freeze([]),
+    });
+  }
+  const source = exactStoredDocument(
+    record,
+    key,
+    OWNERSHIP_WITNESS_DOCUMENT_KEYS,
+    "investment-indication-ownership-witness",
+  );
+  if (
+    !Number.isSafeInteger(source.revision) ||
+    (source.revision as number) < 1 ||
+    source.revision !== record.revision
+  ) unavailable();
+  const values = exactDenseArray(
+    source.indicationIds,
+    MAX_OWNED_INVESTMENT_INDICATIONS,
+  );
+  const indicationIds: InvestmentIndicationId[] = [];
+  for (const value of values) {
+    const parsed = parseStableId<"investment-indication">(value);
+    if (!parsed.ok || indicationIds.includes(parsed.value)) unavailable();
+    indicationIds.push(parsed.value);
+  }
+  if (!sameStrings(indicationIds, [...indicationIds].sort(compareStrings))) {
+    unavailable();
+  }
+  return Object.freeze({
+    record: Object.freeze({
+      key,
+      revision: record.revision,
+      value: source as StorageDocument,
+    }),
+    indicationIds: Object.freeze(indicationIds),
+  });
+}
 
 /**
  * Subject-bound storage repository with bounded metadata, immutable transitions,
@@ -986,6 +1049,11 @@ export class DevelopmentInMemoryIndicationRepository
       actor.subject,
     );
     if (current === null || current.indication.revision < revision) unavailable();
+    await requireParticipantOwnershipWitness(
+      this.#storage,
+      transition.participantSubject,
+      request.id,
+    );
     return mutationResult(materialized.indication, true);
   }
 
@@ -1030,6 +1098,12 @@ export class DevelopmentInMemoryIndicationRepository
       previous?.indication ?? null,
       indication,
     );
+    const ownershipMutation = await participantOwnershipWitnessMutation(
+      this.#storage,
+      indication.participantSubject,
+      indication.id,
+      previous === null,
+    );
     const mutations: readonly StorageMutation[] = Object.freeze([
       Object.freeze({
         type: "put" as const,
@@ -1050,6 +1124,7 @@ export class DevelopmentInMemoryIndicationRepository
         value: chunk.value,
       })),
       ...uniquenessMutations,
+      ownershipMutation,
     ]);
     if (
       mutations.length > MAX_STORAGE_TRANSACTION_MUTATIONS ||
@@ -2782,6 +2857,60 @@ function verifyLeaseRecord(
   }
 }
 
+async function participantOwnershipWitnessMutation(
+  storage: Pick<StorageAdapter, "read">,
+  participantSubject: ActorSubject,
+  indicationId: InvestmentIndicationId,
+  create: boolean,
+): Promise<StorageMutation> {
+  const current = await readParticipantIndicationCompletenessWitness(
+    storage,
+    participantSubject,
+  );
+  let indicationIds: readonly InvestmentIndicationId[];
+  if (create) {
+    if (
+      current.indicationIds.includes(indicationId) ||
+      current.indicationIds.length >= MAX_OWNED_INVESTMENT_INDICATIONS
+    ) {
+      throw new StorageFailure("CONFLICT");
+    }
+    indicationIds = Object.freeze(
+      [...current.indicationIds, indicationId].sort(compareStrings),
+    );
+  } else {
+    if (!current.indicationIds.includes(indicationId)) unavailable();
+    indicationIds = current.indicationIds;
+  }
+  const revision = (current.record?.revision ?? 0) + 1;
+  if (!Number.isSafeInteger(revision)) unavailable();
+  const value = Object.freeze({
+    kind: "investment-indication-ownership-witness",
+    schemaVersion: INDICATION_SCHEMA_VERSION,
+    revision,
+    indicationIds: Object.freeze([...indicationIds]),
+  });
+  requireBoundedRecord(value);
+  return Object.freeze({
+    type: "put" as const,
+    key: await ownershipWitnessKey(participantSubject),
+    expectedRevision: current.record?.revision ?? null,
+    value,
+  });
+}
+
+async function requireParticipantOwnershipWitness(
+  storage: Pick<StorageAdapter, "read">,
+  participantSubject: ActorSubject,
+  indicationId: InvestmentIndicationId,
+): Promise<void> {
+  const witness = await readParticipantIndicationCompletenessWitness(
+    storage,
+    participantSubject,
+  );
+  if (!witness.indicationIds.includes(indicationId)) unavailable();
+}
+
 async function currentIndicationKey(
   id: InvestmentIndicationId,
 ): Promise<StorageKey> {
@@ -2807,6 +2936,15 @@ function requiredCurrentIndicationStorageKey(value: unknown): StorageKey {
     !/^indication-current:[0-9a-f]{64}$/u.test(parsed.value.id)
   ) invalidRequest();
   return parsed.value;
+}
+
+async function ownershipWitnessKey(
+  participantSubject: ActorSubject,
+): Promise<StorageKey> {
+  return requiredStorageKey(
+    OWNERSHIP_WITNESSES,
+    await hashedStorageId("indication-ownership", participantSubject),
+  );
 }
 
 async function indicationHistoryKey(
@@ -2980,6 +3118,15 @@ function exactRecord(
   const source = objectRecord(value);
   if (source === null || !hasExactKeys(source, expected)) unavailable();
   return source;
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length &&
+    left.every((value, index) => value === right[index]);
+}
+
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isSha256(value: string): boolean {

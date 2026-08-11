@@ -66,10 +66,14 @@ Application workflows must budget their own worst-case atomic operation within
 the 25-mutation limit. Investor App therefore limits one participant to four
 active investment indications while retaining up to 100 owned historical
 records. Withdrawn and rejected records do not consume an active slot. The
-participant index is compare-and-set on participant creation, withdrawal, and
-reactivation, so the bound remains valid under concurrent requests and leaves
-room for a later account-deletion transaction to withdraw the complete active
-set atomically.
+indication store atomically maintains a separate bounded subject-keyed ownership
+witness, and the participant coordinator accepts its index only when stable
+witness samples contain the same exact opaque IDs. The index is compare-and-set
+on participant creation, withdrawal, and reactivation while every indication
+lifecycle write compare-and-sets the witness. Missing, legacy, incomplete, or
+continuously moving pairs fail closed without a collection scan, so concurrent
+requests cannot hide a fifth active record and the later account-deletion
+transaction can withdraw the complete active set atomically.
 
 The machine-readable `transaction_shape` declares:
 
