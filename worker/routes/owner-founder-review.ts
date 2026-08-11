@@ -167,7 +167,9 @@ function parseRoute(
   const prefix = `${OWNER_FOUNDER_REVIEW_COLLECTION_PATH}/`;
   if (!url.pathname.startsWith(prefix)) return null;
   const encoded = url.pathname.slice(prefix.length);
-  if (encoded.length === 0 || encoded.includes("/")) return null;
+  if (encoded.length === 0 || encoded.includes("/")) {
+    return { kind: "detail", reviewId: null };
+  }
   let reviewId: string;
   try {
     reviewId = decodeURIComponent(encoded);
@@ -348,17 +350,34 @@ function renderCollection(
 
 function renderDetail(document: OwnerFounderReviewDetailDocument): string {
   const data = document.data;
+  const collection = document.links.find((link) =>
+    link.rel.includes("collection")
+  );
+  const owner = document.links.find((link) => link.rel.includes("owner"));
   const profileLinks = data.professional_profile_links.length === 0
     ? "<p>None provided.</p>"
     : `<ul>${data.professional_profile_links.map((href) =>
       `<li><a href="${escapeAttribute(href)}" rel="noreferrer">${escapeHtml(href)}</a></li>`
     ).join("")}</ul>`;
   const history = `<ol>${data.history.map((entry) =>
-    `<li>${escapeHtml(entry.transition)} · ${escapeHtml(entry.occurred_at)} · revision ${entry.revision}</li>`
+    `<li>${escapeHtml(entry.transition)} · ${escapeHtml(entry.status)} · ${escapeHtml(entry.occurred_at)} · revision ${entry.revision}</li>`
   ).join("")}</ol>`;
+  const navigation = collection === undefined && owner === undefined
+    ? ""
+    : `<nav aria-label="Owner review navigation">${
+      collection === undefined
+        ? ""
+        : `<a href="${escapeAttribute(collection.href)}">Back to founder applications</a>`
+    }${
+      collection !== undefined && owner !== undefined ? " " : ""
+    }${
+      owner === undefined
+        ? ""
+        : `<a href="${escapeAttribute(owner.href)}">Back to campaign workspace</a>`
+    }</nav>`;
   return page(
     "Founder application",
-    `<main><p class="section-kicker">Owner review</p><h1>Founder application</h1><p>Status: <strong>${escapeHtml(data.status)}</strong></p><dl><dt>Expertise</dt><dd>${escapeHtml(data.expertise_summary)}</dd><dt>Intended contribution</dt><dd>${escapeHtml(data.intended_contribution)}</dd><dt>Primary contribution area</dt><dd>${escapeHtml(data.primary_contribution_area_id)}</dd><dt>Other contribution areas</dt><dd>${escapeHtml(data.secondary_contribution_area_ids.join(", ") || "None provided")}</dd><dt>Availability</dt><dd>${escapeHtml(data.approximate_availability)}</dd><dt>Possible start</dt><dd>${escapeHtml(data.possible_start_timing)}</dd><dt>Compensation expectation</dt><dd>${escapeHtml(data.compensation_expectation)}</dd><dt>Note</dt><dd>${escapeHtml(data.note || "None provided")}</dd></dl><section><h2>Professional profiles</h2>${profileLinks}</section><section><h2>Application history</h2>${history}</section><p><a href="/owner/founder-applications">Back to founder applications</a></p></main>`,
+    `<main><p class="section-kicker">Owner review</p><h1>Founder application</h1><dl><dt>Application ID</dt><dd><code>${escapeHtml(data.application_id)}</code></dd><dt>Status</dt><dd>${escapeHtml(data.status)}</dd><dt>Revision</dt><dd>${data.revision}</dd><dt>Created</dt><dd>${escapeHtml(data.created_at)}</dd><dt>Updated</dt><dd>${escapeHtml(data.updated_at)}</dd><dt>Withdrawn</dt><dd>${data.withdrawn_at === null ? "Not withdrawn" : escapeHtml(data.withdrawn_at)}</dd><dt>Expertise</dt><dd>${escapeHtml(data.expertise_summary)}</dd><dt>Intended contribution</dt><dd>${escapeHtml(data.intended_contribution)}</dd><dt>Primary contribution area</dt><dd>${escapeHtml(data.primary_contribution_area_id)}</dd><dt>Other contribution areas</dt><dd>${escapeHtml(data.secondary_contribution_area_ids.join(", ") || "None provided")}</dd><dt>Availability</dt><dd>${escapeHtml(data.approximate_availability)}</dd><dt>Possible start</dt><dd>${escapeHtml(data.possible_start_timing)}</dd><dt>Compensation expectation</dt><dd>${escapeHtml(data.compensation_expectation)}</dd><dt>Note</dt><dd>${escapeHtml(data.note || "None provided")}</dd></dl><section><h2>Professional profiles</h2>${profileLinks}</section><section><h2>Application history</h2>${history}</section>${navigation}</main>`,
   );
 }
 

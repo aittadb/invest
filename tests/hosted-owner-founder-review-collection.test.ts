@@ -261,11 +261,19 @@ test("hosted owner founder detail preserves lifecycle parity across restart", as
   assert.equal(detail.id, collection.data.items[0]?.review_id);
   assert.equal(detail.data.status, "withdrawn");
   assert.equal(detail.data.revision, 3);
+  assert.equal(detail.data.application_id, "founder-application:self");
+  assert.equal(detail.data.created_at, "2026-08-10T10:00:00.000Z");
+  assert.equal(detail.data.updated_at, "2026-08-10T12:00:00.000Z");
+  assert.equal(detail.data.withdrawn_at, "2026-08-10T12:00:00.000Z");
   assert.equal(detail.data.primary_contribution_area_id, "area:product");
   assert.equal(detail.data.note, PRIVATE_NOTE);
   assert.deepEqual(
     detail.data.history.map((entry) => entry.transition),
     ["created", "edited", "withdrawn"],
+  );
+  assert.deepEqual(
+    detail.data.history.map((entry) => entry.status),
+    ["received", "received", "withdrawn"],
   );
   assert.equal(detail.links.some((link) =>
     link.rel.includes("collection") &&
@@ -296,6 +304,30 @@ test("hosted owner founder detail preserves lifecycle parity across restart", as
   assert.match(html, /created/u);
   assert.match(html, /edited/u);
   assert.match(html, /withdrawn/u);
+  for (const value of [
+    detail.data.application_id,
+    String(detail.data.revision),
+    detail.data.created_at,
+    detail.data.updated_at,
+    detail.data.withdrawn_at,
+  ]) {
+    assert(value);
+    assert.ok(html.includes(value));
+  }
+  for (const entry of detail.data.history) {
+    assert.ok(
+      html.includes(
+        `${entry.transition} · ${entry.status} · ${entry.occurred_at} · revision ${entry.revision}`,
+      ),
+    );
+  }
+  for (const relation of ["collection", "owner"] as const) {
+    const link = detail.links.find((candidate) =>
+      candidate.rel.includes(relation)
+    );
+    assert(link);
+    assert.ok(html.includes(`href="${link.href}"`));
+  }
   assert.doesNotMatch(html, /sites-founder-|sites-owner-subject|owner@example/u);
   assert.ok(
     service.readKeys.length - htmlReadStart <=
@@ -326,7 +358,8 @@ test("hosted founder detail denials and invalid IDs do not disclose or read", as
     "area:engineering",
   );
   const env = configuredEnvironment();
-  const worker = hostedWorker(service, []);
+  const renderedRequests: Request[] = [];
+  const worker = hostedWorker(service, renderedRequests);
   const collectionResponse = await worker.fetch(
     ownerRequest("/owner/founder-applications?page_size=1"),
     env,
@@ -364,18 +397,30 @@ test("hosted founder detail denials and invalid IDs do not disclose or read", as
   assert.doesNotMatch(await foreign.text(), /sites-founder-|Private hosted/u);
   assert.equal(founderApplicationReadCount(service), deniedReadStart);
 
-  const malformed = await worker.fetch(
-    ownerRequest(
-      `/owner/founder-applications/${encodeURIComponent(ALICE)}`,
-    ),
-    env,
-    executionContext,
-  );
-  assert.equal(malformed.status, 400);
-  const malformedBody = await malformed.text();
-  assert.doesNotMatch(malformedBody, /sites-founder-|Private hosted/u);
-  assert.match(malformedBody, /owner\/founder-applications\/invalid/u);
+  const malformedPaths = [
+    `/owner/founder-applications/${encodeURIComponent(ALICE)}`,
+    "/owner/founder-applications/",
+    `${detailPath}/`,
+    `/owner/founder-applications/${encodeURIComponent(ALICE)}/history`,
+  ];
+  for (const malformedPath of malformedPaths) {
+    const malformed = await worker.fetch(
+      ownerRequest(malformedPath),
+      env,
+      executionContext,
+    );
+    assert.equal(malformed.status, 400, malformedPath);
+    assert.equal(malformed.headers.get("cache-control"), "no-store");
+    assert.equal(malformed.headers.get("referrer-policy"), "no-referrer");
+    const malformedBody = await malformed.text();
+    assert.doesNotMatch(
+      malformedBody,
+      /sites-founder-|founder-review:|Private hosted/u,
+    );
+    assert.match(malformedBody, /owner\/founder-applications\/invalid/u);
+  }
   assert.equal(founderApplicationReadCount(service), deniedReadStart);
+  assert.equal(renderedRequests.length, 0);
 
   const missingId = `founder-review:${"f".repeat(64)}`;
   const missing = await worker.fetch(

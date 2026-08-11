@@ -4,9 +4,11 @@ import test from "node:test";
 import {
   createFounderApplication,
   parseContributionAreaChoices,
+  withdrawFounderApplication,
   type FounderApplication,
 } from "../domain/founder-application.ts";
 import { parseActorSubject } from "../domain/foundation.ts";
+import type { OwnerFounderReviewDetailDocument } from "../domain/owner-founder-review-resource.ts";
 import { INVESTOR_APP_MEDIA_TYPE } from "../domain/public-campaign-resource.ts";
 import type {
   FounderApplicationReviewCollectionItem,
@@ -160,6 +162,63 @@ test("founder review collection remains independent from detail composition", as
   assert.match(detailHtml, new RegExp(PRIVATE_NOTE));
   assert.match(detailHtml, /Application history/);
   assert.equal(detailHtml.includes(item.application.applicantSubject), false);
+  assert.equal(repository.getCalls, 2);
+});
+
+test("founder detail HTML renders every hypermedia lifecycle fact and navigation link", async () => {
+  const item = withdrawnReviewItem();
+  const repository = new FakeFounderReviewRepository(item);
+  const handler = createOwnerFounderReviewRouteHandler(repository);
+  const detailUrl =
+    `https://invest.example/owner/founder-applications/${encodeURIComponent(item.reviewId)}`;
+
+  const jsonResponse = await requiredResponse(await handler(context(detailUrl, {
+    accept: "application/json",
+  })));
+  const document = await jsonResponse.json() as OwnerFounderReviewDetailDocument;
+  const htmlResponse = await requiredResponse(await handler(context(detailUrl, {
+    accept: "text/html",
+  })));
+  const html = await htmlResponse.text();
+
+  assert.equal(jsonResponse.status, 200);
+  assert.equal(htmlResponse.status, 200);
+  assert.match(
+    html,
+    new RegExp(`<dt>Application ID</dt><dd><code>${document.data.application_id}</code></dd>`, "u"),
+  );
+  assert.match(
+    html,
+    new RegExp(`<dt>Revision</dt><dd>${document.data.revision}</dd>`, "u"),
+  );
+  assert.match(
+    html,
+    new RegExp(`<dt>Created</dt><dd>${document.data.created_at}</dd>`, "u"),
+  );
+  assert.match(
+    html,
+    new RegExp(`<dt>Updated</dt><dd>${document.data.updated_at}</dd>`, "u"),
+  );
+  assert(document.data.withdrawn_at);
+  assert.match(
+    html,
+    new RegExp(`<dt>Withdrawn</dt><dd>${document.data.withdrawn_at}</dd>`, "u"),
+  );
+  for (const entry of document.data.history) {
+    assert.ok(
+      html.includes(
+        `${entry.transition} · ${entry.status} · ${entry.occurred_at} · revision ${entry.revision}`,
+      ),
+    );
+  }
+  for (const relation of ["collection", "owner"] as const) {
+    const link = document.links.find((candidate) =>
+      candidate.rel.includes(relation)
+    );
+    assert(link);
+    assert.ok(html.includes(`href="${link.href}"`));
+  }
+  assert.equal(html.includes(item.application.applicantSubject), false);
   assert.equal(repository.getCalls, 2);
 });
 
@@ -327,6 +386,49 @@ test("detail-only routing exposes no collection or unauthorized lookup", async (
   assert.equal(repository.getCalls, 1);
 });
 
+test("malformed detail paths are canonical, private, and bypass reads and rendering", async () => {
+  const item = reviewItem();
+  const repository = new FakeFounderReviewRepository(item);
+  const handler = createOwnerFounderReviewDetailRouteHandler(repository);
+  const collectionUrl = "https://invest.example/owner/founder-applications";
+  const privateSubject = "issuer.invalid/subject:must-not-be-reflected";
+  const detailUrl = `${collectionUrl}/${encodeURIComponent(item.reviewId)}`;
+  let renderCalls = 0;
+  const malformedUrls = [
+    `${collectionUrl}/`,
+    `${detailUrl}/`,
+    `${collectionUrl}/${encodeURIComponent(privateSubject)}/history`,
+    `${collectionUrl}/%E0%A4%A`,
+  ];
+
+  for (const accept of ["application/json", "text/html"] as const) {
+    for (const url of malformedUrls) {
+      const response = await requiredResponse(await handler(context(url, {
+        accept,
+        renderApplication: async () => {
+          renderCalls += 1;
+          return new Response("renderer must not run", { status: 598 });
+        },
+      })));
+      const body = await response.text();
+      assert.equal(response.status, 400, `${accept} ${url}`);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+      assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+      assert.equal(response.headers.get("x-frame-options"), "DENY");
+      assert.equal(body.includes(privateSubject), false);
+      assert.equal(body.includes(item.reviewId), false);
+      assert.equal(body.includes(PRIVATE_NOTE), false);
+      if (accept === "application/json") {
+        assert.match(body, /owner\/founder-applications\/invalid/u);
+      }
+    }
+  }
+  assert.equal(repository.listCalls, 0);
+  assert.equal(repository.getCalls, 0);
+  assert.equal(renderCalls, 0);
+});
+
 class FakeFounderReviewRepository
 implements FounderApplicationReviewRepository {
   listCalls = 0;
@@ -367,6 +469,7 @@ type ContextOptions = Readonly<{
   actor?: ApplicationRouteContext["actor"];
   isOwner?: boolean;
   method?: string;
+  renderApplication?: ApplicationRouteContext["renderApplication"];
 }>;
 
 function context(
@@ -385,7 +488,8 @@ function context(
     isOwner: options.isOwner ?? actor?.email === "owner@example.invalid",
     participantAccess: null,
     campaign: null,
-    renderApplication: async () => new Response("application fallback"),
+    renderApplication: options.renderApplication ??
+      (async () => new Response("application fallback")),
   };
 }
 
@@ -438,6 +542,18 @@ function reviewItem(): FounderApplicationReviewItem {
       "founder-review:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     application: created.value as FounderApplication,
   });
+}
+
+function withdrawnReviewItem(): FounderApplicationReviewItem {
+  const item = reviewItem();
+  const withdrawn = withdrawFounderApplication(item.application, {
+    actorSubject: item.application.applicantSubject,
+    occurredAt: "2026-08-09T11:00:00.000Z",
+    historyEntryId: "founder-history:review-withdraw",
+  });
+  assert.equal(withdrawn.ok, true);
+  if (!withdrawn.ok) throw new Error("Invalid withdrawn founder fixture.");
+  return Object.freeze({ ...item, application: withdrawn.value });
 }
 
 async function requiredResponse(
