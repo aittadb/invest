@@ -64,11 +64,18 @@ export type ParticipantFounderInterestServiceFactory = (
   actorSubject: ActorSubject,
 ) => ParticipantFounderInterestService;
 
+export type FounderInterestMutationRepositoryProvider = () =>
+  | FounderApplicationRepository
+  | null
+  | Promise<FounderApplicationRepository | null>;
+
 export type FounderInterestServiceOptions = Readonly<{
   actorSubject: ActorSubject;
   applicationId: FounderApplicationId;
   contributionAreaChoices: readonly ContributionAreaChoice[];
   repository: FounderApplicationRepository;
+  repositoryForCreate?: FounderInterestMutationRepositoryProvider;
+  repositoryForEdit?: FounderInterestMutationRepositoryProvider;
   canCreate: () => boolean | Promise<boolean>;
   now?: () => Date;
 }>;
@@ -89,8 +96,11 @@ export function createParticipantFounderInterestService(
   const now = options.now ?? (() => new Date());
 
   if (
-    typeof options.repository !== "object" ||
-    options.repository === null ||
+    !isFounderApplicationRepository(options.repository) ||
+    (options.repositoryForCreate !== undefined &&
+      typeof options.repositoryForCreate !== "function") ||
+    (options.repositoryForEdit !== undefined &&
+      typeof options.repositoryForEdit !== "function") ||
     typeof options.canCreate !== "function" ||
     typeof now !== "function"
   ) {
@@ -118,6 +128,22 @@ export function createParticipantFounderInterestService(
     }
     if (typeof allowed !== "boolean") unavailable();
     return allowed;
+  };
+
+  const mutationRepository = async (
+    provider: FounderInterestMutationRepositoryProvider,
+  ): Promise<FounderApplicationRepository> => {
+    let repository: unknown;
+    try {
+      repository = await provider();
+    } catch (error) {
+      throw new StorageFailure("UNAVAILABLE", { cause: error });
+    }
+    if (repository === null) {
+      throw new StorageFailure("PRECONDITION_FAILED");
+    }
+    if (!isFounderApplicationRepository(repository)) unavailable();
+    return repository;
   };
 
   const mutationMetadata = async (
@@ -181,11 +207,16 @@ export function createParticipantFounderInterestService(
 
     async create(input: CreateFounderInterestInput) {
       const metadata = await mutationMetadata(input.operationId);
-      if (!metadata.replayKnown && !(await creationAllowed())) {
-        throw new StorageFailure("PRECONDITION_FAILED");
+      let repository = options.repository;
+      if (!metadata.replayKnown) {
+        if (options.repositoryForCreate !== undefined) {
+          repository = await mutationRepository(options.repositoryForCreate);
+        } else if (!(await creationAllowed())) {
+          throw new StorageFailure("PRECONDITION_FAILED");
+        }
       }
       return requireOwnedResult(
-        await options.repository.create({
+        await repository.create({
           operationId: metadata.operationId,
           expectedRevision: null,
           id: applicationId,
@@ -201,8 +232,12 @@ export function createParticipantFounderInterestService(
 
     async edit(input: EditFounderInterestInput) {
       const metadata = await mutationMetadata(input.operationId);
+      const repository = !metadata.replayKnown &&
+          options.repositoryForEdit !== undefined
+        ? await mutationRepository(options.repositoryForEdit)
+        : options.repository;
       return requireOwnedResult(
-        await options.repository.edit({
+        await repository.edit({
           operationId: metadata.operationId,
           expectedRevision: input.expectedRevision,
           id: applicationId,
@@ -232,6 +267,17 @@ export function createParticipantFounderInterestService(
       );
     },
   });
+}
+
+function isFounderApplicationRepository(
+  value: unknown,
+): value is FounderApplicationRepository {
+  if (typeof value !== "object" || value === null) return false;
+  const repository = value as Partial<FounderApplicationRepository>;
+  return typeof repository.create === "function" &&
+    typeof repository.get === "function" &&
+    typeof repository.edit === "function" &&
+    typeof repository.withdraw === "function";
 }
 
 function requireOwnedResult<Status extends "received" | "withdrawn">(

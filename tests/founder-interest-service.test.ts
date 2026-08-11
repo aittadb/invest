@@ -33,11 +33,26 @@ const CHOICES = contributionChoices([
 test("founder-interest service binds identity and recovers retry metadata from history", async () => {
   const state = new FounderApplicationRepositoryFixtureState();
   let clockCalls = 0;
+  let createRepositorySamples = 0;
+  let editRepositorySamples = 0;
+  const repository = new FounderApplicationRepositoryFixture(
+    state,
+    ALICE,
+    CHOICES,
+  );
   const service = createParticipantFounderInterestService({
     actorSubject: ALICE,
     applicationId: APPLICATION_ID,
     contributionAreaChoices: CHOICES,
-    repository: new FounderApplicationRepositoryFixture(state, ALICE, CHOICES),
+    repository,
+    repositoryForCreate: () => {
+      createRepositorySamples += 1;
+      return repository;
+    },
+    repositoryForEdit: () => {
+      editRepositorySamples += 1;
+      return repository;
+    },
     canCreate: () => true,
     now: () => {
       clockCalls += 1;
@@ -63,18 +78,23 @@ test("founder-interest service binds identity and recovers retry metadata from h
   assert.equal(replay.replayed, true);
   assert.equal(clockCalls, 1);
   assert.equal(state.requests.length, 2);
+  assert.equal(createRepositorySamples, 1);
   assert.equal(state.requests[0]?.request.occurredAt, state.requests[1]?.request.occurredAt);
   assert.equal(
     Object.hasOwn(state.requests[0]?.request ?? {}, "applicantSubject"),
     false,
   );
 
-  const edited = await service.edit({
+  const editInput = {
     operationId: "founder-operation:edit-alice",
     expectedRevision: 1,
     fields: fields({ note: "Updated application note." }),
-  });
+  };
+  const edited = await service.edit(editInput);
+  const editReplay = await service.edit(editInput);
   assert.equal(edited.snapshot.revision, 2);
+  assert.equal(editReplay.replayed, true);
+  assert.equal(editRepositorySamples, 1);
   assert.equal(edited.snapshot.history.length, 2);
   assert.equal(edited.snapshot.history[0]?.fields.note, "Initial application note.");
   assert.equal(edited.snapshot.history[1]?.fields.note, "Updated application note.");

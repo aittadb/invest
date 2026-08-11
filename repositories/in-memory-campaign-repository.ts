@@ -29,6 +29,7 @@ import {
   parseStorageKey,
   parseStorageOperationId,
   type StorageAdapter,
+  type StorageCheckMutation,
   type StorageCursor,
   type StorageDocument,
   type StorageKey,
@@ -53,6 +54,7 @@ const SETUP_CHUNK_RAW_BYTES = 45_000;
 const MAX_SETUP_CHUNKS = Math.ceil(
   MAX_SERIALIZED_CAMPAIGN_SETUP_BYTES / SETUP_CHUNK_RAW_BYTES,
 );
+export const MAX_CAMPAIGN_SETUP_MATERIALIZATION_READS = 1 + MAX_SETUP_CHUNKS;
 const MAX_SETUP_CHUNK_RECORD_BYTES = 61_440;
 export const CAMPAIGN_OPERATION_INTENT_MAX_RECORD_BYTES = 2_048;
 const SETUP_HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
@@ -188,6 +190,54 @@ export type CampaignSetupHistoryPage = Readonly<{
   items: readonly CampaignSetupRevision[];
   nextCursor: StorageCursor | null;
 }>;
+
+/** Exact current-setup assertion used by atomic dependent writes. */
+export function campaignSetupRevisionCheck(
+  revision: unknown,
+): StorageCheckMutation {
+  if (!Number.isSafeInteger(revision) || (revision as number) < 1) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+  return Object.freeze({
+    type: "check",
+    key: CURRENT_SETUP_KEY,
+    expectedRevision: revision as number,
+  });
+}
+
+/** Validate unchanged current-setup evidence returned for a positive check. */
+export function verifyCampaignSetupRevisionCheckRecord(
+  record: unknown,
+  expectedRevision: unknown,
+): void {
+  if (
+    !Number.isSafeInteger(expectedRevision) ||
+    (expectedRevision as number) < 1
+  ) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+  const envelope = exactDataObject(record, ["key", "revision", "value"]);
+  const key = envelope === null
+    ? null
+    : exactDataObject(envelope.key, ["collection", "id"]);
+  const value = envelope === null
+    ? null
+    : exactDataObject(envelope.value, [...STORED_REVISION_KEYS]);
+  if (
+    envelope === null ||
+    key === null ||
+    value === null ||
+    key.collection !== CURRENT_SETUP_KEY.collection ||
+    key.id !== CURRENT_SETUP_KEY.id ||
+    envelope.revision !== expectedRevision
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  const decoded = decodeRevision(value as StorageDocument);
+  if (decoded.revision !== expectedRevision) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+}
 
 /** Narrow one-campaign-per-deployment persistence contract. */
 export interface CampaignRepository {

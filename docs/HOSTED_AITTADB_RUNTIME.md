@@ -35,6 +35,12 @@ sign-out while withholding founder and investment actions. Indication,
 aggregate, moderation, export, and coordinated deletion persistence still
 require their own named capabilities.
 
+Founder composition opens private campaign policy and a fresh subject-bound
+campaign/profile/application scope only for the exact founder resource after
+participant authorization. Its create and edit repositories add the exact
+sampled campaign revision as an atomic transaction check, so a concurrent
+policy change cannot authorize a stale write.
+
 The persistent owner indication-detail primitive can resolve one deployment-key
 opaque review ID to a bounded verified current record and notification without a
 list scan. It is not installed as a hosted owner route until the separate owner
@@ -134,7 +140,7 @@ replay, the atomic campaign/audit repository, the public campaign projection
 reader, the owner package workspace, the owner-bound indication-review
 collection, the bounded owner founder-review collection, a participant package reader,
 subject-bound package acknowledgment, one participant-access state reader, and
-one participant-bound founder-application pair.
+one participant-bound founder campaign/profile/application scope.
 That reader creates fresh profile and acknowledgment repositories for each
 trusted account and combines them only through the bounded projection service.
 The named `participantRepository(account)` capability returns a fresh repository
@@ -298,22 +304,24 @@ package, acknowledgment, or founder route receive the same subject-bound scope;
 route repository factories cannot reopen the underlying uncapped adapter. A
 second HTTP request receives a new scope.
 
-That scope admits at most 1,390 participant-private storage-record reads. The
+That scope admits at most 1,405 participant-private storage-record reads. The
 maximum valid authorization envelope is 551: 511 unique immutable package
 records plus two outer attempts, each containing six profile reads, two package
 head reads, and three four-read accepted gate attempts. The profile reads cover
 current, matching latest history, and immutable registration revision 1 for
 each sample. The selected capability then owns its own finite route budget:
-package one, acknowledgment eight, profile 23, or founder 839 reads. The founder
-budget covers four maximum bounded application materializations plus three
-retry/recovery reads, including a conflicted mutation and the returned resource
-projection. After the first route read, another route budget cannot be selected.
-The 1,390 global ceiling is the authorization maximum plus the largest route
-budget; either that ceiling or the selected route's smaller ceiling rejects the
-next read before adapter access. Public campaign reads and storage transactions
-are outside these participant read counters, while all profile, package, gate,
-acceptance-head, acceptance-record, and participant-route record reads are
-inside them.
+package one, acknowledgment eight, profile 23, or founder 854 reads. The founder
+budget covers four maximum 209-read application materializations, four
+retry/recovery reads, and two maximum seven-read private campaign-setup
+materializations, including final policy sampling, a conflicted mutation, and
+the returned resource projection. After the first route read, another route
+budget cannot be selected. The 1,405 global ceiling is the authorization maximum
+plus the largest route budget; either that ceiling or the selected route's
+smaller ceiling rejects the next read before adapter access. Public
+campaign-presentation reads and storage transactions are outside these
+participant read counters, while both private founder campaign samples and all
+profile, package, gate, acceptance-head, acceptance-record, and
+participant-route record reads are inside them.
 
 Within the scope, one read-only package reader reuses up to 64 verified immutable
 version reconstructions. Cache hits recharge complete ancestry and logical read
@@ -377,8 +385,11 @@ retry of a pre-upgrade owner operation may replay its original closed schema-4
 transaction only after matching immutable operation evidence; it cannot migrate
 the projection or replace a newer campaign revision.
 Owner reads use the separate atomic repository only after trusted owner
-authorization. Anonymous callers receive `401`; authenticated non-owners receive
-the generic `404` surface before a private repository read.
+authorization. On the founder resource, authentication and subject/role
+authorization also run before unsupported-method disclosure: anonymous callers
+receive `401`, authenticated owner or foreign callers receive the generic `404`,
+and only the authorized participant receives `405` with `Allow`. These rejected
+methods do not enter browser-proof verification or replay storage.
 
 The one shared mutation session is configured to the largest currently composed
 form as an absolute ceiling and explicitly permits only the founder route's
@@ -445,8 +456,14 @@ totals, the complete nested-plus-outer 551-read authorization envelope,
 route-specific read cutoffs, cached ancestry and reconstruction recharge, exact
 material gating, and narrowing-only route mutation limits.
 Founder coverage adds configured-choice projection, create/retry/edit/stale/
-independence, malformed and oversized hosted bodies, equivalent HTML and
-hypermedia state/actions, and reconstruction through a fresh Worker. The
+independence, malformed and oversized hosted bodies, authentication-before-
+method disclosure, equivalent HTML and hypermedia state/actions, and
+reconstruction through a fresh Worker. One-shot hosted transaction races close
+the phase after create's final sample and replace contribution choices after
+edit's final sample; each check failure leaves every founder current, history,
+field, and policy-revision collection unchanged. Recovery with the same
+operation and exact replay after another policy change and Worker restart are
+also covered. The
 synthetic hosted services implement and enforce the discovered AittaDB
 read/list/transaction controls rather than bypassing the adapter. Source
 and built-artifact scans complement `npm run instances:check`, which rejects

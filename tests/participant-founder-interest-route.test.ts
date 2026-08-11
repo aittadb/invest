@@ -28,6 +28,7 @@ import {
   hashCsrfToken,
   type TrustedMutationSession,
 } from "../http/mutation-security.ts";
+import { StorageFailure } from "../domain/storage-adapter.ts";
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
 import { createParticipantFounderInterestService } from "../worker/founder-interest-service.ts";
 import {
@@ -529,21 +530,51 @@ test("anonymous and foreign participants cannot discover or mutate another appli
   assert.deepEqual(await bobFailure.json(), await charlieFailure.json());
 });
 
+test("founder method disclosure follows authentication and subject authorization", async () => {
+  const harness = await createHarness(CHOICES, ALICE);
+
+  const anonymous = await harness.dispatch(unsupportedPut(null), null);
+  assert.equal(anonymous.status, 401);
+  assert.equal(anonymous.headers.get("allow"), null);
+
+  const foreign = await harness.dispatch(unsupportedPut(BOB), BOB);
+  const anotherForeign = await harness.dispatch(
+    unsupportedPut(CHARLIE),
+    CHARLIE,
+  );
+  assert.equal(foreign.status, 404);
+  assert.equal(anotherForeign.status, 404);
+  assert.equal(foreign.headers.get("allow"), null);
+  assert.deepEqual(await foreign.json(), await anotherForeign.json());
+
+  const participant = await harness.dispatch(unsupportedPut(ALICE), ALICE);
+  assert.equal(participant.status, 405);
+  assert.equal(participant.headers.get("allow"), "GET, POST, PATCH, DELETE");
+  assert.equal(harness.proofChecks(), 0);
+  assert.equal(harness.state.requests.length, 0);
+});
+
 type TestHarness = Readonly<{
   state: FounderApplicationRepositoryFixtureState;
+  proofChecks(): number;
   dispatch(request: Request, actor: ActorSubject | null): Promise<Response>;
 }>;
 
 async function createHarness(
   configuredChoices: readonly ContributionAreaChoice[] = CHOICES,
+  authorizedSubject: ActorSubject | null = null,
 ): Promise<TestHarness> {
   const state = new FounderApplicationRepositoryFixtureState();
   const csrfHash = await hashCsrfToken(CSRF_TOKEN);
   let clockMinute = 0;
   let actionSequence = 0;
+  let proofChecks = 0;
   const founderInterestRoute = createFounderInterestRouteHandler({
-    serviceFor: (actorSubject) =>
-      createParticipantFounderInterestService({
+    serviceFor: (actorSubject) => {
+      if (authorizedSubject !== null && actorSubject !== authorizedSubject) {
+        throw new StorageFailure("NOT_FOUND");
+      }
+      return createParticipantFounderInterestService({
         actorSubject,
         applicationId: APPLICATION_ID,
         contributionAreaChoices: configuredChoices,
@@ -560,10 +591,12 @@ async function createHarness(
           clockMinute += 1;
           return value;
         },
-      }),
+      });
+    },
     mutationSecurity: {
       allowedOrigins: [APP_ORIGIN],
       resolveSession: async (request) => {
+        proofChecks += 1;
         const value = request.headers.get("x-test-auth-subject");
         if (!value) return null;
         const actorSubject = subject(value);
@@ -584,11 +617,26 @@ async function createHarness(
 
   return Object.freeze({
     state,
+    proofChecks: () => proofChecks,
     async dispatch(request, actor) {
       const response = await route(routeContext(request, actor));
       assert(response);
       return response;
     },
+  });
+}
+
+function unsupportedPut(actor: ActorSubject | null): Request {
+  return new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+    method: "PUT",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      origin: APP_ORIGIN,
+      [MUTATION_CSRF_HEADER]: CSRF_TOKEN,
+      ...(actor === null ? {} : { "x-test-auth-subject": actor }),
+    },
+    body: "{}",
   });
 }
 

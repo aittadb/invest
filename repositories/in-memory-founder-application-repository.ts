@@ -32,6 +32,7 @@ import {
   parseStorageOperationId,
   storageKeyString,
   type StorageAdapter,
+  type StorageCheckMutation,
   type StorageCollection,
   type StorageCursor,
   type StorageDocument,
@@ -45,6 +46,10 @@ const FOUNDER_APPLICATION_SCHEMA_VERSION = 2;
 const CURRENT_APPLICATIONS = storageCollection("founder-applications");
 const APPLICATION_HISTORY = storageCollection("founder-application-history");
 const APPLICATION_FIELDS = storageCollection("founder-application-fields");
+const APPLICATION_POLICY_REVISIONS = storageCollection(
+  "founder-application-policy-revisions",
+);
+const FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION = 1;
 
 export const MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES = 65_536;
 export const MAX_FOUNDER_APPLICATION_STORAGE_TRANSACTION_BYTES = 1_048_576;
@@ -58,7 +63,7 @@ export const MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS =
   1 + MAX_FOUNDER_APPLICATION_REVISIONS *
     (1 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS);
 export const MAX_FOUNDER_APPLICATION_STORAGE_READS =
-  3 + 2 * MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS;
+  4 + 2 * MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS;
 export const MAX_FOUNDER_APPLICATION_REVIEW_PAGE_SIZE = 25;
 export const MAX_FOUNDER_APPLICATION_REVIEW_CURSOR_CHARACTERS = 2_048;
 export const MAX_FOUNDER_APPLICATION_REVIEW_PAGE_RECORD_READS =
@@ -119,6 +124,14 @@ const FIELDS_PAYLOAD_KEYS = new Set([
   "contributionAreaIds",
   "fields",
 ]);
+const POLICY_REVISION_DOCUMENT_KEYS = [
+  "kind",
+  "schemaVersion",
+  "applicationId",
+  "applicantSubject",
+  "applicationRevision",
+  "campaignSetupRevision",
+] as const;
 
 export type FounderApplicationMutationResult<
   Application extends FounderApplication = FounderApplication,
@@ -167,6 +180,20 @@ export interface FounderApplicationRepository {
     request: WithdrawFounderApplicationRequest,
   ): Promise<FounderApplicationMutationResult<WithdrawnFounderApplication>>;
 }
+
+export type FounderApplicationPolicyRevisionCheck = (
+  revision: number,
+) => StorageCheckMutation;
+export type FounderApplicationPolicyRevisionEvidenceVerifier = (
+  record: unknown,
+  revision: number,
+) => void;
+
+export type StorageFounderApplicationRepositoryOptions = Readonly<{
+  policyRevisionCheck?: FounderApplicationPolicyRevisionCheck;
+  verifyPolicyRevisionCheck?: FounderApplicationPolicyRevisionEvidenceVerifier;
+  writePolicyRevision?: number;
+}>;
 
 export type FounderApplicationReviewItem = Readonly<{
   reviewId: string;
@@ -281,6 +308,13 @@ type PreparedMutation = Readonly<{
   currentDocument: StorageDocument;
   historyDocument: StorageDocument;
   fieldsChunks: readonly PreparedFieldsChunk[];
+  policy: PreparedPolicyRevision | null;
+}>;
+
+type PreparedPolicyRevision = Readonly<{
+  key: StorageKey;
+  value: StorageDocument;
+  check: StorageCheckMutation;
 }>;
 
 /**
@@ -296,11 +330,17 @@ export class StorageFounderApplicationRepository
   readonly #storage: StorageAdapter;
   readonly #applicantSubject: ActorSubject | null;
   readonly #contributionAreaChoices: readonly ContributionAreaChoice[];
+  readonly #policyRevisionCheck: FounderApplicationPolicyRevisionCheck | null;
+  readonly #verifyPolicyRevisionCheck:
+    | FounderApplicationPolicyRevisionEvidenceVerifier
+    | null;
+  readonly #writePolicyRevision: number | null;
 
   constructor(
     storage: StorageAdapter,
     authenticatedApplicantSubject: ActorSubject | null,
     contributionAreaChoices: readonly ContributionAreaChoice[],
+    options: StorageFounderApplicationRepositoryOptions = {},
   ) {
     this.#storage = storage;
     this.#applicantSubject = authenticatedApplicantSubject === null
@@ -310,6 +350,32 @@ export class StorageFounderApplicationRepository
     const parsedChoices = parseContributionAreaChoices(contributionAreaChoices);
     if (!parsedChoices.ok) invalidRequest();
     this.#contributionAreaChoices = parsedChoices.value;
+
+    this.#policyRevisionCheck = options.policyRevisionCheck ?? null;
+    this.#verifyPolicyRevisionCheck = options.verifyPolicyRevisionCheck ?? null;
+    this.#writePolicyRevision = options.writePolicyRevision === undefined
+      ? null
+      : requiredPolicyRevision(options.writePolicyRevision);
+    if (
+      (this.#policyRevisionCheck !== null &&
+        typeof this.#policyRevisionCheck !== "function") ||
+      (this.#verifyPolicyRevisionCheck !== null &&
+        typeof this.#verifyPolicyRevisionCheck !== "function") ||
+      (this.#policyRevisionCheck === null) !==
+        (this.#verifyPolicyRevisionCheck === null) ||
+      (this.#writePolicyRevision !== null && this.#policyRevisionCheck === null)
+    ) {
+      invalidRequest();
+    }
+    if (
+      this.#writePolicyRevision !== null &&
+      this.#policyRevisionCheck !== null
+    ) {
+      requiredPolicyRevisionCheck(
+        this.#policyRevisionCheck,
+        this.#writePolicyRevision,
+      );
+    }
   }
 
   async create(
@@ -501,6 +567,9 @@ export class StorageFounderApplicationRepository
     const fieldsChunks = kind === "withdraw"
       ? Object.freeze([])
       : storedFields.chunks;
+    const policy = kind === "withdraw"
+      ? null
+      : await this.#readPolicyRevision(subject, envelope.id, revision);
     return this.#transactPrepared(
       prepareMutation(
         materialized.application,
@@ -508,6 +577,7 @@ export class StorageFounderApplicationRepository
         terminal.operationFingerprint,
         terminal.fields,
         fieldsChunks,
+        policy,
       ),
       parsed,
       subject,
@@ -552,6 +622,13 @@ export class StorageFounderApplicationRepository
       fingerprint,
       storedFields.reference,
       fieldsChunks,
+      request.fields === undefined
+        ? null
+        : await this.#prepareWritePolicyRevision(
+            subject,
+            application.id,
+            application.revision,
+          ),
     );
     try {
       return await this.#transactPrepared(prepared, request, subject);
@@ -602,10 +679,21 @@ export class StorageFounderApplicationRepository
         expectedRevision: null,
         value: chunk.value,
       })),
+      ...(prepared.policy === null
+        ? []
+        : [
+            {
+              type: "put" as const,
+              key: prepared.policy.key,
+              expectedRevision: null,
+              value: prepared.policy.value,
+            },
+            prepared.policy.check,
+          ]),
     ];
     if (
       mutations.length > MAX_STORAGE_TRANSACTION_MUTATIONS ||
-      mutations.length > 2 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS
+      mutations.length > 4 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS
     ) {
       unavailable();
     }
@@ -639,8 +727,70 @@ export class StorageFounderApplicationRepository
     for (const [index, chunk] of prepared.fieldsChunks.entries()) {
       verifyExactRecord(result.records[index + 2], chunk.key, 1, chunk.value);
     }
+    if (prepared.policy !== null) {
+      if (this.#verifyPolicyRevisionCheck === null) unavailable();
+      const policyIndex = 2 + prepared.fieldsChunks.length;
+      verifyExactRecord(
+        result.records[policyIndex],
+        prepared.policy.key,
+        1,
+        prepared.policy.value,
+      );
+      verifyRevisionCheckRecord(
+        result.records[policyIndex + 1],
+        prepared.policy.check,
+        this.#verifyPolicyRevisionCheck,
+      );
+    }
 
     return mutationResult(prepared.application, result.replayed);
+  }
+
+  async #prepareWritePolicyRevision(
+    subject: ActorSubject,
+    id: FounderApplicationId,
+    applicationRevision: number,
+  ): Promise<PreparedPolicyRevision | null> {
+    if (this.#policyRevisionCheck === null) return null;
+    if (this.#writePolicyRevision === null) {
+      throw new StorageFailure("PRECONDITION_FAILED");
+    }
+    return preparePolicyRevision(
+      subject,
+      id,
+      applicationRevision,
+      this.#writePolicyRevision,
+      this.#policyRevisionCheck,
+    );
+  }
+
+  async #readPolicyRevision(
+    subject: ActorSubject,
+    id: FounderApplicationId,
+    applicationRevision: number,
+  ): Promise<PreparedPolicyRevision | null> {
+    if (this.#policyRevisionCheck === null) return null;
+    const key = await applicationPolicyRevisionKey(
+      subject,
+      id,
+      applicationRevision,
+    );
+    const record = await this.#storage.read(key);
+    if (record === null) return null;
+    const campaignRevision = decodePolicyRevision(
+      record,
+      key,
+      subject,
+      id,
+      applicationRevision,
+    );
+    return preparePolicyRevision(
+      subject,
+      id,
+      applicationRevision,
+      campaignRevision,
+      this.#policyRevisionCheck,
+    );
   }
 }
 
@@ -1431,6 +1581,7 @@ function prepareMutation(
   operationFingerprint: string,
   fields: StoredFieldsReference,
   fieldsChunks: readonly PreparedFieldsChunk[],
+  policy: PreparedPolicyRevision | null,
 ): PreparedMutation {
   const currentDocument = currentApplicationDocument(
     application,
@@ -1451,6 +1602,7 @@ function prepareMutation(
     currentDocument,
     historyDocument,
     fieldsChunks,
+    policy,
   });
 }
 
@@ -1559,6 +1711,79 @@ function fieldsDocument(fields: FounderApplicationFields): StorageDocument {
     professionalProfileLinks: [...fields.professionalProfileLinks],
     note: fields.note,
   });
+}
+
+async function preparePolicyRevision(
+  subject: ActorSubject,
+  id: FounderApplicationId,
+  applicationRevision: number,
+  campaignRevision: number,
+  checkForRevision: FounderApplicationPolicyRevisionCheck,
+): Promise<PreparedPolicyRevision> {
+  const parsedApplicationRevision = requiredApplicationRevision(
+    applicationRevision,
+  );
+  const parsedCampaignRevision = requiredPolicyRevision(campaignRevision);
+  const key = await applicationPolicyRevisionKey(
+    subject,
+    id,
+    parsedApplicationRevision,
+  );
+  const check = requiredPolicyRevisionCheck(
+    checkForRevision,
+    parsedCampaignRevision,
+  );
+  if (storageKeyString(key) === storageKeyString(check.key)) unavailable();
+  const value = Object.freeze({
+    kind: "founder-application-policy-revision",
+    schemaVersion: FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION,
+    applicationId: id,
+    applicantSubject: subject,
+    applicationRevision: parsedApplicationRevision,
+    campaignSetupRevision: parsedCampaignRevision,
+  });
+  requireBoundedRecord(value);
+  return Object.freeze({
+    key,
+    value,
+    check,
+  });
+}
+
+function decodePolicyRevision(
+  record: unknown,
+  expectedKey: StorageKey,
+  expectedSubject: ActorSubject,
+  expectedId: FounderApplicationId,
+  expectedApplicationRevision: number,
+): number {
+  const envelope = exactDataObject(record, ["key", "revision", "value"]);
+  const key = envelope === null
+    ? null
+    : exactDataObject(envelope.key, ["collection", "id"]);
+  const source = envelope === null
+    ? null
+    : exactDataObject(envelope.value, [...POLICY_REVISION_DOCUMENT_KEYS]);
+  if (
+    envelope === null ||
+    key === null ||
+    source === null ||
+    key.collection !== expectedKey.collection ||
+    key.id !== expectedKey.id ||
+    envelope.revision !== 1 ||
+    source.kind !== "founder-application-policy-revision" ||
+    source.schemaVersion !== FOUNDER_APPLICATION_POLICY_SCHEMA_VERSION ||
+    source.applicationId !== expectedId ||
+    source.applicantSubject !== expectedSubject ||
+    source.applicationRevision !== expectedApplicationRevision ||
+    !Number.isSafeInteger(source.campaignSetupRevision) ||
+    (source.campaignSetupRevision as number) < 1 ||
+    jsonByteLength(envelope.value) >
+      MAX_FOUNDER_APPLICATION_STORAGE_RECORD_BYTES
+  ) {
+    unavailable();
+  }
+  return requiredPolicyRevision(source.campaignSetupRevision);
 }
 
 function parseCreateEnvelope(
@@ -1858,6 +2083,86 @@ function verifyExactRecord(
   }
 }
 
+function verifyRevisionCheckRecord(
+  record: unknown,
+  check: StorageCheckMutation,
+  verifyEvidence: FounderApplicationPolicyRevisionEvidenceVerifier,
+): void {
+  const envelope = exactDataObject(record, ["key", "revision", "value"]);
+  const key = envelope === null
+    ? null
+    : exactDataObject(envelope.key, ["collection", "id"]);
+  if (
+    envelope === null ||
+    key === null ||
+    check.expectedRevision === null ||
+    key.collection !== check.key.collection ||
+    key.id !== check.key.id ||
+    envelope.revision !== check.expectedRevision
+  ) {
+    unavailable();
+  }
+  try {
+    verifyEvidence(record, check.expectedRevision);
+  } catch {
+    unavailable();
+  }
+}
+
+function requiredPolicyRevisionCheck(
+  factory: FounderApplicationPolicyRevisionCheck,
+  revision: number,
+): StorageCheckMutation {
+  let candidate: unknown;
+  try {
+    candidate = factory(revision);
+  } catch {
+    invalidRequest();
+  }
+  const source = exactDataObject(candidate, [
+    "type",
+    "key",
+    "expectedRevision",
+  ]);
+  const keySource = source === null
+    ? null
+    : exactDataObject(source.key, ["collection", "id"]);
+  const key = keySource === null
+    ? null
+    : parseStorageKey(keySource.collection, keySource.id);
+  if (
+    source === null ||
+    keySource === null ||
+    key === null ||
+    !key.ok ||
+    source.type !== "check" ||
+    source.expectedRevision !== revision
+  ) {
+    invalidRequest();
+  }
+  return Object.freeze({
+    type: "check",
+    key: Object.freeze({ ...key.value }),
+    expectedRevision: revision,
+  });
+}
+
+function requiredPolicyRevision(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) invalidRequest();
+  return value as number;
+}
+
+function requiredApplicationRevision(value: unknown): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    (value as number) < 1 ||
+    (value as number) > MAX_FOUNDER_APPLICATION_REVISIONS
+  ) {
+    invalidRequest();
+  }
+  return value as number;
+}
+
 function exactStorageTransactionResult(
   value: unknown,
   expectedRecords: number,
@@ -1928,6 +2233,20 @@ async function applicationHistoryKey(
     APPLICATION_HISTORY,
     await hashedStorageId(
       "founder-history",
+      `${subject}\u0000${id}\u0000${revision}`,
+    ),
+  );
+}
+
+async function applicationPolicyRevisionKey(
+  subject: ActorSubject,
+  id: FounderApplicationId,
+  revision: number,
+): Promise<StorageKey> {
+  return requiredStorageKey(
+    APPLICATION_POLICY_REVISIONS,
+    await hashedStorageId(
+      "founder-policy",
       `${subject}\u0000${id}\u0000${revision}`,
     ),
   );

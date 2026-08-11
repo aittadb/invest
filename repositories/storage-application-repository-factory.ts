@@ -35,9 +35,13 @@ import type {
   OwnerIndicationReviewTokenBoundary,
 } from "../services/owner-indication-review-tokens.ts";
 import {
+  MAX_CAMPAIGN_SETUP_MATERIALIZATION_READS,
   StorageCampaignRepository,
   StoragePublicCampaignPresentationReader,
+  campaignSetupRevisionCheck,
+  verifyCampaignSetupRevisionCheckRecord,
   type AtomicCampaignAuditRepository,
+  type CampaignRepository,
   type PublicCampaignPresentationReader,
 } from "./in-memory-campaign-repository.ts";
 import {
@@ -98,6 +102,7 @@ const MAX_ACKNOWLEDGMENT_ROUTE_STORAGE_READS =
   MAX_ACKNOWLEDGMENT_ROUTE_STATE_READS +
   MAX_ACKNOWLEDGMENT_ROUTE_OPERATION_READS;
 export const PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT =
+  2 * MAX_CAMPAIGN_SETUP_MATERIALIZATION_READS +
   2 * MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS +
   MAX_FOUNDER_APPLICATION_STORAGE_READS;
 export const PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT =
@@ -127,8 +132,15 @@ export type ParticipantPackageAcknowledgmentRepositories = Readonly<{
 }>;
 
 export type ParticipantFounderApplicationRepositories = Readonly<{
+  campaign: Pick<CampaignRepository, "readSetup">;
   participant: Pick<ParticipantRepository, "current">;
-  applications: FounderApplicationRepository;
+  applications(
+    contributionAreaChoices: readonly ContributionAreaChoice[],
+  ): FounderApplicationRepository;
+  policyBoundApplications(
+    contributionAreaChoices: readonly ContributionAreaChoice[],
+    campaignSetupRevision: number,
+  ): FounderApplicationRepository;
 }>;
 
 export type ParticipantRequestRepositoryScope = Readonly<{
@@ -140,9 +152,7 @@ export type ParticipantRequestRepositoryScope = Readonly<{
   participantPackageAcknowledgments(
     participantSubject: ActorSubject,
   ): ParticipantPackageAcknowledgmentRepositories;
-  participantFounderApplications(
-    contributionAreaChoices: readonly ContributionAreaChoice[],
-  ): ParticipantFounderApplicationRepositories;
+  participantFounderApplications(): ParticipantFounderApplicationRepositories;
 }>;
 
 /**
@@ -284,6 +294,7 @@ function createParticipantRequestRepositoryScope(
   const readStorage = participantRequestStorage(storage, budget, false);
   const mutationStorage = participantRequestStorage(storage, budget, true);
   const participant = new StorageParticipantRepository(readStorage, account);
+  const campaign = new StorageCampaignRepository(readStorage);
   const participantProfile = new StorageParticipantRepository(
     mutationStorage,
     account,
@@ -364,19 +375,38 @@ function createParticipantRequestRepositoryScope(
       beginRouteReads(MAX_ACKNOWLEDGMENT_ROUTE_STORAGE_READS);
       return packageAcknowledgments;
     },
-    participantFounderApplications: (
-      contributionAreaChoices: readonly ContributionAreaChoice[],
-    ) => {
+    participantFounderApplications: () => {
       beginRouteReads(PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT);
-      return Object.freeze({
-        participant: Object.freeze({
-          current: () => participant.current(),
-        }),
-        applications: new StorageFounderApplicationRepository(
+      const applications = (
+        contributionAreaChoices: readonly ContributionAreaChoice[],
+        campaignSetupRevision?: number,
+      ): FounderApplicationRepository =>
+        new StorageFounderApplicationRepository(
           mutationStorage,
           account.subject,
           contributionAreaChoices,
-        ),
+          {
+            policyRevisionCheck: campaignSetupRevisionCheck,
+            verifyPolicyRevisionCheck: verifyCampaignSetupRevisionCheckRecord,
+            ...(campaignSetupRevision === undefined
+              ? {}
+              : { writePolicyRevision: campaignSetupRevision }),
+          },
+        );
+      return Object.freeze({
+        campaign: Object.freeze({
+          readSetup: () => campaign.readSetup(),
+        }),
+        participant: Object.freeze({
+          current: () => participant.current(),
+        }),
+        applications: (
+          contributionAreaChoices: readonly ContributionAreaChoice[],
+        ) => applications(contributionAreaChoices),
+        policyBoundApplications: (
+          contributionAreaChoices: readonly ContributionAreaChoice[],
+          campaignSetupRevision: number,
+        ) => applications(contributionAreaChoices, campaignSetupRevision),
       });
     },
   });

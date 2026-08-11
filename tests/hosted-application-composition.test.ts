@@ -783,9 +783,9 @@ test("participant access keeps nested package retry reads inside one budget", as
 
 test("participant request scope enforces exact maximum route and retry read budgets", async () => {
   assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 551);
-  assert.equal(PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT, 839);
-  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 839);
-  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 1_390);
+  assert.equal(PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT, 854);
+  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 854);
+  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 1_405);
 
   const service = new SyntheticAittaDBService();
   await registerHostedParticipant(
@@ -844,9 +844,8 @@ test("participant request scope enforces exact maximum route and retry read budg
     routeOnlyStorage,
     () => NOW,
   ).participantRequest(account.value);
-  const founderOnly = founderOnlyRequest.participantFounderApplications(
-    founderChoices.value,
-  ).applications;
+  const founderOnly = founderOnlyRequest.participantFounderApplications()
+    .applications(founderChoices.value);
   for (
     let index = 0;
     index < PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT;
@@ -1587,6 +1586,49 @@ test("unsupported founder PUT leaves hosted JSON and HTML proofs reusable", asyn
   );
   const worker = hostedPackageWorker(service);
 
+  const unsupportedPutAs = (
+    subject: string | null,
+    email: string | null,
+  ): Promise<Response> =>
+    worker.fetch(
+      new Request(`${APP_ORIGIN}${FOUNDER_INTEREST_PATH}`, {
+        method: "PUT",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          ...(subject === null || email === null
+            ? {}
+            : {
+                "oai-authenticated-user-id": subject,
+                "oai-authenticated-user-email": email,
+              }),
+        },
+        body: "{}",
+      }),
+      env,
+      executionContext,
+    );
+  const claimsBeforeAuthorization = recordsIn(
+    service,
+    "browser-mutation-replays",
+  ).length;
+  const anonymousPut = await unsupportedPutAs(null, null);
+  const ownerPut = await unsupportedPutAs(OWNER.subject, OWNER_EMAIL);
+  const foreignPut = await unsupportedPutAs(
+    "sites-foreign-founder-subject",
+    "foreign-founder@example.test",
+  );
+  assert.equal(anonymousPut.status, 401);
+  assert.equal(anonymousPut.headers.get("allow"), null);
+  assert.equal(ownerPut.status, 404);
+  assert.equal(foreignPut.status, 404);
+  assert.equal(ownerPut.headers.get("allow"), null);
+  assert.deepEqual(await ownerPut.json(), await foreignPut.json());
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    claimsBeforeAuthorization,
+  );
+
   const jsonProof = await founderResource(worker, env);
   const createBody = actionBody(
     requiredAction(jsonProof.document, "create-founder-application"),
@@ -1803,6 +1845,176 @@ test("hosted founder creation rechecks campaign policy after action discovery", 
   const closed = await founderResource(hostedPackageWorker(service), env);
   assert.equal(closed.document.data.status, "not_submitted");
   assert.deepEqual(actionNames(closed.document), []);
+});
+
+test("hosted founder create atomically rejects phase closure after its final policy sample", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-create-policy-race",
+    { declaredInterest: "founder" },
+  );
+
+  const discovered = await founderResource(hostedPackageWorker(service), env);
+  const createBody = actionBody(
+    requiredAction(discovered.document, "create-founder-application"),
+    founderFields({ note: "Atomic phase-race founder submission." }),
+  );
+  const founderBeforeRace = founderCollectionSnapshot(service);
+  let phaseClosedDuringTransaction = false;
+  service.raceNextTransactionContaining("founder-applications", async () => {
+    await configureHostedFounderCampaign(service, "closed");
+    phaseClosedDuringTransaction = true;
+  });
+
+  const raced = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    discovered,
+    "POST",
+    createBody,
+  );
+  assert.equal(raced.status, 412);
+  assert.equal(phaseClosedDuringTransaction, true);
+  assert.deepEqual(founderCollectionSnapshot(service), founderBeforeRace);
+
+  await configureHostedFounderCampaign(service, "open");
+  const retryProof = await founderResource(hostedPackageWorker(service), env);
+  const retried = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    retryProof,
+    "POST",
+    createBody,
+  );
+  assert.equal(retried.status, 201);
+  assert.equal(
+    (await retried.json() as FounderInterestDocument).data.history.length,
+    1,
+  );
+  assert.equal(
+    recordsIn(service, "founder-application-policy-revisions").length,
+    1,
+  );
+
+  await configureHostedFounderCampaign(service, "closed");
+  const replayProof = await founderResource(hostedPackageWorker(service), env);
+  const replay = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    replayProof,
+    "POST",
+    createBody,
+  );
+  assert.equal(replay.status, 200);
+  assert.equal(
+    (await replay.json() as FounderInterestDocument).data.history.length,
+    1,
+  );
+  assert.equal(
+    recordsIn(service, "founder-application-policy-revisions").length,
+    1,
+  );
+});
+
+test("hosted founder edit atomically rejects contribution changes after its final policy sample", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-edit-policy-race",
+    { declaredInterest: "founder" },
+  );
+
+  const createProof = await founderResource(hostedPackageWorker(service), env);
+  const created = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    createProof,
+    "POST",
+    actionBody(
+      requiredAction(createProof.document, "create-founder-application"),
+      founderFields(),
+    ),
+  );
+  assert.equal(created.status, 201);
+
+  const editProof = await founderResource(hostedPackageWorker(service), env);
+  const editBody = actionBody(
+    requiredAction(editProof.document, "edit-founder-application"),
+    founderFields({
+      "expected-revision": 1,
+      note: "Atomic contribution-choice race edit.",
+    }),
+  );
+  const evolvedChoices = [
+    { id: "area:commercial", label: "Commercial" },
+    { id: "area:delivery", label: "Delivery" },
+  ] as const;
+  const founderBeforeRace = founderCollectionSnapshot(service);
+  let choicesChangedDuringTransaction = false;
+  service.raceNextTransactionContaining("founder-applications", async () => {
+    await configureHostedFounderCampaign(service, "open", evolvedChoices);
+    choicesChangedDuringTransaction = true;
+  });
+
+  const raced = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    editProof,
+    "PATCH",
+    editBody,
+  );
+  assert.equal(raced.status, 412);
+  assert.equal(choicesChangedDuringTransaction, true);
+  assert.deepEqual(founderCollectionSnapshot(service), founderBeforeRace);
+
+  await configureHostedFounderCampaign(service, "open");
+  const retryProof = await founderResource(hostedPackageWorker(service), env);
+  const retried = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    retryProof,
+    "PATCH",
+    editBody,
+  );
+  assert.equal(retried.status, 200);
+  assert.equal(
+    (await retried.json() as FounderInterestDocument).data.history.length,
+    2,
+  );
+  assert.equal(
+    recordsIn(service, "founder-application-policy-revisions").length,
+    2,
+  );
+
+  await configureHostedFounderCampaign(service, "open", evolvedChoices);
+  const replayProof = await founderResource(hostedPackageWorker(service), env);
+  const replay = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    replayProof,
+    "PATCH",
+    editBody,
+  );
+  assert.equal(replay.status, 200);
+  assert.equal(
+    (await replay.json() as FounderInterestDocument).data.history.length,
+    2,
+  );
+  assert.equal(
+    recordsIn(service, "founder-application-policy-revisions").length,
+    2,
+  );
 });
 
 test("hosted founder history and exact retries survive contribution choice evolution", async () => {
@@ -4186,6 +4398,10 @@ class SyntheticAittaDBService {
     collection: string;
     successfulMatchesRemaining: number;
   }> | null = null;
+  #transactionRace: Readonly<{
+    collection: string;
+    run: () => Promise<void>;
+  }> | null = null;
 
   failNextTransactionContaining(collection: string): void {
     this.failTransactionContainingAfter(collection, 0);
@@ -4201,6 +4417,14 @@ class SyntheticAittaDBService {
       collection,
       successfulMatchesRemaining: successfulMatches,
     });
+  }
+
+  raceNextTransactionContaining(
+    collection: string,
+    run: () => Promise<void>,
+  ): void {
+    assert.ok(collection.length > 0);
+    this.#transactionRace = Object.freeze({ collection, run });
   }
 
   readonly fetch = async (input: string, init: RequestInit): Promise<Response> => {
@@ -4266,10 +4490,10 @@ class SyntheticAittaDBService {
     if (transactionBytes > MAX_HOSTED_TRANSACTION_BYTES) {
       return protocolFailure("invalid_request");
     }
-    return this.transact(JSON.parse(transactionBody) as unknown);
+    return await this.transact(JSON.parse(transactionBody) as unknown);
   };
 
-  private transact(value: unknown): Response {
+  private async transact(value: unknown): Promise<Response> {
     const transaction = requiredObject(requiredObject(value).transaction);
     const operationId = requiredString(transaction.operation_id);
     const mutations = transaction.mutations;
@@ -4298,6 +4522,11 @@ class SyntheticAittaDBService {
     const mutationCollections = mutations.map((candidate) =>
       requiredString(requiredObject(requiredObject(candidate).key).collection)
     );
+    const race = this.#transactionRace;
+    if (race !== null && mutationCollections.includes(race.collection)) {
+      this.#transactionRace = null;
+      await race.run();
+    }
     const failure = this.#transactionFailure;
     if (failure !== null && mutationCollections.includes(failure.collection)) {
       if (failure.successfulMatchesRemaining === 0) {
@@ -5525,6 +5754,23 @@ function recordsIn(
 ): SyntheticRecord[] {
   return [...service.records.values()].filter(
     (record) => record.key.collection === collection,
+  );
+}
+
+function founderCollectionSnapshot(
+  service: SyntheticAittaDBService,
+): readonly SyntheticRecord[] {
+  return Object.freeze(
+    [...service.records.values()]
+      .filter((record) =>
+        record.key.collection.startsWith("founder-application")
+      )
+      .sort((left, right) => {
+        const leftKey = `${left.key.collection}/${left.key.id}`;
+        const rightKey = `${right.key.collection}/${right.key.id}`;
+        return leftKey.localeCompare(rightKey);
+      })
+      .map(cloneSyntheticRecord),
   );
 }
 

@@ -180,23 +180,33 @@ export function createFounderInterestRouteHandler(
       return notAcceptableResponse(context.resourceUrl);
     }
 
-    if (context.request.method === "GET") {
-      const actorSubject = context.actor
-        ? participantSubject(context.actor.userId)
-        : null;
-      if (actorSubject === null) {
-        return errorResponse(
-          authenticationRequiredError(context.resourceUrl),
-          representation.kind,
-        );
-      }
+    const actorSubject = context.actor
+      ? participantSubject(context.actor.userId)
+      : null;
+    if (actorSubject === null) {
+      return errorResponse(
+        authenticationRequiredError(context.resourceUrl),
+        representation.kind,
+      );
+    }
 
+    let service: ParticipantFounderInterestService;
+    try {
+      service = dependencies.serviceFor(actorSubject);
+    } catch (error) {
+      return errorResponse(
+        publicRouteError(error, context.resourceUrl),
+        representation.kind,
+      );
+    }
+
+    if (context.request.method === "GET") {
       try {
         return await resourceResponse({
           context,
           representation: representation.kind,
           actorSubject,
-          service: dependencies.serviceFor(actorSubject),
+          service,
           csrfTokenFor: dependencies.csrfTokenFor,
           createOperationId,
           status: 200,
@@ -227,13 +237,6 @@ export function createFounderInterestRouteHandler(
       });
     }
 
-    if (context.actor === null) {
-      return errorResponse(
-        authenticationRequiredError(context.resourceUrl),
-        representation.kind,
-      );
-    }
-
     let clearCookie: string | null = null;
     try {
       const verified = await mutationGuard(context.request);
@@ -255,7 +258,6 @@ export function createFounderInterestRouteHandler(
         throw new StorageFailure("NOT_FOUND");
       }
 
-      const service = dependencies.serviceFor(verified.actor.subject);
       const mutation = parseFounderMutation(verified);
       let replayed = false;
       if (mutation.kind === "create") {

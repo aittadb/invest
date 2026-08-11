@@ -39,8 +39,13 @@ import {
   type CreateFounderApplicationRequest,
   type EditFounderApplicationRequest,
   type FounderApplicationRepository,
+  type StorageFounderApplicationRepositoryOptions,
   type WithdrawFounderApplicationRequest,
 } from "../repositories/in-memory-founder-application-repository.ts";
+import {
+  campaignSetupRevisionCheck,
+  verifyCampaignSetupRevisionCheckRecord,
+} from "../repositories/in-memory-campaign-repository.ts";
 
 const ALICE_SUBJECT = actorSubject("issuer.invalid/subject:alice");
 const BOB_SUBJECT = actorSubject("issuer.invalid/subject:bob");
@@ -684,6 +689,117 @@ test("maximum founder payloads stay within hosted record, transaction, restart, 
   }
 });
 
+test("founder policy checks roll back writes while exact replay and withdrawal remain policy-independent", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true);
+  const campaignKey = campaignSetupRevisionCheck(1).key;
+  const setCampaignRevision = (revision: number): void => {
+    state.records.set(storageKeyString(campaignKey), freezeRecord({
+      key: campaignKey,
+      revision,
+      value: {
+        kind: "campaign-setup-revision",
+        schemaVersion: 4,
+        revision,
+        recordedAt: "2026-08-10T09:00:00.000Z",
+        operationId: `campaign-operation:founder-policy-${revision}`,
+        setupHash: `sha256:${"0".repeat(64)}`,
+        setupBytes: 1,
+        setupChunks: 1,
+      },
+    }));
+  };
+  const policyOptions = Object.freeze({
+    policyRevisionCheck: campaignSetupRevisionCheck,
+    verifyPolicyRevisionCheck: verifyCampaignSetupRevisionCheckRecord,
+  });
+  const create = createRequest();
+
+  setCampaignRevision(1);
+  const sampledRevisionOne = repository(
+    adapter,
+    ALICE_SUBJECT,
+    contributionAreaChoices,
+    { ...policyOptions, writePolicyRevision: 1 },
+  );
+  setCampaignRevision(2);
+  const founderBeforeRace = founderRecords(state);
+  await rejectsStorage(() => sampledRevisionOne.create(create), "PRECONDITION_FAILED");
+  assert.deepEqual(founderRecords(state), founderBeforeRace);
+  await rejectsStorage(
+    () =>
+      repository(
+        adapter,
+        ALICE_SUBJECT,
+        contributionAreaChoices,
+        policyOptions,
+      ).create(create),
+    "PRECONDITION_FAILED",
+  );
+  assert.deepEqual(founderRecords(state), founderBeforeRace);
+
+  const created = await repository(
+    adapter,
+    ALICE_SUBJECT,
+    contributionAreaChoices,
+    { ...policyOptions, writePolicyRevision: 2 },
+  ).create(create);
+  assert.equal(created.replayed, false);
+  assert.equal(
+    recordsIn(state, "founder-application-policy-revisions").length,
+    1,
+  );
+
+  setCampaignRevision(3);
+  const malformedEvidence = new MalformedTransactionResultStorageAdapter(
+    adapter,
+    (result) =>
+      corruptTransactionRecord(
+        result,
+        result.records.length - 1,
+        (record) => {
+          const value = record.value as MutableRecord;
+          value.kind = "malformed-campaign-check-evidence";
+        },
+      ),
+  );
+  await rejectsStorage(
+    () =>
+      repository(
+        malformedEvidence,
+        ALICE_SUBJECT,
+        contributionAreaChoices,
+        policyOptions,
+      ).create(create),
+    "UNAVAILABLE",
+  );
+  const replay = await repository(
+    adapter,
+    ALICE_SUBJECT,
+    contributionAreaChoices,
+    policyOptions,
+  ).create({ ...create, occurredAt: "2026-08-10T10:01:00.000Z" });
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.snapshot, created.snapshot);
+
+  const withdrawn = await repository(
+    adapter,
+    ALICE_SUBJECT,
+    contributionAreaChoices,
+    policyOptions,
+  ).withdraw(withdrawRequest({
+    operationId: "founder-operation:policy-independent-withdrawal",
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T11:00:00.000Z",
+    historyEntryId: "founder-history:policy-independent-withdrawal",
+  }));
+  assert.equal(withdrawn.snapshot.status, "withdrawn");
+  assert.equal(
+    recordsIn(state, "founder-application-policy-revisions").length,
+    1,
+  );
+});
+
 test("founder ancestry is finite and always reserves the final transition for withdrawal", async () => {
   const state = new MemoryStorageState();
   const observed = new ObservedStorageAdapter(
@@ -1012,12 +1128,25 @@ function repository(
   storage: StorageAdapter,
   subject: ActorSubject | null,
   configuredChoices = contributionAreaChoices,
+  options: StorageFounderApplicationRepositoryOptions = {},
 ): DevelopmentInMemoryFounderApplicationRepository {
   return new DevelopmentInMemoryFounderApplicationRepository(
     storage,
     subject,
     configuredChoices,
+    options,
   );
+}
+
+function founderRecords(state: MemoryStorageState): readonly StorageRecord[] {
+  return [...state.records.values()]
+    .filter((record) =>
+      record.key.collection.startsWith("founder-application")
+    )
+    .sort((left, right) =>
+      storageKeyString(left.key).localeCompare(storageKeyString(right.key))
+    )
+    .map((record) => cloneRecord(record) as StorageRecord);
 }
 
 function maximumContributionAreaChoices(): readonly ContributionAreaChoice[] {
