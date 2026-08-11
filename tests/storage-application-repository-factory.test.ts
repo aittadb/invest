@@ -314,6 +314,7 @@ test("factory exposes only named application repository capabilities", async () 
   assert.deepEqual(Object.keys(participantRequest), [
     "participantAccessReader",
     "participantProfileRepository",
+    "participantAccountDeletionRepository",
     "participantPackageReader",
     "participantPackageAcknowledgments",
     "participantFounderApplications",

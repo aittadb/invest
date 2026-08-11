@@ -162,7 +162,9 @@ function authorizationState(
   currentPackage: RevisionedSnapshot<PackageVersion> | null,
   requiresCurrentAcceptance: boolean | null,
 ): ParticipantAuthorizationState {
-  const packageState = currentPackage === null
+  const deletionRequested =
+    participant.snapshot.accountDeletionRequest.state === "requested";
+  const packageState = deletionRequested || currentPackage === null
     ? null
     : Object.freeze({
         id: currentPackage.snapshot.id,
@@ -180,7 +182,7 @@ function authorizationState(
       declaredInterest: participant.snapshot.declaredInterest,
       participationContext: participant.snapshot.participationContext,
       accountDeletionRequested:
-        participant.snapshot.accountDeletionRequest.state === "requested",
+        deletionRequested,
     }),
     currentPackage: packageState,
   });

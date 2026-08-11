@@ -131,8 +131,13 @@ export function createParticipantProfileCapabilityModel(
     input.profile,
   );
   const revision = requiredRevision(input.revision);
-  const acknowledgment = requiredAcknowledgment(input.acknowledgment);
   const available = new Set(participantProfileOperations(profile));
+  const participantActive =
+    profile.accountDeletionRequest.state === "not-requested";
+  const currentAcknowledgment = requiredAcknowledgment(input.acknowledgment);
+  const acknowledgment = participantActive
+    ? currentAcknowledgment
+    : null;
   const self = new URL(PARTICIPANT_PROFILE_PATH, input.requestUrl).href;
 
   const actions = currentActions(
@@ -236,15 +241,17 @@ export function createParticipantProfileCapabilityModel(
         rel: Object.freeze(["self", "participant-profile"]),
         href: self,
       }),
-      Object.freeze({
-        rel: Object.freeze(["participant-home"]),
-        href: new URL(PARTICIPANT_HOME_PATH, input.requestUrl).href,
-      }),
+      ...(participantActive
+        ? [Object.freeze({
+            rel: Object.freeze(["participant-home"]),
+            href: new URL(PARTICIPANT_HOME_PATH, input.requestUrl).href,
+          })]
+        : []),
       Object.freeze({
         rel: Object.freeze(["campaign"]),
         href: new URL("/", input.requestUrl).href,
       }),
-      ...(acknowledgment === null
+      ...(!participantActive || acknowledgment === null
         ? []
         : [Object.freeze({
             rel: Object.freeze(["private-package"]),

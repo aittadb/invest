@@ -152,6 +152,9 @@ export function authorizeParticipantAccess(
 
   const currentPackage = parseCurrentPackage(state.currentPackage);
   if (state.currentPackage !== null && currentPackage === null) return null;
+  const accountStatus = profile.accountDeletionRequested
+    ? "deletion-requested" as const
+    : "active" as const;
 
   return Object.freeze({
     subject: account.subject,
@@ -159,10 +162,8 @@ export function authorizeParticipantAccess(
     displayName: profile.displayName,
     declaredInterest: profile.declaredInterest,
     participationContext: profile.participationContext,
-    accountStatus: profile.accountDeletionRequested
-      ? "deletion-requested"
-      : "active",
-    currentPackage,
+    accountStatus,
+    currentPackage: accountStatus === "active" ? currentPackage : null,
   });
 }
 
@@ -198,7 +199,7 @@ export function parseAuthorizedParticipantAccess(
     declaredInterest: source.declaredInterest,
     participationContext: source.participationContext,
     accountStatus: source.accountStatus,
-    currentPackage,
+    currentPackage: source.accountStatus === "active" ? currentPackage : null,
   });
 }
 
@@ -209,7 +210,9 @@ export function createParticipantHomeDocument(
   capabilities: ParticipantHomeCapabilities = {},
 ): ParticipantHomeDocument {
   const absolute = (href: string) => new URL(href, requestUrl).href;
-  const currentPackage = participant.currentPackage;
+  const currentPackage = participant.accountStatus === "active"
+    ? participant.currentPackage
+    : null;
   const { founderInterest, investmentInterests } = participantWorkflowAccess(
     participant,
     capabilities,

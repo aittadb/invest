@@ -503,7 +503,6 @@ test("real participant HTML matches active and deletion-requested hypermedia cap
       document.actions.map((action) => action.name),
       accountDeletionRequested
         ? [
-            "read-private-package",
             "open-participant-profile",
             "sign-out",
           ]
@@ -523,7 +522,7 @@ test("real participant HTML matches active and deletion-requested hypermedia cap
     if (accountDeletionRequested) {
       assert.doesNotMatch(
         html,
-        /href="\/participant\/(?:founder-interest|investment-interests)"/u,
+        /href="\/participant\/(?:package|founder-interest|investment-interests)"/u,
       );
     } else {
       assert.match(html, /href="\/participant\/founder-interest"/u);

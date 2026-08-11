@@ -165,9 +165,12 @@ package acknowledgment status. Depending on current state, it exposes separate
 `request-account-deletion` `POST` actions. Identity, process acknowledgment,
 consent grant, deletion system state, and timestamps never become action fields.
 Each mutation carries a server-issued operation ID and exact expected revision,
-and completed one-way actions disappear from both HTML and JSON. Production
-navigation and persistence are installed only by the hosted participant
-composition.
+and completed one-way actions disappear from both HTML and JSON. A successful
+account-deletion request immediately reports package acknowledgment as
+unavailable, removes package, acknowledgment, founder, and investment
+capabilities, and preserves only the independently permitted marketing
+withdrawal action. Production navigation and persistence are installed only by
+the hosted participant composition.
 
 These participant URIs negotiate HTML and version `0.1` hypermedia JSON. A
 signed-out JSON request receives `401 authentication_required`; an

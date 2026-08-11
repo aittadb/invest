@@ -4,7 +4,10 @@ import {
   type ActorSubject,
 } from "../domain/foundation.ts";
 import type { ParticipantAccessStateReader } from "../domain/participant-home-resource.ts";
-import type { ContributionAreaChoice } from "../domain/founder-application.ts";
+import type {
+  ContributionAreaChoice,
+  FounderApplicationId,
+} from "../domain/founder-application.ts";
 import {
   parseParticipantAccount,
   type ParticipantAccount,
@@ -90,6 +93,11 @@ import {
   type PublicCampaignStateReader,
 } from "./storage-public-campaign-state-reader.ts";
 import { StorageOwnerIndicationModerationRepository } from "./storage-owner-indication-moderation-repository.ts";
+import {
+  MAX_PARTICIPANT_ACCOUNT_DELETION_OPERATION_READS,
+  StorageParticipantAccountDeletionRepository,
+  type AtomicParticipantAccountDeletionRepository,
+} from "./storage-participant-account-deletion-repository.ts";
 
 const REPLAY_SCHEMA_VERSION = 1;
 const REPLAY_COLLECTION = storageCollection("browser-mutation-replays");
@@ -104,7 +112,7 @@ const MAX_ACKNOWLEDGMENT_ROUTE_OPERATION_READS = 4;
 const MAX_PROFILE_ROUTE_CURRENT_READS = 3;
 const MAX_PROFILE_ROUTE_REVISION_READS = 2;
 const MAX_PROFILE_ROUTE_MUTATION_READS = 3;
-const MAX_PROFILE_ROUTE_STORAGE_READS =
+const MAX_STANDARD_PROFILE_ROUTE_STORAGE_READS =
   MAX_PROFILE_ROUTE_CURRENT_READS +
   2 * MAX_PROFILE_ROUTE_REVISION_READS +
   MAX_PROFILE_ROUTE_MUTATION_READS +
@@ -112,6 +120,10 @@ const MAX_PROFILE_ROUTE_STORAGE_READS =
   2 * MAX_PROFILE_ROUTE_REVISION_READS +
   MAX_PROFILE_ROUTE_MUTATION_READS +
   MAX_PROFILE_ROUTE_CURRENT_READS;
+const MAX_ACCOUNT_DELETION_PROFILE_ROUTE_STORAGE_READS =
+  MAX_STANDARD_PROFILE_ROUTE_STORAGE_READS +
+  MAX_CAMPAIGN_SETUP_MATERIALIZATION_READS +
+  2 * MAX_PARTICIPANT_ACCOUNT_DELETION_OPERATION_READS;
 const MAX_PACKAGE_ROUTE_STORAGE_READS = 1;
 const MAX_ACKNOWLEDGMENT_ROUTE_STORAGE_READS =
   MAX_ACKNOWLEDGMENT_ROUTE_STATE_READS +
@@ -131,7 +143,7 @@ export const PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT =
   Math.max(
     MAX_PACKAGE_ROUTE_STORAGE_READS,
     MAX_ACKNOWLEDGMENT_ROUTE_STORAGE_READS,
-    MAX_PROFILE_ROUTE_STORAGE_READS,
+    MAX_ACCOUNT_DELETION_PROFILE_ROUTE_STORAGE_READS,
     PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT,
   );
 export const PARTICIPANT_REQUEST_STORAGE_READ_LIMIT =
@@ -162,6 +174,9 @@ export type ParticipantFounderApplicationRepositories = Readonly<{
 export type ParticipantRequestRepositoryScope = Readonly<{
   participantAccessReader(): ParticipantAccessStateReader;
   participantProfileRepository(): ParticipantRepository;
+  participantAccountDeletionRepository(
+    founderApplicationId: FounderApplicationId,
+  ): Promise<AtomicParticipantAccountDeletionRepository>;
   participantPackageReader(
     participantSubject: ActorSubject,
   ): Pick<PackageVersionRepository, "current">;
@@ -416,13 +431,30 @@ function createParticipantRequestRepositoryScope(
       budget.remainingRouteReads = limit;
       return;
     }
-    if (budget.routeReadLimit !== limit) unavailable();
+    if (limit < budget.routeReadLimit) unavailable();
+    if (limit > budget.routeReadLimit) {
+      budget.remainingRouteReads += limit - budget.routeReadLimit;
+      budget.routeReadLimit = limit;
+    }
   };
   return Object.freeze({
     participantAccessReader: () => accessReader,
     participantProfileRepository: () => {
-      beginRouteReads(MAX_PROFILE_ROUTE_STORAGE_READS);
+      beginRouteReads(MAX_STANDARD_PROFILE_ROUTE_STORAGE_READS);
       return participantProfile;
+    },
+    participantAccountDeletionRepository: async (
+      founderApplicationId: FounderApplicationId,
+    ) => {
+      beginRouteReads(MAX_ACCOUNT_DELETION_PROFILE_ROUTE_STORAGE_READS);
+      const currentCampaign = await campaign.readSetup();
+      if (currentCampaign === null) unavailable();
+      return new StorageParticipantAccountDeletionRepository(
+        mutationStorage,
+        account,
+        founderApplicationId,
+        currentCampaign.setup.amountAggregate.amount,
+      );
     },
     participantPackageReader: (participantSubject: ActorSubject) => {
       requireSubject(participantSubject);

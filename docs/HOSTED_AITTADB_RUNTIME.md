@@ -34,10 +34,13 @@ an exact committed retry after a policy update or Worker restart without
 accepting stale evidence for a new registration. The next request after
 registration reconstructs the current package and permitted profile and
 workflow controls from persistent state. A deletion-requested entry retains
-package reading, profile viewing, and sign-out while withholding founder and
-investment actions.
-Export and coordinated deletion persistence still require their own named
-capabilities.
+only profile viewing and sign-out while withholding package, acknowledgment,
+founder, and investment actions. The profile deletion action selects the
+subject-bound atomic coordinator from the same finite request scope, so the
+profile transition, active founder and investment withdrawals, aggregate
+changes, and closed audit evidence commit together or not at all. Independently
+granted marketing consent remains separately withdrawable.
+Export persistence still requires its own named capabilities.
 
 Founder composition opens private campaign policy and a fresh subject-bound
 campaign/profile/application scope only for the exact founder resource after
@@ -406,25 +409,24 @@ package, acknowledgment, or founder route receive the same subject-bound scope;
 route repository factories cannot reopen the underlying uncapped adapter. A
 second HTTP request receives a new scope.
 
-That scope admits at most 1,614 participant-private storage-record reads. The
+That scope admits at most 7,699 participant-private storage-record reads. The
 maximum valid authorization envelope is 551: 511 unique immutable package
 records plus two outer attempts, each containing six profile reads, two package
 head reads, and three four-read accepted gate attempts. The profile reads cover
 current, matching latest history, and immutable registration revision 1 for
 each sample. The selected capability then owns its own finite route budget:
-package one, acknowledgment eight, profile 23, or founder 1,063 reads. The
-founder budget covers five maximum 209-read application materializations, four
-retry/recovery reads, and two maximum seven-read private campaign-setup
-materializations, including final campaign/profile policy sampling, one
-post-policy immutable-history recovery, a conflicted mutation, and the returned
-resource projection. The profile assertion reuses the sampled current revision
-as a transaction check and adds no read. After the first route read, another
-route budget cannot be selected. The 1,614 global ceiling is the authorization
-maximum plus the largest route budget; either that ceiling or the selected
-route's smaller ceiling rejects the next read before adapter access. Public
-campaign-presentation reads and storage transactions are outside these
-participant read counters, while both private founder campaign samples and all
-profile, package, gate, acceptance-head, acceptance-record, and
+package one, acknowledgment eight, ordinary profile actions 23, founder 1,063,
+or account deletion 7,148 reads. The account-deletion budget covers the initial
+profile sample, one bounded campaign materialization, and both an initial
+coordinator attempt and exact replay recovery at its exported maximum. A route
+budget may expand monotonically from the ordinary profile sample to account
+deletion only before the larger work begins; unrelated or smaller budgets
+cannot replace it after reads start. The 7,699 global ceiling is the
+authorization maximum plus the largest route budget; either that ceiling or
+the selected route's smaller ceiling rejects the next read before adapter
+access. Public campaign-presentation reads and storage transactions are outside
+these participant read counters, while private founder/deletion campaign
+samples and all profile, package, gate, acceptance, ownership, aggregate, and
 participant-route record reads are inside them.
 
 Within the scope, one read-only package reader reuses up to 64 verified immutable

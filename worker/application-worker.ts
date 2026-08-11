@@ -724,8 +724,10 @@ function runtimeParticipantProfileRoute(
   }
 
   try {
-    const participant = requiredParticipantRequest(participantRequest)
-      .participantProfileRepository();
+    const participantRepositories = requiredParticipantRequest(
+      participantRequest,
+    );
+    const participant = participantRepositories.participantProfileRepository();
     const appOrigin = new URL(resourceUrl).origin;
     const identity = Object.freeze({
       type: "participant" as const,
@@ -741,6 +743,14 @@ function runtimeParticipantProfileRoute(
           throw new Error("Participant profile is unavailable.");
         }
         return participant;
+      },
+      accountDeletionRepositoryFor(candidate) {
+        if (!sameAccount(candidate)) {
+          throw new Error("Participant profile is unavailable.");
+        }
+        return participantRepositories.participantAccountDeletionRepository(
+          selfFounderApplicationId(),
+        );
       },
       verifyMutation: (request: Request) =>
         runtime.mutationSession.verifyMutation(

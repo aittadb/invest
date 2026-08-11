@@ -262,8 +262,9 @@ test("participant documents expose only configured and permitted interest workfl
   );
   assert.deepEqual(
     inactiveHome.actions.map((action) => action.name),
-    ["read-private-package", "sign-out"],
+    ["sign-out"],
   );
+  assert.equal(inactiveHome.data.current_package, null);
   assert.doesNotMatch(
     JSON.stringify(inactiveHome),
     /founder-interest|investment-interests/u,
@@ -321,10 +322,10 @@ test("participant entry and profile capabilities reflect registration state", ()
     },
   );
   assert.deepEqual(deletionRequested.actions.map(({ name }) => name), [
-    "read-private-package",
     "open-participant-profile",
     "sign-out",
   ]);
+  assert.equal(deletionRequested.data.current_package, null);
   assert.equal(
     deletionRequested.actions.find(
       ({ name }) => name === "open-participant-profile"

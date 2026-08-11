@@ -1656,7 +1656,11 @@ test("resource validation requires operation IDs only for currently available ac
   assert.deepEqual(actionless.document.actions, []);
   assert.equal(
     actionless.document.data.current_acknowledgment_status,
-    "current",
+    "package_unavailable",
+  );
+  assert.deepEqual(
+    actionless.document.links.flatMap(({ rel }) => rel),
+    ["self", "participant-profile", "campaign"],
   );
 });
 

@@ -112,9 +112,16 @@ function requiredParticipantSubject(
   context: Parameters<ApplicationRouteHandler>[0],
 ): ActorSubject {
   if (context.actor === null) authenticationRequired();
-  if (context.participantAccess === null) notFound();
+  const access = context.participantAccess;
+  if (
+    context.isOwner ||
+    access === null ||
+    access.accountStatus !== "active"
+  ) {
+    notFound();
+  }
   const subject = parseActorSubject(context.actor.userId);
-  if (!subject.ok || subject.value !== context.participantAccess.subject) {
+  if (!subject.ok || subject.value !== access.subject) {
     notFound();
   }
   return subject.value;

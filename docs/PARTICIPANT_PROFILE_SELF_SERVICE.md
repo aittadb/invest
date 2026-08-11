@@ -59,10 +59,13 @@ The subject-bound persistent coordinator stages that profile transition with
 any active founder application, every active bounded investment indication,
 their aggregate contributions, one closed audit event, and one immutable retry
 receipt, then commits all effects or none. Marketing consent remains an
-independent later withdrawal. Hosted profile-route composition remains
-`TASK-110`. The participant entry representation continues to link to this
-resource as a profile view and retains only currently permitted package access
-and sign-out alongside it; founder and investment workflow actions are withheld.
+independent later withdrawal. Hosted composition selects this atomic
+coordinator only for the deletion action; profile edits and marketing withdrawal
+continue through the narrow profile repository. The resulting participant
+representation retains only profile viewing, sign-out, and any still-available
+marketing withdrawal. Private package, acknowledgment, founder, and investment
+resources return the same non-disclosing unavailable surface as other inactive
+participant capabilities.
 
 ## Mutation Boundary
 
@@ -88,17 +91,17 @@ successful response or any later parser, repository, or rendering failure;
 failures before verification attach none. A resource with no mutation actions
 issues neither operation IDs nor a CSRF proof or cookie.
 
-Mutations delegate compare-and-set, idempotency, and immutable revision history
-to the existing `ParticipantRepository`. Exact immediate retries reuse the
-persisted resulting timestamp and return the repository replay without adding a
-revision. If concurrent exact requests sample different server timestamps, the
-loser performs one bounded current-snapshot recovery and retries with the
-winner's persisted timestamp. Changed retries still conflict and stale
-operations still fail their precondition. Before any existing-profile write,
-the storage repository verifies the current record against the expected
-immutable revision. A response lost after commit can be reconstructed only from
-the exact stored operation revision, and new attempts to repeat a completed
-withdraw-only or request-only transition do not create no-op revisions.
+Profile edits and marketing withdrawal delegate compare-and-set, idempotency,
+and immutable revision history to the existing `ParticipantRepository`.
+Account deletion delegates the same action contract to the atomic application
+coordinator. Exact immediate retries reuse the persisted resulting timestamp
+and return repository or coordinator replay evidence without adding a revision.
+If concurrent exact requests sample different server timestamps, the loser
+performs one bounded current-snapshot recovery and retries with the winner's
+persisted timestamp. Changed retries still conflict and stale operations still
+fail their precondition. A response lost after commit can be reconstructed only
+from exact immutable operation evidence, and repeating a completed one-way
+transition does not create a no-op revision.
 
 Anonymous requests receive only the fixed sign-in resource. Owners,
 unregistered accounts, foreign subjects, missing records, and inaccessible

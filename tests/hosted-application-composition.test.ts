@@ -28,12 +28,20 @@ import {
 } from "../http/runtime-participant.ts";
 import type { OwnerPackageDocument } from "../domain/owner-package-resource.ts";
 import {
+  createPackageAcceptance,
+  createPackageVersion,
+} from "../domain/package-content.ts";
+import {
   FOUNDER_INTEREST_PATH,
   FOUNDER_SECONDARY_AREAS_FIELD,
   FOUNDER_WITHDRAWAL_REPLAY_ACTION,
   type FounderInterestDocument,
 } from "../domain/participant-founder-interest-resource.ts";
 import { parseContributionAreaChoices } from "../domain/founder-application.ts";
+import type {
+  InvestmentIndicationId,
+  TrustedPackageAcknowledgmentContext,
+} from "../domain/investment-indication.ts";
 import {
   PARTICIPANT_REGISTRATION_PATH,
   parseParticipantRegistrationOperationId,
@@ -65,6 +73,11 @@ import {
   StoragePackageVersionRepository,
 } from "../repositories/in-memory-content-repository.ts";
 import { StorageParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
+import { StorageFounderApplicationRepository } from "../repositories/in-memory-founder-application-repository.ts";
+import {
+  initializeParticipantInvestmentOwnership,
+  StorageParticipantInvestmentInterestRepository,
+} from "../repositories/storage-participant-investment-repository.ts";
 import {
   PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT,
   PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT,
@@ -73,6 +86,7 @@ import {
   StorageApplicationRepositoryFactory,
 } from "../repositories/storage-application-repository-factory.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
+import { createParticipantInvestmentInterestService } from "../worker/investment-interest-service.ts";
 import type {
   InvestorAppEnv,
   WorkerExecutionContext,
@@ -786,8 +800,8 @@ test("participant access keeps nested package retry reads inside one budget", as
 test("participant request scope enforces exact maximum route and retry read budgets", async () => {
   assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 551);
   assert.equal(PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT, 1_063);
-  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 1_063);
-  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 1_614);
+  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 7_148);
+  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 7_699);
 
   const service = new SyntheticAittaDBService();
   await registerHostedParticipant(
@@ -3791,6 +3805,17 @@ test("hosted participant profile self-service persists bounded actions across re
   assert(historicalUpdate);
   assert.equal(historicalUpdate.snapshot.updatedAt, committedUpdateTimestamp);
 
+  await configureHostedFounderCampaign(service);
+  await initializeParticipantInvestmentOwnership(
+    hostedStorageAdapter(service),
+    PARTICIPANT_SUBJECT,
+    {
+      operationId: "investment-ownership-initialization:hosted-profile-deletion",
+      indications: [],
+    },
+  );
+  const deletionInterests = await seedHostedDeletionInterests(service);
+
   const deletionDiscoveryWorker = hostedPackageWorker(
     service,
     () => new Date(restartEpoch + 60_000),
@@ -3842,6 +3867,23 @@ test("hosted participant profile self-service persists bounded actions across re
     ),
   ]);
   assert.deepEqual(deletionResponses.map(({ status }) => status), [200, 200]);
+  const deletionDocuments = await Promise.all(
+    deletionResponses.map((response) =>
+      response.clone().json() as Promise<ParticipantProfileDocument>
+    ),
+  );
+  for (const document of deletionDocuments) {
+    assert.equal(document.data.account_deletion_state, "requested");
+    assert.equal(
+      document.data.current_acknowledgment_status,
+      "package_unavailable",
+    );
+    assert.deepEqual(
+      document.links.flatMap(({ rel }) => rel),
+      ["self", "participant-profile", "campaign"],
+    );
+    assert.deepEqual(actionNames(document), []);
+  }
   for (const [index, response] of deletionResponses.entries()) {
     assertProfileMutationCookieLifecycle(
       response,
@@ -3849,6 +3891,41 @@ test("hosted participant profile self-service persists bounded actions across re
       [deletionFirst, deletionRetry][index]?.cookie ?? null,
     );
   }
+  assert.equal(
+    (await deletionInterests.founder.get(
+      deletionInterests.founderApplicationId,
+    ))?.status,
+    "withdrawn",
+  );
+  assert.equal(
+    (await deletionInterests.investments.get(
+      deletionInterests.investmentIndicationId,
+    ))?.lifecycle.status,
+    "withdrawn",
+  );
+  assert.equal(
+    recordsIn(service, "participant-account-deletion-operations").length,
+    1,
+  );
+  const aggregateRecord = recordsIn(
+    service,
+    "investment-aggregate-states",
+  )[0];
+  assert(aggregateRecord);
+  const aggregateSnapshot = requiredObject(aggregateRecord.value.snapshot);
+  assert.equal(aggregateSnapshot.totalAmount, 0);
+  assert.equal(aggregateSnapshot.contributingIndicationCount, 0);
+  assert.equal(
+    recordsIn(service, "audit-events").filter((record) => {
+      const event = record.value.event;
+      return typeof event === "object" && event !== null &&
+        "detail" in event &&
+        typeof event.detail === "object" && event.detail !== null &&
+        "transition" in event.detail &&
+        event.detail.transition === "deletion-requested";
+    }).length,
+    1,
+  );
 
   const participantRecordsBeforeClosedReplay = JSON.stringify([
     ...recordsIn(service, "participant-profiles"),
@@ -3970,6 +4047,81 @@ test("hosted participant profile self-service persists bounded actions across re
   ]) {
     assert.doesNotMatch(disclosureProbe, new RegExp(privateValue, "u"));
   }
+});
+
+test("hosted atomic deletion preserves only independent consent withdrawal", async () => {
+  const service = new SyntheticAittaDBService();
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Consent-after-deletion participant",
+    "participant-operation:consent-after-atomic-deletion",
+    { marketingConsent: true },
+  );
+  await configureHostedFounderCampaign(service);
+  await initializeParticipantInvestmentOwnership(
+    hostedStorageAdapter(service),
+    PARTICIPANT_SUBJECT,
+    {
+      operationId:
+        "investment-ownership-initialization:consent-after-atomic-deletion",
+      indications: [],
+    },
+  );
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  const worker = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-14T12:00:00.000Z"),
+  );
+  const before = await participantProfile(worker, env);
+  const deletion = requiredAction(
+    before.document,
+    "request-account-deletion",
+  );
+  const deletedResponse = await submitProfile(
+    worker,
+    env,
+    before,
+    deletion,
+    actionBody(deletion, { "confirm-account-deletion-request": true }),
+  );
+  assert.equal(deletedResponse.status, 200);
+
+  const restarted = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-14T12:05:00.000Z"),
+  );
+  const requested = await participantProfile(restarted, env);
+  assert.deepEqual(actionNames(requested.document), [
+    "withdraw-marketing-consent",
+  ]);
+  assert.deepEqual(
+    requested.document.links.flatMap(({ rel }) => rel),
+    ["self", "participant-profile", "campaign"],
+  );
+  const withdrawal = requiredAction(
+    requested.document,
+    "withdraw-marketing-consent",
+  );
+  const withdrawnResponse = await submitProfile(
+    restarted,
+    env,
+    requested,
+    withdrawal,
+    actionBody(withdrawal, {
+      "confirm-marketing-consent-withdrawal": true,
+    }),
+  );
+  assert.equal(withdrawnResponse.status, 200);
+  const withdrawn = await withdrawnResponse.json() as ParticipantProfileDocument;
+  assert.equal(withdrawn.data.account_deletion_state, "requested");
+  assert.equal(withdrawn.data.marketing_consent_state, "withdrawn");
+  assert.deepEqual(actionNames(withdrawn), []);
+  assert.equal(
+    recordsIn(service, "participant-account-deletion-operations").length,
+    1,
+  );
 });
 
 test("hosted delayed profile replays reject impossible consent ancestry and preserve valid withdrawal replay", async () => {
@@ -4428,6 +4580,14 @@ test("hosted signed-in entry advances through registration and trusted participa
     }),
   );
   assert.equal(registered.status, 201);
+  await initializeParticipantInvestmentOwnership(
+    hostedStorageAdapter(service),
+    PARTICIPANT_SUBJECT,
+    {
+      operationId: "investment-ownership-initialization:participant-entry",
+      indications: [],
+    },
+  );
 
   const activeWorker = createEntryWorker();
   const activeJson = await activeWorker.fetch(
@@ -4523,12 +4683,12 @@ test("hosted signed-in entry advances through registration and trusted participa
   );
   assert.equal(deletedJson.status, 200);
   const deletedDocument = await deletedJson.json() as {
-    data: { account_status: string };
+    data: { account_status: string; current_package: unknown };
     actions: readonly TestAction[];
   };
   assert.equal(deletedDocument.data.account_status, "deletion-requested");
+  assert.equal(deletedDocument.data.current_package, null);
   assert.deepEqual(actionNames(deletedDocument), [
-    "read-private-package",
     "open-participant-profile",
     "sign-out",
   ]);
@@ -4539,6 +4699,26 @@ test("hosted signed-in entry advances through registration and trusted participa
   assert.doesNotMatch(
     JSON.stringify(deletedDocument),
     /founder-interest|investment-interests/u,
+  );
+  const deletedPackage = await deletedWorker.fetch(
+    participantRequest("/participant/package"),
+    env,
+    executionContext,
+  );
+  assert.equal(deletedPackage.status, 404);
+  assert.doesNotMatch(
+    await deletedPackage.text(),
+    /Private current package|package:budget|participant@example\.test/u,
+  );
+  const deletedAcknowledgment = await deletedWorker.fetch(
+    participantRequest("/participant/package/acknowledgment"),
+    env,
+    executionContext,
+  );
+  assert.equal(deletedAcknowledgment.status, 404);
+  assert.doesNotMatch(
+    await deletedAcknowledgment.text(),
+    /Private current package|package:budget|participant@example\.test/u,
   );
 
   const deletionHtml = await deletedWorker.fetch(
@@ -5844,6 +6024,124 @@ async function configureHostedFounderCampaign(
     },
   });
   assert.equal(result.setup.phases[0]?.state, phaseState);
+}
+
+async function seedHostedDeletionInterests(
+  service: SyntheticAittaDBService,
+): Promise<Readonly<{
+  founderApplicationId: StableId<"founder-application">;
+  investmentIndicationId: InvestmentIndicationId;
+  founder: StorageFounderApplicationRepository;
+  investments: StorageParticipantInvestmentInterestRepository;
+}>> {
+  const storage = hostedStorageAdapter(service);
+  const campaign = await new StorageCampaignRepository(storage).readSetup();
+  assert(campaign);
+  const setup = campaign.setup;
+  const subject = parseActorSubject(PARTICIPANT_SUBJECT);
+  const founderApplicationId = parseStableId<"founder-application">(
+    "founder-application:self",
+  );
+  assert(subject.ok);
+  assert(founderApplicationId.ok);
+  const founder = new StorageFounderApplicationRepository(
+    storage,
+    subject.value,
+    setup.campaignPolicy.founderContributionChoices,
+  );
+  await founder.create({
+    operationId: "founder-operation:hosted-profile-deletion",
+    expectedRevision: null,
+    id: founderApplicationId.value,
+    occurredAt: "2026-08-11T11:00:00.000Z",
+    historyEntryId: "founder-history:hosted-profile-deletion",
+    fields: {
+      expertiseSummary: "Hosted deletion integration expertise.",
+      intendedContribution: "Validate the complete deletion workflow.",
+      primaryContributionAreaId: "area:engineering",
+      secondaryContributionAreaIds: ["area:product"],
+      approximateAvailability: "Part-time.",
+      possibleStartTiming: "After mutual confirmation.",
+      compensationExpectation: "Open to discussion.",
+      professionalProfileLinks: [],
+      note: null,
+    },
+  });
+
+  const investmentRepository =
+    new StorageParticipantInvestmentInterestRepository(
+      storage,
+      subject.value,
+      setup.amountAggregate.amount,
+    );
+  const context = await hostedDeletionAcknowledgmentContext(subject.value);
+  const investment = createParticipantInvestmentInterestService({
+    actorSubject: subject.value,
+    amountConfiguration: setup.amountAggregate.amount,
+    reader: investmentRepository,
+    mutations: investmentRepository,
+    loadAcknowledgmentContext: () => context,
+    loadPermissions: () => Object.freeze({
+      createPersonal: true,
+      createCompany: true,
+      reactivatePersonal: true,
+      reactivateCompany: true,
+    }),
+    indicationIdForOperation: hostedIndicationId,
+    now: () => new Date("2026-08-11T11:05:00.000Z"),
+  });
+  const created = await investment.create({
+    operationId: "investment-indication:hosted-profile-deletion",
+    fields: {
+      kind: "personal",
+      residenceCountry: "FI",
+      amount: 25_000,
+      availabilityPeriod: "Within twelve months.",
+      note: null,
+    },
+  });
+  return Object.freeze({
+    founderApplicationId: founderApplicationId.value,
+    investmentIndicationId: created.snapshot.id,
+    founder,
+    investments: investmentRepository,
+  });
+}
+
+async function hostedDeletionAcknowledgmentContext(
+  participantSubject: ActorSubject,
+): Promise<TrustedPackageAcknowledgmentContext> {
+  const version = await createPackageVersion({
+    id: "package-version:hosted-profile-deletion",
+    createdAt: "2026-08-11T10:00:00.000Z",
+    changeSummary: "Hosted deletion test package.",
+    materialChange: false,
+    acknowledgmentText: "This indication remains non-binding.",
+    sections: [{
+      id: "package-section:hosted-profile-deletion",
+      order: 0,
+      title: "Overview",
+      markdown: "Hosted deletion test package.",
+      enabled: true,
+    }],
+  }, null);
+  if (!version.ok) assert.fail(JSON.stringify(version.issues));
+  const acceptance = createPackageAcceptance({
+    id: "package-acceptance:hosted-profile-deletion",
+    participantSubject,
+    acceptedAt: "2026-08-11T10:05:00.000Z",
+  }, version.value);
+  if (!acceptance.ok) assert.fail(JSON.stringify(acceptance.issues));
+  return Object.freeze({
+    currentVersion: version.value,
+    latestAcceptance: acceptance.value,
+  });
+}
+
+function hostedIndicationId(value: unknown): InvestmentIndicationId {
+  const parsed = parseStableId<"investment-indication">(value);
+  if (!parsed.ok) assert.fail(JSON.stringify(parsed.issues));
+  return parsed.value;
 }
 
 function hostedStorageAdapter(

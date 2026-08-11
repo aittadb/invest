@@ -62,6 +62,9 @@ import type {
   ParticipantProfileSnapshot,
   ParticipantRepository,
 } from "../../repositories/in-memory-participant-repository.ts";
+import type {
+  AtomicParticipantAccountDeletionRepository,
+} from "../../repositories/storage-participant-account-deletion-repository.ts";
 import type { ApplicationRouteHandler } from "../contracts.ts";
 import {
   hypermediaResponse,
@@ -142,6 +145,12 @@ export type ParticipantProfileRepositoryFactory = (
   account: ParticipantAccount,
 ) => ParticipantRepository;
 
+export type ParticipantAccountDeletionRepositoryFactory = (
+  account: ParticipantAccount,
+) =>
+  | AtomicParticipantAccountDeletionRepository
+  | Promise<AtomicParticipantAccountDeletionRepository>;
+
 export type ParticipantProfileCsrfTokenProvider = (
   request: Request,
   account: ParticipantAccount,
@@ -159,6 +168,7 @@ export type ParticipantProfileMutationVerifier = (
 
 export type ParticipantProfileRouteDependencies = Readonly<{
   repositoryFor: ParticipantProfileRepositoryFactory;
+  accountDeletionRepositoryFor?: ParticipantAccountDeletionRepositoryFactory;
   mutationSecurity?: BrowserMutationGuardOptions;
   verifyMutation?: ParticipantProfileMutationVerifier;
   csrfTokenFor: ParticipantProfileCsrfTokenProvider;
@@ -172,6 +182,8 @@ export function createParticipantProfileRouteHandler(
 ): ApplicationRouteHandler {
   if (
     typeof dependencies.repositoryFor !== "function" ||
+    (dependencies.accountDeletionRepositoryFor !== undefined &&
+      typeof dependencies.accountDeletionRepositoryFor !== "function") ||
     typeof dependencies.csrfTokenFor !== "function" ||
     (dependencies.verifyMutation === undefined) ===
       (dependencies.mutationSecurity === undefined)
@@ -272,8 +284,17 @@ export function createParticipantProfileRouteHandler(
       );
       const mutation = parseProfileMutation(verified);
       requireMutationAvailable(current, mutation);
+      const accountDeletionRepository = mutation.kind ===
+          "request-account-deletion" &&
+          dependencies.accountDeletionRepositoryFor !== undefined
+        ? await requiredAccountDeletionRepository(
+            dependencies.accountDeletionRepositoryFor,
+            authorized.account,
+          )
+        : null;
       const applied = await applyMutationWithReplayRecovery(
         repository,
+        accountDeletionRepository,
         authorized.account,
         mutation,
         current,
@@ -492,6 +513,7 @@ function requireMutationAvailableFromBase(
 
 async function applyMutation(
   repository: ParticipantRepository,
+  accountDeletionRepository: AtomicParticipantAccountDeletionRepository | null,
   mutation: ProfileMutation,
   occurredAt: Timestamp,
 ): Promise<ParticipantProfileMutationResult> {
@@ -510,7 +532,7 @@ async function applyMutation(
       withdrawnAt: occurredAt,
     });
   }
-  return repository.requestAccountDeletion({
+  return (accountDeletionRepository ?? repository).requestAccountDeletion({
     operationId: mutation.operationId,
     expectedRevision: mutation.expectedRevision,
     requestedAt: occurredAt,
@@ -525,6 +547,7 @@ type AppliedProfileMutation = Readonly<{
 
 async function applyMutationWithReplayRecovery(
   repository: ParticipantRepository,
+  accountDeletionRepository: AtomicParticipantAccountDeletionRepository | null,
   account: ParticipantAccount,
   mutation: ProfileMutation,
   current: ParticipantProfileSnapshot,
@@ -541,6 +564,7 @@ async function applyMutationWithReplayRecovery(
     return Object.freeze({
       result: await applyMutation(
         repository,
+        accountDeletionRepository,
         mutation,
         replayContext.occurredAt,
       ),
@@ -569,6 +593,7 @@ async function applyMutationWithReplayRecovery(
     return Object.freeze({
       result: await applyMutation(
         repository,
+        accountDeletionRepository,
         mutation,
         recovered.occurredAt,
       ),
@@ -904,6 +929,26 @@ function requiredRepository(
   ) {
     unavailable();
   }
+  return repository;
+}
+
+async function requiredAccountDeletionRepository(
+  factory: ParticipantAccountDeletionRepositoryFactory,
+  account: ParticipantAccount,
+): Promise<AtomicParticipantAccountDeletionRepository> {
+  let repository: AtomicParticipantAccountDeletionRepository;
+  try {
+    repository = await factory(account);
+  } catch (error) {
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+  if (
+    typeof repository !== "object" ||
+    repository === null ||
+    repository.deletionConsistency !==
+      "atomic-profile-founder-investment-aggregate-audit" ||
+    typeof repository.requestAccountDeletion !== "function"
+  ) unavailable();
   return repository;
 }
 
