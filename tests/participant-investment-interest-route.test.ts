@@ -34,7 +34,13 @@ import {
   hashCsrfToken,
   type TrustedMutationSession,
 } from "../http/mutation-security.ts";
-import type { BrowserMutationProof } from "../http/browser-mutation-session.ts";
+import {
+  createBrowserMutationSession,
+  type BrowserMutationProof,
+  type BrowserMutationReplayClaim,
+  type BrowserMutationSession,
+  type TrustedSitesMutationIdentity,
+} from "../http/browser-mutation-session.ts";
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
 import {
   createParticipantInvestmentInterestService,
@@ -66,6 +72,14 @@ const CLEAR_COOKIE =
   "__Host-investor_mutation_investment=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict";
 const ALICE = subject("issuer.invalid/participant:alice-route-investment");
 const BOB = subject("issuer.invalid/participant:bob-route-investment");
+const PARTICIPANT_IDENTITY = Object.freeze({
+  type: "participant",
+  subject: ALICE,
+}) satisfies TrustedSitesMutationIdentity;
+const OWNER_IDENTITY = Object.freeze({
+  type: "owner",
+  subject: ALICE,
+}) satisfies TrustedSitesMutationIdentity;
 const AMOUNT = configuredAmount();
 const ALLOW_ALL = Object.freeze({
   createPersonal: true,
@@ -719,10 +733,217 @@ test("investment route owns finite per-method mutation limits", () => {
   );
 });
 
+test("real hosted investment verification applies method limits before replay or persistence", async () => {
+  const hosted = await createHostedMutationSession();
+  const proof = await issueHostedInvestmentProof(
+    hosted.session,
+    PARTICIPANT_IDENTITY,
+  );
+  const harness = await createHarness({
+    verifyMutation: (request) => hosted.session.verifyMutation(
+      request,
+      PARTICIPANT_IDENTITY,
+      CANONICAL_ORIGIN,
+      investmentInterestMutationLimits(request.method),
+    ),
+    csrfTokenFor: () => proof,
+  });
+  const itemPath = investmentInterestItemPath(
+    "investment-operation:hosted-limit-target",
+  );
+
+  for (const [name, request] of [
+    [
+      "post",
+      hostedInvestmentJsonMutation(
+        proof,
+        INVESTMENT_INTEREST_PATH,
+        "POST",
+        personalBody("investment-operation:hosted-post-limit", {
+          note: "x".repeat(MAX_INVESTMENT_POST_MUTATION_BYTES),
+        }),
+      ),
+    ],
+    [
+      "patch",
+      hostedInvestmentJsonMutation(
+        proof,
+        itemPath,
+        "PATCH",
+        personalBody("investment-operation:hosted-patch-limit", {
+          "expected-revision": 1,
+          note: "x".repeat(MAX_INVESTMENT_PATCH_MUTATION_BYTES),
+        }),
+      ),
+    ],
+    [
+      "delete",
+      hostedInvestmentJsonMutation(
+        proof,
+        itemPath,
+        "DELETE",
+        {
+          "operation-id": "investment-operation:hosted-delete-limit",
+          "expected-revision": 1,
+          "confirm-withdrawal": "x".repeat(
+            MAX_INVESTMENT_DELETE_MUTATION_BYTES,
+          ),
+        },
+      ),
+    ],
+  ] as const) {
+    const response = await harness.dispatch(request, ALICE);
+    assert.equal(response.status, 413, name);
+  }
+
+  const excessBody = Object.freeze({
+    ...personalBody("investment-operation:hosted-excess-fields"),
+    ...Object.fromEntries(
+      Array.from(
+        { length: MAX_INVESTMENT_POST_MUTATION_FIELDS },
+        (_, index) => [`unexpected-${index}`, "private"],
+      ),
+    ),
+  });
+  assert(
+    Object.keys(excessBody).length > MAX_INVESTMENT_POST_MUTATION_FIELDS,
+  );
+  const excess = await harness.dispatch(
+    hostedInvestmentJsonMutation(
+      proof,
+      INVESTMENT_INTEREST_PATH,
+      "POST",
+      excessBody,
+    ),
+    ALICE,
+  );
+  assert.equal(excess.status, 400);
+
+  const repeated = await harness.dispatch(
+    hostedInvestmentFormMutation(proof, INVESTMENT_INTEREST_PATH, [
+      ["operation-id", "investment-operation:hosted-repeated-field"],
+      ["kind", "personal"],
+      ["residence-country", "FI"],
+      ["amount", "1250"],
+      ["availability-period", "Within twelve months."],
+      ["note", "First private note"],
+      ["note", "Second private note"],
+    ]),
+    ALICE,
+  );
+  assert.equal(repeated.status, 400);
+
+  assert.equal(harness.serviceCalls(), 0);
+  assert.equal(harness.state.indications.size, 0);
+  assert.deepEqual(hosted.claims.calls, []);
+});
+
+test("real hosted investment proofs are participant-bound, one-time, and replaced after use", async () => {
+  const hosted = await createHostedMutationSession();
+  const participantProof = await issueHostedInvestmentProof(
+    hosted.session,
+    PARTICIPANT_IDENTITY,
+  );
+  const replacements: BrowserMutationProof[] = [];
+  const harness = await createHarness({
+    verifyMutation: (request) => hosted.session.verifyMutation(
+      request,
+      PARTICIPANT_IDENTITY,
+      CANONICAL_ORIGIN,
+      investmentInterestMutationLimits(request.method),
+    ),
+    async csrfTokenFor(request, actorSubject) {
+      assert.equal(actorSubject, ALICE);
+      const replacement = await hosted.session.issue(
+        request,
+        PARTICIPANT_IDENTITY,
+        CANONICAL_ORIGIN,
+      );
+      replacements.push(replacement);
+      return replacement;
+    },
+  });
+  const body = personalBody("investment-operation:hosted-real-session");
+
+  const successful = await harness.dispatch(
+    hostedInvestmentJsonMutation(
+      participantProof,
+      INVESTMENT_INTEREST_PATH,
+      "POST",
+      body,
+    ),
+    ALICE,
+  );
+  assert.equal(successful.status, 201);
+  assert.equal(replacements.length, 1);
+  const replacement = replacements[0];
+  assert(replacement);
+  assert.notEqual(cookieName(participantProof), cookieName(replacement));
+  assert.equal(
+    successful.headers.get(MUTATION_CSRF_HEADER),
+    replacement.token,
+  );
+  assert.deepEqual(
+    successful.headers.getSetCookie().sort(),
+    [
+      replacement.setCookie,
+      expiredProofCookie(participantProof),
+    ].sort(),
+  );
+  const successfulBody = await successful.text();
+  assert.doesNotMatch(
+    successfulBody,
+    new RegExp(`${participantProof.token}|${replacement.token}`, "u"),
+  );
+  assert.doesNotMatch(successfulBody, /set-cookie|Max-Age=0|HttpOnly/iu);
+  assert.equal(harness.serviceCalls(), 1);
+  assert.equal(harness.state.indications.size, 1);
+  assert.equal(hosted.claims.calls.length, 1);
+
+  const replay = await harness.dispatch(
+    hostedInvestmentJsonMutation(
+      participantProof,
+      INVESTMENT_INTEREST_PATH,
+      "POST",
+      body,
+    ),
+    ALICE,
+  );
+  assert.equal(replay.status, 403);
+  assert.deepEqual(replay.headers.getSetCookie(), []);
+  assert.equal(harness.serviceCalls(), 1);
+  assert.equal(harness.state.indications.size, 1);
+  assert.equal(hosted.claims.calls.length, 2);
+  assert.equal(
+    hosted.claims.calls[0]?.capabilityId,
+    hosted.claims.calls[1]?.capabilityId,
+  );
+
+  const ownerProof = await issueHostedInvestmentProof(
+    hosted.session,
+    OWNER_IDENTITY,
+  );
+  const ownerAttempt = await harness.dispatch(
+    hostedInvestmentJsonMutation(
+      ownerProof,
+      INVESTMENT_INTEREST_PATH,
+      "POST",
+      personalBody("investment-operation:hosted-owner-proof"),
+    ),
+    ALICE,
+  );
+  assert.equal(ownerAttempt.status, 403);
+  assert.deepEqual(ownerAttempt.headers.getSetCookie(), []);
+  assert.equal(harness.serviceCalls(), 1);
+  assert.equal(harness.state.indications.size, 1);
+  assert.equal(hosted.claims.calls.length, 2);
+});
+
 type Harness = Readonly<{
   state: InvestmentInterestRepositoryFixtureState;
   contexts: Map<ActorSubject, TrustedPackageAcknowledgmentContext>;
   permissions: Map<ActorSubject, InvestmentInterestPermissions>;
+  serviceCalls(): number;
   dispatch(
     request: Request,
     actorSubject: ActorSubject | null,
@@ -731,7 +952,10 @@ type Harness = Readonly<{
 }>;
 
 type HarnessOptions = Readonly<{
-  csrfTokenFor?: () =>
+  csrfTokenFor?: (
+    request: Request,
+    actorSubject: ActorSubject,
+  ) =>
     | string
     | BrowserMutationProof
     | null
@@ -752,16 +976,17 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
   ]);
   const clocks = new Map<ActorSubject, number>();
   let operationCounter = 0;
+  let serviceCalls = 0;
   const csrfHash = await hashCsrfToken(CSRF_TOKEN);
   const handler = createInvestmentInterestRouteHandler({
-    serviceFor: (actorSubject) =>
-      {
-        const persistence = new InvestmentInterestRepositoryFixture(
-          state,
-          actorSubject,
-          AMOUNT,
-        );
-        return createParticipantInvestmentInterestService({
+    serviceFor: (actorSubject) => {
+      serviceCalls += 1;
+      const persistence = new InvestmentInterestRepositoryFixture(
+        state,
+        actorSubject,
+        AMOUNT,
+      );
+      return createParticipantInvestmentInterestService({
         actorSubject,
         amountConfiguration: AMOUNT,
         reader: persistence,
@@ -776,8 +1001,8 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
             `2026-08-12T${String(next).padStart(2, "0")}:00:00.000Z`,
           );
         },
-        });
-      },
+      });
+    },
     ...(options.verifyMutation === undefined
       ? {
           mutationSecurity: {
@@ -813,6 +1038,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     state,
     contexts,
     permissions,
+    serviceCalls: () => serviceCalls,
     async dispatch(request, actorSubject, options = {}) {
       const url = new URL(request.url);
       const context = routeContext(
@@ -945,6 +1171,117 @@ function formMutation(
     },
     body: body.toString(),
   });
+}
+
+class AtomicBrowserMutationClaims {
+  readonly calls: BrowserMutationReplayClaim[] = [];
+  readonly #claimed = new Set<string>();
+
+  async claim(claim: BrowserMutationReplayClaim): Promise<boolean> {
+    this.calls.push(claim);
+    if (this.#claimed.has(claim.capabilityId)) return false;
+    this.#claimed.add(claim.capabilityId);
+    return true;
+  }
+}
+
+async function createHostedMutationSession(): Promise<Readonly<{
+  session: BrowserMutationSession;
+  claims: AtomicBrowserMutationClaims;
+}>> {
+  const claims = new AtomicBrowserMutationClaims();
+  let randomCall = 0;
+  const session = createBrowserMutationSession({
+    appOrigin: CANONICAL_ORIGIN,
+    encryptionKey: await aesKey(73),
+    claimReplay: (claim) => claims.claim(claim),
+    now: () => new Date("2026-08-12T09:00:00.000Z"),
+    randomBytes(length) {
+      randomCall += 1;
+      return Uint8Array.from(
+        { length },
+        (_, index) => (randomCall * 41 + index) % 256,
+      );
+    },
+    ttlSeconds: 300,
+  });
+  return Object.freeze({ session, claims });
+}
+
+function issueHostedInvestmentProof(
+  session: BrowserMutationSession,
+  identity: TrustedSitesMutationIdentity,
+): Promise<BrowserMutationProof> {
+  return session.issue(
+    new Request(`${CANONICAL_ORIGIN}${INVESTMENT_INTEREST_PATH}`),
+    identity,
+    CANONICAL_ORIGIN,
+  );
+}
+
+function hostedInvestmentJsonMutation(
+  proof: BrowserMutationProof,
+  path: string,
+  method: "POST" | "PATCH" | "DELETE",
+  body: Readonly<Record<string, unknown>>,
+): Request {
+  return new Request(`${CANONICAL_ORIGIN}${path}`, {
+    method,
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      cookie: proofCookieHeader(proof),
+      origin: CANONICAL_ORIGIN,
+      [MUTATION_CSRF_HEADER]: proof.token,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+function hostedInvestmentFormMutation(
+  proof: BrowserMutationProof,
+  path: string,
+  entries: readonly (readonly [string, string])[],
+): Request {
+  const body = new URLSearchParams();
+  body.append(MUTATION_CSRF_FIELD, proof.token);
+  for (const [name, value] of entries) body.append(name, value);
+  return new Request(`${CANONICAL_ORIGIN}${path}`, {
+    method: "POST",
+    headers: {
+      accept: "text/html",
+      "content-type": "application/x-www-form-urlencoded",
+      cookie: proofCookieHeader(proof),
+      origin: CANONICAL_ORIGIN,
+    },
+    body,
+  });
+}
+
+function proofCookieHeader(proof: BrowserMutationProof): string {
+  const value = proof.setCookie.split(";", 1)[0];
+  assert(value);
+  return value;
+}
+
+function cookieName(proof: BrowserMutationProof): string {
+  const name = proofCookieHeader(proof).split("=", 1)[0];
+  assert(name);
+  return name;
+}
+
+function expiredProofCookie(proof: BrowserMutationProof): string {
+  return `${cookieName(proof)}=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; HttpOnly; SameSite=Strict`;
+}
+
+async function aesKey(seed: number): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    "raw",
+    Uint8Array.from({ length: 32 }, (_, index) => (seed + index) % 256),
+    "AES-GCM",
+    false,
+    ["encrypt", "decrypt"],
+  );
 }
 
 function investmentVerifierFor(
