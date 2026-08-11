@@ -298,18 +298,22 @@ package, acknowledgment, or founder route receive the same subject-bound scope;
 route repository factories cannot reopen the underlying uncapped adapter. A
 second HTTP request receives a new scope.
 
-That scope admits at most 574 participant-private storage-record reads. The
+That scope admits at most 1,390 participant-private storage-record reads. The
 maximum valid authorization envelope is 551: 511 unique immutable package
 records plus two outer attempts, each containing six profile reads, two package
 head reads, and three four-read accepted gate attempts. The profile reads cover
 current, matching latest history, and immutable registration revision 1 for
-each sample. The selected route owns the remaining 23 reads. This covers a
-profile mutation's current state, two historical samples, failed first attempt,
-recovery state and history, retry, and final projection. Package GET uses one
-cached-head read and acknowledgment GET uses at most four. The next read fails
-before adapter access. Public campaign reads and storage transactions are
-outside this participant read counter, while all profile, package, gate,
-acceptance-head, acceptance-record, and participant-route reads are inside it.
+each sample. The selected capability then owns its own finite route budget:
+package one, acknowledgment eight, profile 23, or founder 839 reads. The founder
+budget covers four maximum bounded application materializations plus three
+retry/recovery reads, including a conflicted mutation and the returned resource
+projection. After the first route read, another route budget cannot be selected.
+The 1,390 global ceiling is the authorization maximum plus the largest route
+budget; either that ceiling or the selected route's smaller ceiling rejects the
+next read before adapter access. Public campaign reads and storage transactions
+are outside these participant read counters, while all profile, package, gate,
+acceptance-head, acceptance-record, and participant-route record reads are
+inside them.
 
 Within the scope, one read-only package reader reuses up to 64 verified immutable
 version reconstructions. Cache hits recharge complete ancestry and logical read
@@ -437,13 +441,12 @@ records, failed-stage and failed-final-publication recovery, hostile record and
 transaction-result matrices, package/acceptance concurrency, stable gate
 sampling, accepted and unaccepted maximum-history aggregate read counts, nested
 publication retry counts, exact maximum-package GET and acknowledgment GET
-totals, the complete nested-plus-outer 551-read envelope, the read-560 cutoff,
-cached ancestry and reconstruction recharge, exact material gating, and
-narrowing-only route mutation limits.
+totals, the complete nested-plus-outer 551-read authorization envelope,
+route-specific read cutoffs, cached ancestry and reconstruction recharge, exact
+material gating, and narrowing-only route mutation limits.
 Founder coverage adds configured-choice projection, create/retry/edit/stale/
-withdraw history, policy closure between action discovery and mutation, foreign
-and owner non-disclosure, origin and proof rejection, investment-state
-independence, and reconstruction through a fresh Worker. The
+independence, malformed and oversized hosted bodies, equivalent HTML and
+hypermedia state/actions, and reconstruction through a fresh Worker. The
 synthetic hosted services implement and enforce the discovered AittaDB
 read/list/transaction controls rather than bypassing the adapter. Source
 and built-artifact scans complement `npm run instances:check`, which rejects

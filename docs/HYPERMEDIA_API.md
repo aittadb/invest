@@ -203,7 +203,7 @@ The route obtains a participant-bound application service from an injected facto
 
 Founder history contains at most 16 transitions and reserves its final slot for withdrawal. Historical field payloads retain the contribution-choice IDs under which they were accepted, so configuration changes do not invalidate reads or exact retries. Current choices alone constrain new create and edit submissions; removed historical values remain visible in history but are not advertised as valid edit choices.
 
-HTML and JSON mutations use the same origin-bound, actor-bound, one-use browser proof. The founder route narrows the shared mutation envelope and is the only route that permits repeated `secondary-contribution-area-ids`. Founder mutations call only the subject-bound founder repository, so an account's investment indications and aggregates are neither prerequisites nor side effects.
+HTML and JSON mutations use the same origin-bound, actor-bound, one-use browser proof. The founder route narrows the shared mutation envelope and is the only route that permits repeated `secondary-contribution-area-ids`. Oversized bodies are rejected before proof claim, while a bounded malformed command consumes and expires its claimed proof without changing founder state. Founder mutations call only the subject-bound founder repository, so an account's investment indications and aggregates are neither prerequisites nor side effects.
 
 ## Owner Founder-Application Collection
 

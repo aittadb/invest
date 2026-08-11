@@ -32,6 +32,7 @@ import {
   FOUNDER_SECONDARY_AREAS_FIELD,
   type FounderInterestDocument,
 } from "../domain/participant-founder-interest-resource.ts";
+import { parseContributionAreaChoices } from "../domain/founder-application.ts";
 import {
   PARTICIPANT_REGISTRATION_PATH,
   parseParticipantRegistrationOperationId,
@@ -64,6 +65,7 @@ import {
 import { StorageParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
 import {
   PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT,
+  PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT,
   PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT,
   PARTICIPANT_REQUEST_STORAGE_READ_LIMIT,
   StorageApplicationRepositoryFactory,
@@ -75,6 +77,7 @@ import type {
 } from "../worker/contracts.ts";
 import { createHostedApplicationRuntimeResolver } from "../worker/hosted-application-composition.ts";
 import {
+  MAX_FOUNDER_INTEREST_MUTATION_BYTES,
   MAX_FOUNDER_INTEREST_MUTATION_FIELDS,
 } from "../worker/routes/founder-interest.ts";
 import {
@@ -780,8 +783,9 @@ test("participant access keeps nested package retry reads inside one budget", as
 
 test("participant request scope enforces exact maximum route and retry read budgets", async () => {
   assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 551);
-  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 23);
-  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 574);
+  assert.equal(PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT, 839);
+  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 839);
+  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 1_390);
 
   const service = new SyntheticAittaDBService();
   await registerHostedParticipant(
@@ -797,8 +801,64 @@ test("participant request scope enforces exact maximum route and retry read budg
     accountEmailLabel: PARTICIPANT_EMAIL,
   });
   const subject = parseActorSubject(PARTICIPANT_SUBJECT);
+  const founderApplicationId = parseStableId<"founder-application">(
+    "founder-application:self",
+  );
   assert(account.ok);
   assert(subject.ok);
+  assert(founderApplicationId.ok);
+
+  let routeOnlyReads = 0;
+  const routeOnlyStorage: StorageAdapter = Object.freeze({
+    async read() {
+      routeOnlyReads += 1;
+      return null;
+    },
+    async list() {
+      throw new StorageFailure("UNAVAILABLE");
+    },
+    async transact() {
+      throw new StorageFailure("UNAVAILABLE");
+    },
+  });
+  const packageOnlyRequest = new StorageApplicationRepositoryFactory(
+    routeOnlyStorage,
+    () => NOW,
+  ).participantRequest(account.value);
+  assert.equal(
+    await packageOnlyRequest.participantPackageReader(subject.value).current(),
+    null,
+  );
+  await assert.rejects(
+    packageOnlyRequest.participantPackageReader(subject.value).current(),
+    (error) => error instanceof StorageFailure && error.code === "UNAVAILABLE",
+  );
+  assert.equal(routeOnlyReads, 1);
+
+  routeOnlyReads = 0;
+  const founderChoices = parseContributionAreaChoices([
+    { id: "area:engineering", label: "Engineering" },
+  ]);
+  assert(founderChoices.ok);
+  const founderOnlyRequest = new StorageApplicationRepositoryFactory(
+    routeOnlyStorage,
+    () => NOW,
+  ).participantRequest(account.value);
+  const founderOnly = founderOnlyRequest.participantFounderApplications(
+    founderChoices.value,
+  ).applications;
+  for (
+    let index = 0;
+    index < PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT;
+    index += 1
+  ) {
+    assert.equal(await founderOnly.get(founderApplicationId.value), null);
+  }
+  await assert.rejects(
+    founderOnly.get(founderApplicationId.value),
+    (error) => error instanceof StorageFailure && error.code === "UNAVAILABLE",
+  );
+  assert.equal(routeOnlyReads, PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT);
   await recordHostedAcceptance(
     service,
     subject.value,
@@ -969,22 +1029,11 @@ test("participant request scope enforces exact maximum route and retry read budg
     "Maximum combined retry participant",
   );
   assert.equal(combinedReads.count(), 554);
-
-  const combinedAcknowledgments =
-    combinedRequest.participantPackageAcknowledgments(subject.value);
-  await combinedAcknowledgments.packages.current();
-  await combinedAcknowledgments.acknowledgments.latest();
-  await combinedAcknowledgments.packages.current();
-  assert.equal(combinedReads.count(), 558);
-  for (let index = 0; index < 16; index += 1) {
-    await combinedRequest.participantPackageReader(subject.value).current();
-  }
-  assert.equal(combinedReads.count(), PARTICIPANT_REQUEST_STORAGE_READ_LIMIT);
-  await assert.rejects(
-    combinedRequest.participantPackageReader(subject.value).current(),
+  assert.throws(
+    () => combinedRequest.participantPackageAcknowledgments(subject.value),
     (error) => error instanceof StorageFailure && error.code === "UNAVAILABLE",
   );
-  assert.equal(combinedReads.count(), PARTICIPANT_REQUEST_STORAGE_READ_LIMIT);
+  assert.equal(combinedReads.count(), 554);
 });
 
 test("request-scoped cache rejects over-limit hosted ancestry like a fresh reader", async () => {
@@ -1359,6 +1408,64 @@ test("hosted founder applications persist their complete lifecycle across worker
   }
 });
 
+test("hosted founder HTML and hypermedia project the same persistent state and actions", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-hosted-parity",
+    { declaredInterest: "founder" },
+  );
+
+  const initialJson = await founderResource(hostedPackageWorker(service), env);
+  const initialHtml = await founderHtmlResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  assert.deepEqual(
+    profileHtmlActionNames(initialHtml.html),
+    actionNames(initialJson.document),
+  );
+  assert.match(initialHtml.html, /Not submitted/u);
+
+  const privateNote = "Hosted parity founder note";
+  const created = await submitFounderMutation(
+    hostedPackageWorker(service),
+    env,
+    initialJson,
+    "POST",
+    actionBody(
+      requiredAction(initialJson.document, "create-founder-application"),
+      founderFields({ note: privateNote }),
+    ),
+  );
+  assert.equal(created.status, 201);
+
+  const restartedJson = await founderResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  const restartedHtml = await founderHtmlResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  assert.equal(restartedJson.document.data.status, "received");
+  assert.equal(restartedJson.document.data.revision, 1);
+  assert.equal(restartedJson.document.data.fields?.note, privateNote);
+  assert.deepEqual(
+    profileHtmlActionNames(restartedHtml.html),
+    actionNames(restartedJson.document),
+  );
+  assert.match(restartedHtml.html, /Received/u);
+  assert.match(restartedHtml.html, /Revision 1/u);
+  assert.match(restartedHtml.html, new RegExp(privateNote, "u"));
+  assert.match(restartedHtml.html, /Engineering/u);
+});
+
 test("hosted founder applications remain readable and withdrawable after interest and phase changes", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
@@ -1567,6 +1674,98 @@ test("unsupported founder PUT leaves hosted JSON and HTML proofs reusable", asyn
   assert.equal(
     recordsIn(service, "browser-mutation-replays").length,
     claimsBeforeHtmlPut + 1,
+  );
+});
+
+test("hosted founder bounds reject malformed and oversized bodies with exact proof semantics", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-hosted-bounds",
+    { declaredInterest: "founder" },
+  );
+  const worker = hostedPackageWorker(service);
+
+  const malformedProof = await founderResource(worker, env);
+  const malformedBody = {
+    ...actionBody(
+      requiredAction(
+        malformedProof.document,
+        "create-founder-application",
+      ),
+      founderFields(),
+    ),
+    unexpected: "must be rejected",
+  };
+  const claimsBeforeMalformed = recordsIn(
+    service,
+    "browser-mutation-replays",
+  ).length;
+  const malformed = await submitFounderMutation(
+    worker,
+    env,
+    malformedProof,
+    "POST",
+    malformedBody,
+  );
+  assert.equal(malformed.status, 400);
+  assert.match(malformed.headers.get("set-cookie") ?? "", /Max-Age=0/u);
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    claimsBeforeMalformed + 1,
+  );
+  const consumedProof = await submitFounderMutation(
+    worker,
+    env,
+    malformedProof,
+    "POST",
+    malformedBody,
+  );
+  assert.equal(consumedProof.status, 403);
+  assert.deepEqual(recordsIn(service, "founder-applications"), []);
+
+  const oversizedProof = await founderResource(worker, env);
+  const oversizedBody = actionBody(
+    requiredAction(oversizedProof.document, "create-founder-application"),
+    founderFields({ note: "x".repeat(MAX_FOUNDER_INTEREST_MUTATION_BYTES) }),
+  );
+  const claimsBeforeOversized = recordsIn(
+    service,
+    "browser-mutation-replays",
+  ).length;
+  const oversized = await submitFounderMutation(
+    worker,
+    env,
+    oversizedProof,
+    "POST",
+    oversizedBody,
+  );
+  assert.equal(oversized.status, 413);
+  assert.equal(oversized.headers.get("set-cookie"), null);
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    claimsBeforeOversized,
+  );
+
+  const corrected = await submitFounderMutation(
+    worker,
+    env,
+    oversizedProof,
+    "POST",
+    actionBody(
+      requiredAction(oversizedProof.document, "create-founder-application"),
+      founderFields({ note: "Corrected bounded founder submission." }),
+    ),
+  );
+  assert.equal(corrected.status, 201);
+  assert.equal(
+    recordsIn(service, "browser-mutation-replays").length,
+    claimsBeforeOversized + 1,
   );
 });
 
@@ -4772,6 +4971,7 @@ function maximumHostedFounderFields(
 type FounderHtmlProof = Readonly<{
   csrfToken: string;
   cookie: string;
+  html: string;
 }>;
 
 async function founderHtmlResource(
@@ -4798,6 +4998,7 @@ async function founderHtmlResource(
   return Object.freeze({
     csrfToken,
     cookie: cookieHeader(setCookie),
+    html,
   });
 }
 
