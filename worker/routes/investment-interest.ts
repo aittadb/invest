@@ -259,6 +259,7 @@ export function createInvestmentInterestRouteHandler(
 
     let clearCookie: string | null = null;
     try {
+      assertExactResourceOrigin(context.request, context.resourceUrl);
       const verificationLimits = await investmentInterestVerificationLimits(
         context.request,
       );
@@ -269,7 +270,6 @@ export function createInvestmentInterestRouteHandler(
         }
         clearCookie = verified.clearCookie;
       }
-      assertExactResourceOrigin(context.request, context.resourceUrl);
       if (
         verified.actor.type !== "participant" ||
         !authorizedParticipant(context, verified.actor.subject)

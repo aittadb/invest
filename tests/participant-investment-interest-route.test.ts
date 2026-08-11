@@ -783,6 +783,84 @@ test("above-POST-cap override preflight completes without consuming its proof", 
   assert.equal(harness.state.indications.size, 0);
 });
 
+test("hosted investment rejects a wrong origin before preflight or proof consumption", async () => {
+  const hosted = await createHostedMutationSession();
+  const proof = await issueHostedInvestmentProof(
+    hosted.session,
+    PARTICIPANT_IDENTITY,
+  );
+  const replacements: BrowserMutationProof[] = [];
+  let verificationCalls = 0;
+  const harness = await createHarness({
+    verifyMutation(request, limits) {
+      verificationCalls += 1;
+      return hosted.session.verifyMutation(
+        request,
+        PARTICIPANT_IDENTITY,
+        CANONICAL_ORIGIN,
+        limits,
+      );
+    },
+    async csrfTokenFor(request) {
+      const replacement = await hosted.session.issue(
+        request,
+        PARTICIPANT_IDENTITY,
+        CANONICAL_ORIGIN,
+      );
+      replacements.push(replacement);
+      return replacement;
+    },
+  });
+  const privateMarker = "wrong-origin-private-investment-marker";
+
+  const rejected = await completesWithin(
+    harness.dispatch(
+      hostedInvestmentFormMutation(
+        proof,
+        INVESTMENT_INTEREST_PATH,
+        [
+          ["operation-id", "investment-operation:wrong-origin"],
+          ["kind", "personal"],
+          ["residence-country", "FI"],
+          ["amount", "1250"],
+          ["availability-period", "Within twelve months."],
+          [
+            "note",
+            `${privateMarker}${"x".repeat(70 * 1_024)}`,
+          ],
+        ],
+        "https://attacker.example",
+      ),
+      ALICE,
+    ),
+    FORM_PREFLIGHT_DEADLINE_MS,
+  );
+
+  assert.equal(rejected.status, 403);
+  assert.deepEqual(rejected.headers.getSetCookie(), []);
+  assert.doesNotMatch(await rejected.text(), new RegExp(privateMarker, "u"));
+  assert.equal(verificationCalls, 0);
+  assert.deepEqual(hosted.claims.calls, []);
+  assert.equal(harness.serviceCalls(), 0);
+  assert.equal(harness.state.indications.size, 0);
+
+  const corrected = await harness.dispatch(
+    hostedInvestmentJsonMutation(
+      proof,
+      INVESTMENT_INTEREST_PATH,
+      "POST",
+      personalBody("investment-operation:corrected-origin"),
+    ),
+    ALICE,
+  );
+  assert.equal(corrected.status, 201);
+  assert.equal(verificationCalls, 1);
+  assert.equal(hosted.claims.calls.length, 1);
+  assert.equal(harness.serviceCalls(), 1);
+  assert.equal(harness.state.indications.size, 1);
+  assert.equal(replacements.length, 1);
+});
+
 test("real hosted investment verification applies method limits before replay or persistence", async () => {
   const hosted = await createHostedMutationSession();
   const proof = await issueHostedInvestmentProof(
@@ -1480,6 +1558,7 @@ function hostedInvestmentFormMutation(
   proof: BrowserMutationProof,
   path: string,
   entries: readonly (readonly [string, string])[],
+  origin = CANONICAL_ORIGIN,
 ): Request {
   const body = new URLSearchParams();
   body.append(MUTATION_CSRF_FIELD, proof.token);
@@ -1490,7 +1569,7 @@ function hostedInvestmentFormMutation(
       accept: "text/html",
       "content-type": "application/x-www-form-urlencoded",
       cookie: proofCookieHeader(proof),
-      origin: CANONICAL_ORIGIN,
+      origin,
     },
     body,
   });
