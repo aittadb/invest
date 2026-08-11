@@ -4,7 +4,7 @@
 
 This repository contains opt-in hosted composition for a confidential AittaDB Authorization Code flow with PKCE. It does not register an OAuth client, install a real client secret, enable OAuth Apps on an AittaDB deployment, change a Sites access policy, or by itself prove a hosted callback.
 
-`worker/index.ts` installs only a fail-closed resolver. `/owner/aittadb-connection` exists when one deployment supplies every exact configuration and secret value plus the dedicated D1 binding; absent, partial, malformed, or unbound deployments keep the route and owner navigation absent. TASK-030 remains open until the live proof in this document succeeds.
+`worker/index.ts` installs only a fail-closed resolver. `/owner/aittadb-connection` exists when one deployment supplies every exact configuration and secret value plus the dedicated D1 binding; absent, partial, malformed, or unbound deployments keep the route and owner navigation absent. TASK-101 remains open until the live proof in this document succeeds.
 
 ## Application Resources
 
@@ -70,6 +70,6 @@ An authorized acceptance operator must complete all of these steps:
 1. Configure the exact acceptance server transport origin and deploy the validated source without changing the logical issuer or callback.
 2. Sign in as the configured acceptance owner and run the owner-only connection check end to end.
 3. Confirm discovery, consent, callback, token exchange, introspection, exact scope/audience/expiry validation, replay rejection, cookie clearing, and closed proof persistence without credentials in responses or private logs.
-4. Record the hosted evidence on the integrating branch, then and only then archive TASK-030.
+4. Record the hosted evidence on the integrating branch, then and only then archive TASK-101.
 
 Use a development or acceptance deployment for this proof. Do not change production access or production data as part of source validation.
