@@ -54,4 +54,4 @@ If exposure is suspected, do not echo or paste the value. Escalate privately wit
 
 Production publication is blocked until the configured backend supports the required authorization, consistency, listing, pagination, atomic transaction, replay retention, quota, and non-disclosure behavior and the production adapter passes contract, hosted credential-boundary, and end-to-end tests. Source-level runtime composition and deterministic protocol tests are not hosted acceptance evidence; keep deployment readiness false until objective live proof is recorded.
 
-TASK-101 remains open until the installed least-privilege acceptance client completes the owner callback proof without credential disclosure. Verified discovery and client metadata do not by themselves prove deployed Worker reachability, token exchange, introspection, replay handling, or browser and log non-exposure.
+The optional owner callback proof is deferred under `BACKLOG-019`. Verified discovery and client metadata do not prove deployed Worker reachability, token exchange, introspection, replay handling, or browser and log non-exposure, and no such proof is claimed for the MVP.

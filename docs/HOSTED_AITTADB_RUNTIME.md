@@ -272,9 +272,9 @@ immutable profile records. Exact and stale-policy registration recovery verify
 that immutable root and the complete current bounded ownership state, including
 after later valid lifecycle activity. An existing legacy profile with absent
 ownership metadata remains unavailable rather than being initialized by an
-ordinary request. `TASK-159` must still provide the credential-closed complete
-inventory migration for those legacy participants before hosted investment
-routes are enabled for the relevant population.
+ordinary request. Conditional `BACKLOG-011` retains the credential-closed
+complete-inventory migration for a deployment preserving those legacy
+participants. A fresh MVP namespace needs no migration.
 Each head recomputes the terminal operation fingerprint, including the
 normalized field-reference commitment for create and edit, before its lifecycle
 status can affect capacity. Each active head then verifies its one-to-eight

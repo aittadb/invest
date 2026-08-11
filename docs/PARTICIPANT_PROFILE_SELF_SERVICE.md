@@ -59,8 +59,8 @@ The subject-bound persistent coordinator stages that profile transition with
 any active founder application, every active bounded investment indication,
 their aggregate contributions, one closed audit event, and one immutable retry
 receipt, then commits all effects or none. Marketing consent remains an
-independent later withdrawal. Hosted profile-route composition remains
-`TASK-110`. The participant entry representation continues to link to this
+independent later withdrawal. Hosted profile-route composition is deferred as
+`BACKLOG-024`. The participant entry representation continues to link to this
 resource as a profile view and retains only currently permitted package access
 and sign-out alongside it; founder and investment workflow actions are withheld.
 

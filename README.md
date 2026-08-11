@@ -42,7 +42,7 @@ Each application URI supports equivalent human HTML and versioned hypermedia JSO
 
 The source includes an opt-in, owner-only confidential Authorization Code with PKCE boundary for development verification. The production Worker exposes it only when one deployment supplies a complete exact OAuth configuration, separate hosted cookie keys, and the dedicated D1 proof binding. Missing or malformed values leave the route absent. Reusable source contains no OAuth client, secret, cookie key, hostname, owner, or scope default. See [docs/AITTADB_OAUTH_PROOF.md](docs/AITTADB_OAUTH_PROOF.md) for its route and hosted-secret contract.
 
-TASK-101 remains open until the configured acceptance client completes the hosted callback. The selected acceptance AittaDB build and client support Authorization Code, S256 PKCE, confidential client authentication, and the read-only proof scope, but issuer reachability and the complete callback must still be proven against the deployed Worker; source capability and client metadata alone are not hosted callback evidence.
+The optional hosted callback proof is deferred under `BACKLOG-019`. The selected acceptance AittaDB build and client support Authorization Code, S256 PKCE, confidential client authentication, and the read-only proof scope, but source capability and client metadata are not hosted callback evidence and no successful callback is claimed.
 
 ## Repository Files
 

@@ -4,6 +4,82 @@ Completed `PLAN.md` tasks and retired planning umbrellas are preserved here. Ent
 
 ## Unreleased
 
+- **TASK-107:** Wire the audited owner CSV review export. Depends on: `TASK-068`, `TASK-069`, `TASK-089`, `TASK-073`, `TASK-076`, `TASK-105`, `TASK-133`, `TASK-134`. DoD: one owner-only route streams bounded current AittaDB-backed campaign, package, participant, founder, indication, aggregate, and audit rows as formula-neutralized CSV with private download headers and immutable closed export audit evidence; anonymous, non-owner, stale, oversized, looping-page, cancellation, changed retry, restart, and partial-download paths remain credential-free and fail closed, and full validation passes.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-007` so audited CSV export composition does not gate the first functional MVP. This is a scope move, not completion evidence or a capability claim.
+
+- **TASK-108:** Wire the audited owner JSON backup export. Depends on: `TASK-068`, `TASK-069`, `TASK-089`, `TASK-073`, `TASK-076`, `TASK-105`, `TASK-133`, `TASK-134`. DoD: one owner-only route streams a versioned bounded current-state JSON backup from the AittaDB-backed campaign, package, participant, founder, indication, aggregate, and audit projections with private download headers and immutable closed export audit evidence; anonymous, non-owner, stale, oversized, looping-page, cancellation, changed retry, restart, and partial-download paths remain credential-free and fail closed, and full validation passes.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-008` so audited JSON backup composition does not gate the first functional MVP. This is a scope move, not completion evidence or a capability claim.
+
+- **TASK-145:** Prove the hosted CSV review export. Depends on: `TASK-107`, `TASK-112`. DoD: the configured acceptance owner downloads one bounded formula-neutralized CSV containing only the expected namespaced current review projection with private cache/download headers and one immutable export event; anonymous, non-owner, stale, oversized, looping-page, cancellation, retry, restart, and partial-download paths fail closed.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-009` with its export prerequisite mapped to `BACKLOG-007`. Hosted CSV proof is no longer an MVP acceptance or production-publication prerequisite.
+
+- **TASK-146:** Prove the hosted JSON backup export. Depends on: `TASK-108`, `TASK-112`. DoD: the configured acceptance owner downloads one bounded versioned JSON backup containing only the expected namespaced current-state allowlist with private cache/download headers and one immutable export event; anonymous, non-owner, stale, oversized, looping-page, cancellation, retry, restart, and partial-download paths fail closed.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-010` with its export prerequisite mapped to `BACKLOG-008`. Hosted backup proof is no longer an MVP acceptance or production-publication prerequisite.
+
+- **TASK-159:** Provide the legacy investment-ownership migration command. Depends on: `TASK-073`, `TASK-154`, `TASK-155`. DoD: one backend-only credential-closed operator command consumes an explicitly authoritative bounded subject inventory and initializes each legacy participant's complete ownership root, index, and witness without a browser route or ordinary-request absence fallback; empty, active, withdrawn, rejected, maximum-record, over-capacity, incomplete, crossed, corrupt, exact-retry, resume, restart, redaction, documentation, and full-validation tests pass.
+
+  Planning evidence: Deferred unchanged to conditional `BACKLOG-011`; a fresh MVP namespace consumes no legacy ownership state. Existing task-branch work remains isolated and is not completion evidence or part of this planning commit.
+
+- **TASK-160:** Provide the legacy indication-summary migration command. Depends on: `TASK-073`, `TASK-097`, `TASK-154`. DoD: one backend-only credential-closed operator command consumes an explicitly authoritative bounded subject-indication inventory, fully verifies every schema-4 indication's immutable ancestry, fields, lifecycle, and active lease, and compare-and-sets its current head to the schema-5 bounded summary envelope without changing the domain revision; empty, maximum-history, missing, crossed, corrupt, concurrent, exact-retry, response-loss, resume, restart, redaction, no-browser-GET-write, documentation, and full-validation tests pass.
+
+  Planning evidence: Deferred unchanged to conditional `BACKLOG-012`; a fresh MVP namespace consumes no schema-4 indication state. Existing task-branch work remains isolated and is not completion evidence or part of this planning commit.
+
+- **TASK-136:** Prove persistent audit-producer integration. Depends on: `TASK-068`, `TASK-069`, `TASK-073`, `TASK-076`, `TASK-089`, `TASK-103`, `TASK-106`, `TASK-107`, `TASK-108`, `TASK-109`. DoD: campaign, package, participant, indication, aggregate, moderation, reconciliation, notification, export, and deletion producers append their canonical closed events exactly once across exact retry, changed retry, rollback, concurrency, and Worker reconstruction; unknown or private evidence remains non-disclosing, focused cross-producer tests pass, and full validation passes.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-013`; its broad optional-feature producer matrix no longer gates the core campaign, founder, and investment MVP journeys. Existing per-feature audit guarantees remain governed by their completed task evidence.
+
+- **TASK-144:** Prove hosted audit and notification activity. Depends on: `TASK-105`, `TASK-106`, `TASK-112`, `TASK-136`. DoD: the configured acceptance owner pages canonical audit events and private notification history, records copied and sent facts separately, and observes each expected producer event once across retries and reconstruction through equivalent bounded HTML and hypermedia; anonymous, non-owner, malformed, unknown, and private-detail paths disclose nothing.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-014`; broad hosted audit and notification activity is no longer an MVP acceptance or publication prerequisite.
+
+- **TASK-142:** Prove the hosted indication-moderation journey. Depends on: `TASK-104`, `TASK-112`. DoD: the configured acceptance owner pages and inspects opaque indication resources and rejects one active synthetic indication exactly once through equivalent bounded HTML and hypermedia; aggregate, participant-visible reason, audit, and notification effects remain consistent across stale, retry, non-owner, foreign, and restart paths.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-015`; hosted moderation proof is not required to collect and review non-binding MVP interest.
+
+- **TASK-143:** Prove the hosted aggregate-reconciliation journey. Depends on: `TASK-076`, `TASK-112`. DoD: the configured acceptance owner compares calculated and stored synthetic aggregate state and applies only an exact preview-bound correction through equivalent bounded HTML and hypermedia; matching, stale, retry, non-owner, overflow, failure, and restart paths remain safe and non-disclosing.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-016`; hosted reconciliation proof is not required for the first functional MVP acceptance matrix.
+
+- **TASK-114:** Prove acceptance service-client secret rotation. Depends on: `TASK-113`. DoD: rotating the acceptance service-client secret makes the old credential unusable, lets the exact acceptance Worker continue through the replacement hosted secret, preserves stored synthetic records, and changes no source, client scopes, origins, redirects, access mode, unrelated AittaDB setting, or production environment; retained evidence contains no old or new credential.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-017`; least-privilege authorization remains active MVP work, while the operational rotation rehearsal no longer gates initial publication.
+
+- **TASK-099:** Prove hosted acceptance issuer reachability. Depends on: `TASK-098`. DoD: the exact acceptance Worker version reaches and validates the configured issuer's discovery contract without weakening issuer, endpoint, redirect, status, media, size, encoding, JSON, grant, response-mode, PKCE, or confidential-authentication checks; retained private evidence contains only the fixed failure phase or success, Worker logs and public output remain credential-free, and the deployed source version plus rollback version are recorded without secrets.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-018`; the disposable owner-initiated OAuth proof path is separate from the production service-client and participant identity boundaries used by the MVP.
+
+- **TASK-101:** Prove the hosted OAuth callback token path. Depends on: `TASK-099`, `TASK-100`. DoD: an owner-initiated acceptance flow reaches the configured provider, returns through the exact callback, exchanges one S256 authorization code confidentially, validates introspection audience, client, scope, time, subject, and replay state, and records only closed proof evidence; failed and successful paths expose no code, token, secret, identity, provider body, or exception, and focused hosted verification plus full local validation pass.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-019`; its issuer prerequisite is mapped to `BACKLOG-018`, and the disposable callback proof no longer gates the MVP runtime.
+
+- **TASK-127:** Revoke the disposable OAuth proof client. Depends on: `TASK-101`. DoD: all proof-client grants are revoked and the disposable client is disabled or removed from the acceptance AittaDB deployment without changing another client, namespace, data record, feature flag, access mode, or production setting; retained evidence contains no client identifier, identity, credential, token, or private environment value.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-020`. Deferral is not authorization to retain a credential indefinitely; the disposable proof boundary must be reviewed before the proof path is resumed or reused.
+
+- **TASK-128:** Remove disposable OAuth configuration from Investor acceptance. Depends on: `TASK-101`. DoD: the proof-client secret and every now-unused interactive OAuth setting are removed from the Investor acceptance Sites environment without changing source, the application service client, D1/R2 bindings, access mode, unrelated environment values, or production; the owner connection becomes unavailable and retained evidence contains no removed value.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-021`. Deferral is not authorization to expose or reuse the hosted secret; the disposable proof boundary must be reviewed before the proof path is resumed.
+
+- **TASK-129:** Remove temporary AittaDB acceptance administration. Depends on: `TASK-101`. DoD: the AittaDB project removes the temporary Investor proof administrator subject from the acceptance deployment without changing another administrator, client, namespace, feature flag, access mode, data record, or production environment; anonymous and former-admin access to client registration fail identically and no identity or environment value is retained.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-022`. Deferral is not authorization to broaden administration; the temporary acceptance boundary must be reviewed before the proof path is resumed.
+
+- **TASK-130:** Verify disposable OAuth cleanup boundaries. Depends on: `TASK-127`, `TASK-128`, `TASK-129`. DoD: former proof initiation, callback, client use, hosted-secret access, and administrator access all fail as expected while the application service client, D1/R2, accepted application workflows, and unrelated acceptance settings remain healthy; repositories are clean and retained evidence contains no identity, credential, token, client identifier, or private environment value.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-023` with its three cleanup prerequisites mapped to `BACKLOG-020` through `BACKLOG-022`.
+
+- **TASK-110:** Compose the hosted account-deletion request flow. Depends on: `TASK-090`, `TASK-092`, `TASK-109`. DoD: the existing profile deletion action invokes the atomic coordinator through the hosted mutation session, immediately removes participant/package/founder/investor capabilities according to policy, preserves only the independently allowed marketing-withdrawal action, and passes equivalent HTML/JSON, origin, proof, retry, stale, restart, owner, foreign, and non-disclosure tests plus full validation.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-024`; automated hosted deletion is no longer an MVP prerequisite. Reviewed but unfinished branch work remains isolated from `develop`, and the review findings are not represented as resolved or completed here.
+
+- **TASK-147:** Prove the hosted account-deletion journey. Depends on: `TASK-110`, `TASK-112`. DoD: one acceptance participant requests deletion and immediately loses participant, package, founder, and investor capabilities according to policy while every active interest and aggregate contribution is withdrawn exactly once and independently allowed marketing withdrawal remains available; equivalent HTML/hypermedia, retry, stale, restart, owner, and foreign paths remain safe and non-disclosing.
+
+  Planning evidence: Deferred unchanged to `BACKLOG-025` with its implementation prerequisite mapped to `BACKLOG-024`; hosted automated-deletion proof no longer gates MVP acceptance or publication.
+
 - **TASK-109:** Compose the atomic participant account-deletion coordinator. Depends on: `TASK-064`, `TASK-067`, `TASK-089`, `TASK-071`, `TASK-073`, `TASK-105`, `TASK-155`, `TASK-156`, `TASK-157`. DoD: one retry-stable AittaDB transaction marks the participant deletion requested, withdraws every active founder application and investment indication, updates aggregate contributions, and appends closed audit evidence or changes none; marketing consent remains independent, and empty, partial-failure, changed-retry, stale, concurrency, maximum-record, malformed-result, restart, and foreign-access tests plus full validation pass.
 
   Acceptance evidence: `StorageParticipantAccountDeletionRepository` now binds the trusted participant, exact profile revision, active founder withdrawal or founder-absence assertion, complete bounded investment ownership set, every active withdrawal and aggregate contribution, one aggregate update, closed audit evidence, and an immutable retry receipt into one transaction or changes none. Empty and inactive accounts still commit founder, index, and witness barriers; cleanup derives historical amount validation from the aggregate's persisted immutable currency; and the audit identity binds the complete receipt-effect fingerprint so omitted withdrawals or altered aggregate results fail closed. Marketing withdrawal remains independent. Maximum founder history plus 100 owned indications, four active withdrawals, a 25-mutation commit, response loss, and replay stay inside the exported combined read ceiling. Direct founder creation, indication creation, and reactivation races roll back every deletion effect. Changed retry, stale input, partial failure, malformed evidence, corrupt effects, configuration evolution, restart, anonymous, foreign, and non-disclosure paths pass. Clean commits `e3454f8`, `10899eb`, `732be04`, and `73cfc7b` exclude the private specification from both task diff and task history. Independent Sol High review found and then confirmed resolution of founder-absence, receipt-integrity, and read-proof gaps; final re-review reported no findings. The exact integrated tree passed lint, typecheck, production build, plan and instance checks, runtime-secret scanning, and all 1,236 tests. Residual uncertainty: hosted profile composition remains `TASK-110`, complete persistent producer proof remains `TASK-136`, and live AittaDB atomic behavior remains a separate acceptance gate.

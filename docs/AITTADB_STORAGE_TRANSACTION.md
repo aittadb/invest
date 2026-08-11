@@ -90,9 +90,9 @@ profile revision, ownership root, empty index, and empty summary commit under
 one operation ID or none do. Exact registration replay authenticates the
 immutable root and the complete current ownership state, so later valid
 indication activity does not invalidate the original result. Existing profiles
-never gain ownership metadata through ordinary absence fallback. `TASK-159`
-still must provide the bounded operator-only migration path for legacy
-participants before hosted investment persistence is ready.
+never gain ownership metadata through ordinary absence fallback. Conditional
+`BACKLOG-011` retains the bounded operator-only migration path for a deployment
+that must preserve legacy participants; a fresh MVP namespace needs no migration.
 
 One capacity proof reads the root, summary, and index, then the current and
 terminal record for each owned ID, and finally re-reads the summary. It
