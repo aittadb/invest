@@ -23,6 +23,11 @@ export const PARTICIPANT_INVESTMENT_MUTATION_CONSISTENCY =
 export interface ParticipantInvestmentInterestReader {
   get(id: InvestmentIndicationId): Promise<InvestmentIndication | null>;
   listOwned(): Promise<readonly InvestmentIndication[]>;
+  /**
+   * Return only whether a fresh mutation can use the configured currency.
+   * Implementations must not expose the private aggregate snapshot.
+   */
+  freshMutationCurrencyCompatible(): Promise<boolean>;
 }
 
 type AtomicMutationCommandBase = Readonly<{

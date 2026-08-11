@@ -17,10 +17,12 @@ import {
   type Timestamp,
 } from "../domain/foundation.ts";
 import {
+  participantVisibleIndicationLifecycle,
   type ActiveInvestmentIndication,
   type InvestmentIndication,
   type InvestmentIndicationHistoryEntryId,
   type InvestmentIndicationId,
+  type ParticipantVisibleIndicationTransition,
   type TrustedPackageAcknowledgmentContext,
   type WithdrawnInvestmentIndication,
 } from "../domain/investment-indication.ts";
@@ -168,6 +170,7 @@ export function createParticipantInvestmentInterestService(
     options.reader === null ||
     typeof options.reader.get !== "function" ||
     typeof options.reader.listOwned !== "function" ||
+    typeof options.reader.freshMutationCurrencyCompatible !== "function" ||
     typeof options.mutations !== "object" ||
     options.mutations === null ||
     options.mutations.mutationConsistency !==
@@ -237,6 +240,18 @@ export function createParticipantInvestmentInterestService(
       throw new StorageFailure("UNAVAILABLE", { cause: error });
     }
     return requiredPermissions(value);
+  };
+
+  const loadFreshMutationCurrencyCompatibility = async (): Promise<boolean> => {
+    let value: unknown;
+    try {
+      value = await options.reader.freshMutationCurrencyCompatible();
+    } catch (error) {
+      if (error instanceof StorageFailure) throw error;
+      throw new StorageFailure("UNAVAILABLE", { cause: error });
+    }
+    if (typeof value !== "boolean") unavailable();
+    return value;
   };
 
   const loadAcknowledgmentContext = async ():
@@ -362,10 +377,16 @@ export function createParticipantInvestmentInterestService(
 
   return Object.freeze({
     async getCollectionState() {
-      const [indications, context, permissions] = await Promise.all([
+      const [
+        indications,
+        context,
+        permissions,
+        freshCurrencyCompatible,
+      ] = await Promise.all([
         listOwned(),
         loadAcknowledgmentContext(),
         loadPermissions(),
+        loadFreshMutationCurrencyCompatibility(),
       ]);
       const acknowledgmentCurrent = acknowledgmentIsCurrent(context);
       const activePersonal = indications.some(
@@ -381,10 +402,14 @@ export function createParticipantInvestmentInterestService(
         canCreatePersonal:
           hasCapacity &&
           acknowledgmentCurrent &&
+          freshCurrencyCompatible &&
           permissions.createPersonal &&
           !activePersonal,
         canCreateCompany:
-          hasCapacity && acknowledgmentCurrent && permissions.createCompany,
+          hasCapacity &&
+          acknowledgmentCurrent &&
+          freshCurrencyCompatible &&
+          permissions.createCompany,
       });
     },
 
@@ -392,13 +417,17 @@ export function createParticipantInvestmentInterestService(
       const id = requiredIndicationId(indicationId);
       const indication = await loadOwned(id);
       if (indication === null) return null;
-      const [context, permissions] = await Promise.all([
+      const [context, permissions, freshCurrencyCompatible] = await Promise.all([
         loadAcknowledgmentContext(),
         loadPermissions(),
+        loadFreshMutationCurrencyCompatibility(),
       ]);
       const acknowledgmentCurrent = acknowledgmentIsCurrent(context);
-      const active = indication.lifecycle.status === "active";
-      const withdrawn = indication.lifecycle.status === "withdrawn";
+      const editAvailable = transitionAvailable(indication, "edit");
+      const withdrawAvailable = transitionAvailable(indication, "withdraw");
+      const reactivateAvailable = transitionAvailable(indication, "reactivate");
+      const fieldsUseCurrentCurrency =
+        indication.fields.currency === amountConfiguration.currency;
       const fieldsMeetCurrentAmountPolicy = indicationFieldsMeetAmountPolicy(
         indication,
         amountConfiguration,
@@ -407,11 +436,16 @@ export function createParticipantInvestmentInterestService(
         indication,
         amountConfiguration,
         acknowledgmentCurrent,
-        canEdit: active && acknowledgmentCurrent,
-        canWithdraw: active,
+        canEdit:
+          editAvailable &&
+          fieldsUseCurrentCurrency &&
+          freshCurrencyCompatible &&
+          acknowledgmentCurrent,
+        canWithdraw: withdrawAvailable,
         canReactivate:
-          withdrawn &&
+          reactivateAvailable &&
           fieldsMeetCurrentAmountPolicy &&
+          freshCurrencyCompatible &&
           acknowledgmentCurrent &&
           (indication.kind === "personal"
             ? permissions.reactivatePersonal
@@ -426,8 +460,12 @@ export function createParticipantInvestmentInterestService(
       const metadata = await mutationMetadata(operationId, current);
       const kind = requiredFieldsKind(input.fields);
       if (!metadata.replayKnown) {
-        const permissions = await loadPermissions();
+        const [permissions, freshCurrencyCompatible] = await Promise.all([
+          loadPermissions(),
+          loadFreshMutationCurrencyCompatibility(),
+        ]);
         if (
+          !freshCurrencyCompatible ||
           (kind === "personal" && !permissions.createPersonal) ||
           (kind === "company" && !permissions.createCompany)
         ) {
@@ -462,8 +500,14 @@ export function createParticipantInvestmentInterestService(
       const current = await loadOwned(id);
       if (current === null) notFound();
       const metadata = await mutationMetadata(input.operationId, current);
-      if (!metadata.replayKnown && current.lifecycle.status !== "active") {
-        preconditionFailed();
+      if (!metadata.replayKnown) {
+        if (
+          !transitionAvailable(current, "edit") ||
+          current.fields.currency !== amountConfiguration.currency ||
+          !(await loadFreshMutationCurrencyCompatibility())
+        ) {
+          preconditionFailed();
+        }
       }
       const acknowledgmentContext = await requiredMutationContext(
         metadata.replayKnown,
@@ -498,7 +542,7 @@ export function createParticipantInvestmentInterestService(
       const current = await loadOwned(id);
       if (current === null) notFound();
       const metadata = await mutationMetadata(input.operationId, current);
-      if (!metadata.replayKnown && current.lifecycle.status !== "active") {
+      if (!metadata.replayKnown && !transitionAvailable(current, "withdraw")) {
         preconditionFailed();
       }
       const request = transitionRequest(
@@ -530,12 +574,16 @@ export function createParticipantInvestmentInterestService(
       if (current === null) notFound();
       const metadata = await mutationMetadata(input.operationId, current);
       if (!metadata.replayKnown) {
-        if (current.lifecycle.status !== "withdrawn") preconditionFailed();
+        if (!transitionAvailable(current, "reactivate")) preconditionFailed();
         if (!indicationFieldsMeetAmountPolicy(current, amountConfiguration)) {
           preconditionFailed();
         }
-        const permissions = await loadPermissions();
+        const [permissions, freshCurrencyCompatible] = await Promise.all([
+          loadPermissions(),
+          loadFreshMutationCurrencyCompatibility(),
+        ]);
         if (
+          !freshCurrencyCompatible ||
           (current.kind === "personal" && !permissions.reactivatePersonal) ||
           (current.kind === "company" && !permissions.reactivateCompany)
         ) {
@@ -725,6 +773,15 @@ function indicationFieldsMeetAmountPolicy(
 ): boolean {
   return indication.fields.currency === amountConfiguration.currency &&
     parseConfiguredAmount(indication.fields.amount, amountConfiguration).ok;
+}
+
+function transitionAvailable(
+  indication: InvestmentIndication,
+  type: ParticipantVisibleIndicationTransition["type"],
+): boolean {
+  return participantVisibleIndicationLifecycle(indication).transitions.some(
+    (transition) => transition.type === type,
+  );
 }
 
 function requiredResultCurrency(

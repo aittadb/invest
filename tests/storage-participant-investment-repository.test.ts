@@ -220,6 +220,10 @@ test("historical currency preserves withdrawal and exact retries after policy ev
     ALICE,
     AMOUNT,
   );
+  assert.equal(
+    await originalRepository.freshMutationCurrencyCompatible(),
+    true,
+  );
   const original = await serviceFor(
     originalRepository,
     ALICE,
@@ -233,12 +237,17 @@ test("historical currency preserves withdrawal and exact retries after policy ev
     increment: 1_000,
     maximum: 20_000,
   });
+  const evolvedRepository = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    evolvedAmount,
+  );
+  assert.equal(
+    await evolvedRepository.freshMutationCurrencyCompatible(),
+    false,
+  );
   const evolvedService = serviceFor(
-    new StorageParticipantInvestmentInterestRepository(
-      new MemoryStorageAdapter(state),
-      ALICE,
-      evolvedAmount,
-    ),
+    evolvedRepository,
     ALICE,
     context,
     () => new Date("2026-08-12T11:00:00.000Z"),
@@ -258,6 +267,10 @@ test("historical currency preserves withdrawal and exact retries after policy ev
   assert.equal(withdrawn.snapshot.lifecycle.status, "withdrawn");
   assert.equal(withdrawn.snapshot.fields.currency, AMOUNT.currency);
   assertAggregate(state, 2, 0, 0);
+  assert.equal(
+    await evolvedRepository.freshMutationCurrencyCompatible(),
+    true,
+  );
 
   const rolloverInput = Object.freeze({
     operationId: "investment-operation:storage-currency-rollover-create",
@@ -284,6 +297,10 @@ test("historical currency preserves withdrawal and exact retries after policy ev
   );
   assert.equal(rollovers[0]?.snapshot.fields.currency, evolvedAmount.currency);
   assertAggregate(state, 3, 5_000, 1, evolvedAmount.currency);
+  assert.equal(
+    await evolvedRepository.freshMutationCurrencyCompatible(),
+    true,
+  );
 
   const restarted = serviceFor(
     new StorageParticipantInvestmentInterestRepository(
@@ -363,6 +380,16 @@ test("currency rollover rejects every non-empty aggregate shape without writes",
       () => new Date("2026-08-12T11:00:00.000Z"),
       evolvedAmount,
     );
+    const compatibility = new StorageParticipantInvestmentInterestRepository(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      evolvedAmount,
+    );
+    assert.equal(
+      await compatibility.freshMutationCurrencyCompatible(),
+      false,
+      candidate.name,
+    );
 
     const failure = await captureStorageFailure(() => evolved.create({
       operationId:
@@ -371,7 +398,36 @@ test("currency rollover rejects every non-empty aggregate shape without writes",
         companyIdentifier: `BLOCKED-${candidate.count}`,
       }),
     }));
-    assert.equal(failure.code, "UNAVAILABLE", candidate.name);
+    assert.equal(failure.code, "PRECONDITION_FAILED", candidate.name);
+    assert.deepEqual([...state.records.entries()], recordsBefore, candidate.name);
+    assert.deepEqual(
+      [...state.operations.entries()],
+      operationsBefore,
+      candidate.name,
+    );
+
+    const raced = createParticipantInvestmentInterestService({
+      actorSubject: ALICE,
+      amountConfiguration: evolvedAmount,
+      reader: Object.freeze({
+        get: compatibility.get.bind(compatibility),
+        listOwned: compatibility.listOwned.bind(compatibility),
+        freshMutationCurrencyCompatible: () => Promise.resolve(true),
+      }),
+      mutations: compatibility,
+      loadAcknowledgmentContext: () => context,
+      loadPermissions: () => ALLOW_ALL,
+      indicationIdForOperation,
+      now: () => new Date("2026-08-12T11:30:00.000Z"),
+    });
+    const racedFailure = await captureStorageFailure(() => raced.create({
+      operationId:
+        `investment-operation:storage-currency-rollover-raced-${candidate.count}`,
+      fields: companyFields({
+        companyIdentifier: `RACED-${candidate.count}`,
+      }),
+    }));
+    assert.equal(racedFailure.code, "UNAVAILABLE", candidate.name);
     assert.deepEqual([...state.records.entries()], recordsBefore, candidate.name);
     assert.deepEqual(
       [...state.operations.entries()],

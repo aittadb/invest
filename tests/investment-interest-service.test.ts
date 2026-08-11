@@ -370,6 +370,133 @@ test("current acknowledgment and deployment permissions gate advertised and pers
   );
 });
 
+test("currency evolution suppresses fresh actions without blocking exact historical retries", async () => {
+  const state = new InvestmentInterestRepositoryFixtureState();
+  const context = await currentContext(ALICE, "currency-evolution");
+  const persistence = new InvestmentInterestRepositoryFixture(
+    state,
+    ALICE,
+    AMOUNT,
+  );
+  let oldHour = 9;
+  const oldService = createParticipantInvestmentInterestService({
+    actorSubject: ALICE,
+    amountConfiguration: AMOUNT,
+    reader: persistence,
+    mutations: persistence,
+    loadAcknowledgmentContext: () => context,
+    loadPermissions: () => ALLOW_ALL,
+    indicationIdForOperation,
+    now: () =>
+      new Date(`2026-08-14T${String(oldHour++).padStart(2, "0")}:00:00.000Z`),
+  });
+  const createInput = Object.freeze({
+    operationId: "investment-operation:currency-history-create",
+    fields: personalFields(),
+  });
+  const created = await oldService.create(createInput);
+  const editInput = Object.freeze({
+    operationId: "investment-operation:currency-history-edit",
+    indicationId: created.snapshot.id,
+    expectedRevision: 1,
+    fields: personalFields({ amount: 1_500 }),
+  });
+  await oldService.edit(editInput);
+  const oldWithdrawInput = Object.freeze({
+    operationId: "investment-operation:currency-history-withdraw",
+    indicationId: created.snapshot.id,
+    expectedRevision: 2,
+  });
+  await oldService.withdraw(oldWithdrawInput);
+  const oldReactivateInput = Object.freeze({
+    operationId: "investment-operation:currency-history-reactivate",
+    indicationId: created.snapshot.id,
+    expectedRevision: 3,
+  });
+  await oldService.reactivate(oldReactivateInput);
+
+  const evolvedAmount = amountWithCurrency("USD");
+  const incompatibleReader = Object.freeze({
+    get: persistence.get.bind(persistence),
+    listOwned: persistence.listOwned.bind(persistence),
+    freshMutationCurrencyCompatible: () => Promise.resolve(false),
+  });
+  const evolvedService = createParticipantInvestmentInterestService({
+    actorSubject: ALICE,
+    amountConfiguration: evolvedAmount,
+    reader: incompatibleReader,
+    mutations: persistence,
+    loadAcknowledgmentContext: () => context,
+    loadPermissions: () => ALLOW_ALL,
+    indicationIdForOperation,
+    now: () => new Date("2026-08-14T15:00:00.000Z"),
+  });
+
+  const collection = await evolvedService.getCollectionState();
+  assert.equal(collection.canCreatePersonal, false);
+  assert.equal(collection.canCreateCompany, false);
+  const activeItem = await evolvedService.getItemState(created.snapshot.id);
+  assert.equal(activeItem?.canEdit, false);
+  assert.equal(activeItem?.canWithdraw, true);
+  assert.equal(activeItem?.canReactivate, false);
+
+  let requestCount = state.requests.length;
+  assert.equal(
+    (await captureStorageFailure(() => evolvedService.create({
+      operationId: "investment-operation:currency-denied-create",
+      fields: companyFields(),
+    }))).code,
+    "PRECONDITION_FAILED",
+  );
+  assert.equal(state.requests.length, requestCount);
+  assert.equal(
+    (await captureStorageFailure(() => evolvedService.edit({
+      operationId: "investment-operation:currency-denied-edit",
+      indicationId: created.snapshot.id,
+      expectedRevision: 4,
+      fields: personalFields({ amount: 2_000 }),
+    }))).code,
+    "PRECONDITION_FAILED",
+  );
+  assert.equal(state.requests.length, requestCount);
+
+  for (const replay of [
+    () => evolvedService.create(createInput),
+    () => evolvedService.edit(editInput),
+    () => evolvedService.withdraw(oldWithdrawInput),
+    () => evolvedService.reactivate(oldReactivateInput),
+  ]) {
+    assert.equal((await replay()).replayed, true);
+  }
+
+  const currentWithdrawal = Object.freeze({
+    operationId: "investment-operation:currency-current-withdraw",
+    indicationId: created.snapshot.id,
+    expectedRevision: 4,
+  });
+  const withdrawn = await evolvedService.withdraw(currentWithdrawal);
+  assert.equal(withdrawn.snapshot.lifecycle.status, "withdrawn");
+  const withdrawnItem = await evolvedService.getItemState(created.snapshot.id);
+  assert.equal(withdrawnItem?.canEdit, false);
+  assert.equal(withdrawnItem?.canWithdraw, false);
+  assert.equal(withdrawnItem?.canReactivate, false);
+
+  requestCount = state.requests.length;
+  assert.equal(
+    (await captureStorageFailure(() => evolvedService.reactivate({
+      operationId: "investment-operation:currency-denied-reactivate",
+      indicationId: created.snapshot.id,
+      expectedRevision: 5,
+    }))).code,
+    "PRECONDITION_FAILED",
+  );
+  assert.equal(state.requests.length, requestCount);
+  assert.equal(
+    (await evolvedService.withdraw(currentWithdrawal)).replayed,
+    true,
+  );
+});
+
 test("investment route and service contain no production in-process persistence", async () => {
   const sources = await Promise.all([
     readFile(
@@ -422,6 +549,20 @@ function configuredAmount(): AmountConfiguration {
       minimum: 1_000,
       increment: 250,
       maximum: 10_000,
+    },
+    publicAggregate: { visibility: "hidden" },
+  });
+  if (!parsed.ok) assert.fail(JSON.stringify(parsed.issues));
+  return parsed.value.amount;
+}
+
+function amountWithCurrency(currency: string): AmountConfiguration {
+  const parsed = parseAmountAggregateConfiguration({
+    amount: {
+      currency,
+      minimum: AMOUNT.minimum,
+      increment: AMOUNT.increment,
+      maximum: AMOUNT.maximum,
     },
     publicAggregate: { visibility: "hidden" },
   });

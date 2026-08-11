@@ -11,9 +11,10 @@ import {
   parseTimestamp,
   type ActorSubject,
 } from "../domain/foundation.ts";
-import type {
-  InvestmentIndicationId,
-  TrustedPackageAcknowledgmentContext,
+import {
+  MAX_INVESTMENT_INDICATION_REVISIONS,
+  type InvestmentIndicationId,
+  type TrustedPackageAcknowledgmentContext,
 } from "../domain/investment-indication.ts";
 import {
   createPackageAcceptance,
@@ -21,6 +22,7 @@ import {
   type PackageAcceptanceRecord,
   type PackageVersion,
 } from "../domain/package-content.ts";
+import { StorageFailure } from "../domain/storage-adapter.ts";
 import {
   INVESTMENT_INTEREST_PATH,
   investmentInterestItemPath,
@@ -240,6 +242,123 @@ test("participant investment route completes personal create, edit, withdraw, re
     historyOf(reactivated).map((entry) => dataOf(entry).transition),
     ["created", "edited", "withdrawn", "reactivated"],
   );
+});
+
+test("HTML and hypermedia suppress edit and reactivation at domain revision ceilings", async () => {
+  const harness = await createHarness();
+  const context = harness.contexts.get(ALICE);
+  assert(context);
+  const persistence = new InvestmentInterestRepositoryFixture(
+    harness.state,
+    ALICE,
+    AMOUNT,
+  );
+  let minute = 0;
+  const service = createParticipantInvestmentInterestService({
+    actorSubject: ALICE,
+    amountConfiguration: AMOUNT,
+    reader: persistence,
+    mutations: persistence,
+    loadAcknowledgmentContext: () => context,
+    loadPermissions: () => ALLOW_ALL,
+    indicationIdForOperation,
+    now: () => new Date(Date.UTC(2026, 7, 12, 10, minute++)),
+  });
+  let current = (await service.create({
+    operationId: "investment-operation:route-ceiling-create",
+    fields: {
+      kind: "personal",
+      residenceCountry: "FI",
+      amount: 1_250,
+      availabilityPeriod: "Within twelve months.",
+      note: "Revision 1.",
+    },
+  })).snapshot;
+  const activeCeiling = MAX_INVESTMENT_INDICATION_REVISIONS - 1;
+  for (let revision = 2; revision <= activeCeiling; revision += 1) {
+    current = (await service.edit({
+      operationId: `investment-operation:route-ceiling-edit-${revision}`,
+      indicationId: current.id,
+      expectedRevision: revision - 1,
+      fields: {
+        kind: "personal",
+        residenceCountry: "FI",
+        amount: 1_250,
+        availabilityPeriod: "Within twelve months.",
+        note: `Revision ${revision}.`,
+      },
+    })).snapshot;
+  }
+  assert.equal(current.revision, activeCeiling);
+  const itemPath = investmentInterestItemPath(current.id);
+
+  const activeJsonResponse = await harness.dispatch(
+    getRequest(itemPath, ALICE),
+    ALICE,
+  );
+  const activeJson = await jsonDocument(activeJsonResponse);
+  const activeHtmlResponse = await harness.dispatch(
+    getRequest(itemPath, ALICE, "text/html"),
+    ALICE,
+  );
+  const activeHtml = await activeHtmlResponse.text();
+  assert.deepEqual(actionNames(activeJson), ["withdraw-investment-interest"]);
+  assertActionFormParity(activeJson, activeHtml);
+  assert.doesNotMatch(activeHtml, /data-action-name="edit-investment-interest"/u);
+
+  let requestCount = harness.state.requests.length;
+  assert.equal(
+    (await captureStorageFailure(() => service.edit({
+      operationId: "investment-operation:route-ceiling-denied-edit",
+      indicationId: current.id,
+      expectedRevision: activeCeiling,
+      fields: {
+        kind: "personal",
+        residenceCountry: "FI",
+        amount: 1_500,
+        availabilityPeriod: "Within twelve months.",
+        note: "Must not commit.",
+      },
+    }))).code,
+    "PRECONDITION_FAILED",
+  );
+  assert.equal(harness.state.requests.length, requestCount);
+
+  const withdrawn = await service.withdraw({
+    operationId: "investment-operation:route-ceiling-withdraw",
+    indicationId: current.id,
+    expectedRevision: activeCeiling,
+  });
+  assert.equal(
+    withdrawn.snapshot.revision,
+    MAX_INVESTMENT_INDICATION_REVISIONS,
+  );
+
+  const withdrawnJsonResponse = await harness.dispatch(
+    getRequest(itemPath, ALICE),
+    ALICE,
+  );
+  assert.equal(withdrawnJsonResponse.headers.get(MUTATION_CSRF_HEADER), null);
+  const withdrawnJson = await jsonDocument(withdrawnJsonResponse);
+  const withdrawnHtmlResponse = await harness.dispatch(
+    getRequest(itemPath, ALICE, "text/html"),
+    ALICE,
+  );
+  const withdrawnHtml = await withdrawnHtmlResponse.text();
+  assert.deepEqual(actionNames(withdrawnJson), []);
+  assertActionFormParity(withdrawnJson, withdrawnHtml);
+  assert.doesNotMatch(withdrawnHtml, new RegExp(MUTATION_CSRF_FIELD, "u"));
+
+  requestCount = harness.state.requests.length;
+  assert.equal(
+    (await captureStorageFailure(() => service.reactivate({
+      operationId: "investment-operation:route-ceiling-denied-reactivate",
+      indicationId: current.id,
+      expectedRevision: MAX_INVESTMENT_INDICATION_REVISIONS,
+    }))).code,
+    "PRECONDITION_FAILED",
+  );
+  assert.equal(harness.state.requests.length, requestCount);
 });
 
 test("native company forms match hypermedia actions and duplicate failures disclose no owner", async () => {
@@ -1855,6 +1974,18 @@ function indicationIdForOperation(value: unknown): InvestmentIndicationId {
   const parsed = parseStableId<"investment-indication">(value);
   if (!parsed.ok) assert.fail(JSON.stringify(parsed.issues));
   return parsed.value;
+}
+
+async function captureStorageFailure(
+  operation: () => Promise<unknown>,
+): Promise<StorageFailure> {
+  try {
+    await operation();
+  } catch (error) {
+    assert(error instanceof StorageFailure);
+    return error;
+  }
+  assert.fail("Expected a StorageFailure.");
 }
 
 function timestamp(value: string) {

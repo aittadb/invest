@@ -310,7 +310,8 @@ from both counters; unused authorization capacity cannot widen route work. This 
 profile mutation's current state, two historical samples, failed first attempt,
 recovery state and history, retry, and final projection. Package GET uses one
 cached-head read, acknowledgment GET uses at most four, and an ordinary
-maximum-count investment collection remains bounded; unusually deep combined
+maximum-count investment collection plus its one-record aggregate compatibility
+projection remains bounded; unusually deep combined
 indication histories fail closed at the same ceiling. Route read 513 or total
 read 1,064 fails
 before adapter access. General public campaign reads and storage transactions
@@ -327,6 +328,15 @@ head before commit fails the transaction precondition and rolls back every
 indication, aggregate, audit, index, and receipt write. Exact operation replays
 return their immutable receipt before fresh checks, and withdrawal deliberately
 does not depend on current campaign or package policy.
+
+The investment reader reduces the private aggregate to one compatibility bit.
+Fresh create, edit, and reactivation are advertised and accepted only when the
+aggregate already uses the configured currency or is absent or exactly empty.
+Historical-currency edit and reactivation remain hidden, as do transitions past
+the domain revision ceiling. Exact retries bypass these fresh gates only after
+matching immutable operation evidence. If the aggregate changes after the
+compatibility read, its existing compare-and-set mutation remains authoritative
+and fails without indication, aggregate, audit, index, or receipt writes.
 
 Within the scope, one read-only package reader reuses up to 64 verified immutable
 version reconstructions. Cache hits recharge complete ancestry and logical read

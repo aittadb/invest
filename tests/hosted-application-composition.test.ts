@@ -2239,13 +2239,70 @@ test("hosted investment interests persist their full lifecycle across workers an
   assert.equal(recordsIn(service, "investment-aggregate-states").length, 1);
 
   await configureHostedInvestmentCurrency(service, "EUR");
+  const evolvedCollection = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  assert.deepEqual(actionNames(evolvedCollection.document), []);
+  assert.equal(evolvedCollection.csrfToken, null);
+  assert.equal(evolvedCollection.cookie, null);
+  const evolvedCollectionHtmlResponse = await hostedPackageWorker(service).fetch(
+    participantHtmlRequest(INVESTMENT_INTEREST_PATH),
+    env,
+    executionContext,
+  );
+  assert.equal(evolvedCollectionHtmlResponse.status, 200);
+  const evolvedCollectionHtml = await evolvedCollectionHtmlResponse.text();
+  assert.deepEqual(investmentHtmlActionNames(evolvedCollectionHtml), []);
+  assert.doesNotMatch(evolvedCollectionHtml, new RegExp(MUTATION_CSRF_FIELD, "u"));
+
+  const evolvedPersonal = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  assert.deepEqual(actionNames(evolvedPersonal.document), [
+    "withdraw-investment-interest",
+  ]);
+  const evolvedPersonalHtml = await investmentHtmlResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  assert.deepEqual(investmentHtmlActionNames(evolvedPersonalHtml.html), [
+    "withdraw-investment-interest",
+  ]);
+
+  const deniedHistoricalEditCounts = investmentWriteCounts(service);
+  const deniedHistoricalEdit = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    evolvedPersonal,
+    editAction,
+    actionBody(editAction, {
+      "operation-id": "investment-operation:hosted-currency-denied-edit",
+      "expected-revision": 4,
+      amount: 35_000,
+      note: "Historical-currency edit must not be stored.",
+    }),
+  );
+  assert.equal(deniedHistoricalEdit.status, 412);
+  assert.deepEqual(
+    investmentWriteCounts(service),
+    deniedHistoricalEditCounts,
+  );
+
   for (const replay of [
     { action: personalAction, body: personalBody },
     { action: editAction, body: editBody },
     { action: withdrawAction, body: withdrawBody },
     { action: reactivateAction, body: reactivateBody },
   ]) {
-    const proof = await investmentResource(hostedPackageWorker(service), env);
+    const proof = await investmentResource(
+      hostedPackageWorker(service),
+      env,
+      itemPath,
+    );
     const response = await submitInvestmentMutation(
       hostedPackageWorker(service),
       env,
@@ -2265,11 +2322,45 @@ test("hosted investment interests persist their full lifecycle across workers an
     companyPath,
   );
   assert.deepEqual(actionNames(evolvedCompany.document), [
-    "edit-investment-interest",
     "withdraw-investment-interest",
   ]);
+  const evolvedCompanyHtml = await investmentHtmlResource(
+    hostedPackageWorker(service),
+    env,
+    companyPath,
+  );
+  assert.deepEqual(investmentHtmlActionNames(evolvedCompanyHtml.html), [
+    "withdraw-investment-interest",
+  ]);
+
+  const deniedWriteCounts = investmentWriteCounts(service);
+  const deniedCurrentCreate = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    evolvedCompany,
+    companyAction,
+    actionBody(companyAction, {
+      "operation-id": "investment-operation:hosted-currency-denied-create",
+      "company-name": "Current Currency Company Oy",
+      "registration-country": "FI",
+      "company-identifier": "CURRENT-CURRENCY-DENIED",
+      "representative-name": "Current Representative",
+      "representative-authority-declared": true,
+      amount: 50_000,
+      "availability-period": "Within the next twelve months.",
+      note: "Must not be stored while historical contributions remain.",
+    }),
+  );
+  assert.equal(deniedCurrentCreate.status, 412);
+  assert.deepEqual(investmentWriteCounts(service), deniedWriteCounts);
+
+  const evolvedCompanyWithdrawalProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    companyPath,
+  );
   const evolvedWithdrawal = requiredAction(
-    evolvedCompany.document,
+    evolvedCompanyWithdrawalProof.document,
     "withdraw-investment-interest",
   );
   const evolvedWithdrawalBody = actionBody(evolvedWithdrawal, {
@@ -2280,7 +2371,7 @@ test("hosted investment interests persist their full lifecycle across workers an
   const evolvedWithdrawalResponse = await submitInvestmentMutation(
     hostedPackageWorker(service),
     env,
-    evolvedCompany,
+    evolvedCompanyWithdrawalProof,
     evolvedWithdrawal,
     evolvedWithdrawalBody,
   );
@@ -2290,10 +2381,46 @@ test("hosted investment interests persist their full lifecycle across workers an
   assert.equal(evolvedWithdrawn.data.status, "withdrawn");
   assert.equal(evolvedWithdrawn.data.fields.currency, "SEK");
   assert.deepEqual(actionNames(evolvedWithdrawn), []);
+  const evolvedWithdrawnHtmlResponse = await hostedPackageWorker(service).fetch(
+    participantHtmlRequest(companyPath),
+    env,
+    executionContext,
+  );
+  assert.equal(evolvedWithdrawnHtmlResponse.status, 200);
+  const evolvedWithdrawnHtml = await evolvedWithdrawnHtmlResponse.text();
+  assert.deepEqual(investmentHtmlActionNames(evolvedWithdrawnHtml), []);
+  assert.doesNotMatch(evolvedWithdrawnHtml, new RegExp(MUTATION_CSRF_FIELD, "u"));
+
+  const deniedReactivateProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  const deniedHistoricalReactivateCounts = investmentWriteCounts(service);
+  const deniedHistoricalReactivate = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    deniedReactivateProof,
+    Object.freeze({
+      ...reactivateAction,
+      href: `${APP_ORIGIN}${companyPath}`,
+    }),
+    {
+      "operation-id": "investment-operation:hosted-currency-denied-reactivate",
+      "expected-revision": 2,
+      "confirm-reactivation": true,
+    },
+  );
+  assert.equal(deniedHistoricalReactivate.status, 412);
+  assert.deepEqual(
+    investmentWriteCounts(service),
+    deniedHistoricalReactivateCounts,
+  );
 
   const restartedProof = await investmentResource(
     hostedPackageWorker(service),
     env,
+    itemPath,
   );
   const evolvedWithdrawalReplay = await submitInvestmentMutation(
     hostedPackageWorker(service),
@@ -6575,6 +6702,23 @@ function recordsIn(
   return [...service.records.values()].filter(
     (record) => record.key.collection === collection,
   );
+}
+
+function investmentWriteCounts(
+  service: SyntheticAittaDBService,
+): Readonly<Record<string, number>> {
+  return Object.freeze(Object.fromEntries([
+    "investment-indications",
+    "investment-indication-history",
+    "investment-indication-fields",
+    "investment-indication-active-keys",
+    "investment-aggregate-states",
+    "investment-aggregate-contributions",
+    "investment-aggregate-operations",
+    "participant-investment-indexes",
+    "participant-investment-operations",
+    "audit-events",
+  ].map((collection) => [collection, recordsIn(service, collection).length])));
 }
 
 function bumpHostedRecordRevision(

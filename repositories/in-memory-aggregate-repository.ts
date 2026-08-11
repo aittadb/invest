@@ -319,6 +319,22 @@ export async function readAtomicAggregateContributionHead(
     : decodeAtomicAggregateRecord(record, currency, currencyMode);
 }
 
+/**
+ * Project the private aggregate into the one bit needed for fresh mutations.
+ * A prior currency is compatible only after both aggregate dimensions are zero.
+ */
+export async function readFreshAggregateCurrencyCompatibility(
+  storage: Pick<StorageAdapter, "read">,
+  currency: CurrencyCode,
+): Promise<boolean> {
+  const record = await storage.read(CURRENT_AGGREGATE_KEY);
+  if (record === null) return true;
+  const snapshot = decodeAggregateRecordInStoredCurrency(record);
+  return snapshot.currency === currency ||
+    (snapshot.totalAmount === 0 &&
+      snapshot.contributingIndicationCount === 0);
+}
+
 /** Verify the immutable aggregate receipt for a completed atomic operation. */
 export async function readAtomicAggregateContributionReplay(
   storage: Pick<StorageAdapter, "read">,

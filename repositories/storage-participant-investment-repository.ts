@@ -48,6 +48,7 @@ import {
   prepareAtomicAggregateContribution,
   readAtomicAggregateContributionHead,
   readAtomicAggregateContributionReplay,
+  readFreshAggregateCurrencyCompatibility,
   type AtomicAggregateCurrencyMode,
 } from "./in-memory-aggregate-repository.ts";
 import {
@@ -204,6 +205,17 @@ export class StorageParticipantInvestmentInterestRepository
         indications.push(indication);
       }
       return Object.freeze(indications);
+    } catch (error) {
+      return mapRepositoryError(error);
+    }
+  }
+
+  async freshMutationCurrencyCompatible(): Promise<boolean> {
+    try {
+      return await readFreshAggregateCurrencyCompatibility(
+        this.#storage,
+        this.#amount.currency,
+      );
     } catch (error) {
       return mapRepositoryError(error);
     }

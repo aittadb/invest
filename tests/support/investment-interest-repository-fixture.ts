@@ -112,6 +112,13 @@ export class InvestmentInterestRepositoryFixture
     return indication?.participantSubject === this.#subject ? indication : null;
   }
 
+  async freshMutationCurrencyCompatible(): Promise<boolean> {
+    const aggregate = requiredAggregate(this.#state);
+    return aggregate.currency === this.#amount.currency ||
+      (aggregate.totalAmount === 0 &&
+        aggregate.contributingIndicationCount === 0);
+  }
+
   async commit(
     command: AtomicParticipantInvestmentInterestCommand,
   ): Promise<AtomicParticipantInvestmentInterestResult> {
