@@ -11,6 +11,7 @@ import {
   type ActorSubject,
 } from "../domain/foundation.ts";
 import type {
+  InvestmentIndicationParsingOptions,
   InvestmentIndicationId,
   TrustedPackageAcknowledgmentContext,
 } from "../domain/investment-indication.ts";
@@ -151,6 +152,114 @@ test("storage participant investment repository commits one persistent atomic li
   );
   assert.equal(await foreign.get(created.snapshot.id), null);
   assert.deepEqual(await foreign.listOwned(), []);
+});
+
+test("atomic exact retries survive amount-policy evolution before current validation", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const context = await currentContext(ALICE, "storage-policy-evolution");
+  const input = Object.freeze({
+    operationId: "investment-operation:storage-policy-evolution",
+    fields: personalFields({ amount: 1_250 }),
+  });
+  const originalRepository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  const original = await serviceFor(
+    originalRepository,
+    ALICE,
+    context,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  ).create(input);
+
+  const evolvedAmount = amountConfiguration({
+    minimum: 2_000,
+    increment: 250,
+  });
+  const evolvedRepository = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    evolvedAmount,
+  );
+  const evolved = serviceFor(
+    evolvedRepository,
+    ALICE,
+    context,
+    () => new Date("2026-08-12T11:00:00.000Z"),
+    evolvedAmount,
+  );
+  const replay = await evolved.create(input);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.snapshot, original.snapshot);
+
+  const changed = await captureStorageFailure(() => evolved.create({
+    ...input,
+    fields: personalFields({ amount: 2_000 }),
+  }));
+  assert.equal(changed.code, "CONFLICT");
+  assertAggregate(state, 1, 1_250, 1);
+  assert.equal(recordsIn(state, "audit-events").length, 1);
+});
+
+test("atomic exact retries survive normalizer evolution without semantic substitution", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const context = await currentContext(ALICE, "storage-normalizer-evolution");
+  const originalOptions: InvestmentIndicationParsingOptions = Object.freeze({
+    companyIdentifier: Object.freeze({
+      normalize: () => "ORIGINAL-CANONICAL-ID",
+    }),
+  });
+  const evolvedOptions: InvestmentIndicationParsingOptions = Object.freeze({
+    companyIdentifier: Object.freeze({
+      normalize: (value: string) =>
+        value === "Changed raw spelling"
+          ? "ORIGINAL-CANONICAL-ID"
+          : "EVOLVED-CANONICAL-ID",
+    }),
+  });
+  const input = Object.freeze({
+    operationId: "investment-operation:storage-normalizer-evolution",
+    fields: companyFields({ companyIdentifier: "Original raw spelling" }),
+  });
+  const originalRepository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+    originalOptions,
+  );
+  const original = await serviceFor(
+    originalRepository,
+    ALICE,
+    context,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  ).create(input);
+
+  const evolvedRepository = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+    evolvedOptions,
+  );
+  const evolved = serviceFor(
+    evolvedRepository,
+    ALICE,
+    context,
+    () => new Date("2026-08-12T11:00:00.000Z"),
+  );
+  const replay = await evolved.create(input);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.snapshot, original.snapshot);
+
+  const changed = await captureStorageFailure(() => evolved.create({
+    ...input,
+    fields: companyFields({ companyIdentifier: "Changed raw spelling" }),
+  }));
+  assert.equal(changed.code, "CONFLICT");
+  assertAggregate(state, 1, 2_000, 1);
+  assert.equal(recordsIn(state, "audit-events").length, 1);
 });
 
 test("storage participant investment repository enforces global company uniqueness", async () => {
@@ -501,10 +610,11 @@ function serviceFor(
   actorSubject: ActorSubject,
   context: TrustedPackageAcknowledgmentContext,
   now: () => Date,
+  configuredAmount: AmountConfiguration = AMOUNT,
 ) {
   return createParticipantInvestmentInterestService({
     actorSubject,
-    amountConfiguration: AMOUNT,
+    amountConfiguration: configuredAmount,
     reader: repository,
     mutations: repository,
     loadAcknowledgmentContext: () => context,
@@ -648,13 +758,16 @@ function acceptance(
   return parsed.value;
 }
 
-function amountConfiguration(): AmountConfiguration {
+function amountConfiguration(
+  overrides: Readonly<Record<string, unknown>> = {},
+): AmountConfiguration {
   const parsed = parseAmountAggregateConfiguration({
     amount: {
       currency: "eur",
       minimum: 1_000,
       increment: 250,
       maximum: 10_000,
+      ...overrides,
     },
     publicAggregate: { visibility: "hidden" },
   });

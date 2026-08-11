@@ -46,7 +46,6 @@ import {
   parseStorageCollection,
   parseStorageKey,
   parseStorageOperationId,
-  storageKeyString,
   type StorageAdapter,
   type StorageCollection,
   type StorageDocument,
@@ -56,7 +55,7 @@ import {
   type StorageRecord,
 } from "../domain/storage-adapter.ts";
 
-const INDICATION_SCHEMA_VERSION = 2;
+const INDICATION_SCHEMA_VERSION = 3;
 const CURRENT_INDICATIONS = storageCollection("investment-indications");
 const INDICATION_HISTORY = storageCollection("investment-indication-history");
 const INDICATION_FIELDS = storageCollection("investment-indication-fields");
@@ -83,6 +82,7 @@ const CURRENT_DOCUMENT_KEYS = new Set([
   "schemaVersion",
   "operationId",
   "operationFingerprint",
+  "requestFingerprint",
   "indicationId",
   "participantSubject",
   "revision",
@@ -93,6 +93,7 @@ const TRANSITION_DOCUMENT_KEYS = new Set([
   "schemaVersion",
   "operationId",
   "operationFingerprint",
+  "requestFingerprint",
   "indicationId",
   "participantSubject",
   "historyEntryId",
@@ -212,8 +213,51 @@ export type PreparedParticipantIndicationMutation = Readonly<{
   occurredAt: Timestamp;
   expectedRevision: number | null;
   resultingRevision: number;
+  requestFingerprint: string;
   fingerprint: string;
 }>;
+
+/** Config-independent descriptor used to verify an immutable exact retry. */
+export type PreparedParticipantIndicationReplay = Omit<
+  PreparedParticipantIndicationMutation,
+  "fingerprint"
+>;
+
+/**
+ * Validate the stable mutation envelope and fingerprint the exact submitted
+ * request without applying deployment amount or normalization policy.
+ */
+export async function prepareParticipantIndicationReplay(
+  kind: ParticipantIndicationMutationKind,
+  participantSubject: unknown,
+  request: ParticipantIndicationMutationRequest,
+): Promise<PreparedParticipantIndicationReplay> {
+  if (
+    kind !== "create" &&
+    kind !== "edit" &&
+    kind !== "withdraw" &&
+    kind !== "reactivate"
+  ) invalidRequest();
+  const subject = requiredActorSubject(participantSubject);
+  const expectedRevision = kind === "create"
+    ? null
+    : requiredExpectedRevision(request.expectedRevision);
+  const envelope = parseMutationEnvelope(request, expectedRevision);
+  const actor = Object.freeze({
+    type: "participant" as const,
+    subject,
+  });
+  return Object.freeze({
+    kind,
+    participantSubject: subject,
+    operationId: envelope.operationId,
+    id: envelope.id,
+    occurredAt: envelope.occurredAt,
+    expectedRevision,
+    resultingRevision: nextRevision(expectedRevision),
+    requestFingerprint: await exactRequestFingerprint(kind, actor, envelope),
+  });
+}
 
 /** Subject-bound persistence contract for participant and configured-owner use. */
 export interface IndicationRepository {
@@ -246,13 +290,12 @@ export async function prepareParticipantIndicationMutation(
   amountConfiguration: AmountConfiguration,
   parsingOptions: InvestmentIndicationParsingOptions = {},
 ): Promise<PreparedParticipantIndicationMutation> {
-  if (
-    kind !== "create" &&
-    kind !== "edit" &&
-    kind !== "withdraw" &&
-    kind !== "reactivate"
-  ) invalidRequest();
-  const subject = requiredActorSubject(participantSubject);
+  const replay = await prepareParticipantIndicationReplay(
+    kind,
+    participantSubject,
+    request,
+  );
+  const subject = replay.participantSubject;
   const amount = requiredAmountConfiguration(amountConfiguration);
   const options = Object.freeze({ ...parsingOptions });
   const parsed = kind === "create"
@@ -267,13 +310,7 @@ export async function prepareParticipantIndicationMutation(
     subject,
   });
   return Object.freeze({
-    kind,
-    participantSubject: subject,
-    operationId: parsed.operationId,
-    id: parsed.id,
-    occurredAt: parsed.occurredAt,
-    expectedRevision: parsed.expectedRevision,
-    resultingRevision: nextRevision(parsed.expectedRevision),
+    ...replay,
     fingerprint: await operationFingerprint(kind, actor, parsed),
   });
 }
@@ -324,6 +361,7 @@ type StoredFields = Readonly<{
 type StoredTransition = Readonly<{
   operationId: StorageOperationId;
   operationFingerprint: string;
+  requestFingerprint: string;
   indicationId: InvestmentIndicationId;
   participantSubject: ActorSubject;
   historyEntryId: InvestmentIndicationHistoryEntryId;
@@ -337,6 +375,7 @@ type StoredTransition = Readonly<{
 type StoredCurrent = Readonly<{
   operationId: StorageOperationId;
   operationFingerprint: string;
+  requestFingerprint: string;
   indicationId: InvestmentIndicationId;
   participantSubject: ActorSubject;
   revision: number;
@@ -416,6 +455,11 @@ export class DevelopmentInMemoryIndicationRepository
       actor,
       parsed,
     );
+    const requestFingerprint = await exactRequestFingerprint(
+      "create",
+      actor,
+      envelope,
+    );
 
     const created = domainMutation(() =>
       createInvestmentIndication(
@@ -433,7 +477,13 @@ export class DevelopmentInMemoryIndicationRepository
     );
 
     return activeResult(
-      await this.#writeSnapshot(created, null, parsed, fingerprint),
+      await this.#writeSnapshot(
+        created,
+        null,
+        parsed,
+        fingerprint,
+        requestFingerprint,
+      ),
     );
   }
 
@@ -449,7 +499,7 @@ export class DevelopmentInMemoryIndicationRepository
 
   /** Reopen one immutable operation result without projecting a later head. */
   async readPreparedParticipantMutation(
-    prepared: PreparedParticipantIndicationMutation,
+    prepared: PreparedParticipantIndicationReplay,
   ): Promise<IndicationMutationResult | null> {
     const subject = this.#authenticatedSubject;
     if (
@@ -457,7 +507,7 @@ export class DevelopmentInMemoryIndicationRepository
       subject === this.#configuredOwnerSubject ||
       prepared.participantSubject !== subject ||
       prepared.resultingRevision !== nextRevision(prepared.expectedRevision) ||
-      !isSha256(prepared.fingerprint)
+      !isSha256(prepared.requestFingerprint)
     ) {
       return null;
     }
@@ -476,7 +526,7 @@ export class DevelopmentInMemoryIndicationRepository
     );
     if (
       transition.operationId !== prepared.operationId ||
-      transition.operationFingerprint !== prepared.fingerprint ||
+      transition.requestFingerprint !== prepared.requestFingerprint ||
       transition.occurredAt !== prepared.occurredAt
     ) {
       throw new StorageFailure("CONFLICT");
@@ -487,7 +537,6 @@ export class DevelopmentInMemoryIndicationRepository
       prepared.id,
       prepared.resultingRevision,
       transition,
-      this.#configuredOwnerSubject,
     );
     return mutationResult(materialized.indication, true);
   }
@@ -523,6 +572,11 @@ export class DevelopmentInMemoryIndicationRepository
       this.#parsingOptions,
     );
     const fingerprint = await operationFingerprint("edit", actor, parsed);
+    const requestFingerprint = await exactRequestFingerprint(
+      "edit",
+      actor,
+      envelope,
+    );
 
     const current = await this.#readCurrent(
       parsed.id,
@@ -552,6 +606,7 @@ export class DevelopmentInMemoryIndicationRepository
         current,
         parsed,
         fingerprint,
+        requestFingerprint,
       ),
     );
   }
@@ -568,6 +623,11 @@ export class DevelopmentInMemoryIndicationRepository
     if (replay !== null) return withdrawnResult(replay);
     const parsed = parseTransitionRequest(request);
     const fingerprint = await operationFingerprint("withdraw", actor, parsed);
+    const requestFingerprint = await exactRequestFingerprint(
+      "withdraw",
+      actor,
+      envelope,
+    );
 
     const current = await this.#readCurrent(
       parsed.id,
@@ -593,6 +653,7 @@ export class DevelopmentInMemoryIndicationRepository
         current,
         parsed,
         fingerprint,
+        requestFingerprint,
       ),
     );
   }
@@ -610,6 +671,11 @@ export class DevelopmentInMemoryIndicationRepository
     if (replay !== null) return activeResult(replay);
     const parsed = parseTransitionRequest(request);
     const fingerprint = await operationFingerprint("reactivate", actor, parsed);
+    const requestFingerprint = await exactRequestFingerprint(
+      "reactivate",
+      actor,
+      envelope,
+    );
 
     const current = await this.#readCurrent(
       parsed.id,
@@ -636,6 +702,7 @@ export class DevelopmentInMemoryIndicationRepository
         current,
         parsed,
         fingerprint,
+        requestFingerprint,
       ),
     );
   }
@@ -652,6 +719,11 @@ export class DevelopmentInMemoryIndicationRepository
     if (replay !== null) return rejectedResult(replay);
     const parsed = parseRejectRequest(request);
     const fingerprint = await operationFingerprint("reject", actor, parsed);
+    const requestFingerprint = await exactRequestFingerprint(
+      "reject",
+      actor,
+      envelope,
+    );
 
     const current = await this.#readCurrent(parsed.id, "owner", actor.subject);
     if (current === null) notFound();
@@ -674,6 +746,7 @@ export class DevelopmentInMemoryIndicationRepository
         current,
         parsed,
         fingerprint,
+        requestFingerprint,
       ),
     );
   }
@@ -710,8 +783,8 @@ export class DevelopmentInMemoryIndicationRepository
     if (record === null) return null;
 
     if (access === "participant") {
-      const storedSubject = peekParticipantSubject(record.value);
-      if (storedSubject === null || storedSubject !== subject) return null;
+      const storedSubject = peekParticipantSubject(record);
+      if (storedSubject !== subject) return null;
     } else if (subject !== this.#configuredOwnerSubject) {
       return null;
     }
@@ -728,13 +801,13 @@ export class DevelopmentInMemoryIndicationRepository
       id,
       current.revision,
       null,
-      this.#configuredOwnerSubject,
     );
     if (
       canonicalJson(currentIndicationDocument(
         materialized.indication,
         materialized.terminal.operationId,
         materialized.terminal.operationFingerprint,
+        materialized.terminal.requestFingerprint,
         materialized.terminal.fields,
       )) !== canonicalJson(current.document)
     ) {
@@ -762,6 +835,13 @@ export class DevelopmentInMemoryIndicationRepository
     const record = await this.#storage.read(historyKey);
     if (record === null) return null;
 
+    if (
+      actor.type === "participant" &&
+      peekParticipantSubject(record) !== actor.subject
+    ) {
+      return null;
+    }
+
     const transition = decodeStoredTransition(
       record,
       historyKey,
@@ -777,43 +857,22 @@ export class DevelopmentInMemoryIndicationRepository
     if (mutationKindForTransition(transition.transitionKind) !== kind) {
       throw new StorageFailure("CONFLICT");
     }
+    let requestFingerprint: string;
+    try {
+      requestFingerprint = await exactRequestFingerprint(kind, actor, request);
+    } catch {
+      throw new StorageFailure("CONFLICT");
+    }
+    if (requestFingerprint !== transition.requestFingerprint) {
+      throw new StorageFailure("CONFLICT");
+    }
     const materialized = await materializeIndication(
       this.#storage,
       transition.participantSubject,
       request.id,
       revision,
       transition,
-      this.#configuredOwnerSubject,
     );
-    const historical = materialized.indication.history[revision - 1];
-    if (historical === undefined) unavailable();
-    const replayEnvelope = Object.freeze({
-      operationId: request.operationId,
-      id: request.id,
-      occurredAt: request.occurredAt,
-      historyEntryId: request.historyEntryId,
-      expectedRevision: request.expectedRevision,
-    });
-    let replayRequest: ParsedMutationRequest;
-    if (kind === "create" || kind === "edit") {
-      const fields = parseInvestmentIndicationFields(
-        request.fields,
-        storedAmountConfiguration(historical.fields),
-        this.#parsingOptions,
-      );
-      if (!fields.ok) throw new StorageFailure("CONFLICT");
-      replayRequest = Object.freeze({ ...replayEnvelope, fields: fields.value });
-    } else if (kind === "reject") {
-      const reason = parseRejectionReason(request.reason);
-      if (reason === null) throw new StorageFailure("CONFLICT");
-      replayRequest = Object.freeze({ ...replayEnvelope, reason });
-    } else {
-      replayRequest = replayEnvelope;
-    }
-    if (
-      await operationFingerprint(kind, actor, replayRequest) !==
-        transition.operationFingerprint
-    ) throw new StorageFailure("CONFLICT");
     const current = await this.#readCurrent(
       request.id,
       actor.type === "owner" ? "owner" : "participant",
@@ -828,6 +887,7 @@ export class DevelopmentInMemoryIndicationRepository
     previous: MaterializedIndication | null,
     request: ParsedMutationRequest,
     fingerprint: string,
+    requestFingerprint: string,
   ): Promise<IndicationMutationResult> {
     if (indication.revision !== nextRevision(request.expectedRevision)) {
       unavailable();
@@ -848,6 +908,7 @@ export class DevelopmentInMemoryIndicationRepository
       indication,
       request.operationId,
       fingerprint,
+      requestFingerprint,
       storedFields.reference,
       transition.transition === "created" || transition.transition === "edited"
         ? storedFields.chunks
@@ -1102,6 +1163,21 @@ function domainMutation<Value>(
   }
 }
 
+function reconstructStoredTransition<Value>(
+  operation: () => ValidationResult<Value>,
+): Value {
+  try {
+    const result = operation();
+    if (!result.ok) unavailable();
+    return result.value;
+  } catch (error) {
+    if (error instanceof StorageFailure && error.code === "UNAVAILABLE") {
+      throw error;
+    }
+    throw new StorageFailure("UNAVAILABLE", { cause: error });
+  }
+}
+
 function decodeStoredCurrent(
   record: StorageRecord,
   expectedKey: StorageKey,
@@ -1116,6 +1192,7 @@ function decodeStoredCurrent(
   );
   const operationId = storedOperationId(source.operationId);
   const operationFingerprint = storedFingerprint(source.operationFingerprint);
+  const requestFingerprint = storedFingerprint(source.requestFingerprint);
   const indicationId = storedIndicationId(source.indicationId);
   const participantSubject = storedActorSubject(source.participantSubject);
   const revision = storedRevision(source.revision);
@@ -1128,6 +1205,7 @@ function decodeStoredCurrent(
   return Object.freeze({
     operationId,
     operationFingerprint,
+    requestFingerprint,
     indicationId,
     participantSubject,
     revision,
@@ -1152,6 +1230,7 @@ function decodeStoredTransition(
   );
   const operationId = storedOperationId(source.operationId);
   const operationFingerprint = storedFingerprint(source.operationFingerprint);
+  const requestFingerprint = storedFingerprint(source.requestFingerprint);
   const indicationId = storedIndicationId(source.indicationId);
   const participantSubject = storedActorSubject(source.participantSubject);
   const historyEntryId = storedHistoryEntryId(source.historyEntryId);
@@ -1168,6 +1247,7 @@ function decodeStoredTransition(
   return Object.freeze({
     operationId,
     operationFingerprint,
+    requestFingerprint,
     indicationId,
     participantSubject,
     historyEntryId,
@@ -1185,7 +1265,6 @@ async function materializeIndication(
   id: InvestmentIndicationId,
   revision: number,
   knownTerminal: StoredTransition | null,
-  configuredOwnerSubject: ActorSubject | null,
 ): Promise<MaterializedIndication> {
   if (
     !Number.isSafeInteger(revision) ||
@@ -1250,45 +1329,44 @@ async function materializeIndication(
     const options = storedParsingOptions();
     if (transition.transitionKind === "created") {
       if (indication !== null) unavailable();
-      const created = createInvestmentIndication({
+      indication = reconstructStoredTransition(() => createInvestmentIndication({
         id,
         occurredAt: transition.occurredAt,
         historyEntryId: transition.historyEntryId,
         fields: domainFieldsInput(storedFields.fields),
       }, storedParticipantActor(source.actor), amount, storedAcknowledgmentContext(
         acknowledgment,
-      ), options);
-      if (!created.ok) unavailable();
-      indication = created.value;
+      ), options));
     } else if (transition.transitionKind === "edited") {
       if (indication === null) unavailable();
-      const edited = editInvestmentIndication(indication, {
+      indication = reconstructStoredTransition(() => editInvestmentIndication(indication!, {
         occurredAt: transition.occurredAt,
         historyEntryId: transition.historyEntryId,
         fields: domainFieldsInput(storedFields.fields),
       }, storedParticipantActor(source.actor), amount, storedAcknowledgmentContext(
         acknowledgment,
-      ), options);
-      if (!edited.ok) unavailable();
-      indication = edited.value;
+      ), options));
     } else if (transition.transitionKind === "withdrawn") {
       if (indication === null) unavailable();
-      const withdrawn = withdrawInvestmentIndication(indication, {
+      indication = reconstructStoredTransition(() => withdrawInvestmentIndication(
+        indication!,
+        {
         occurredAt: transition.occurredAt,
         historyEntryId: transition.historyEntryId,
-      }, storedParticipantActor(source.actor));
-      if (!withdrawn.ok) unavailable();
-      indication = withdrawn.value;
+        },
+        storedParticipantActor(source.actor),
+      ));
     } else if (transition.transitionKind === "reactivated") {
       if (indication === null) unavailable();
-      const reactivated = reactivateInvestmentIndication(indication, {
+      indication = reconstructStoredTransition(() => reactivateInvestmentIndication(
+        indication!,
+        {
         occurredAt: transition.occurredAt,
         historyEntryId: transition.historyEntryId,
-      }, storedParticipantActor(source.actor), storedAcknowledgmentContext(
-        acknowledgment,
+        },
+        storedParticipantActor(source.actor),
+        storedAcknowledgmentContext(acknowledgment),
       ));
-      if (!reactivated.ok) unavailable();
-      indication = reactivated.value;
     } else {
       if (indication === null) unavailable();
       const rejection = exactRecord(source.rejection, new Set([
@@ -1296,13 +1374,15 @@ async function materializeIndication(
         "rejectedAt",
         "rejectedBy",
       ]));
-      const rejected = rejectInvestmentIndication(indication, {
+      indication = reconstructStoredTransition(() => rejectInvestmentIndication(
+        indication!,
+        {
         occurredAt: transition.occurredAt,
         historyEntryId: transition.historyEntryId,
         reason: rejection.reason,
-      }, storedOwnerActor(source.actor, configuredOwnerSubject));
-      if (!rejected.ok) unavailable();
-      indication = rejected.value;
+        },
+        storedOwnerActor(source.actor),
+      ));
     }
     const fingerprint = await fingerprintForStoredIndication(
       indication,
@@ -1314,6 +1394,7 @@ async function materializeIndication(
         indication,
         transition.operationId,
         transition.operationFingerprint,
+        transition.requestFingerprint,
         transition.fields,
       )) !== canonicalJson(transition.document)
     ) unavailable();
@@ -1511,17 +1592,11 @@ function storedParticipantActor(value: unknown): ParticipantIndicationActor {
   return Object.freeze({ type: "participant", subject: subject.value });
 }
 
-function storedOwnerActor(
-  value: unknown,
-  configuredOwnerSubject: ActorSubject | null,
-): OwnerIndicationActor {
+function storedOwnerActor(value: unknown): OwnerIndicationActor {
   const source = objectRecord(value);
   if (source === null || source.type !== "owner") unavailable();
   const subject = parseActorSubject(source.subject);
-  if (
-    !subject.ok ||
-    (configuredOwnerSubject !== null && subject.value !== configuredOwnerSubject)
-  ) unavailable();
+  if (!subject.ok) unavailable();
   return Object.freeze({ type: "owner", subject: subject.value });
 }
 
@@ -1697,6 +1772,7 @@ function prepareSnapshotMutation(
   indication: InvestmentIndication,
   operationId: StorageOperationId,
   fingerprint: string,
+  requestFingerprint: string,
   fields: StoredFieldsReference,
   fieldsChunks: readonly PreparedFieldsChunk[],
 ): PreparedSnapshotMutation {
@@ -1704,12 +1780,14 @@ function prepareSnapshotMutation(
     indication,
     operationId,
     fingerprint,
+    requestFingerprint,
     fields,
   );
   const transitionDocument = transitionIndicationDocument(
     indication,
     operationId,
     fingerprint,
+    requestFingerprint,
     fields,
   );
   requireBoundedRecord(currentDocument);
@@ -1726,6 +1804,7 @@ function currentIndicationDocument(
   indication: InvestmentIndication,
   operationId: StorageOperationId,
   fingerprint: string,
+  requestFingerprint: string,
   fields: StoredFieldsReference,
 ): StorageDocument {
   return Object.freeze({
@@ -1733,6 +1812,7 @@ function currentIndicationDocument(
     schemaVersion: INDICATION_SCHEMA_VERSION,
     operationId,
     operationFingerprint: fingerprint,
+    requestFingerprint,
     indicationId: indication.id,
     participantSubject: indication.participantSubject,
     revision: indication.revision,
@@ -1744,6 +1824,7 @@ function transitionIndicationDocument(
   indication: InvestmentIndication,
   operationId: StorageOperationId,
   fingerprint: string,
+  requestFingerprint: string,
   fields: StoredFieldsReference,
 ): StorageDocument {
   const entry = indication.history.at(-1);
@@ -1753,6 +1834,7 @@ function transitionIndicationDocument(
     schemaVersion: INDICATION_SCHEMA_VERSION,
     operationId,
     operationFingerprint: fingerprint,
+    requestFingerprint,
     indicationId: indication.id,
     participantSubject: indication.participantSubject,
     historyEntryId: entry.id,
@@ -1979,6 +2061,31 @@ async function operationFingerprint(
   return hashDocument(payload);
 }
 
+async function exactRequestFingerprint(
+  kind: MutationKind,
+  actor: ParticipantIndicationActor | OwnerIndicationActor,
+  request: ParsedMutationEnvelope,
+): Promise<string> {
+  const payload = {
+    kind,
+    operationId: request.operationId,
+    actor: actorDocument(actor),
+    expectedRevision: request.expectedRevision,
+    id: request.id,
+    occurredAt: request.occurredAt,
+    historyEntryId: request.historyEntryId,
+    ...(Object.hasOwn(request, "fields") ? { fields: request.fields } : {}),
+    ...(Object.hasOwn(request, "reason") ? { reason: request.reason } : {}),
+  };
+  let serialized: string;
+  try {
+    serialized = canonicalJson(payload);
+  } catch {
+    return invalidRequest();
+  }
+  return `sha256:${await sha256Hex(serialized)}`;
+}
+
 async function hashDocument(value: StorageDocument): Promise<string> {
   return `sha256:${await sha256Hex(canonicalJson(value))}`;
 }
@@ -2046,14 +2153,14 @@ function verifyLeaseRecord(
   expected: ActiveLease,
   indicationId: InvestmentIndicationId,
 ): void {
-  const source = objectRecord(record.value);
+  const source = exactStoredDocument(
+    record,
+    expected.key,
+    LEASE_DOCUMENT_KEYS,
+    "active-indication-lease",
+  );
   if (
-    storageKeyString(record.key) !== storageKeyString(expected.key) ||
     record.revision !== 1 ||
-    source === null ||
-    !hasExactKeys(source, LEASE_DOCUMENT_KEYS) ||
-    source.kind !== "active-indication-lease" ||
-    source.schemaVersion !== INDICATION_SCHEMA_VERSION ||
     source.indicationId !== indicationId ||
     source.uniquenessFingerprint !== expected.fingerprint ||
     canonicalJson(source) !== canonicalJson(expected.document)
@@ -2153,10 +2260,13 @@ function base64UrlDecode(value: string): Uint8Array {
   return bytes;
 }
 
-function peekParticipantSubject(value: StorageDocument): ActorSubject | null {
-  const source = objectRecord(value);
-  const parsed = parseActorSubject(source?.participantSubject);
-  return parsed.ok ? parsed.value : null;
+function peekParticipantSubject(record: StorageRecord): ActorSubject {
+  const envelope = exactRecord(record, STORAGE_RECORD_KEYS);
+  const source = objectRecord(envelope.value);
+  if (source === null) unavailable();
+  const parsed = parseActorSubject(source.participantSubject);
+  if (!parsed.ok) unavailable();
+  return parsed.value;
 }
 
 function requiredAmountConfiguration(
@@ -2213,7 +2323,7 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
     (Object.getPrototypeOf(value) !== Object.prototype &&
       Object.getPrototypeOf(value) !== null)
   ) return null;
-  const result: Record<string, unknown> = {};
+  const result = Object.create(null) as Record<string, unknown>;
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== "string") return null;
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
@@ -2222,7 +2332,12 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
       !descriptor.enumerable ||
       !("value" in descriptor)
     ) return null;
-    result[key] = descriptor.value;
+    Object.defineProperty(result, key, {
+      value: descriptor.value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
   }
   return result;
 }

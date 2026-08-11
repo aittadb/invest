@@ -57,6 +57,9 @@ import {
 const ALICE_SUBJECT = actorSubject("issuer.invalid/subject:alice-indicator");
 const BOB_SUBJECT = actorSubject("issuer.invalid/subject:bob-indicator");
 const OWNER_SUBJECT = actorSubject("issuer.invalid/subject:configured-owner");
+const NEXT_OWNER_SUBJECT = actorSubject(
+  "issuer.invalid/subject:next-configured-owner",
+);
 const PERSONAL_ONE = indicationId("indication:personal:alice-one");
 const PERSONAL_TWO = indicationId("indication:personal:alice-two");
 const COMPANY_ONE = indicationId("indication:company:alice-one");
@@ -553,6 +556,53 @@ test("adapter-backed development repository passes the indication contract", asy
   });
 });
 
+test("foreign occupied history slots are indistinguishable from missing indications", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const contexts = await packageContexts();
+  const alice = repository(storage, ALICE_SUBJECT);
+  await alice.create(createRequest({
+    operationId: "indication-operation:foreign-slot-create",
+    id: PERSONAL_ONE,
+    occurredAt: "2026-08-10T09:00:00.000Z",
+    historyEntryId: "indication-history:foreign-slot-create",
+    fields: personalFields(),
+  }), contexts.aliceCurrent);
+  await alice.edit(editRequest({
+    operationId: "indication-operation:foreign-slot-edit",
+    id: PERSONAL_ONE,
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T10:00:00.000Z",
+    historyEntryId: "indication-history:foreign-slot-edit",
+    fields: personalFields({ note: "Occupied foreign revision." }),
+  }), contexts.aliceCurrent);
+
+  const request = editRequest({
+    operationId: "indication-operation:foreign-slot-probe",
+    id: PERSONAL_ONE,
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T10:30:00.000Z",
+    historyEntryId: "indication-history:foreign-slot-probe",
+    fields: personalFields({ note: "Private probe." }),
+  });
+  const foreign = await captureStorageFailure(() =>
+    repository(storage, BOB_SUBJECT).edit(request, contexts.bobCurrent)
+  );
+  const missing = await captureStorageFailure(() =>
+    repository(
+      new DeterministicMemoryStorageAdapter(new MemoryStorageState(), true),
+      BOB_SUBJECT,
+    ).edit(request, contexts.bobCurrent)
+  );
+
+  assert.equal(foreign.code, "NOT_FOUND");
+  assert.equal(missing.code, "NOT_FOUND");
+  assert.deepEqual(
+    toPublicStorageFailure(foreign),
+    toPublicStorageFailure(missing),
+  );
+});
+
 test("current records require every immutable transition revision", async () => {
   const state = new MemoryStorageState();
   const storage = new DeterministicMemoryStorageAdapter(state, true);
@@ -651,6 +701,109 @@ test("persisted indication history survives amount configuration evolution", asy
   assert.equal(current.snapshot.history[2]?.fields.currency, "USD");
 });
 
+test("exact retries survive normalizer evolution without accepting changed raw input", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const contexts = await packageContexts();
+  const originalOptions: InvestmentIndicationParsingOptions = Object.freeze({
+    companyIdentifier: Object.freeze({
+      normalize: () => "ORIGINAL-CANONICAL-ID",
+    }),
+  });
+  const evolvedOptions: InvestmentIndicationParsingOptions = Object.freeze({
+    companyIdentifier: Object.freeze({
+      normalize: (value: string) =>
+        value === "Changed raw spelling"
+          ? "ORIGINAL-CANONICAL-ID"
+          : "EVOLVED-CANONICAL-ID",
+    }),
+  });
+  const request = createRequest({
+    operationId: "indication-operation:normalizer-evolution",
+    id: COMPANY_ONE,
+    occurredAt: "2026-08-10T09:00:00.000Z",
+    historyEntryId: "indication-history:normalizer-evolution",
+    fields: companyFields({ companyIdentifier: "Original raw spelling" }),
+  });
+  const original = await repository(
+    storage,
+    ALICE_SUBJECT,
+    amountConfiguration,
+    originalOptions,
+  ).create(request, contexts.aliceCurrent);
+  assert.equal(original.snapshot.kind, "company");
+  if (original.snapshot.kind !== "company") assert.fail("Expected company.");
+  assert.equal(
+    original.snapshot.fields.companyIdentifier,
+    "ORIGINAL-CANONICAL-ID",
+  );
+
+  const evolved = repository(
+    storage,
+    ALICE_SUBJECT,
+    amountConfiguration,
+    evolvedOptions,
+  );
+  const replay = await evolved.create(request, contexts.aliceCurrent);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.snapshot, original.snapshot);
+  await rejectsStorage(
+    () => evolved.create({
+      ...request,
+      fields: companyFields({ companyIdentifier: "Changed raw spelling" }),
+    }, contexts.aliceCurrent),
+    "CONFLICT",
+  );
+});
+
+test("owner rotation preserves historical rejection attribution and current authorization", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const contexts = await packageContexts();
+  await repository(storage, ALICE_SUBJECT).create(createRequest({
+    operationId: "indication-operation:owner-rotation-create",
+    id: PERSONAL_ONE,
+    occurredAt: "2026-08-10T09:00:00.000Z",
+    historyEntryId: "indication-history:owner-rotation-create",
+    fields: personalFields(),
+  }), contexts.aliceCurrent);
+  const rejection = rejectRequest({
+    operationId: "indication-operation:owner-rotation-reject",
+    id: PERSONAL_ONE,
+    expectedRevision: 1,
+    occurredAt: "2026-08-10T10:00:00.000Z",
+    historyEntryId: "indication-history:owner-rotation-reject",
+    reason: "Rejected before the configured owner changed.",
+  });
+  const rejected = await repository(storage, OWNER_SUBJECT).reject(rejection);
+
+  const currentOwner = repository(
+    storage,
+    NEXT_OWNER_SUBJECT,
+    amountConfiguration,
+    {},
+    NEXT_OWNER_SUBJECT,
+  );
+  const reopened = await currentOwner.get(PERSONAL_ONE);
+  assert.deepEqual(reopened, rejected.snapshot);
+  assert.equal(reopened?.history[1]?.actor.subject, OWNER_SUBJECT);
+  assert.equal(
+    reopened?.lifecycle.rejection?.rejectedBy.subject,
+    OWNER_SUBJECT,
+  );
+  await rejectsStorage(() => currentOwner.reject(rejection), "CONFLICT");
+
+  const formerOwner = repository(
+    storage,
+    OWNER_SUBJECT,
+    amountConfiguration,
+    {},
+    NEXT_OWNER_SUBJECT,
+  );
+  assert.equal(await formerOwner.get(PERSONAL_ONE), null);
+  await rejectsStorage(() => formerOwner.reject(rejection), "NOT_FOUND");
+});
+
 test("compact indication records reject current, transition, reference, and chunk corruption", async (t) => {
   const baseline = new MemoryStorageState();
   const storage = new DeterministicMemoryStorageAdapter(baseline, true);
@@ -707,6 +860,20 @@ test("compact indication records reject current, transition, reference, and chun
         ),
         (document) => {
           document.transitionKind = "withdrawn";
+        },
+      ),
+    },
+    {
+      name: "transition actor ownership",
+      apply: (state) => mutateStoredDocument(
+        state,
+        requiredRecordWhere(
+          state,
+          "investment-indication-history",
+          (record) => record.value.revision === 2,
+        ),
+        (document) => {
+          mutableRecord(document.actor).subject = BOB_SUBJECT;
         },
       ),
     },
@@ -825,6 +992,118 @@ test("compact indication records reject current, transition, reference, and chun
           new DeterministicMemoryStorageAdapter(state, true),
           ALICE_SUBJECT,
         ).get(PERSONAL_ONE),
+        "UNAVAILABLE",
+      );
+    });
+  }
+});
+
+test("stored envelopes reject prototype mutation, custom prototypes, and accessors", async (t) => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const contexts = await packageContexts();
+  await repository(storage, ALICE_SUBJECT).create(createRequest({
+    operationId: "indication-operation:hostile-envelope-create",
+    id: PERSONAL_ONE,
+    occurredAt: "2026-08-10T09:00:00.000Z",
+    historyEntryId: "indication-history:hostile-envelope-create",
+    fields: personalFields(),
+  }), contexts.aliceCurrent);
+
+  const cases: readonly Readonly<{
+    name: string;
+    collection: string;
+    transform(record: StorageRecord): StorageRecord;
+  }>[] = [
+    {
+      name: "own __proto__ in current document",
+      collection: "investment-indications",
+      transform: (record) => {
+        const value = { ...record.value };
+        Object.defineProperty(value, "__proto__", {
+          value: Object.freeze({ polluted: true }),
+          enumerable: true,
+          configurable: true,
+        });
+        return { ...record, value } as StorageRecord;
+      },
+    },
+    {
+      name: "custom current record prototype",
+      collection: "investment-indications",
+      transform: (record) =>
+        Object.assign(Object.create({ inherited: true }), record) as StorageRecord,
+    },
+    {
+      name: "transition value accessor",
+      collection: "investment-indication-history",
+      transform: (record) =>
+        Object.defineProperty(
+          { key: record.key, revision: record.revision },
+          "value",
+          { enumerable: true, get: () => record.value },
+        ) as StorageRecord,
+    },
+    {
+      name: "custom field-chunk key prototype",
+      collection: "investment-indication-fields",
+      transform: (record) => ({
+        ...record,
+        key: Object.assign(Object.create({ inherited: true }), record.key),
+      }) as StorageRecord,
+    },
+    {
+      name: "field-chunk data accessor",
+      collection: "investment-indication-fields",
+      transform: (record) => {
+        const value = { ...record.value };
+        Object.defineProperty(value, "data", {
+          enumerable: true,
+          get: () => record.value.data,
+        });
+        return { ...record, value } as StorageRecord;
+      },
+    },
+    {
+      name: "own __proto__ in active lease",
+      collection: "investment-indication-active-keys",
+      transform: (record) => {
+        const value = { ...record.value };
+        Object.defineProperty(value, "__proto__", {
+          value: Object.freeze({ polluted: true }),
+          enumerable: true,
+          configurable: true,
+        });
+        return { ...record, value } as StorageRecord;
+      },
+    },
+    {
+      name: "custom active-lease record prototype",
+      collection: "investment-indication-active-keys",
+      transform: (record) =>
+        Object.assign(Object.create({ inherited: true }), record) as StorageRecord,
+    },
+    {
+      name: "active-lease value accessor",
+      collection: "investment-indication-active-keys",
+      transform: (record) =>
+        Object.defineProperty(
+          { key: record.key, revision: record.revision },
+          "value",
+          { enumerable: true, get: () => record.value },
+        ) as StorageRecord,
+    },
+  ];
+
+  for (const candidate of cases) {
+    await t.test(candidate.name, async () => {
+      const hostile = new ReadTransformStorageAdapter(
+        storage,
+        candidate.collection,
+        candidate.transform,
+      );
+      await rejectsStorage(
+        () => repository(hostile, ALICE_SUBJECT).get(PERSONAL_ONE),
         "UNAVAILABLE",
       );
     });
@@ -1095,11 +1374,12 @@ function repository(
   subject: ActorSubject | null,
   configuredAmount: AmountConfiguration = amountConfiguration,
   parsingOptions: InvestmentIndicationParsingOptions = {},
+  configuredOwnerSubject: ActorSubject = OWNER_SUBJECT,
 ): DevelopmentInMemoryIndicationRepository {
   return new DevelopmentInMemoryIndicationRepository(
     storage,
     subject,
-    OWNER_SUBJECT,
+    configuredOwnerSubject,
     configuredAmount,
     parsingOptions,
   );
@@ -1482,6 +1762,39 @@ class ObservedStorageAdapter implements StorageAdapter {
     assert.ok(
       jsonBytes(request) <= MAX_INDICATION_STORAGE_TRANSACTION_BYTES,
     );
+    return this.#delegate.transact(request);
+  }
+}
+
+class ReadTransformStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #collection: string;
+  readonly #transform: (record: StorageRecord) => StorageRecord;
+
+  constructor(
+    delegate: StorageAdapter,
+    collection: string,
+    transform: (record: StorageRecord) => StorageRecord,
+  ) {
+    this.#delegate = delegate;
+    this.#collection = collection;
+    this.#transform = transform;
+  }
+
+  async read(key: StorageKey): Promise<StorageRecord | null> {
+    const record = await this.#delegate.read(key);
+    return record !== null && record.key.collection === this.#collection
+      ? this.#transform(record)
+      : record;
+  }
+
+  list(request: Parameters<StorageAdapter["list"]>[0]): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
     return this.#delegate.transact(request);
   }
 }

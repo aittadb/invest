@@ -55,8 +55,10 @@ import {
 import {
   DevelopmentInMemoryIndicationRepository,
   prepareParticipantIndicationMutation,
+  prepareParticipantIndicationReplay,
   type IndicationMutationResult,
   type PreparedParticipantIndicationMutation,
+  type PreparedParticipantIndicationReplay,
 } from "./in-memory-indication-repository.ts";
 import {
   PARTICIPANT_INVESTMENT_MUTATION_CONSISTENCY,
@@ -67,7 +69,7 @@ import {
 } from "../worker/participant-investment-mutation-port.ts";
 
 const PARTICIPANT_INDEX_SCHEMA_VERSION = 1;
-const PARTICIPANT_OPERATION_SCHEMA_VERSION = 1;
+const PARTICIPANT_OPERATION_SCHEMA_VERSION = 2;
 const MAX_OWNED_INDICATIONS = 100;
 const PARTICIPANT_INDEXES = collection("participant-investment-indexes");
 const PARTICIPANT_OPERATIONS = collection("participant-investment-operations");
@@ -102,11 +104,15 @@ type ParticipantIndex = Readonly<{
   ids: readonly InvestmentIndicationId[];
 }>;
 
-type PreparedCommand = Readonly<{
+type PreparedReplayCommand = Readonly<{
   command: AtomicParticipantInvestmentInterestCommand;
-  indication: PreparedParticipantIndicationMutation;
+  indication: PreparedParticipantIndicationReplay;
   audit: PreparedAuditAppend;
   fingerprint: string;
+}>;
+
+type PreparedCommand = Omit<PreparedReplayCommand, "indication"> & Readonly<{
+  indication: PreparedParticipantIndicationMutation;
 }>;
 
 type StoredOperationReceipt = Readonly<{
@@ -189,14 +195,20 @@ export class StorageParticipantInvestmentInterestRepository
     command: AtomicParticipantInvestmentInterestCommand,
   ): Promise<AtomicParticipantInvestmentInterestResult> {
     try {
+      const replayPrepared = await prepareReplayCommand(
+        command,
+        this.#subject,
+      );
+      const known = await this.#replay(replayPrepared);
+      if (known !== null) return known;
+
       const prepared = await prepareCommand(
         command,
         this.#subject,
         this.#amount,
         this.#parsingOptions,
+        replayPrepared,
       );
-      const known = await this.#replay(prepared);
-      if (known !== null) return known;
 
       try {
         return await this.#commitNew(prepared);
@@ -299,7 +311,7 @@ export class StorageParticipantInvestmentInterestRepository
   }
 
   async #replay(
-    prepared: PreparedCommand,
+    prepared: PreparedReplayCommand,
   ): Promise<AtomicParticipantInvestmentInterestResult | null> {
     const receiptKey = await operationReceiptKey(
       prepared.indication.operationId,
@@ -355,18 +367,43 @@ async function prepareCommand(
   subject: ActorSubject,
   amount: AmountConfiguration,
   parsingOptions: InvestmentIndicationParsingOptions,
+  replayPrepared: PreparedReplayCommand,
 ): Promise<PreparedCommand> {
-  if (
-    typeof command !== "object" ||
-    command === null ||
-    !isParticipantCommandKind(command.kind)
-  ) invalid();
   const indication = await prepareParticipantIndicationMutation(
     command.kind,
     subject,
     command.request,
     amount,
     parsingOptions,
+  );
+  if (
+    indication.kind !== replayPrepared.indication.kind ||
+    indication.participantSubject !==
+      replayPrepared.indication.participantSubject ||
+    indication.operationId !== replayPrepared.indication.operationId ||
+    indication.id !== replayPrepared.indication.id ||
+    indication.occurredAt !== replayPrepared.indication.occurredAt ||
+    indication.expectedRevision !== replayPrepared.indication.expectedRevision ||
+    indication.resultingRevision !== replayPrepared.indication.resultingRevision ||
+    indication.requestFingerprint !==
+      replayPrepared.indication.requestFingerprint
+  ) unavailable();
+  return Object.freeze({ ...replayPrepared, indication });
+}
+
+async function prepareReplayCommand(
+  command: AtomicParticipantInvestmentInterestCommand,
+  subject: ActorSubject,
+): Promise<PreparedReplayCommand> {
+  if (
+    typeof command !== "object" ||
+    command === null ||
+    !isParticipantCommandKind(command.kind)
+  ) invalid();
+  const indication = await prepareParticipantIndicationReplay(
+    command.kind,
+    subject,
+    command.request,
   );
   const parsedAudit = parseAuditAppendIntent(command.auditIntent);
   if (!parsedAudit.ok) invalid();
@@ -377,7 +414,7 @@ async function prepareCommand(
   const fingerprint = await sha256(
     canonicalJson({
       kind: command.kind,
-      indication: indication.fingerprint,
+      indication: indication.requestFingerprint,
       audit: parsedAudit.value,
     }),
   );
@@ -402,7 +439,7 @@ async function applyIndication(
 
 function requireMatchingAudit(
   kind: AtomicParticipantInvestmentInterestCommand["kind"],
-  indication: PreparedParticipantIndicationMutation,
+  indication: PreparedParticipantIndicationReplay,
   event: AuditEvent,
   subject: ActorSubject,
 ): void {
@@ -432,7 +469,7 @@ function transitionFor(
 }
 
 function operationReceiptMutation(
-  prepared: PreparedCommand,
+  prepared: PreparedReplayCommand,
   aggregate: StoredInvestmentAggregateSnapshot,
   receiptKey: StorageKey,
 ): StorageMutation {
@@ -495,7 +532,7 @@ function decodeOperationReceipt(
 
 function requireMatchingReceipt(
   receipt: StoredOperationReceipt,
-  prepared: PreparedCommand,
+  prepared: PreparedReplayCommand,
 ): void {
   if (receipt.operationFingerprint !== prepared.fingerprint) conflict();
   if (
