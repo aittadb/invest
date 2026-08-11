@@ -133,3 +133,17 @@ Keep commands synchronized with `package.json`, CI, README, and contributor docs
 Use feature branches. Keep intended changes checkpointed with focused commits; do not leave completed work loose in the worktree. For parallel agent implementation, reserve independent PLAN tasks first, use one isolated Git worktree per task, and integrate only reviewed, complete, validated commits after their declared dependencies. Preserve unrelated work. Do not push to `main`, merge, deploy, publish, rotate hosted secrets, or change Sites access without explicit approval.
 
 Production publication is blocked until the configured backend supports the required authorization, consistency, listing, pagination, quota, and non-disclosure behavior and the production adapter passes contract and end-to-end tests.
+
+## Multi-agent execution
+
+- GPT-5.6 Sol Ultra is the primary architect, orchestrator, integrator, and final decision-maker.
+- The primary agent owns requirements analysis, architecture, task decomposition, dependency ordering, conflict resolution, final review, and validation.
+- Use GPT-5.6 Luna Max for small, fully specified implementation tasks with clear scope, acceptance criteria, file ownership, tests, and no unresolved architectural decisions.
+- Use GPT-5.6 Terra High for read-only codebase exploration, dependency mapping, and investigation when implementation boundaries are not yet clear.
+- Use GPT-5.6 Sol High or Max for independent architecture, security, correctness, and integration review.
+- Do not delegate ambiguous product, protocol, authorization, data-integrity, concurrency, or cross-cutting architectural decisions to Luna.
+- Parallelize only independent work. Never allow concurrent write agents to modify overlapping files, shared behavior, or tightly coupled components.
+- Every delegated implementation unit must include implementation, relevant tests, and documentation as one complete task.
+- Subagents must report changed files, validation performed, assumptions, and unresolved risks.
+- The primary agent must inspect and integrate all returned work, resolve review findings, run the full relevant validation suite, and review the final combined diff before declaring completion.
+- Prefer the specified models and reasoning levels whenever explicit subagent selection is available; otherwise treat them as the intended routing policy.
