@@ -11,6 +11,7 @@ const APP_ORIGIN = "https://invest.example.test";
 const ISSUER = "https://storage.example.test";
 const ENTRY_HREF = `${ISSUER}/bounded-storage`;
 const MUTATION_KEY = keyMaterial(1);
+const OWNER_REVIEW_KEY = keyMaterial(2);
 const SERVICE_SECRET = "application-service-client-secret";
 
 const configuredEnvironment = Object.freeze({
@@ -37,6 +38,7 @@ test("application runtime stays disabled without application storage values", as
     "AITTADB_STORAGE_CLIENT_SECRET",
     "AITTADB_STORAGE_SCOPES",
     "BROWSER_MUTATION_SESSION_KEY",
+    "OWNER_INDICATION_REVIEW_KEY",
     "DEPLOYMENT_PUBLICATION_READY",
   ] as const) {
     assert.equal(
@@ -83,6 +85,7 @@ test("complete application configuration is exact and imports a closed key", asy
   assert.equal(configuration.mutationKey.algorithm.name, "AES-GCM");
   assert.equal(configuration.mutationKey.extractable, false);
   assert.deepEqual(configuration.mutationKey.usages, ["encrypt", "decrypt"]);
+  assert.equal(configuration.ownerIndicationReviewKey, null);
   assert.equal(Object.isFrozen(configuration), true);
   assert.equal(Object.isFrozen(configuration.storageScopes), true);
   assert.equal(typeof configuration.createServiceTokenProvider, "function");
@@ -91,6 +94,26 @@ test("complete application configuration is exact and imports a closed key", asy
   const serialized = JSON.stringify(configuration);
   assert.equal(serialized.includes("investor-app-service"), false);
   assert.equal(serialized.includes(SERVICE_SECRET), false);
+});
+
+test("owner indication review uses an optional independent closed key", async () => {
+  const configuration = await parseHostedAittaDBApplicationConfiguration({
+    ...configuredEnvironment,
+    OWNER_INDICATION_REVIEW_KEY: OWNER_REVIEW_KEY,
+  });
+
+  assert.ok(configuration);
+  assert.ok(configuration.ownerIndicationReviewKey);
+  assert.equal(
+    configuration.ownerIndicationReviewKey.algorithm.name,
+    "AES-GCM",
+  );
+  assert.equal(configuration.ownerIndicationReviewKey.extractable, false);
+  assert.deepEqual(
+    configuration.ownerIndicationReviewKey.usages,
+    ["encrypt", "decrypt"],
+  );
+  assert.equal(JSON.stringify(configuration).includes(OWNER_REVIEW_KEY), false);
 });
 
 test("deployment publication readiness accepts only exact boolean text", async () => {
@@ -170,6 +193,7 @@ test("malformed origins, discovery, credentials, scopes, and keys fail closed", 
     ["AITTADB_STORAGE_SCOPES", "storage.write storage.read storage.delete"],
     ["AITTADB_STORAGE_SCOPES", "storage.read storage.write openid"],
     ["BROWSER_MUTATION_SESSION_KEY", "not-base64url"],
+    ["OWNER_INDICATION_REVIEW_KEY", "not-base64url"],
   ];
 
   for (const [field, value] of invalidValues) {
@@ -187,6 +211,7 @@ test("application and interactive proof material is pairwise distinct", async ()
     "AITTADB_STORAGE_CLIENT_ID",
     "AITTADB_STORAGE_CLIENT_SECRET",
     "BROWSER_MUTATION_SESSION_KEY",
+    "OWNER_INDICATION_REVIEW_KEY",
     "AITTADB_OAUTH_CLIENT_ID",
     "AITTADB_OAUTH_CLIENT_SECRET",
     "AITTADB_OAUTH_TRANSACTION_KEY",
@@ -197,6 +222,7 @@ test("application and interactive proof material is pairwise distinct", async ()
     AITTADB_STORAGE_CLIENT_ID: keyMaterial(21),
     AITTADB_STORAGE_CLIENT_SECRET: keyMaterial(22),
     BROWSER_MUTATION_SESSION_KEY: keyMaterial(23),
+    OWNER_INDICATION_REVIEW_KEY: keyMaterial(28),
     AITTADB_OAUTH_CLIENT_ID: keyMaterial(24),
     AITTADB_OAUTH_CLIENT_SECRET: keyMaterial(25),
     AITTADB_OAUTH_TRANSACTION_KEY: keyMaterial(26),

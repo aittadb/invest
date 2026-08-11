@@ -30,6 +30,7 @@ import {
   FOUNDER_INTEREST_PATH,
   FOUNDER_SECONDARY_AREAS_FIELD,
 } from "../domain/participant-founder-interest-resource.ts";
+import { OWNER_INDICATIONS_PATH } from "../domain/owner-indication-moderation-resource.ts";
 import { resolveAppOrigin, withAppOrigin } from "../http/app-origin.ts";
 import { withRuntimeCapabilities } from "../http/runtime-capabilities.ts";
 import { withRuntimeCampaign } from "../http/runtime-campaign.ts";
@@ -75,6 +76,8 @@ import {
 } from "./routes/application.ts";
 import {
   createOwnerIndicationModerationRouteHandler,
+  MAX_OWNER_INDICATION_MODERATION_MUTATION_BYTES,
+  MAX_OWNER_INDICATION_MODERATION_MUTATION_FIELDS,
   type OwnerIndicationModerationRouteDependencies,
 } from "./routes/owner-indication-moderation.ts";
 import {
@@ -217,9 +220,19 @@ export function createApplicationWorker(
             packageRoutes?.participantAcknowledgment
           : undefined;
       const ownerPackageAvailable = ownerPackage !== undefined;
+      const ownerIndicationModeration =
+        dependencies.dispatchRoute === undefined
+          ? dependencies.ownerIndicationModeration ??
+            await runtimeOwnerIndicationModeration(
+              applicationRuntime,
+              actor,
+              isOwner,
+              resourceUrl,
+              url.pathname,
+            )
+          : undefined;
       const ownerIndicationModerationAvailable =
-        dependencies.dispatchRoute === undefined &&
-        dependencies.ownerIndicationModeration !== undefined;
+        ownerIndicationModeration !== undefined;
       const ownerReviewExportsAvailable =
         dependencies.dispatchRoute === undefined &&
         dependencies.ownerReviewExports !== undefined;
@@ -415,6 +428,7 @@ export function createApplicationWorker(
               ownerOAuthProof,
               participantRegistration,
               participantProfile,
+              ownerIndicationModeration,
               ownerAuditHistory,
               ownerFounderReview,
               ownerAuditNotificationHistory,
@@ -505,6 +519,9 @@ function createInjectedRouteDispatcher(
   ownerOAuthProof: OwnerOAuthProofRouteDependencies | null,
   participantRegistration: ParticipantRegistrationRouteDependencies | null,
   participantProfile: ParticipantProfileRouteDependencies | null,
+  ownerIndicationModeration:
+    | OwnerIndicationModerationRouteDependencies
+    | undefined,
   ownerAuditHistory: OwnerAuditHistoryRouteDependencies | undefined,
   ownerFounderReview:
     | FounderApplicationReviewCollectionRepository
@@ -563,9 +580,9 @@ function createInjectedRouteDispatcher(
         ...(packageRoutes.owner
           ? [createOwnerPackageRouteHandler(packageRoutes.owner)]
           : []),
-        ...(dependencies.ownerIndicationModeration
+        ...(ownerIndicationModeration
           ? [createOwnerIndicationModerationRouteHandler(
-              dependencies.ownerIndicationModeration,
+              ownerIndicationModeration,
             )]
           : []),
         ...(dependencies.ownerReviewExports
@@ -1082,6 +1099,89 @@ function randomOperationId(namespace: string): StorageOperationId {
   );
   if (!parsed.ok) throw new Error("Unable to issue a package operation ID.");
   return parsed.value;
+}
+
+async function runtimeOwnerIndicationModeration(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  resourceUrl: string,
+  pathname: string,
+): Promise<OwnerIndicationModerationRouteDependencies | undefined> {
+  const exactResource = pathname === OWNER_INDICATIONS_PATH ||
+    pathname.startsWith(`${OWNER_INDICATIONS_PATH}/`);
+  if (
+    runtime === null ||
+    runtime.ownerIndicationReviewTokens === undefined ||
+    (pathname !== "/owner" && !exactResource)
+  ) {
+    return undefined;
+  }
+  if (actor === null || !isOwner) {
+    return exactResource ? unavailableOwnerIndicationModeration() : undefined;
+  }
+  const owner = parseActorSubject(actor.userId);
+  if (!owner.ok) {
+    return exactResource ? unavailableOwnerIndicationModeration() : undefined;
+  }
+
+  try {
+    const campaign = await runtime.repositoryFactory
+      .campaignRepository()
+      .readSetup();
+    if (campaign === null) {
+      return exactResource ? unavailableOwnerIndicationModeration() : undefined;
+    }
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "owner" as const,
+      subject: owner.value,
+    });
+    return Object.freeze({
+      repository: runtime.repositoryFactory.ownerIndicationModeration(
+        owner.value,
+        owner.value,
+        campaign.setup.amountAggregate.amount,
+        runtime.ownerIndicationReviewTokens,
+      ),
+      verifyMutation: (request: Request) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          {
+            maxBodyBytes: MAX_OWNER_INDICATION_MODERATION_MUTATION_BYTES,
+            maxFields: MAX_OWNER_INDICATION_MODERATION_MUTATION_FIELDS,
+            repeatedFormFields: [],
+          },
+        ),
+      csrfToken: (request: Request) =>
+        runtime.mutationSession.issue(request, identity, appOrigin),
+      issueOperationId: () => randomOperationId("owner-rejection"),
+      now: runtime.now,
+    });
+  } catch {
+    return exactResource ? unavailableOwnerIndicationModeration() : undefined;
+  }
+}
+
+function unavailableOwnerIndicationModeration():
+  OwnerIndicationModerationRouteDependencies {
+  const unavailable = (): never => {
+    throw new StorageFailure("UNAVAILABLE");
+  };
+  return Object.freeze({
+    repository: Object.freeze({
+      moderationConsistency:
+        "atomic-indication-aggregate-audit-notification" as const,
+      list: async () => unavailable(),
+      get: async () => unavailable(),
+      rejectWithEffects: async () => unavailable(),
+    }),
+    verifyMutation: async () => unavailable(),
+    csrfToken: async () => null,
+    issueOperationId: unavailable,
+  });
 }
 
 function runtimeOwnerAuditHistory(

@@ -23,6 +23,8 @@ import type {
 } from "../repositories/in-memory-audit-notification-repositories.ts";
 import type { PublicCampaignStateReader } from "../repositories/storage-public-campaign-state-reader.ts";
 import type { CampaignRevisionBoundAggregateCorrectionRepository } from "../repositories/in-memory-aggregate-repository.ts";
+import type { OwnerIndicationReviewTokenBoundary } from "../services/owner-indication-review-tokens.ts";
+import type { AtomicOwnerIndicationModerationRepository } from "../services/owner-indication-moderation.ts";
 import type {
   AtomicParticipantInvestmentInterestMutationPort,
   ParticipantInvestmentInterestReader,
@@ -41,6 +43,13 @@ export type ApplicationRepositoryFactory = Readonly<{
   publicCampaignStateReader(): PublicCampaignStateReader;
   ownerPackageWorkspace(): OwnerPackageWorkspaceService;
   ownerAuditEvents(): AuditEventReader;
+  ownerIndicationModeration(
+    authenticatedSubject: ActorSubject | null,
+    configuredOwnerSubject: ActorSubject,
+    amountConfiguration: AmountConfiguration,
+    tokens: OwnerIndicationReviewTokenBoundary,
+    parsingOptions?: InvestmentIndicationParsingOptions,
+  ): AtomicOwnerIndicationModerationRepository;
   ownerFounderApplicationReviews(): FounderApplicationReviewCollectionRepository;
   ownerManualNotificationActivity(): AtomicManualNotificationActivityRepository;
   ownerAggregateReconciliation(
@@ -65,6 +74,7 @@ export type ApplicationRepositoryFactory = Readonly<{
 export type ApplicationRuntimeDeploymentCapability = Readonly<{
   repositoryFactory: ApplicationRepositoryFactory;
   mutationSession: BrowserMutationSession;
+  ownerIndicationReviewTokens?: OwnerIndicationReviewTokenBoundary;
   publicationReady: boolean;
   now(): Date;
 }>;

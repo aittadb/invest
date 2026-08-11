@@ -10,6 +10,7 @@ import {
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
 import { StorageApplicationRepositoryFactory } from "../repositories/storage-application-repository-factory.ts";
 import type { AittaDBServiceTokenFetch } from "../services/aittadb-service-token.ts";
+import { AeadOwnerIndicationReviewTokenBoundary } from "../services/owner-indication-review-tokens.ts";
 import type { InvestorAppEnv } from "./contracts.ts";
 import type { ApplicationRuntimeDeploymentCapability } from "./deployment-capabilities.ts";
 import { parseHostedAittaDBApplicationConfiguration } from "./hosted-application-configuration.ts";
@@ -95,9 +96,19 @@ async function composeHostedApplicationRuntime(
       maxFields: MAX_MUTATION_FIELDS,
       repeatedFormFields: [FOUNDER_SECONDARY_AREAS_FIELD],
     });
+    const ownerIndicationReviewTokens =
+      configuration.ownerIndicationReviewKey === null
+        ? null
+        : new AeadOwnerIndicationReviewTokenBoundary({
+            encryptionKey: configuration.ownerIndicationReviewKey,
+            randomBytes,
+          });
     return Object.freeze({
       repositoryFactory,
       mutationSession,
+      ...(ownerIndicationReviewTokens === null
+        ? {}
+        : { ownerIndicationReviewTokens }),
       publicationReady: configuration.publicationReady,
       now,
     });

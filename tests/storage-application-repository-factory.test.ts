@@ -216,6 +216,7 @@ test("factory exposes only named application repository capabilities", async () 
     "ownerPackageWorkspace",
     "ownerAuditEvents",
     "ownerIndicationReviews",
+    "ownerIndicationModeration",
     "ownerFounderApplicationReviews",
     "ownerManualNotificationActivity",
     "ownerAggregateReconciliation",
@@ -402,6 +403,34 @@ test("factory exposes only named application repository capabilities", async () 
     (error) => storageFailure(error, "NOT_FOUND"),
   );
   assertNoGenericStorageSurface(reconciliation, storage);
+  const moderation = factory.ownerIndicationModeration(
+    subject.value,
+    subject.value,
+    amount.value.amount,
+    OWNER_REVIEW_TOKENS,
+  );
+  assert.notEqual(
+    factory.ownerIndicationModeration(
+      subject.value,
+      subject.value,
+      amount.value.amount,
+      OWNER_REVIEW_TOKENS,
+    ),
+    moderation,
+  );
+  assert.deepEqual(Object.keys(moderation), ["moderationConsistency"]);
+  assert.equal(
+    moderation.moderationConsistency,
+    "atomic-indication-aggregate-audit-notification",
+  );
+  assert.equal(typeof moderation.list, "function");
+  assert.equal(typeof moderation.get, "function");
+  assert.equal(typeof moderation.rejectWithEffects, "function");
+  assert.equal(Object.isFrozen(moderation), true);
+  for (const property of ["adapter", "storage", "read", "transact"]) {
+    assert.equal(property in moderation, false, property);
+  }
+  assert.equal(Object.values(moderation).includes(storage), false);
   const investment = factory.participantInvestmentRepository(
     subject.value,
     amount.value.amount,

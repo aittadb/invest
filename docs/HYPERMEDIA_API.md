@@ -218,7 +218,7 @@ The continuation value is the bounded-storage protocol's opaque cursor, not a su
 
 ## Owner Investment-Indication Moderation
 
-`GET /owner/investment-indications` exposes a bounded owner-only collection with opaque review identifiers. It accepts only `page_size`, bounded from 1 through 100, and an optional opaque `cursor`. Summary data includes indication kind, lifecycle, amount, currency, revision, update time, and manual-notification state; internal indication identifiers and participant subjects do not enter collection links.
+`GET /owner/investment-indications` exposes a bounded owner-only collection with opaque review identifiers. It accepts only `page_size`, bounded from 1 through 25, and an optional opaque `cursor`. Summary data includes only the opaque review ID, indication kind, lifecycle, amount, currency, revision, and update time; internal indication identifiers, participant subjects, company identifiers, notes, and notification detail do not enter the collection or its links.
 
 `GET /owner/investment-indications/{review-id}` exposes the permitted private detail and immutable transition history to the configured owner. An active indication backed by the required strong repository capability advertises `reject-investment-indication`. The `POST` action carries a hidden server-issued `operation-id`, hidden `expected-revision`, and one participant-visible multiline `reason` bounded to 500 characters. HTML forms and version `0.1` hypermedia actions derive from the same contract, and JSON clients receive CSRF discovery in the designated response header only while a mutation is available.
 

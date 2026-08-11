@@ -23,7 +23,8 @@ import type {
 } from "./storage-adapter.ts";
 import type {
   OwnerIndicationModerationItem,
-  OwnerIndicationModerationPage,
+  OwnerIndicationReviewPage,
+  OwnerIndicationReviewSummary,
 } from "../services/owner-indication-moderation.ts";
 
 export const OWNER_INDICATIONS_PATH = "/owner/investment-indications";
@@ -36,7 +37,6 @@ export type OwnerIndicationSummary = Readonly<{
   currency: string;
   updated_at: string;
   revision: number;
-  notification_state: "none" | "not-marked-sent" | "marked-sent";
 }>;
 
 export type OwnerIndicationCollectionDocument = Readonly<{
@@ -113,7 +113,7 @@ export type OwnerIndicationOperationIdIssuer = () => StorageOperationId;
 
 export function createOwnerIndicationCollectionDocument(
   requestUrl: string,
-  page: OwnerIndicationModerationPage,
+  page: OwnerIndicationReviewPage,
   pageSize: number,
 ): OwnerIndicationCollectionDocument {
   const self = new URL(requestUrl);
@@ -242,20 +242,16 @@ function rejectControl(
 }
 
 function projectSummary(
-  item: OwnerIndicationModerationItem,
+  item: OwnerIndicationReviewSummary,
 ): OwnerIndicationSummary {
-  const { indication, notification } = item;
   return {
     review_id: item.reviewId,
-    kind: indication.kind,
-    status: indication.lifecycle.status,
-    amount: indication.fields.amount,
-    currency: indication.fields.currency,
-    updated_at: indication.updatedAt,
-    revision: indication.revision,
-    notification_state: notification === null
-      ? "none"
-      : manualNotificationDeliveryState(notification.record),
+    kind: item.kind,
+    status: item.status,
+    amount: item.amount,
+    currency: item.currency,
+    updated_at: item.updatedAt,
+    revision: item.revision,
   };
 }
 

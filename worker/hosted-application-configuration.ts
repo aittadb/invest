@@ -20,6 +20,7 @@ const REQUIRED_CONFIGURATION_FIELDS = [
 ] as const;
 const OPTIONAL_CONFIGURATION_FIELDS = [
   "AITTADB_STORAGE_TRANSPORT_ORIGIN",
+  "OWNER_INDICATION_REVIEW_KEY",
   "DEPLOYMENT_PUBLICATION_READY",
 ] as const;
 
@@ -32,6 +33,7 @@ export type HostedAittaDBApplicationEnvironment = Readonly<{
   AITTADB_STORAGE_CLIENT_SECRET?: unknown;
   AITTADB_STORAGE_SCOPES?: unknown;
   BROWSER_MUTATION_SESSION_KEY?: unknown;
+  OWNER_INDICATION_REVIEW_KEY?: unknown;
   DEPLOYMENT_PUBLICATION_READY?: unknown;
   AITTADB_OAUTH_CLIENT_ID?: unknown;
   AITTADB_OAUTH_CLIENT_SECRET?: unknown;
@@ -46,6 +48,7 @@ export type HostedAittaDBApplicationConfiguration = Readonly<{
   storageEntryHref: string;
   storageScopes: readonly AittaDBStorageScope[];
   mutationKey: CryptoKey;
+  ownerIndicationReviewKey: CryptoKey | null;
   publicationReady: boolean;
   createServiceTokenProvider(
     dependencies: Readonly<{
@@ -106,6 +109,9 @@ export async function parseHostedAittaDBApplicationConfiguration(
     const mutationKeyMaterial = exactKeyMaterial(
       environment.BROWSER_MUTATION_SESSION_KEY,
     );
+    const ownerIndicationReviewKeyMaterial = optionalKeyMaterial(
+      environment.OWNER_INDICATION_REVIEW_KEY,
+    );
     const publicationReady = exactPublicationReadiness(
       environment.DEPLOYMENT_PUBLICATION_READY,
     );
@@ -114,8 +120,12 @@ export async function parseHostedAittaDBApplicationConfiguration(
       serviceClientId,
       serviceClientSecret,
       mutationKeyMaterial,
+      ownerIndicationReviewKeyMaterial,
     );
     const mutationKey = await importAesKey(mutationKeyMaterial);
+    const ownerIndicationReviewKey = ownerIndicationReviewKeyMaterial === null
+      ? null
+      : await importAesKey(ownerIndicationReviewKeyMaterial);
     const createServiceTokenProvider = Object.freeze((
       dependencies: Readonly<{
         expirySkewSeconds: number;
@@ -142,6 +152,7 @@ export async function parseHostedAittaDBApplicationConfiguration(
       storageEntryHref,
       storageScopes: Object.freeze([...storageScopes]),
       mutationKey,
+      ownerIndicationReviewKey,
       publicationReady,
       createServiceTokenProvider,
     });
@@ -233,16 +244,22 @@ function exactKeyMaterial(value: unknown): string {
   return value;
 }
 
+function optionalKeyMaterial(value: unknown): string | null {
+  return value === undefined ? null : exactKeyMaterial(value);
+}
+
 function rejectReusedProofMaterial(
   environment: HostedAittaDBApplicationEnvironment,
   serviceClientId: string,
   serviceClientSecret: string,
   mutationKey: string,
+  ownerIndicationReviewKey: string | null,
 ): void {
   const material = [
     serviceClientId,
     serviceClientSecret,
     mutationKey,
+    ownerIndicationReviewKey,
     environment.AITTADB_OAUTH_CLIENT_ID,
     environment.AITTADB_OAUTH_CLIENT_SECRET,
     environment.AITTADB_OAUTH_TRANSACTION_KEY,

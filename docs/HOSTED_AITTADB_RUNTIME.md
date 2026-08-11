@@ -37,6 +37,8 @@ registration reconstructs the current package and permitted profile and
 workflow controls from persistent state. A deletion-requested entry retains
 package reading, profile viewing, and sign-out while withholding founder and
 investment actions.
+Export and coordinated deletion persistence still require their own named
+capabilities.
 
 Founder composition opens private campaign policy and a fresh subject-bound
 campaign/profile/application scope only for the exact founder resource after
@@ -61,19 +63,24 @@ retry on the immutable winner. Its contribution scan stops at 1,000 records or
 
 The persistent owner indication-detail primitive can resolve one deployment-key
 opaque review ID to a bounded verified current record and notification without a
-list scan. It is not installed as a hosted owner route until the separate owner
-moderation composition supplies the shared token boundary, collection, detail,
-atomic rejection, and mutation-session capabilities together.
+list scan.
 
 The persistent owner-rejection primitive can commit an indication transition,
 aggregate update, audit event, notification template, and retry receipt
-atomically. Hosted moderation still requires the separate route composition
-that assembles the collection, detail, rejection, and mutation-session lanes.
+atomically.
+
+When `OWNER_INDICATION_REVIEW_KEY` is configured, the runtime imports one
+non-extractable owner-review key and assembles the persistent summary
+collection, one opaque detail reader, atomic rejection, and hosted mutation
+session into the owner route group. Detail resolution performs no list scan;
+rejection commits the indication transition, aggregate update, audit event,
+notification template, and retry receipt atomically. Missing review-key
+configuration omits only this capability and does not expose a partial route.
+
 The already-created private notification records are available through the
 hosted owner collection/detail route, whose copy and owner-entered sent
-transitions append audit evidence atomically. Indication route, export,
-deletion coordination, and profile-route composition retain their own named
-capability boundaries.
+transitions append audit evidence atomically. Export, deletion coordination,
+and profile-route composition retain their own named capability boundaries.
 
 This source composition and its deterministic protocol services are not hosted
 acceptance evidence. Activation remains blocked until the configured AittaDB
@@ -105,7 +112,10 @@ Hosted secrets:
 
 - `AITTADB_STORAGE_CLIENT_SECRET`: dedicated service-client secret; and
 - `BROWSER_MUTATION_SESSION_KEY`: canonical base64url encoding of an independent
-  256-bit AES-GCM key.
+  256-bit AES-GCM key; and
+- `OWNER_INDICATION_REVIEW_KEY`: optional canonical base64url encoding of a
+  different 256-bit AES-GCM key. Configure it to enable owner indication
+  collection, detail, and rejection routes.
 
 The service client is non-interactive. Register no browser origin or redirect
 URI for it. AittaDB must bind it to only this deployment's isolated storage
@@ -137,6 +147,7 @@ only:
 {
   repositoryFactory,
   mutationSession,
+  ownerIndicationReviewTokens?,
   publicationReady,
   now,
 }
@@ -193,17 +204,15 @@ map. `StoragePackageVersionRepository` and
 `InMemory*` names remain compatibility exports for deterministic fixtures.
 
 `ownerIndicationReviews(authenticatedSubject, configuredOwnerSubject, tokens)`
-creates a fresh read-only repository bound to that exact owner authorization
-decision and to a narrow application-owned navigation-token capability.
-The repository lists only the bounded current indication collection and returns
-an allowlisted opaque summary page; it exposes no generic storage, detail, or
-mutation method. The application runtime type does not install this capability
-into a route yet. Hosted moderation composition remains separate so collection,
-detail, token-key import, and rejection contracts can be validated independently.
-The future composition must import one stable, non-extractable, deployment-only
-AES-GCM key and inject the stateless token boundary; no key material, backend
-cursor, or decrypted current-record key may enter runtime configuration output,
-campaign content, logs, or browser-visible failures.
+remains the narrow read-only summary capability. Hosted route composition uses
+`ownerIndicationModeration(...)`, a fresh frozen facade over that collection,
+the one-record detail reader, and atomic rejection. Both are bound to the exact
+owner authorization decision and one application-owned navigation-token
+boundary. The runtime imports one stable, non-extractable, deployment-only
+AES-GCM key and exposes only the resulting token capability; no key material,
+backend cursor, decrypted current-record key, or adapter enters runtime
+configuration output, campaign content, rendering, logs, or browser-visible
+failures.
 
 The owner founder-review capability is a singleton read port with only `list`.
 It exposes neither the adapter nor a detail lookup. Each request lists at most 25

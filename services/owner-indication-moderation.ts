@@ -61,11 +61,6 @@ export interface OwnerIndicationReviewCollectionRepository {
   ): Promise<OwnerIndicationReviewPage>;
 }
 
-export type OwnerIndicationModerationPage = Readonly<{
-  items: readonly OwnerIndicationModerationItem[];
-  nextCursor: StorageCursor | null;
-}>;
-
 /** Owner-bound read contract for one opaque indication review resource. */
 export interface OwnerIndicationReviewDetailRepository {
   get(reviewId: unknown): Promise<OwnerIndicationModerationItem | null>;
@@ -110,6 +105,6 @@ export interface AtomicOwnerIndicationModerationRepository
   extends AtomicOwnerIndicationRejectionRepository {
   list(
     request: OwnerIndicationModerationListRequest,
-  ): Promise<OwnerIndicationModerationPage>;
+  ): Promise<OwnerIndicationReviewPage>;
   get(reviewId: unknown): Promise<OwnerIndicationModerationItem | null>;
 }

@@ -34,6 +34,9 @@ import {
 import type {
   OwnerIndicationReviewTokenBoundary,
 } from "../services/owner-indication-review-tokens.ts";
+import type {
+  AtomicOwnerIndicationModerationRepository,
+} from "../services/owner-indication-moderation.ts";
 import {
   MAX_CAMPAIGN_SETUP_MATERIALIZATION_READS,
   StorageCampaignRepository,
@@ -84,6 +87,7 @@ import {
   StoragePublicCampaignStateReader,
   type PublicCampaignStateReader,
 } from "./storage-public-campaign-state-reader.ts";
+import { StorageOwnerIndicationModerationRepository } from "./storage-owner-indication-moderation-repository.ts";
 
 const REPLAY_SCHEMA_VERSION = 1;
 const REPLAY_COLLECTION = storageCollection("browser-mutation-replays");
@@ -254,6 +258,23 @@ export class StorageApplicationRepositoryFactory {
       authenticatedSubject,
       configuredOwnerSubject,
       tokens,
+    );
+  }
+
+  ownerIndicationModeration(
+    authenticatedSubject: ActorSubject | null,
+    configuredOwnerSubject: ActorSubject,
+    amountConfiguration: AmountConfiguration,
+    tokens: OwnerIndicationReviewTokenBoundary,
+    parsingOptions: InvestmentIndicationParsingOptions = {},
+  ): AtomicOwnerIndicationModerationRepository {
+    return new StorageOwnerIndicationModerationRepository(
+      this.#storage,
+      authenticatedSubject,
+      configuredOwnerSubject,
+      amountConfiguration,
+      tokens,
+      parsingOptions,
     );
   }
 

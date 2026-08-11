@@ -53,7 +53,7 @@ import type {
   AtomicOwnerIndicationModerationRepository,
   OwnerIndicationModerationItem,
   OwnerIndicationModerationListRequest,
-  OwnerIndicationModerationPage,
+  OwnerIndicationReviewPage,
   RejectIndicationWithEffectsRequest,
   RejectIndicationWithEffectsResult,
 } from "../services/owner-indication-moderation.ts";
@@ -133,7 +133,7 @@ test("owner indication resources are finite, canonical, equivalent, and non-disc
   );
 
   const invalidPage = await fixture.request(
-    "/owner/investment-indications?page_size=101&unexpected=value",
+    "/owner/investment-indications?page_size=26&unexpected=value",
     { accept: "application/json", actor: "owner" },
   );
   assert.equal(invalidPage.status, 400);
@@ -379,9 +379,18 @@ class FakeAtomicModerationRepository
 
   async list(
     request: OwnerIndicationModerationListRequest,
-  ): Promise<OwnerIndicationModerationPage> {
+  ): Promise<OwnerIndicationReviewPage> {
     const offset = cursorOffset(request.cursor);
-    const items = [this.#item].slice(offset, offset + request.limit);
+    const indication = this.#item.indication;
+    const items = [Object.freeze({
+      reviewId: this.#item.reviewId,
+      kind: indication.kind,
+      status: indication.lifecycle.status,
+      amount: indication.fields.amount,
+      currency: indication.fields.currency,
+      updatedAt: indication.updatedAt,
+      revision: indication.revision,
+    })].slice(offset, offset + request.limit);
     const nextCursor = offset + items.length < 1
       ? cursor(offset + items.length)
       : null;

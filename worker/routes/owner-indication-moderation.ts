@@ -31,9 +31,10 @@ import {
   MUTATION_CSRF_HEADER,
   MutationSecurityFailure,
   toPublicMutationSecurityFailure,
-  type BrowserMutationGuard,
   type MutationMediaType,
+  type VerifiedMutationRequest,
 } from "../../http/mutation-security.ts";
+import type { BrowserMutationProof } from "../../http/browser-mutation-session.ts";
 import type {
   AtomicOwnerIndicationModerationRepository,
   RejectIndicationWithEffectsResult,
@@ -48,6 +49,9 @@ import {
 } from "./responses.ts";
 
 const DEFAULT_PAGE_SIZE = 25;
+const MAX_PAGE_SIZE = 25;
+export const MAX_OWNER_INDICATION_MODERATION_MUTATION_BYTES = 8_192;
+export const MAX_OWNER_INDICATION_MODERATION_MUTATION_FIELDS = 4;
 const MUTATION_FIELDS = new Set([
   "operation-id",
   "expected-revision",
@@ -61,8 +65,12 @@ type ModerationRoute =
 
 export type OwnerIndicationModerationRouteDependencies = Readonly<{
   repository: AtomicOwnerIndicationModerationRepository;
-  verifyMutation: BrowserMutationGuard;
-  csrfToken: (request: Request) => Promise<string | null>;
+  verifyMutation: (
+    request: Request,
+  ) => Promise<VerifiedMutationRequest & Readonly<{ clearCookie?: string }>>;
+  csrfToken: (
+    request: Request,
+  ) => Promise<string | BrowserMutationProof | null>;
   issueOperationId: OwnerIndicationOperationIdIssuer;
   now?: () => Date;
 }>;
@@ -76,6 +84,7 @@ export function createOwnerIndicationModerationRouteHandler(
   const now = dependencies.now ?? (() => new Date());
 
   return async (context) => {
+    let clearCookie: string | null = null;
     const route = parseRoute(context.url);
     if (route === null) return null;
     const negotiated = negotiateRepresentation(
@@ -129,6 +138,7 @@ export function createOwnerIndicationModerationRouteHandler(
           representation,
           resource,
           dependencies.csrfToken,
+          null,
         );
       }
 
@@ -140,6 +150,7 @@ export function createOwnerIndicationModerationRouteHandler(
       }
       assertNoQuery(context.url);
       const verified = await dependencies.verifyMutation(context.request);
+      clearCookie = optionalClearCookie(verified.clearCookie);
       if (
         verified.method !== "POST" ||
         verified.actor.type !== "owner" ||
@@ -175,14 +186,14 @@ export function createOwnerIndicationModerationRouteHandler(
         context.resourceUrl,
       ).href;
       if (representation === "html") {
-        return new Response(null, {
+        return withSetCookies(new Response(null, {
           status: 303,
           headers: {
             "Cache-Control": "no-store",
             Location: detailUrl,
             Vary: "Accept",
           },
-        });
+        }), [clearCookie]);
       }
       const resource = createOwnerIndicationDetailResource(
         detailUrl,
@@ -195,13 +206,14 @@ export function createOwnerIndicationModerationRouteHandler(
         representation,
         resource,
         dependencies.csrfToken,
+        clearCookie,
       );
     } catch (error) {
-      return mappedFailureResponse(
+      return withSetCookies(mappedFailureResponse(
         representation,
         context.resourceUrl,
         error,
-      );
+      ), [clearCookie]);
     }
   };
 }
@@ -211,14 +223,18 @@ async function detailResponse(
   representation: Representation,
   resource: OwnerIndicationDetailResource,
   csrfProvider: OwnerIndicationModerationRouteDependencies["csrfToken"],
+  clearCookie: string | null,
 ): Promise<Response> {
-  const token = resource.reject === null
+  const proof = resource.reject === null
     ? null
-    : requiredCsrfToken(await csrfProvider(context.request));
+    : requiredCsrfProof(await csrfProvider(context.request));
   const response = representation === "hypermedia-json"
     ? hypermediaResponse(resource.document)
-    : htmlResponse(renderDetail(resource, token));
-  return token === null ? response : withCsrfToken(response, token);
+    : htmlResponse(renderDetail(resource, proof?.token ?? null));
+  if (proof !== null) {
+    response.headers.set(MUTATION_CSRF_HEADER, proof.token);
+  }
+  return withSetCookies(response, [clearCookie, proof?.setCookie ?? null]);
 }
 
 function parseRoute(url: URL): ModerationRoute | null {
@@ -253,7 +269,7 @@ function parsePageRequest(
   if (
     !Number.isSafeInteger(limit) ||
     limit < 1 ||
-    limit > 100 ||
+    limit > MAX_PAGE_SIZE ||
     (serialized !== undefined && String(limit) !== serialized)
   ) {
     throw new StorageFailure("INVALID_REQUEST");
@@ -428,16 +444,46 @@ function currentTimestamp(now: () => Date): Timestamp {
   return parsed.value;
 }
 
+function requiredCsrfProof(
+  value: string | BrowserMutationProof | null,
+): Readonly<{ token: string; setCookie: string | null }> {
+  if (typeof value === "string") {
+    return Object.freeze({ token: requiredCsrfToken(value), setCookie: null });
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !validSetCookie(value.setCookie)
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return Object.freeze({
+    token: requiredCsrfToken(value.token),
+    setCookie: value.setCookie,
+  });
+}
+
 function requiredCsrfToken(value: unknown): string {
   if (
     typeof value !== "string" ||
     value.length < 32 ||
     value.length > 256 ||
     !/^[A-Za-z0-9_-]+$/.test(value)
-  ) {
-    throw new StorageFailure("UNAVAILABLE");
-  }
+  ) throw new StorageFailure("UNAVAILABLE");
   return value;
+}
+
+function optionalClearCookie(value: unknown): string | null {
+  if (value === undefined) return null;
+  if (!validSetCookie(value)) throw new StorageFailure("UNAVAILABLE");
+  return value;
+}
+
+function validSetCookie(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 4_096 &&
+    !/[\r\n]/u.test(value);
 }
 
 function hasUnsafeMultilineCharacter(value: string): boolean {
@@ -479,9 +525,14 @@ function sameNotificationSnapshot(
     left.sentMarker === right.sentMarker;
 }
 
-function withCsrfToken(response: Response, token: string): Response {
+function withSetCookies(
+  response: Response,
+  cookies: readonly (string | null)[],
+): Response {
+  const selected = cookies.filter(validSetCookie);
+  if (selected.length === 0) return response;
   const headers = new Headers(response.headers);
-  headers.set(MUTATION_CSRF_HEADER, token);
+  for (const cookie of selected) headers.append("Set-Cookie", cookie);
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
