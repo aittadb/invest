@@ -80,6 +80,13 @@ export type FounderInterestServiceOptions = Readonly<{
   now?: () => Date;
 }>;
 
+type FounderInterestMutationMetadata = Readonly<{
+  operationId: StorageOperationId;
+  historyEntryId: FounderApplicationHistoryEntryId;
+  occurredAt: Timestamp;
+  replayKnown: boolean;
+}>;
+
 /**
  * Compose one participant's use case without retaining process-local state.
  * Repository identity, campaign policy, contribution choices, and time are all
@@ -130,9 +137,40 @@ export function createParticipantFounderInterestService(
     return allowed;
   };
 
+  const knownReplayMetadata = (
+    current: FounderApplication | null,
+    operationId: StorageOperationId,
+    historyEntryId: FounderApplicationHistoryEntryId,
+  ): FounderInterestMutationMetadata | null => {
+    const priorEntry = current?.history.find(
+      (entry) => entry.id === historyEntryId,
+    );
+    return priorEntry === undefined
+      ? null
+      : Object.freeze({
+          operationId,
+          historyEntryId,
+          occurredAt: priorEntry.occurredAt,
+          replayKnown: true,
+        });
+  };
+
+  const recoverMutationReplay = async (
+    metadata: FounderInterestMutationMetadata,
+  ): Promise<FounderInterestMutationMetadata | null> =>
+    knownReplayMetadata(
+      await loadOwned(),
+      metadata.operationId,
+      metadata.historyEntryId,
+    );
+
   const mutationRepository = async (
     provider: FounderInterestMutationRepositoryProvider,
-  ): Promise<FounderApplicationRepository> => {
+    metadata: FounderInterestMutationMetadata,
+  ): Promise<Readonly<{
+    repository: FounderApplicationRepository;
+    metadata: FounderInterestMutationMetadata;
+  }>> => {
     let repository: unknown;
     try {
       repository = await provider();
@@ -140,20 +178,22 @@ export function createParticipantFounderInterestService(
       throw new StorageFailure("UNAVAILABLE", { cause: error });
     }
     if (repository === null) {
-      throw new StorageFailure("PRECONDITION_FAILED");
+      const recovered = await recoverMutationReplay(metadata);
+      if (recovered === null) {
+        throw new StorageFailure("PRECONDITION_FAILED");
+      }
+      return Object.freeze({
+        repository: options.repository,
+        metadata: recovered,
+      });
     }
     if (!isFounderApplicationRepository(repository)) unavailable();
-    return repository;
+    return Object.freeze({ repository, metadata });
   };
 
   const mutationMetadata = async (
     operation: unknown,
-  ): Promise<Readonly<{
-    operationId: StorageOperationId;
-    historyEntryId: FounderApplicationHistoryEntryId;
-    occurredAt: Timestamp;
-    replayKnown: boolean;
-  }>> => {
+  ): Promise<FounderInterestMutationMetadata> => {
     const operationId = parseStorageOperationId(operation);
     const historyEntryId = parseStableId<"founder-application-history-entry">(
       operation,
@@ -161,17 +201,12 @@ export function createParticipantFounderInterestService(
     if (!operationId.ok || !historyEntryId.ok) invalidRequest();
 
     const current = await loadOwned();
-    const priorEntry = current?.history.find(
-      (entry) => entry.id === historyEntryId.value,
+    const replay = knownReplayMetadata(
+      current,
+      operationId.value,
+      historyEntryId.value,
     );
-    if (priorEntry) {
-      return Object.freeze({
-        operationId: operationId.value,
-        historyEntryId: historyEntryId.value,
-        occurredAt: priorEntry.occurredAt,
-        replayKnown: true,
-      });
-    }
+    if (replay !== null) return replay;
 
     let currentDate: Date;
     try {
@@ -206,11 +241,16 @@ export function createParticipantFounderInterestService(
     },
 
     async create(input: CreateFounderInterestInput) {
-      const metadata = await mutationMetadata(input.operationId);
+      let metadata = await mutationMetadata(input.operationId);
       let repository = options.repository;
       if (!metadata.replayKnown) {
         if (options.repositoryForCreate !== undefined) {
-          repository = await mutationRepository(options.repositoryForCreate);
+          const selected = await mutationRepository(
+            options.repositoryForCreate,
+            metadata,
+          );
+          repository = selected.repository;
+          metadata = selected.metadata;
         } else if (!(await creationAllowed())) {
           throw new StorageFailure("PRECONDITION_FAILED");
         }
@@ -231,11 +271,16 @@ export function createParticipantFounderInterestService(
     },
 
     async edit(input: EditFounderInterestInput) {
-      const metadata = await mutationMetadata(input.operationId);
-      const repository = !metadata.replayKnown &&
-          options.repositoryForEdit !== undefined
-        ? await mutationRepository(options.repositoryForEdit)
-        : options.repository;
+      let metadata = await mutationMetadata(input.operationId);
+      let repository = options.repository;
+      if (!metadata.replayKnown && options.repositoryForEdit !== undefined) {
+        const selected = await mutationRepository(
+          options.repositoryForEdit,
+          metadata,
+        );
+        repository = selected.repository;
+        metadata = selected.metadata;
+      }
       return requireOwnedResult(
         await repository.edit({
           operationId: metadata.operationId,

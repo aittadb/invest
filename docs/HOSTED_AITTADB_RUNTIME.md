@@ -304,21 +304,22 @@ package, acknowledgment, or founder route receive the same subject-bound scope;
 route repository factories cannot reopen the underlying uncapped adapter. A
 second HTTP request receives a new scope.
 
-That scope admits at most 1,405 participant-private storage-record reads. The
+That scope admits at most 1,614 participant-private storage-record reads. The
 maximum valid authorization envelope is 551: 511 unique immutable package
 records plus two outer attempts, each containing six profile reads, two package
 head reads, and three four-read accepted gate attempts. The profile reads cover
 current, matching latest history, and immutable registration revision 1 for
 each sample. The selected capability then owns its own finite route budget:
-package one, acknowledgment eight, profile 23, or founder 854 reads. The founder
-budget covers four maximum 209-read application materializations, four
+package one, acknowledgment eight, profile 23, or founder 1,063 reads. The
+founder budget covers five maximum 209-read application materializations, four
 retry/recovery reads, and two maximum seven-read private campaign-setup
-materializations, including final campaign/profile policy sampling, a conflicted
-mutation, and the returned resource projection. The profile assertion reuses the
-sampled current revision as a transaction check and adds no read. After the first route read, another route
-budget cannot be selected. The 1,405 global ceiling is the authorization maximum
-plus the largest route budget; either that ceiling or the selected route's
-smaller ceiling rejects the next read before adapter access. Public
+materializations, including final campaign/profile policy sampling, one
+post-policy immutable-history recovery, a conflicted mutation, and the returned
+resource projection. The profile assertion reuses the sampled current revision
+as a transaction check and adds no read. After the first route read, another
+route budget cannot be selected. The 1,614 global ceiling is the authorization
+maximum plus the largest route budget; either that ceiling or the selected
+route's smaller ceiling rejects the next read before adapter access. Public
 campaign-presentation reads and storage transactions are outside these
 participant read counters, while both private founder campaign samples and all
 profile, package, gate, acceptance-head, acceptance-record, and
@@ -464,8 +465,9 @@ the phase or change country, declared interest, and deletion state after
 create's final sample, and replace contribution choices after edit's final
 sample; each check failure leaves every founder current, history, field,
 policy-revision, audit, and founder-operation effect unchanged. Recovery with
-the same operation and exact replay after campaign/profile evolution and Worker
-restart are also covered. The
+the same overlapping operation after a null policy sample, exact replay after
+campaign/profile evolution and Worker restart, and changed or stale rejection
+are also covered. The
 synthetic hosted services implement and enforce the discovered AittaDB
 read/list/transaction controls rather than bypassing the adapter. Source
 and built-artifact scans complement `npm run instances:check`, which rejects

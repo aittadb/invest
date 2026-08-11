@@ -783,9 +783,9 @@ test("participant access keeps nested package retry reads inside one budget", as
 
 test("participant request scope enforces exact maximum route and retry read budgets", async () => {
   assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 551);
-  assert.equal(PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT, 854);
-  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 854);
-  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 1_405);
+  assert.equal(PARTICIPANT_FOUNDER_ROUTE_STORAGE_READ_LIMIT, 1_063);
+  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 1_063);
+  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 1_614);
 
   const service = new SyntheticAittaDBService();
   await registerHostedParticipant(
@@ -2051,6 +2051,157 @@ test("hosted founder create atomically rejects participant eligibility changes a
   }
 });
 
+test("hosted overlapping exact founder create recovers after null policy and restart", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-create-overlap-recovery",
+    { declaredInterest: "founder" },
+  );
+  const losingWorker = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-11T12:02:00.000Z"),
+  );
+  const winningWorker = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-11T12:01:00.000Z"),
+  );
+  const losingProof = await founderResource(losingWorker, env);
+  const winningProof = await founderResource(winningWorker, env);
+  const submission = founderFields({
+    note: "Overlapping exact founder create.",
+  });
+  const losingBody = actionBody(
+    requiredAction(losingProof.document, "create-founder-application"),
+    submission,
+  );
+  const operationId = String(losingBody["operation-id"]);
+  const winningBody = actionBody(
+    requiredAction(winningProof.document, "create-founder-application"),
+    { ...submission, "operation-id": operationId },
+  );
+  const evolvedChoices = [
+    { id: "area:commercial", label: "Commercial" },
+    { id: "area:delivery", label: "Delivery" },
+  ] as const;
+  let winningStatus: number | null = null;
+  let founderAfterWinner: readonly SyntheticRecord[] | null = null;
+  let auditAfterEvolution: readonly SyntheticRecord[] | null = null;
+
+  service.raceNextReadFrom("founder-applications", async () => {
+    const winning = await submitFounderMutation(
+      winningWorker,
+      env,
+      winningProof,
+      "POST",
+      winningBody,
+    );
+    winningStatus = winning.status;
+    const winningDocument = await winning.json() as FounderInterestDocument;
+    assert.equal(winningDocument.data.revision, 1);
+    assert.equal(
+      winningDocument.data.history[0]?.occurred_at,
+      "2026-08-11T12:01:00.000Z",
+    );
+    founderAfterWinner = founderCollectionSnapshot(service);
+    await configureHostedFounderCampaign(service, "closed", evolvedChoices);
+    await updateHostedParticipantProfile(
+      service,
+      { country: "US", declaredInterest: "investor" },
+      "participant-operation:founder-create-overlap-policy-evolution",
+    );
+    auditAfterEvolution = recordsIn(service, "audit-events").map(
+      cloneSyntheticRecord,
+    );
+  });
+
+  const losing = await submitFounderMutation(
+    losingWorker,
+    env,
+    losingProof,
+    "POST",
+    losingBody,
+  );
+  assert.equal(winningStatus, 201);
+  assert.equal(losing.status, 200);
+  const losingDocument = await losing.json() as FounderInterestDocument;
+  assert.equal(losingDocument.data.revision, 1);
+  assert.equal(
+    losingDocument.data.history[0]?.occurred_at,
+    "2026-08-11T12:01:00.000Z",
+  );
+  assert(founderAfterWinner);
+  assert(auditAfterEvolution);
+  assert.deepEqual(founderCollectionSnapshot(service), founderAfterWinner);
+  assert.deepEqual(
+    recordsIn(service, "audit-events").map(cloneSyntheticRecord),
+    auditAfterEvolution,
+  );
+  const committedOperation = service.operations.get(operationId);
+  assert(committedOperation);
+
+  const restartedWorker = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-11T12:03:00.000Z"),
+  );
+  const restartProof = await founderResource(restartedWorker, env);
+  const restartedReplay = await submitFounderMutation(
+    restartedWorker,
+    env,
+    restartProof,
+    "POST",
+    losingBody,
+  );
+  assert.equal(restartedReplay.status, 200);
+  const restartedDocument = await restartedReplay.json() as FounderInterestDocument;
+  assert.equal(restartedDocument.data.revision, 1);
+  assert.equal(
+    restartedDocument.data.history[0]?.occurred_at,
+    "2026-08-11T12:01:00.000Z",
+  );
+
+  const changedWorker = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-11T12:04:00.000Z"),
+  );
+  const changedProof = await founderResource(changedWorker, env);
+  const changed = await submitFounderMutation(
+    changedWorker,
+    env,
+    changedProof,
+    "POST",
+    { ...losingBody, note: "Changed overlapping founder create." },
+  );
+  assert.equal(changed.status, 409);
+
+  const newOperationId = "founder-operation:overlap-create-new";
+  const newWorker = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-11T12:05:00.000Z"),
+  );
+  const newProof = await founderResource(newWorker, env);
+  const newCreate = await submitFounderMutation(
+    newWorker,
+    env,
+    newProof,
+    "POST",
+    { ...losingBody, "operation-id": newOperationId },
+  );
+  assert.equal(newCreate.status, 412);
+  assert.equal(service.operations.has(newOperationId), false);
+  assert.strictEqual(service.operations.get(operationId), committedOperation);
+  assert.deepEqual(founderCollectionSnapshot(service), founderAfterWinner);
+  assert.deepEqual(
+    recordsIn(service, "audit-events").map(cloneSyntheticRecord),
+    auditAfterEvolution,
+  );
+});
+
 test("hosted founder edit atomically rejects contribution changes after its final policy sample", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
@@ -2144,6 +2295,182 @@ test("hosted founder edit atomically rejects contribution changes after its fina
     recordsIn(service, "founder-application-policy-revisions").length,
     2,
   );
+});
+
+test("hosted overlapping exact founder edit recovers after choice change and restart", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedFounderCampaign(service);
+  await registerHostedParticipant(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    "Founder participant",
+    "participant-operation:founder-edit-overlap-recovery",
+    { declaredInterest: "founder" },
+  );
+  const initialWorker = hostedPackageWorker(service);
+  const createProof = await founderResource(initialWorker, env);
+  assert.equal(
+    (await submitFounderMutation(
+      initialWorker,
+      env,
+      createProof,
+      "POST",
+      actionBody(
+        requiredAction(createProof.document, "create-founder-application"),
+        founderFields(),
+      ),
+    )).status,
+    201,
+  );
+
+  const losingWorker = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-11T12:02:00.000Z"),
+  );
+  const winningWorker = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-11T12:01:00.000Z"),
+  );
+  const losingProof = await founderResource(losingWorker, env);
+  const winningProof = await founderResource(winningWorker, env);
+  const editFields = founderFields({
+    "expected-revision": 1,
+    note: "Overlapping exact founder edit.",
+  });
+  const losingBody = actionBody(
+    requiredAction(losingProof.document, "edit-founder-application"),
+    editFields,
+  );
+  const operationId = String(losingBody["operation-id"]);
+  const winningBody = actionBody(
+    requiredAction(winningProof.document, "edit-founder-application"),
+    { ...editFields, "operation-id": operationId },
+  );
+  const evolvedChoices = [
+    { id: "area:commercial", label: "Commercial" },
+    { id: "area:delivery", label: "Delivery" },
+  ] as const;
+  let winningStatus: number | null = null;
+  let founderAfterWinner: readonly SyntheticRecord[] | null = null;
+  let auditAfterEvolution: readonly SyntheticRecord[] | null = null;
+
+  service.raceNextReadFrom("founder-applications", async () => {
+    const winning = await submitFounderMutation(
+      winningWorker,
+      env,
+      winningProof,
+      "PATCH",
+      winningBody,
+    );
+    winningStatus = winning.status;
+    const winningDocument = await winning.json() as FounderInterestDocument;
+    assert.equal(winningDocument.data.revision, 2);
+    assert.equal(
+      winningDocument.data.history[1]?.occurred_at,
+      "2026-08-11T12:01:00.000Z",
+    );
+    founderAfterWinner = founderCollectionSnapshot(service);
+    await configureHostedFounderCampaign(service, "open", evolvedChoices);
+    auditAfterEvolution = recordsIn(service, "audit-events").map(
+      cloneSyntheticRecord,
+    );
+  });
+
+  const losing = await submitFounderMutation(
+    losingWorker,
+    env,
+    losingProof,
+    "PATCH",
+    losingBody,
+  );
+  assert.equal(winningStatus, 200);
+  assert.equal(losing.status, 200);
+  const losingDocument = await losing.json() as FounderInterestDocument;
+  assert.equal(losingDocument.data.revision, 2);
+  assert.equal(
+    losingDocument.data.history[1]?.occurred_at,
+    "2026-08-11T12:01:00.000Z",
+  );
+  assert(founderAfterWinner);
+  assert(auditAfterEvolution);
+  assert.deepEqual(founderCollectionSnapshot(service), founderAfterWinner);
+  assert.deepEqual(
+    recordsIn(service, "audit-events").map(cloneSyntheticRecord),
+    auditAfterEvolution,
+  );
+  const committedOperation = service.operations.get(operationId);
+  assert(committedOperation);
+
+  const restartedWorker = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-11T12:03:00.000Z"),
+  );
+  const restartProof = await founderResource(restartedWorker, env);
+  const restartedReplay = await submitFounderMutation(
+    restartedWorker,
+    env,
+    restartProof,
+    "PATCH",
+    losingBody,
+  );
+  assert.equal(restartedReplay.status, 200);
+  const restartedDocument = await restartedReplay.json() as FounderInterestDocument;
+  assert.equal(restartedDocument.data.revision, 2);
+  assert.equal(
+    restartedDocument.data.history[1]?.occurred_at,
+    "2026-08-11T12:01:00.000Z",
+  );
+
+  const changedWorker = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-11T12:04:00.000Z"),
+  );
+  const changedProof = await founderResource(changedWorker, env);
+  const changed = await submitFounderMutation(
+    changedWorker,
+    env,
+    changedProof,
+    "PATCH",
+    { ...losingBody, note: "Changed overlapping founder edit." },
+  );
+  assert.equal(changed.status, 409);
+
+  const staleOperationId = "founder-operation:overlap-edit-stale";
+  const staleWorker = hostedPackageWorker(
+    service,
+    () => new Date("2026-08-11T12:05:00.000Z"),
+  );
+  const staleProof = await founderResource(staleWorker, env);
+  const staleBody = actionBody(
+    requiredAction(staleProof.document, "edit-founder-application"),
+    founderFields({
+      "operation-id": staleOperationId,
+      "expected-revision": 1,
+      "primary-contribution-area-id": "area:commercial",
+      [FOUNDER_SECONDARY_AREAS_FIELD]: ["area:delivery"],
+      note: "Stale edit after overlapping winner.",
+    }),
+  );
+  const laterChoices = [
+    { id: "area:operations", label: "Operations" },
+    { id: "area:legal", label: "Legal" },
+  ] as const;
+  service.raceNextReadFrom("founder-applications", async () => {
+    await configureHostedFounderCampaign(service, "open", laterChoices);
+  });
+  const stale = await submitFounderMutation(
+    staleWorker,
+    env,
+    staleProof,
+    "PATCH",
+    staleBody,
+  );
+  assert.equal(stale.status, 412);
+  assert.equal(service.operations.has(staleOperationId), false);
+  assert.strictEqual(service.operations.get(operationId), committedOperation);
+  assert.deepEqual(founderCollectionSnapshot(service), founderAfterWinner);
 });
 
 test("hosted founder history and exact retries survive contribution choice evolution", async () => {
@@ -4531,6 +4858,10 @@ class SyntheticAittaDBService {
     collection: string;
     run: () => Promise<void>;
   }> | null = null;
+  #readRace: Readonly<{
+    collection: string;
+    run: () => Promise<void>;
+  }> | null = null;
 
   failNextTransactionContaining(collection: string): void {
     this.failTransactionContainingAfter(collection, 0);
@@ -4554,6 +4885,11 @@ class SyntheticAittaDBService {
   ): void {
     assert.ok(collection.length > 0);
     this.#transactionRace = Object.freeze({ collection, run });
+  }
+
+  raceNextReadFrom(collection: string, run: () => Promise<void>): void {
+    assert.ok(collection.length > 0);
+    this.#readRace = Object.freeze({ collection, run });
   }
 
   readonly fetch = async (input: string, init: RequestInit): Promise<Response> => {
@@ -4603,6 +4939,11 @@ class SyntheticAittaDBService {
       const id = decodeURIComponent(read[2] ?? "");
       this.readCollections.push(collection);
       const record = this.records.get(`${collection}/${id}`);
+      const race = this.#readRace;
+      if (race !== null && race.collection === collection) {
+        this.#readRace = null;
+        await race.run();
+      }
       return record === undefined
         ? protocolFailure("not_found")
         : protocolResponse(recordDocument(record));
