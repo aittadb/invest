@@ -15,6 +15,7 @@ import type {
   InvestmentIndicationId,
   TrustedPackageAcknowledgmentContext,
 } from "../domain/investment-indication.ts";
+import { MAX_INVESTMENT_INDICATION_REVISIONS } from "../domain/investment-indication.ts";
 import { projectInvestmentIndicationForAggregation } from "../domain/investment-aggregate.ts";
 import {
   createPackageAcceptance,
@@ -23,7 +24,9 @@ import {
   type PackageVersion,
 } from "../domain/package-content.ts";
 import {
+  parseStorageKey,
   StorageFailure,
+  storageKeyString,
   toPublicStorageFailure,
   type StorageAdapter,
   type StorageDocument,
@@ -39,13 +42,17 @@ import {
   DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
-  MAX_INDICATION_MATERIALIZATION_READS,
   MAX_OWNED_INVESTMENT_INDICATIONS,
+  type ParticipantIndicationOwnershipEntry,
 } from "../repositories/in-memory-indication-repository.ts";
 import {
   MAX_PARTICIPANT_CAPACITY_READS,
   MAX_PARTICIPANT_INDEX_SNAPSHOT_READS,
+  MAX_PARTICIPANT_OWNERSHIP_CONCURRENT_REPLAY_READS,
+  MAX_PARTICIPANT_OWNERSHIP_FIRST_INITIALIZATION_READS,
+  MAX_PARTICIPANT_OWNERSHIP_RESTART_READS,
   StorageParticipantInvestmentInterestRepository,
+  initializeParticipantInvestmentOwnership,
 } from "../repositories/storage-participant-investment-repository.ts";
 import { MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS } from "../worker/participant-investment-mutation-port.ts";
 import {
@@ -68,9 +75,259 @@ const ALLOW_ALL = Object.freeze({
   reactivateCompany: true,
 }) satisfies InvestmentInterestPermissions;
 
+test("ordinary participant access requires explicit ownership initialization", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const acknowledgment = await currentContext(ALICE, "ownership-uninitialized");
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  const recordsBefore = storedStateFingerprint(state);
+
+  const readFailure = await captureStorageFailure(() => repository.listOwned());
+  const writeFailure = await captureStorageFailure(() => serviceFor(
+    repository,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  ).create({
+    operationId: "investment-operation:ownership-uninitialized",
+    fields: personalFields(),
+  }));
+  for (const failure of [readFailure, writeFailure]) {
+    assert.equal(failure.code, "UNAVAILABLE");
+    assert.doesNotMatch(
+      JSON.stringify(toPublicStorageFailure(failure)),
+      /alice-storage-investment|ownership|participant-investment/iu,
+    );
+  }
+  assert.equal(storedStateFingerprint(state), recordsBefore);
+  assert.equal(state.operations.size, 0);
+
+  const request = Object.freeze({
+    operationId: "investment-ownership-initialization:explicit-empty",
+    indications: Object.freeze([]),
+  });
+  assert.deepEqual(
+    await initializeParticipantInvestmentOwnership(storage, ALICE, request),
+    { replayed: false, indicationCount: 0, activeCount: 0 },
+  );
+  assert.deepEqual(
+    await initializeParticipantInvestmentOwnership(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      request,
+    ),
+    { replayed: true, indicationCount: 0, activeCount: 0 },
+  );
+  assert.equal(recordsIn(state, "participant-investment-ownership-roots").length, 1);
+  assert.equal(recordsIn(state, "participant-investment-indexes").length, 1);
+  assert.equal(
+    recordsIn(state, "investment-indication-ownership-witnesses").length,
+    1,
+  );
+  assert.deepEqual(await repository.listOwned(), []);
+
+  const changedOperation = await captureStorageFailure(() =>
+    initializeParticipantInvestmentOwnership(storage, ALICE, {
+      operationId: "investment-ownership-initialization:changed",
+      indications: [],
+    })
+  );
+  const changedInventory = await captureStorageFailure(() =>
+    initializeParticipantInvestmentOwnership(storage, ALICE, {
+      ...request,
+      indications: [{
+        indicationId: "investment-indication:not-present",
+        indicationRevision: 1,
+        lifecycleStatus: "active",
+      }],
+    })
+  );
+  assert.equal(changedOperation.code, "CONFLICT");
+  assert.equal(changedInventory.code, "CONFLICT");
+});
+
+test("correlated metadata absence fails closed and trusted migration restores four active heads", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "dual-absence-seed");
+  const acknowledgment = await currentContext(ALICE, "dual-absence");
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  const service = serviceFor(
+    repository,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  const active: Awaited<ReturnType<typeof service.create>>[] = [];
+  for (let index = 0; index < MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS; index += 1) {
+    active.push(await service.create({
+      operationId: `investment-operation:dual-absence-${index}`,
+      fields: companyFields({
+        companyName: `Dual absence company ${index}`,
+        companyIdentifier: `DUAL-ABSENCE-${index}`,
+      }),
+    }));
+  }
+  const migrationInventory = Object.freeze(active.map(({ snapshot }) =>
+    Object.freeze({
+      indicationId: snapshot.id,
+      indicationRevision: snapshot.revision,
+      lifecycleStatus: snapshot.lifecycle.status,
+    })
+  ));
+
+  deleteOnlyRecordIn(state, "participant-investment-indexes");
+  deleteOnlyRecordIn(state, "investment-indication-ownership-witnesses");
+  const corruptState = storedStateFingerprint(state);
+  const operationsBefore = state.operations.size;
+  const reopened = new StorageParticipantInvestmentInterestRepository(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    AMOUNT,
+  );
+  const readFailure = await captureStorageFailure(() => reopened.listOwned());
+  const fifthFailure = await captureStorageFailure(() => serviceFor(
+    reopened,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T11:00:00.000Z"),
+  ).create({
+    operationId: "investment-operation:dual-absence-fifth",
+    fields: companyFields({
+      companyName: "Private dual-absence fifth",
+      companyIdentifier: "PRIVATE-DUAL-ABSENCE-FIFTH",
+    }),
+  }));
+  for (const failure of [readFailure, fifthFailure]) {
+    assert.equal(failure.code, "UNAVAILABLE");
+    assert.doesNotMatch(
+      JSON.stringify(toPublicStorageFailure(failure)),
+      /PRIVATE-DUAL-ABSENCE|alice-storage-investment|ownership/iu,
+    );
+  }
+  assert.equal(storedStateFingerprint(state), corruptState);
+  assert.equal(state.operations.size, operationsBefore);
+
+  deleteOnlyRecordIn(state, "participant-investment-ownership-roots");
+  const migrationRequest = Object.freeze({
+    operationId: "investment-ownership-initialization:dual-absence-migration",
+    indications: migrationInventory,
+  });
+  assert.deepEqual(
+    await initializeParticipantInvestmentOwnership(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      migrationRequest,
+    ),
+    { replayed: false, indicationCount: 4, activeCount: 4 },
+  );
+  assert.deepEqual(
+    await initializeParticipantInvestmentOwnership(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      migrationRequest,
+    ),
+    { replayed: true, indicationCount: 4, activeCount: 4 },
+  );
+  assert.equal(activeOwned(await reopened.listOwned()), 4);
+  const restoredState = storedStateFingerprint(state);
+  const restoredOperations = state.operations.size;
+  const restoredFifth = await captureStorageFailure(() => serviceFor(
+    reopened,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T12:00:00.000Z"),
+  ).create({
+    operationId: "investment-operation:dual-absence-restored-fifth",
+    fields: companyFields({
+      companyName: "Restored fifth remains blocked",
+      companyIdentifier: "RESTORED-FIFTH-BLOCKED",
+    }),
+  }));
+  assert.equal(restoredFifth.code, "CONFLICT");
+  assert.equal(storedStateFingerprint(state), restoredState);
+  assert.equal(state.operations.size, restoredOperations);
+});
+
+test("legacy ID-only ownership metadata migrates once to the status summary", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "legacy-witness-seed");
+  const acknowledgment = await currentContext(ALICE, "legacy-witness");
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  const created = await serviceFor(
+    repository,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  ).create({
+    operationId: "investment-operation:legacy-witness",
+    fields: personalFields(),
+  });
+  deleteOnlyRecordIn(state, "participant-investment-ownership-roots");
+  replaceOwnershipWitnessWithLegacyIds(state);
+
+  const readFailure = await captureStorageFailure(() => repository.listOwned());
+  assert.equal(readFailure.code, "UNAVAILABLE");
+  const recordsBeforeForeignMigration = storedStateFingerprint(state);
+  const operationsBeforeForeignMigration = state.operations.size;
+  const foreignMigration = await captureStorageFailure(() =>
+    initializeParticipantInvestmentOwnership(storage, BOB, {
+      operationId: "investment-ownership-initialization:foreign-legacy",
+      indications: [{
+        indicationId: created.snapshot.id,
+        indicationRevision: created.snapshot.revision,
+        lifecycleStatus: created.snapshot.lifecycle.status,
+      }],
+    })
+  );
+  assert.equal(foreignMigration.code, "UNAVAILABLE");
+  assert.equal(storedStateFingerprint(state), recordsBeforeForeignMigration);
+  assert.equal(state.operations.size, operationsBeforeForeignMigration);
+  const request = Object.freeze({
+    operationId: "investment-ownership-initialization:legacy-witness",
+    indications: Object.freeze([Object.freeze({
+      indicationId: created.snapshot.id,
+      indicationRevision: created.snapshot.revision,
+      lifecycleStatus: created.snapshot.lifecycle.status,
+    })]),
+  });
+  assert.deepEqual(
+    await initializeParticipantInvestmentOwnership(storage, ALICE, request),
+    { replayed: false, indicationCount: 1, activeCount: 1 },
+  );
+  assert.deepEqual(
+    await initializeParticipantInvestmentOwnership(
+      new MemoryStorageAdapter(state),
+      ALICE,
+      request,
+    ),
+    { replayed: true, indicationCount: 1, activeCount: 1 },
+  );
+  const witness = recordsIn(
+    state,
+    "investment-indication-ownership-witnesses",
+  )[0];
+  assert.equal(witness?.value.schemaVersion, 2);
+  assert.deepEqual(await repository.listOwned(), [created.snapshot]);
+});
+
 test("storage participant investment repository commits one persistent atomic lifecycle", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "storage-lifecycle-alice");
   const context = await currentContext(ALICE, "storage-lifecycle");
   let hour = 10;
   const repository = new StorageParticipantInvestmentInterestRepository(
@@ -95,7 +352,7 @@ test("storage participant investment repository commits one persistent atomic li
   const replay = await service.create(createInput);
   assert.equal(replay.replayed, true);
   assert.deepEqual(replay.snapshot, created.snapshot);
-  assert.equal(state.operations.size, 1);
+  assert.equal(state.operations.size, 2);
   const changedRetry = await captureStorageFailure(() => service.create({
     operationId: "investment-operation:storage-personal-create",
     fields: personalFields({ amount: 1_500 }),
@@ -108,6 +365,7 @@ test("storage participant investment repository commits one persistent atomic li
     BOB,
     AMOUNT,
   );
+  await initializeEmptyOwnership(storage, BOB, "storage-lifecycle-bob");
   const foreignService = serviceFor(
     foreignRepository,
     BOB,
@@ -177,6 +435,7 @@ test("storage participant investment repository commits one persistent atomic li
 test("atomic exact retries survive amount-policy evolution before current validation", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "storage-policy-evolution");
   const context = await currentContext(ALICE, "storage-policy-evolution");
   const input = Object.freeze({
     operationId: "investment-operation:storage-policy-evolution",
@@ -226,6 +485,7 @@ test("atomic exact retries survive amount-policy evolution before current valida
 test("atomic exact retries survive normalizer evolution without semantic substitution", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "storage-normalizer-evolution");
   const context = await currentContext(ALICE, "storage-normalizer-evolution");
   const originalOptions: InvestmentIndicationParsingOptions = Object.freeze({
     companyIdentifier: Object.freeze({
@@ -285,6 +545,8 @@ test("atomic exact retries survive normalizer evolution without semantic substit
 test("storage participant investment repository enforces global company uniqueness", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "company-alice");
+  await initializeEmptyOwnership(storage, BOB, "company-bob");
   const aliceContext = await currentContext(ALICE, "company-alice");
   const bobContext = await currentContext(BOB, "company-bob");
   const aliceRepository = new StorageParticipantInvestmentInterestRepository(
@@ -326,6 +588,11 @@ test("storage participant investment repository enforces global company uniquene
 
 test("concurrent exact storage commits have one transaction and two successful results", async () => {
   const state = new MemoryStorageState();
+  await initializeEmptyOwnership(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    "storage-concurrent",
+  );
   const context = await currentContext(ALICE, "storage-concurrent");
   const create = () => {
     const repository = new StorageParticipantInvestmentInterestRepository(
@@ -345,7 +612,7 @@ test("concurrent exact storage commits have one transaction and two successful r
   };
   const results = await Promise.all([create(), create()]);
   assert.deepEqual(results.map(({ replayed }) => replayed).sort(), [false, true]);
-  assert.equal(state.operations.size, 1);
+  assert.equal(state.operations.size, 2);
   assert.equal(recordsIn(state, "audit-events").length, 1);
   assertAggregate(state, 1, 1_250, 1);
 });
@@ -353,6 +620,7 @@ test("concurrent exact storage commits have one transaction and two successful r
 test("active capacity survives withdrawal, rejection, reactivation, and restart", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "active-capacity-lifecycle");
   const context = await currentContext(ALICE, "active-capacity-lifecycle");
   let minute = 0;
   const repository = new StorageParticipantInvestmentInterestRepository(
@@ -462,6 +730,11 @@ test("active capacity survives withdrawal, rejection, reactivation, and restart"
 
 test("competing fourth activations cannot admit a fifth and exact retry stays stable", async () => {
   const state = new MemoryStorageState();
+  await initializeEmptyOwnership(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    "active-capacity-concurrency",
+  );
   const context = await currentContext(ALICE, "active-capacity-concurrency");
   const repository = new StorageParticipantInvestmentInterestRepository(
     new MemoryStorageAdapter(state),
@@ -529,6 +802,11 @@ test("missing index or ownership witness fails closed after restart", async (con
     await context.test(candidate.name, async () => {
       const state = new MemoryStorageState();
       const storage = new MemoryStorageAdapter(state);
+      await initializeEmptyOwnership(
+        storage,
+        ALICE,
+        `capacity-missing-pair-${caseIndex}`,
+      );
       const acknowledgment = await currentContext(
         ALICE,
         `capacity-missing-pair-${caseIndex}`,
@@ -590,6 +868,7 @@ test("missing index or ownership witness fails closed after restart", async (con
 test("a hidden fifth current record and contribution block create and reactivation", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "capacity-hidden-fifth");
   const acknowledgment = await currentContext(ALICE, "capacity-hidden-fifth");
   const repository = new StorageParticipantInvestmentInterestRepository(
     storage,
@@ -702,6 +981,11 @@ test("a hidden fifth current record and contribution block create and reactivati
 
 test("a mixed create and reactivation race admits exactly one fourth active indication", async () => {
   const state = new MemoryStorageState();
+  await initializeEmptyOwnership(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    "capacity-mixed-race",
+  );
   const acknowledgment = await currentContext(ALICE, "capacity-mixed-race");
   const repository = new StorageParticipantInvestmentInterestRepository(
     new MemoryStorageAdapter(state),
@@ -782,6 +1066,7 @@ test("a mixed create and reactivation race admits exactly one fourth active indi
 test("a direct reactivation between capacity sampling and create staging blocks the create", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "capacity-direct-race");
   const acknowledgment = await currentContext(ALICE, "capacity-direct-race");
   const seedRepository = new StorageParticipantInvestmentInterestRepository(
     storage,
@@ -875,6 +1160,7 @@ test("a direct reactivation between capacity sampling and create staging blocks 
 test("pre-existing over-capacity and missing indexed state fail closed", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "active-capacity-corruption");
   const context = await currentContext(ALICE, "active-capacity-corruption");
   const repository = new StorageParticipantInvestmentInterestRepository(
     storage,
@@ -948,11 +1234,162 @@ test("pre-existing over-capacity and missing indexed state fail closed", async (
   assert.equal(state.operations.size, corruptOperations);
 });
 
+test("a forged non-active summary cannot hide an active terminal transition", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "capacity-status-corruption");
+  const acknowledgment = await currentContext(ALICE, "capacity-status-corruption");
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  const service = serviceFor(
+    repository,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  const created = await service.create({
+    operationId: "investment-operation:capacity-status-corruption",
+    fields: personalFields(),
+  });
+  replaceOwnershipWitnessStatus(state, created.snapshot.id, "withdrawn");
+  const recordsBefore = storedStateFingerprint(state);
+  const operationsBefore = state.operations.size;
+
+  const failure = await captureStorageFailure(() => service.create({
+    operationId: "investment-operation:capacity-status-corruption-second",
+    fields: personalFields({ note: "Must not be committed." }),
+  }));
+  assert.equal(failure.code, "UNAVAILABLE");
+  assert.doesNotMatch(
+    JSON.stringify(toPublicStorageFailure(failure)),
+    /alice-storage-investment|Must not be committed|withdrawn/iu,
+  );
+  assert.equal(storedStateFingerprint(state), recordsBefore);
+  assert.equal(state.operations.size, operationsBefore);
+});
+
+test("correlated summary and terminal-kind damage cannot hide an active edit", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "capacity-terminal-corruption");
+  const acknowledgment = await currentContext(ALICE, "capacity-terminal-corruption");
+  const repository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  const service = serviceFor(
+    repository,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  );
+  const created = await service.create({
+    operationId: "investment-operation:capacity-terminal-create",
+    fields: personalFields(),
+  });
+  const edited = await service.edit({
+    operationId: "investment-operation:capacity-terminal-edit",
+    indicationId: created.snapshot.id,
+    expectedRevision: created.snapshot.revision,
+    fields: personalFields({ note: "Still active before corruption." }),
+  });
+  replaceOwnershipWitnessStatus(state, edited.snapshot.id, "withdrawn");
+  replaceTerminalTransitionKind(
+    state,
+    edited.snapshot.id,
+    edited.snapshot.revision,
+    "withdrawn",
+  );
+  const recordsBefore = storedStateFingerprint(state);
+  const operationsBefore = state.operations.size;
+
+  const failure = await captureStorageFailure(() => service.create({
+    operationId: "investment-operation:capacity-terminal-second",
+    fields: personalFields({ note: "Must remain absent." }),
+  }));
+  assert.equal(failure.code, "UNAVAILABLE");
+  assert.equal(storedStateFingerprint(state), recordsBefore);
+  assert.equal(state.operations.size, operationsBefore);
+});
+
+test("ownership movement between bounded witness samples fails without outer mutation", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "capacity-moving-sample");
+  const acknowledgment = await currentContext(ALICE, "capacity-moving-sample");
+  const seedRepository = new StorageParticipantInvestmentInterestRepository(
+    storage,
+    ALICE,
+    AMOUNT,
+  );
+  const created = await serviceFor(
+    seedRepository,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T10:00:00.000Z"),
+  ).create({
+    operationId: "investment-operation:capacity-moving-sample",
+    fields: personalFields(),
+  });
+
+  let injectedState: string | null = null;
+  let injectedOperations = 0;
+  const movingStorage = new WitnessReadHookStorageAdapter(storage, async () => {
+    const withdrawn = await new DevelopmentInMemoryIndicationRepository(
+      storage,
+      ALICE,
+      OWNER,
+      AMOUNT,
+    ).withdraw({
+      operationId: "indication-operation:capacity-moving-withdraw",
+      id: created.snapshot.id,
+      expectedRevision: created.snapshot.revision,
+      occurredAt: "2026-08-12T11:00:00.000Z",
+      historyEntryId: "indication-history:capacity-moving-withdraw",
+    });
+    await persistAggregateProjection(
+      storage,
+      withdrawn.snapshot,
+      "aggregate-operation:capacity-moving-withdraw",
+    );
+    injectedState = storedStateFingerprint(state);
+    injectedOperations = state.operations.size;
+  }, 2);
+  const movingRepository = new StorageParticipantInvestmentInterestRepository(
+    movingStorage,
+    ALICE,
+    AMOUNT,
+  );
+  const failure = await captureStorageFailure(() => serviceFor(
+    movingRepository,
+    ALICE,
+    acknowledgment,
+    () => new Date("2026-08-12T12:00:00.000Z"),
+  ).create({
+    operationId: "investment-operation:capacity-moving-blocked-create",
+    fields: personalFields({ note: "Private moving-state candidate." }),
+  }));
+  assert.equal(failure.code, "UNAVAILABLE");
+  assert.equal(movingStorage.injected, true);
+  assert(injectedState);
+  assert.equal(storedStateFingerprint(state), injectedState);
+  assert.equal(state.operations.size, injectedOperations);
+  assert.doesNotMatch(
+    JSON.stringify(toPublicStorageFailure(failure)),
+    /Private moving-state|alice-storage-investment/iu,
+  );
+});
+
 test("atomic contribution work stays constant-read with unrelated indications", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
   for (let index = 0; index < 24; index += 1) {
     const actor = subject(`issuer.invalid/participant:bounded-${index}`);
+    await initializeEmptyOwnership(storage, actor, `bounded-${index}`);
     const repository = new StorageParticipantInvestmentInterestRepository(
       storage,
       actor,
@@ -970,6 +1407,7 @@ test("atomic contribution work stays constant-read with unrelated indications", 
   }
 
   const actor = subject("issuer.invalid/participant:bounded-target");
+  await initializeEmptyOwnership(storage, actor, "bounded-target");
   const counted = new CountingStorageAdapter(
     new MemoryStorageAdapter(state),
   );
@@ -989,40 +1427,91 @@ test("atomic contribution work stays constant-read with unrelated indications", 
   });
 
   assert.equal(counted.listCalls, 0);
-  assert.equal(counted.readCalls, 22);
+  assert.equal(counted.readCalls, 23);
   assertAggregate(state, 25, 31_250, 25);
 });
 
-test("participant index has an observed 100-item read and write ceiling", async () => {
+test("capacity checks the 100-record maximum-depth ownership shape within its read ceiling", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
-  const context = await currentContext(ALICE, "storage-index-ceiling");
-  const repository = new StorageParticipantInvestmentInterestRepository(
-    storage,
-    ALICE,
-    AMOUNT,
+  const indications = await seedMaximumOwnershipHeads(state, ALICE);
+  const overCapacityInventory = Object.freeze(indications.map((entry, index) =>
+    index === MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS
+      ? Object.freeze({ ...entry, lifecycleStatus: "active" as const })
+      : entry
+  ));
+  const headsBefore = storedStateFingerprint(state);
+  const overCapacityInitialization = await captureStorageFailure(() =>
+    initializeParticipantInvestmentOwnership(storage, ALICE, {
+      operationId: "investment-ownership-initialization:over-capacity",
+      indications: overCapacityInventory,
+    })
   );
-  const service = serviceFor(
-    repository,
-    ALICE,
-    context,
-    () => new Date("2026-08-12T10:00:00.000Z"),
-  );
-  for (let index = 0; index < 100; index += 1) {
-    const created = await service.create({
-      operationId: `investment-operation:index-ceiling-${index}`,
-      fields: companyFields({
-        companyName: `Synthetic company ${index}`,
-        companyIdentifier: `SYNTHETIC-${index}`,
-      }),
-    });
-    await service.withdraw({
-      operationId: `investment-operation:index-ceiling-withdraw-${index}`,
-      indicationId: created.snapshot.id,
-      expectedRevision: created.snapshot.revision,
-    });
-  }
+  assert.equal(overCapacityInitialization.code, "UNAVAILABLE");
+  assert.equal(storedStateFingerprint(state), headsBefore);
+  assert.equal(state.operations.size, 0);
 
+  const initializationStorage = new CountingStorageAdapter(storage);
+  const initialization = await initializeParticipantInvestmentOwnership(
+    initializationStorage,
+    ALICE,
+    {
+      operationId: "investment-ownership-initialization:maximum-shape",
+      indications,
+    },
+  );
+  assert.deepEqual(initialization, {
+    replayed: false,
+    indicationCount: MAX_OWNED_INVESTMENT_INDICATIONS,
+    activeCount: MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS,
+  });
+  assert.equal(initializationStorage.listCalls, 0);
+  assert.equal(
+    initializationStorage.readCalls,
+    MAX_PARTICIPANT_OWNERSHIP_FIRST_INITIALIZATION_READS,
+  );
+  assert.equal(indications.length, MAX_OWNED_INVESTMENT_INDICATIONS);
+  assert.equal(indications.every(({ indicationId }) => indicationId.length === 128), true);
+  assert.equal(
+    indications.every(({ indicationRevision }) =>
+      indicationRevision === MAX_INVESTMENT_INDICATION_REVISIONS
+    ),
+    true,
+  );
+  const witness = recordsIn(
+    state,
+    "investment-indication-ownership-witnesses",
+  )[0];
+  assert(witness);
+  assert.equal(
+    new TextEncoder().encode(JSON.stringify(witness.value)).byteLength <= 65_536,
+    true,
+  );
+
+  const restartStorage = new CountingStorageAdapter(
+    new MemoryStorageAdapter(state),
+  );
+  assert.deepEqual(
+    await initializeParticipantInvestmentOwnership(
+      restartStorage,
+      ALICE,
+      {
+        operationId: "investment-ownership-initialization:maximum-shape",
+        indications,
+      },
+    ),
+    {
+      replayed: true,
+      indicationCount: MAX_OWNED_INVESTMENT_INDICATIONS,
+      activeCount: MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS,
+    },
+  );
+  assert.equal(
+    restartStorage.readCalls,
+    MAX_PARTICIPANT_OWNERSHIP_RESTART_READS,
+  );
+
+  const context = await currentContext(ALICE, "storage-index-ceiling");
   const counted = new CountingStorageAdapter(
     new MemoryStorageAdapter(state),
   );
@@ -1031,19 +1520,8 @@ test("participant index has an observed 100-item read and write ceiling", async 
     ALICE,
     AMOUNT,
   );
-  assert.equal((await reopened.listOwned()).length, 100);
-  assert.equal(counted.listCalls, 0);
-  assert.equal(counted.readCalls, 403);
-  assert.equal(counted.readCalls <= MAX_PARTICIPANT_CAPACITY_READS, true);
-  assert.equal(
-    MAX_PARTICIPANT_CAPACITY_READS,
-    MAX_PARTICIPANT_INDEX_SNAPSHOT_READS +
-      MAX_OWNED_INVESTMENT_INDICATIONS * MAX_INDICATION_MATERIALIZATION_READS,
-  );
-
-  const recordsBefore = state.records.size;
+  const recordsBefore = storedStateFingerprint(state);
   const operationsBefore = state.operations.size;
-  counted.resetReads();
   const failure = await captureStorageFailure(() => serviceFor(
     reopened,
     ALICE,
@@ -1057,16 +1535,58 @@ test("participant index has an observed 100-item read and write ceiling", async 
     }),
   }));
   assert.equal(failure.code, "CONFLICT");
-  assert.equal(counted.readCalls, 406);
-  assert.equal(counted.readCalls <= 1 + MAX_PARTICIPANT_CAPACITY_READS, true);
-  assert.equal(state.records.size, recordsBefore);
+  assert.equal(counted.listCalls, 0);
+  assert.equal(counted.readCalls, 3 + MAX_PARTICIPANT_CAPACITY_READS);
+  assert.equal(MAX_PARTICIPANT_INDEX_SNAPSHOT_READS, 4);
+  assert.equal(
+    MAX_PARTICIPANT_CAPACITY_READS,
+    MAX_PARTICIPANT_INDEX_SNAPSHOT_READS +
+      2 * MAX_OWNED_INVESTMENT_INDICATIONS,
+  );
+  assert.equal(storedStateFingerprint(state), recordsBefore);
   assert.equal(state.operations.size, operationsBefore);
-  assertAggregate(state, 200, 0, 0);
+});
+
+test("concurrent maximum-shape initialization replay stays inside its exact budget", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const indications = await seedMaximumOwnershipHeads(state, ALICE);
+  const request = Object.freeze({
+    operationId: "investment-ownership-initialization:maximum-concurrent",
+    indications,
+  });
+  const racing = new BeforeTransactionStorageAdapter(storage, async () => {
+    const winner = await initializeParticipantInvestmentOwnership(
+      storage,
+      ALICE,
+      request,
+    );
+    assert.equal(winner.replayed, false);
+  });
+  const counted = new CountingStorageAdapter(racing);
+  assert.deepEqual(
+    await initializeParticipantInvestmentOwnership(counted, ALICE, request),
+    {
+      replayed: true,
+      indicationCount: MAX_OWNED_INVESTMENT_INDICATIONS,
+      activeCount: MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS,
+    },
+  );
+  assert.equal(racing.injected, true);
+  assert.equal(counted.listCalls, 0);
+  assert.equal(
+    counted.readCalls,
+    MAX_PARTICIPANT_OWNERSHIP_CONCURRENT_REPLAY_READS,
+  );
 });
 
 test("a failed outer transaction leaves no indication, aggregate, audit, index, or receipt", async () => {
   const state = new MemoryStorageState();
-  const adapter = new FailOnceStorageAdapter(new MemoryStorageAdapter(state));
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "storage-rollback");
+  const recordsBefore = storedStateFingerprint(state);
+  const operationsBefore = state.operations.size;
+  const adapter = new FailOnceStorageAdapter(storage);
   const context = await currentContext(ALICE, "storage-rollback");
   const repository = new StorageParticipantInvestmentInterestRepository(
     adapter,
@@ -1086,8 +1606,8 @@ test("a failed outer transaction leaves no indication, aggregate, audit, index, 
 
   const failed = await captureStorageFailure(() => service.create(input));
   assert.equal(failed.code, "UNAVAILABLE");
-  assert.equal(state.records.size, 0);
-  assert.equal(state.operations.size, 0);
+  assert.equal(storedStateFingerprint(state), recordsBefore);
+  assert.equal(state.operations.size, operationsBefore);
 
   const committed = await service.create(input);
   assert.equal(committed.replayed, false);
@@ -1100,8 +1620,10 @@ test("a failed outer transaction leaves no indication, aggregate, audit, index, 
 
 test("transaction result object-key order does not change semantic verification", async () => {
   const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "storage-reordered-result");
   const repository = new StorageParticipantInvestmentInterestRepository(
-    new ReorderedResultStorageAdapter(new MemoryStorageAdapter(state)),
+    new ReorderedResultStorageAdapter(storage),
     ALICE,
     AMOUNT,
   );
@@ -1213,9 +1735,11 @@ test("atomic transaction results reject a closed malformed envelope matrix", asy
   for (const candidate of cases) {
     await context.test(candidate.name, async () => {
       const slug = candidate.name.replaceAll(" ", "-");
+      const storage = new MemoryStorageAdapter();
+      await initializeEmptyOwnership(storage, ALICE, `malformed-${slug}`);
       const repository = new StorageParticipantInvestmentInterestRepository(
         new ResultTransformStorageAdapter(
-          new MemoryStorageAdapter(),
+          storage,
           candidate.transform,
         ),
         ALICE,
@@ -1237,7 +1761,7 @@ test("atomic transaction results reject a closed malformed envelope matrix", asy
   }
 });
 
-test("stored operation receipts and participant indexes require closed envelopes", async (context) => {
+test("stored operation receipts and ownership metadata require closed envelopes", async (context) => {
   const cases: readonly Readonly<{
     name: string;
     collection: string;
@@ -1281,19 +1805,46 @@ test("stored operation receipts and participant indexes require closed envelopes
       replay: false,
     },
     {
+      name: "ownership root extra value member",
+      collection: "participant-investment-ownership-roots",
+      transform: (record) => ({
+        ...record,
+        value: { ...record.value, privateDetail: "not disclosed" },
+      }),
+      replay: false,
+    },
+    {
+      name: "ownership root operation accessor",
+      collection: "participant-investment-ownership-roots",
+      transform: (record) => ({
+        ...record,
+        value: Object.defineProperty(
+          { ...record.value },
+          "operationId",
+          {
+            enumerable: true,
+            get: () => {
+              throw new Error("private root getter");
+            },
+          },
+        ),
+      }),
+      replay: false,
+    },
+    {
       name: "ownership witness extra member",
       collection: "investment-indication-ownership-witnesses",
       transform: (record) => ({ ...record, privateDetail: "not disclosed" }),
       replay: false,
     },
     {
-      name: "ownership witness IDs accessor",
+      name: "ownership witness entries accessor",
       collection: "investment-indication-ownership-witnesses",
       transform: (record) => ({
         ...record,
         value: Object.defineProperty(
           { ...record.value },
-          "indicationIds",
+          "indications",
           {
             enumerable: true,
             get: () => {
@@ -1319,6 +1870,11 @@ test("stored operation receipts and participant indexes require closed envelopes
           ALICE,
           AMOUNT,
         );
+      await initializeEmptyOwnership(
+        new MemoryStorageAdapter(state),
+        ALICE,
+        `closed-envelope-${index}`,
+      );
       const acknowledgment = await currentContext(
         ALICE,
         `closed-envelope-${index}`,
@@ -1354,13 +1910,18 @@ test("stored operation receipts and participant indexes require closed envelopes
         String(failure),
         /private|receipt getter|not disclosed/iu,
       );
-      assert.equal(state.operations.size, 1);
+      assert.equal(state.operations.size, 2);
     });
   }
 });
 
 test("a valid-looking changed aggregate receipt fails closed without writes", async () => {
   const state = new MemoryStorageState();
+  await initializeEmptyOwnership(
+    new MemoryStorageAdapter(state),
+    ALICE,
+    "storage-corrupt-receipt",
+  );
   const context = await currentContext(ALICE, "storage-corrupt-receipt");
   const repository = new StorageParticipantInvestmentInterestRepository(
     new MemoryStorageAdapter(state),
@@ -1388,6 +1949,251 @@ test("a valid-looking changed aggregate receipt fails closed without writes", as
   assert.equal(state.operations.size, operationsBefore);
   assertAggregate(state, 1, 1_250, 1);
 });
+
+async function initializeEmptyOwnership(
+  storage: StorageAdapter,
+  participantSubject: ActorSubject,
+  suffix: string,
+): Promise<void> {
+  const initialized = await initializeParticipantInvestmentOwnership(
+    storage,
+    participantSubject,
+    {
+      operationId: `investment-ownership-initialization:${suffix}`,
+      indications: [],
+    },
+  );
+  assert.equal(initialized.indicationCount, 0);
+  assert.equal(initialized.activeCount, 0);
+}
+
+async function seedMaximumOwnershipHeads(
+  state: MemoryStorageState,
+  participantSubject: ActorSubject,
+) {
+  const templates = await maximumOwnershipHeadTemplates(participantSubject);
+  const indications: ParticipantIndicationOwnershipEntry[] = [];
+  for (let index = 0; index < MAX_OWNED_INVESTMENT_INDICATIONS; index += 1) {
+    const idPrefix = `investment-indication:maximum-${String(index).padStart(3, "0")}-`;
+    const indicationId = indicationIdForOperation(
+      `${idPrefix}${"x".repeat(128 - idPrefix.length)}`,
+    );
+    const lifecycleStatus: ParticipantIndicationOwnershipEntry["lifecycleStatus"] =
+      index < MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS
+      ? "active"
+      : index % 2 === 0
+      ? "withdrawn"
+      : "rejected";
+    const template = templates[lifecycleStatus];
+    const current = cloneDocument(template.current);
+    const terminal = cloneDocument(template.terminal);
+    current.indicationId = indicationId;
+    current.participantSubject = participantSubject;
+    current.revision = MAX_INVESTMENT_INDICATION_REVISIONS;
+    terminal.indicationId = indicationId;
+    terminal.participantSubject = participantSubject;
+    terminal.revision = MAX_INVESTMENT_INDICATION_REVISIONS;
+    if (lifecycleStatus !== "active") {
+      const fingerprint = await syntheticTerminalOperationFingerprint(
+        terminal,
+        indicationId,
+        lifecycleStatus,
+      );
+      current.operationFingerprint = fingerprint;
+      terminal.operationFingerprint = fingerprint;
+    }
+    const currentKey = await syntheticIndicationStorageKey(
+      "investment-indications",
+      "indication-current",
+      indicationId,
+    );
+    const terminalKey = await syntheticIndicationStorageKey(
+      "investment-indication-history",
+      "indication-history",
+      `${indicationId}\u0000${MAX_INVESTMENT_INDICATION_REVISIONS}`,
+    );
+    state.records.set(storageKeyString(currentKey), Object.freeze({
+      key: currentKey,
+      revision: MAX_INVESTMENT_INDICATION_REVISIONS,
+      value: Object.freeze(current) as StorageDocument,
+    }));
+    state.records.set(storageKeyString(terminalKey), Object.freeze({
+      key: terminalKey,
+      revision: 1,
+      value: Object.freeze(terminal) as StorageDocument,
+    }));
+    indications.push(Object.freeze({
+      indicationId,
+      indicationRevision: MAX_INVESTMENT_INDICATION_REVISIONS,
+      lifecycleStatus,
+    }));
+  }
+  return Object.freeze(indications);
+}
+
+async function maximumOwnershipHeadTemplates(
+  participantSubject: ActorSubject,
+) {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  const indicationId = indicationIdForOperation(
+    "investment-indication:maximum-shape-template",
+  );
+  const acknowledgment = await currentContext(
+    participantSubject,
+    "maximum-shape-template",
+  );
+  const participant = new DevelopmentInMemoryIndicationRepository(
+    storage,
+    participantSubject,
+    OWNER,
+    AMOUNT,
+  );
+  const created = await participant.create({
+    operationId: "indication-operation:maximum-shape-create",
+    id: indicationId,
+    expectedRevision: null,
+    occurredAt: "2026-08-12T10:00:00.000Z",
+    historyEntryId: "indication-history:maximum-shape-create",
+    fields: personalFields(),
+  }, acknowledgment);
+  const edited = await participant.edit({
+    operationId: "indication-operation:maximum-shape-edit",
+    id: indicationId,
+    expectedRevision: created.snapshot.revision,
+    occurredAt: "2026-08-12T10:01:00.000Z",
+    historyEntryId: "indication-history:maximum-shape-edit",
+    fields: personalFields({ note: "Maximum shape active template." }),
+  }, acknowledgment);
+  const active = ownershipHeadTemplate(state, indicationId, edited.snapshot.revision);
+  const withdrawnResult = await participant.withdraw({
+    operationId: "indication-operation:maximum-shape-withdraw",
+    id: indicationId,
+    expectedRevision: edited.snapshot.revision,
+    occurredAt: "2026-08-12T10:02:00.000Z",
+    historyEntryId: "indication-history:maximum-shape-withdraw",
+  });
+  const withdrawn = ownershipHeadTemplate(
+    state,
+    indicationId,
+    withdrawnResult.snapshot.revision,
+  );
+  const reactivated = await participant.reactivate({
+    operationId: "indication-operation:maximum-shape-reactivate",
+    id: indicationId,
+    expectedRevision: withdrawnResult.snapshot.revision,
+    occurredAt: "2026-08-12T10:03:00.000Z",
+    historyEntryId: "indication-history:maximum-shape-reactivate",
+  }, acknowledgment);
+  const rejectedResult = await new DevelopmentInMemoryIndicationRepository(
+    storage,
+    OWNER,
+    OWNER,
+    AMOUNT,
+  ).reject({
+    operationId: "indication-operation:maximum-shape-reject",
+    id: indicationId,
+    expectedRevision: reactivated.snapshot.revision,
+    occurredAt: "2026-08-12T10:04:00.000Z",
+    historyEntryId: "indication-history:maximum-shape-reject",
+    reason: "Maximum shape rejection template.",
+  });
+  const rejected = ownershipHeadTemplate(
+    state,
+    indicationId,
+    rejectedResult.snapshot.revision,
+  );
+  return Object.freeze({ active, withdrawn, rejected });
+}
+
+function ownershipHeadTemplate(
+  state: MemoryStorageState,
+  indicationId: InvestmentIndicationId,
+  revision: number,
+) {
+  const current = recordsIn(state, "investment-indications").find((record) =>
+    record.value.indicationId === indicationId
+  );
+  const terminal = recordsIn(state, "investment-indication-history").find((record) =>
+    record.value.indicationId === indicationId && record.value.revision === revision
+  );
+  assert(current);
+  assert(terminal);
+  return Object.freeze({ current: current.value, terminal: terminal.value });
+}
+
+function cloneDocument(value: StorageDocument): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+}
+
+async function syntheticIndicationStorageKey(
+  collection: string,
+  namespace: string,
+  value: string,
+) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`${namespace}\u0000${value}`),
+  );
+  const hexadecimal = [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  const parsed = parseStorageKey(collection, `${namespace}:${hexadecimal}`);
+  if (!parsed.ok) assert.fail(JSON.stringify(parsed.issues));
+  return parsed.value;
+}
+
+async function syntheticTerminalOperationFingerprint(
+  terminal: Readonly<Record<string, unknown>>,
+  indicationId: InvestmentIndicationId,
+  lifecycleStatus: "withdrawn" | "rejected",
+): Promise<string> {
+  assert(typeof terminal.operationId === "string");
+  assert(typeof terminal.occurredAt === "string");
+  assert(typeof terminal.historyEntryId === "string");
+  assert(typeof terminal.requestFingerprint === "string");
+  assert(typeof terminal.actor === "object" && terminal.actor !== null);
+  const payload: Record<string, unknown> = {
+    kind: lifecycleStatus === "withdrawn" ? "withdraw" : "reject",
+    operationId: terminal.operationId,
+    actor: terminal.actor,
+    expectedRevision: MAX_INVESTMENT_INDICATION_REVISIONS - 1,
+    id: indicationId,
+    occurredAt: terminal.occurredAt,
+    historyEntryId: terminal.historyEntryId,
+    requestFingerprint: terminal.requestFingerprint,
+  };
+  if (lifecycleStatus === "rejected") {
+    assert(typeof terminal.rejection === "object" && terminal.rejection !== null);
+    const rejection = terminal.rejection as Readonly<Record<string, unknown>>;
+    assert(typeof rejection.reason === "string");
+    payload.reason = rejection.reason;
+  }
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(canonicalJsonForTest(payload)),
+  );
+  return `sha256:${[...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")}`;
+}
+
+function canonicalJsonForTest(value: unknown): string {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    typeof value === "number"
+  ) return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJsonForTest).join(",")}]`;
+  }
+  assert(typeof value === "object");
+  const source = value as Readonly<Record<string, unknown>>;
+  return `{${Object.keys(source).sort().map((key) =>
+    `${JSON.stringify(key)}:${canonicalJsonForTest(source[key])}`
+  ).join(",")}}`;
+}
 
 function serviceFor(
   repository: StorageParticipantInvestmentInterestRepository,
@@ -1446,7 +2252,16 @@ function participantIdsIn(
 ): readonly InvestmentIndicationId[] {
   const record = recordsIn(state, collection)[0];
   assert(record);
-  return record.value.indicationIds as readonly InvestmentIndicationId[];
+  const source = record.value as Readonly<Record<string, unknown>>;
+  if (Array.isArray(source.indicationIds)) {
+    return source.indicationIds as readonly InvestmentIndicationId[];
+  }
+  assert(Array.isArray(source.indications));
+  return source.indications.map((entry) => {
+    assert(typeof entry === "object" && entry !== null);
+    return (entry as Readonly<Record<string, unknown>>)
+      .indicationId as InvestmentIndicationId;
+  });
 }
 
 function deleteOnlyRecordIn(
@@ -1458,6 +2273,86 @@ function deleteOnlyRecordIn(
   );
   assert.equal(entries.length, 1);
   state.records.delete(entries[0]![0]);
+}
+
+function replaceOwnershipWitnessWithLegacyIds(
+  state: MemoryStorageState,
+): void {
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "investment-indication-ownership-witnesses"
+  );
+  assert(entry);
+  const [identity, record] = entry;
+  const source = record.value as Readonly<Record<string, unknown>>;
+  assert(Array.isArray(source.indications));
+  const indicationIds = source.indications.map((value) => {
+    assert(typeof value === "object" && value !== null);
+    return (value as Readonly<Record<string, unknown>>).indicationId as string;
+  });
+  state.records.set(identity, Object.freeze({
+    key: record.key,
+    revision: record.revision,
+    value: Object.freeze({
+      kind: "investment-indication-ownership-witness",
+      schemaVersion: 4,
+      revision: record.revision,
+      indicationIds: Object.freeze(indicationIds),
+    }),
+  }));
+}
+
+function replaceOwnershipWitnessStatus(
+  state: MemoryStorageState,
+  indicationId: InvestmentIndicationId,
+  lifecycleStatus: ParticipantIndicationOwnershipEntry["lifecycleStatus"],
+): void {
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "investment-indication-ownership-witnesses"
+  );
+  assert(entry);
+  const [identity, record] = entry;
+  const source = record.value as Readonly<Record<string, unknown>>;
+  assert(Array.isArray(source.indications));
+  const indications = source.indications.map((value) => {
+    assert(typeof value === "object" && value !== null);
+    const ownership = value as Readonly<Record<string, unknown>>;
+    return ownership.indicationId === indicationId
+      ? Object.freeze({ ...ownership, lifecycleStatus })
+      : ownership;
+  });
+  const revision = record.revision + 1;
+  state.records.set(identity, Object.freeze({
+    key: record.key,
+    revision,
+    value: Object.freeze({
+      ...source,
+      revision,
+      indications: Object.freeze(indications),
+    }) as StorageDocument,
+  }));
+}
+
+function replaceTerminalTransitionKind(
+  state: MemoryStorageState,
+  indicationId: InvestmentIndicationId,
+  revision: number,
+  transitionKind: string,
+): void {
+  const entry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "investment-indication-history" &&
+    record.value.indicationId === indicationId &&
+    record.value.revision === revision
+  );
+  assert(entry);
+  const [identity, record] = entry;
+  state.records.set(identity, Object.freeze({
+    key: record.key,
+    revision: record.revision,
+    value: Object.freeze({
+      ...record.value,
+      transitionKind,
+    }) as StorageDocument,
+  }));
 }
 
 function activeOwned(
@@ -1738,10 +2633,9 @@ class CountingStorageAdapter implements StorageAdapter {
     this.#delegate.transact(request);
 }
 
-class WitnessReadHookStorageAdapter implements StorageAdapter {
+class BeforeTransactionStorageAdapter implements StorageAdapter {
   readonly #delegate: StorageAdapter;
   readonly #inject: () => Promise<void>;
-  #witnessReads = 0;
   injected = false;
 
   constructor(delegate: StorageAdapter, inject: () => Promise<void>) {
@@ -1749,12 +2643,43 @@ class WitnessReadHookStorageAdapter implements StorageAdapter {
     this.#inject = inject;
   }
 
+  read: StorageAdapter["read"] = (key) => this.#delegate.read(key);
+  list: StorageAdapter["list"] = (request) => this.#delegate.list(request);
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    if (!this.injected) {
+      this.injected = true;
+      await this.#inject();
+    }
+    return this.#delegate.transact(request);
+  }
+}
+
+class WitnessReadHookStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #inject: () => Promise<void>;
+  readonly #triggerAt: number;
+  #witnessReads = 0;
+  injected = false;
+
+  constructor(
+    delegate: StorageAdapter,
+    inject: () => Promise<void>,
+    triggerAt = 3,
+  ) {
+    this.#delegate = delegate;
+    this.#inject = inject;
+    this.#triggerAt = triggerAt;
+  }
+
   async read(
     key: Parameters<StorageAdapter["read"]>[0],
   ): Promise<StorageRecord | null> {
     if (key.collection === "investment-indication-ownership-witnesses") {
       this.#witnessReads += 1;
-      if (this.#witnessReads === 3) {
+      if (this.#witnessReads === this.#triggerAt) {
         this.injected = true;
         await this.#inject();
       }

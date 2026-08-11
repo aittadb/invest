@@ -66,14 +66,32 @@ Application workflows must budget their own worst-case atomic operation within
 the 25-mutation limit. Investor App therefore limits one participant to four
 active investment indications while retaining up to 100 owned historical
 records. Withdrawn and rejected records do not consume an active slot. The
-indication store atomically maintains a separate bounded subject-keyed ownership
-witness, and the participant coordinator accepts its index only when stable
-witness samples contain the same exact opaque IDs. The index is compare-and-set
-on participant creation, withdrawal, and reactivation while every indication
-lifecycle write compare-and-sets the witness. Missing, legacy, incomplete, or
-continuously moving pairs fail closed without a collection scan, so concurrent
-requests cannot hide a fifth active record and the later account-deletion
-transaction can withdraw the complete active set atomically.
+indication store atomically maintains a subject-keyed ownership summary whose
+at-most-100 sorted entries contain only opaque indication ID, current revision,
+and lifecycle status. A separate immutable subject root proves that ownership
+metadata was explicitly initialized; ordinary reads and writes never interpret
+an absent root, index, or summary as an empty account.
+
+Initialization and migration are one trusted, retry-stable three-mutation
+operation over the root, index, and summary. Its caller must supply the complete
+sorted subject inventory. The repository checks every supplied entry against
+the exact subject-bound current record and its immutable terminal transition,
+rejects more than four active entries, and accepts an ID-only schema-4 witness
+only through this explicit boundary. A changed retry conflicts. A missing,
+incomplete, over-capacity, malformed, mismatched, or moving state is unavailable
+and changes nothing.
+
+One capacity proof reads the root, summary, and index, then exactly the current
+and terminal record for each owned ID, and finally re-reads the summary. It does
+not list a collection, read field chunks, or replay transition ancestry. The
+exact ceilings are 204 reads for 100 owned records, 203 reads for first
+initialization, 205 for an initialized restart, and 407 when a maximum-size
+initialization loses a concurrent exact race and verifies the winner. A fresh
+create rejected by capacity uses 207 reads including the service's target lookup
+and both operation-receipt checks. The summary replaces the previous witness in
+the same lifecycle mutation slot, and the immutable root is not rewritten by a
+lifecycle transition, so the accepted 25-mutation account-deletion bound is
+unchanged.
 
 The machine-readable `transaction_shape` declares:
 

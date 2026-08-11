@@ -18,10 +18,11 @@ import {
   projectInvestmentIndicationForAggregation,
   type StoredInvestmentAggregateSnapshot,
 } from "../domain/investment-aggregate.ts";
-import type {
-  InvestmentIndication,
-  InvestmentIndicationId,
-  InvestmentIndicationParsingOptions,
+import {
+  MAX_INVESTMENT_INDICATION_REVISIONS,
+  type InvestmentIndication,
+  type InvestmentIndicationId,
+  type InvestmentIndicationParsingOptions,
 } from "../domain/investment-indication.ts";
 import {
   MAX_STORAGE_TRANSACTION_MUTATIONS,
@@ -29,6 +30,7 @@ import {
   normalizeStorageTransactionRequest,
   parseStorageCollection,
   parseStorageKey,
+  parseStorageOperationId,
   storageKeyString,
   type StorageAdapter,
   type StorageCollection,
@@ -56,13 +58,14 @@ import {
   DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
-  MAX_INDICATION_MATERIALIZATION_READS,
   MAX_OWNED_INVESTMENT_INDICATIONS,
   prepareParticipantIndicationMutation,
   prepareParticipantIndicationReplay,
   readParticipantIndicationCompletenessWitness,
+  readParticipantIndicationOwnershipHead,
   type IndicationMutationResult,
   type ParticipantIndicationCompletenessWitness,
+  type ParticipantIndicationOwnershipEntry,
   type PreparedParticipantIndicationMutation,
   type PreparedParticipantIndicationReplay,
 } from "./in-memory-indication-repository.ts";
@@ -77,14 +80,28 @@ import {
 
 const PARTICIPANT_INDEX_SCHEMA_VERSION = 1;
 const PARTICIPANT_OPERATION_SCHEMA_VERSION = 2;
-const MAX_PARTICIPANT_INDEX_SNAPSHOT_ATTEMPTS = 2;
-export const MAX_PARTICIPANT_INDEX_SNAPSHOT_READS =
-  3 * MAX_PARTICIPANT_INDEX_SNAPSHOT_ATTEMPTS;
+const PARTICIPANT_OWNERSHIP_ROOT_SCHEMA_VERSION = 1;
+const PARTICIPANT_OWNERSHIP_WITNESS_SCHEMA_VERSION = 2;
+const LEGACY_OWNERSHIP_WITNESS_SCHEMA_VERSION = 4;
+export const MAX_PARTICIPANT_INDEX_SNAPSHOT_READS = 4;
 export const MAX_PARTICIPANT_CAPACITY_READS =
   MAX_PARTICIPANT_INDEX_SNAPSHOT_READS +
-  MAX_OWNED_INVESTMENT_INDICATIONS * MAX_INDICATION_MATERIALIZATION_READS;
+  2 * MAX_OWNED_INVESTMENT_INDICATIONS;
+export const MAX_PARTICIPANT_OWNERSHIP_FIRST_INITIALIZATION_READS =
+  3 + 2 * MAX_OWNED_INVESTMENT_INDICATIONS;
+export const MAX_PARTICIPANT_OWNERSHIP_RESTART_READS =
+  1 + MAX_PARTICIPANT_CAPACITY_READS;
+export const MAX_PARTICIPANT_OWNERSHIP_CONCURRENT_REPLAY_READS =
+  MAX_PARTICIPANT_OWNERSHIP_FIRST_INITIALIZATION_READS +
+  MAX_PARTICIPANT_CAPACITY_READS;
 const PARTICIPANT_INDEXES = collection("participant-investment-indexes");
 const PARTICIPANT_OPERATIONS = collection("participant-investment-operations");
+const PARTICIPANT_OWNERSHIP_ROOTS = collection(
+  "participant-investment-ownership-roots",
+);
+const PARTICIPANT_OWNERSHIP_WITNESSES = collection(
+  "investment-indication-ownership-witnesses",
+);
 const INDEX_DOCUMENT_KEYS = new Set([
   "kind",
   "schemaVersion",
@@ -100,6 +117,29 @@ const RECEIPT_DOCUMENT_KEYS = new Set([
   "indicationRevision",
   "aggregate",
   "auditEventId",
+]);
+const OWNERSHIP_ROOT_DOCUMENT_KEYS = new Set([
+  "kind",
+  "schemaVersion",
+  "operationId",
+  "initializationFingerprint",
+]);
+const LEGACY_OWNERSHIP_WITNESS_DOCUMENT_KEYS = new Set([
+  "kind",
+  "schemaVersion",
+  "revision",
+  "indicationIds",
+]);
+const OWNERSHIP_WITNESS_DOCUMENT_KEYS = new Set([
+  "kind",
+  "schemaVersion",
+  "revision",
+  "indications",
+]);
+const OWNERSHIP_ENTRY_DOCUMENT_KEYS = new Set([
+  "indicationId",
+  "indicationRevision",
+  "lifecycleStatus",
 ]);
 const AGGREGATE_KEYS = new Set([
   "revision",
@@ -121,6 +161,41 @@ type CompleteParticipantIndex = Readonly<{
   witness: ParticipantIndicationCompletenessWitness;
 }>;
 
+type ParticipantOwnershipRoot = Readonly<{
+  record: StorageRecord;
+  operationId: StorageOperationId;
+  initializationFingerprint: string;
+}>;
+
+export type ParticipantInvestmentOwnershipInitializationEntry = Readonly<{
+  indicationId: unknown;
+  indicationRevision: unknown;
+  lifecycleStatus: unknown;
+}>;
+
+export type ParticipantInvestmentOwnershipInitializationRequest = Readonly<{
+  operationId: unknown;
+  indications: unknown;
+}>;
+
+export type ParticipantInvestmentOwnershipInitializationResult = Readonly<{
+  replayed: boolean;
+  indicationCount: number;
+  activeCount: number;
+}>;
+
+type ParsedOwnershipInitialization = Readonly<{
+  operationId: StorageOperationId;
+  indications: readonly ParticipantIndicationOwnershipEntry[];
+  fingerprint: string;
+}>;
+
+type ParticipantMigrationWitness = Readonly<{
+  record: StorageRecord;
+  indicationIds: readonly InvestmentIndicationId[];
+  indications: readonly ParticipantIndicationOwnershipEntry[] | null;
+}>;
+
 type PreparedReplayCommand = Readonly<{
   command: AtomicParticipantInvestmentInterestCommand;
   indication: PreparedParticipantIndicationReplay;
@@ -140,6 +215,95 @@ type StoredOperationReceipt = Readonly<{
   aggregate: StoredInvestmentAggregateSnapshot;
   auditEventId: string;
 }>;
+
+/**
+ * Explicit deployment/migration boundary for one subject's ownership metadata.
+ * Ordinary participant reads and writes never infer initialization from absence.
+ */
+export async function initializeParticipantInvestmentOwnership(
+  storage: StorageAdapter,
+  participantSubject: unknown,
+  request: ParticipantInvestmentOwnershipInitializationRequest,
+): Promise<ParticipantInvestmentOwnershipInitializationResult> {
+  try {
+    const adapter = requiredStorageAdapter(storage);
+    const subject = requiredSubject(participantSubject);
+    const parsed = await parseOwnershipInitializationRequest(subject, request);
+    if (
+      parsed.indications.filter((entry) =>
+        entry.lifecycleStatus === "active"
+      ).length > MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS
+    ) unavailable();
+    const existingRoot = await readParticipantOwnershipRoot(adapter, subject);
+    if (existingRoot !== null) {
+      if (
+        existingRoot.operationId !== parsed.operationId ||
+        existingRoot.initializationFingerprint !== parsed.fingerprint
+      ) conflict();
+      const complete = await readCompleteParticipantIndex(adapter, subject);
+      if (!sameOwnershipEntries(complete.witness.indications, parsed.indications)) {
+        unavailable();
+      }
+      return ownershipInitializationResult(parsed.indications, true);
+    }
+
+    const index = await readParticipantIndex(adapter, subject);
+    const migrationWitness = await readParticipantMigrationWitness(
+      adapter,
+      subject,
+    );
+    const expectedIds = ownershipEntryIds(parsed.indications);
+    if (
+      (index.record !== null && !sameStrings(index.ids, expectedIds)) ||
+      (migrationWitness !== null &&
+        !sameStrings(migrationWitness.indicationIds, expectedIds)) ||
+      (migrationWitness?.indications !== null &&
+        migrationWitness?.indications !== undefined &&
+        !sameOwnershipEntries(
+          migrationWitness.indications,
+          parsed.indications,
+        ))
+    ) unavailable();
+    await verifyOwnershipHeads(adapter, subject, parsed.indications);
+
+    const rootKey = await participantOwnershipRootKey(subject);
+    const rootMutation = Object.freeze({
+      type: "put" as const,
+      key: rootKey,
+      expectedRevision: null,
+      value: ownershipRootDocument(parsed),
+    });
+    const indexMutation = await participantIndexMutation(
+      subject,
+      index,
+      expectedIds,
+    );
+    const witnessMutation = await participantOwnershipWitnessMutation(
+      subject,
+      migrationWitness?.record ?? null,
+      parsed.indications,
+    );
+    const transaction = normalizeStorageTransactionRequest({
+      operationId: parsed.operationId,
+      mutations: Object.freeze([
+        rootMutation,
+        indexMutation,
+        witnessMutation,
+      ]),
+    });
+    const result = await adapter.transact(transaction);
+    verifyInitializationTransactionResult(result, transaction.mutations);
+    if (result.replayed) {
+      const complete = await readCompleteParticipantIndex(adapter, subject);
+      if (!sameOwnershipEntries(complete.witness.indications, parsed.indications)) {
+        unavailable();
+      }
+    }
+    return ownershipInitializationResult(parsed.indications, result.replayed);
+  } catch (error) {
+    return mapRepositoryError(error);
+  }
+}
 
 /**
  * Participant-owned reads and one strong indication/aggregate/audit write port.
@@ -262,7 +426,6 @@ export class StorageParticipantInvestmentInterestRepository
     );
     const capacity = await readParticipantCapacity(
       staged,
-      indications,
       this.#subject,
     );
     if (capacity.activeCount > MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS) {
@@ -291,6 +454,11 @@ export class StorageParticipantInvestmentInterestRepository
         [...capacity.index.ids, indication.snapshot.id].sort(compareIds),
       )
       : capacity.index.ids;
+    const nextOwnershipEntries = replaceOwnershipEntry(
+      capacity.witness.indications,
+      indication.snapshot,
+      prepared.command.kind === "create",
+    );
     const stagedWitness = await readParticipantIndicationCompletenessWitness(
       staged,
       this.#subject,
@@ -299,7 +467,11 @@ export class StorageParticipantInvestmentInterestRepository
       stagedWitness.record === null ||
       stagedWitness.record.revision !==
         (capacity.witness.record?.revision ?? 0) + 1 ||
-      !sameStrings(stagedWitness.indicationIds, nextIndexIds)
+      !sameOwnershipEntries(
+        stagedWitness.indications,
+        nextOwnershipEntries,
+      ) ||
+      !sameStrings(ownershipEntryIds(stagedWitness.indications), nextIndexIds)
     ) unavailable();
 
     const aggregateBefore = await new DevelopmentInMemoryAggregateRepository(
@@ -629,40 +801,352 @@ async function readParticipantIndex(
   });
 }
 
+async function readParticipantOwnershipRoot(
+  storage: Pick<StorageAdapter, "read">,
+  subject: ActorSubject,
+): Promise<ParticipantOwnershipRoot | null> {
+  const expectedKey = await participantOwnershipRootKey(subject);
+  const record = await storage.read(expectedKey);
+  if (record === null) return null;
+  const envelope = exactStoredRecordEnvelope(record, expectedKey);
+  if (envelope.revision !== 1) unavailable();
+  const source = exactRecord(envelope.value, OWNERSHIP_ROOT_DOCUMENT_KEYS);
+  const operationId = parseStorageOperationId(source.operationId);
+  if (
+    source.kind !== "participant-investment-ownership-root" ||
+    source.schemaVersion !== PARTICIPANT_OWNERSHIP_ROOT_SCHEMA_VERSION ||
+    !operationId.ok ||
+    typeof source.initializationFingerprint !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(source.initializationFingerprint)
+  ) unavailable();
+  return Object.freeze({
+    record: Object.freeze({
+      key: expectedKey,
+      revision: envelope.revision,
+      value: source as StorageDocument,
+    }),
+    operationId: operationId.value,
+    initializationFingerprint: source.initializationFingerprint,
+  });
+}
+
+async function readParticipantMigrationWitness(
+  storage: Pick<StorageAdapter, "read">,
+  subject: ActorSubject,
+): Promise<ParticipantMigrationWitness | null> {
+  const expectedKey = await participantOwnershipWitnessKey(subject);
+  const record = await storage.read(expectedKey);
+  if (record === null) return null;
+  const envelope = exactStoredRecordEnvelope(record, expectedKey);
+  const value = envelope.value;
+  const candidate = exactDataRecord(value);
+  if (candidate.schemaVersion === LEGACY_OWNERSHIP_WITNESS_SCHEMA_VERSION) {
+    const source = exactRecord(value, LEGACY_OWNERSHIP_WITNESS_DOCUMENT_KEYS);
+    if (
+      source.kind !== "investment-indication-ownership-witness" ||
+      source.revision !== envelope.revision
+    ) unavailable();
+    const indicationIds = parseStoredIndicationIds(source.indicationIds);
+    return Object.freeze({
+      record: Object.freeze({
+        key: expectedKey,
+        revision: envelope.revision,
+        value: source as StorageDocument,
+      }),
+      indicationIds,
+      indications: null,
+    });
+  }
+  const source = exactRecord(value, OWNERSHIP_WITNESS_DOCUMENT_KEYS);
+  if (
+    source.kind !== "investment-indication-ownership-witness" ||
+    source.schemaVersion !== PARTICIPANT_OWNERSHIP_WITNESS_SCHEMA_VERSION ||
+    source.revision !== envelope.revision
+  ) unavailable();
+  const indications = parseOwnershipEntries(source.indications, "stored");
+  return Object.freeze({
+    record: Object.freeze({
+      key: expectedKey,
+      revision: envelope.revision,
+      value: source as StorageDocument,
+    }),
+    indicationIds: ownershipEntryIds(indications),
+    indications,
+  });
+}
+
+async function verifyOwnershipHeads(
+  storage: Pick<StorageAdapter, "read">,
+  subject: ActorSubject,
+  indications: readonly ParticipantIndicationOwnershipEntry[],
+): Promise<void> {
+  for (const expected of indications) {
+    const actual = await readParticipantIndicationOwnershipHead(
+      storage,
+      subject,
+      expected.indicationId,
+    );
+    if (
+      actual === null ||
+      actual.indicationId !== expected.indicationId ||
+      actual.indicationRevision !== expected.indicationRevision ||
+      actual.lifecycleStatus !== expected.lifecycleStatus
+    ) unavailable();
+  }
+}
+
+async function parseOwnershipInitializationRequest(
+  subject: ActorSubject,
+  request: ParticipantInvestmentOwnershipInitializationRequest,
+): Promise<ParsedOwnershipInitialization> {
+  let source: Record<string, unknown>;
+  let indications: readonly ParticipantIndicationOwnershipEntry[];
+  try {
+    source = exactRecord(request, new Set(["operationId", "indications"]));
+    indications = parseOwnershipEntries(source.indications, "input");
+  } catch {
+    return invalid();
+  }
+  const operationId = parseStorageOperationId(source.operationId);
+  if (!operationId.ok) invalid();
+  const fingerprint = await sha256(canonicalJson({
+    kind: "participant-investment-ownership-initialization",
+    participantSubject: subject,
+    indications: indications.map(ownershipEntryDocument),
+  }));
+  return Object.freeze({
+    operationId: operationId.value,
+    indications,
+    fingerprint,
+  });
+}
+
+function parseOwnershipEntries(
+  value: unknown,
+  mode: "input" | "stored",
+): readonly ParticipantIndicationOwnershipEntry[] {
+  let values: readonly unknown[];
+  try {
+    values = exactDenseArray(value, MAX_OWNED_INVESTMENT_INDICATIONS);
+  } catch {
+    return mode === "input" ? invalid() : unavailable();
+  }
+  const indications: ParticipantIndicationOwnershipEntry[] = [];
+  for (const value of values) {
+    let source: Record<string, unknown>;
+    try {
+      source = exactRecord(value, OWNERSHIP_ENTRY_DOCUMENT_KEYS);
+    } catch {
+      return mode === "input" ? invalid() : unavailable();
+    }
+    const indicationId = parseStableId<"investment-indication">(
+      source.indicationId,
+    );
+    if (
+      !indicationId.ok ||
+      indications.some((entry) =>
+        entry.indicationId === indicationId.value
+      ) ||
+      !Number.isSafeInteger(source.indicationRevision) ||
+      (source.indicationRevision as number) < 1 ||
+      (source.indicationRevision as number) >
+        MAX_INVESTMENT_INDICATION_REVISIONS ||
+      !isOwnershipLifecycleStatus(source.lifecycleStatus)
+    ) {
+      return mode === "input" ? invalid() : unavailable();
+    }
+    indications.push(Object.freeze({
+      indicationId: indicationId.value,
+      indicationRevision: source.indicationRevision as number,
+      lifecycleStatus: source.lifecycleStatus,
+    }));
+  }
+  const sorted = [...indications].sort(compareOwnershipEntries);
+  if (
+    mode === "stored" &&
+    !sameStrings(ownershipEntryIds(indications), ownershipEntryIds(sorted))
+  ) unavailable();
+  return Object.freeze(sorted);
+}
+
+function parseStoredIndicationIds(
+  value: unknown,
+): readonly InvestmentIndicationId[] {
+  const values = exactDenseArray(value, MAX_OWNED_INVESTMENT_INDICATIONS);
+  const ids: InvestmentIndicationId[] = [];
+  for (const value of values) {
+    const parsed = parseStableId<"investment-indication">(value);
+    if (!parsed.ok || ids.includes(parsed.value)) unavailable();
+    ids.push(parsed.value);
+  }
+  if (!sameStrings(ids, [...ids].sort(compareIds))) unavailable();
+  return Object.freeze(ids);
+}
+
+function ownershipRootDocument(
+  parsed: ParsedOwnershipInitialization,
+): StorageDocument {
+  return Object.freeze({
+    kind: "participant-investment-ownership-root",
+    schemaVersion: PARTICIPANT_OWNERSHIP_ROOT_SCHEMA_VERSION,
+    operationId: parsed.operationId,
+    initializationFingerprint: parsed.fingerprint,
+  });
+}
+
+async function participantOwnershipWitnessMutation(
+  subject: ActorSubject,
+  current: StorageRecord | null,
+  indications: readonly ParticipantIndicationOwnershipEntry[],
+): Promise<StorageMutation> {
+  const revision = (current?.revision ?? 0) + 1;
+  if (!Number.isSafeInteger(revision)) unavailable();
+  return Object.freeze({
+    type: "put" as const,
+    key: await participantOwnershipWitnessKey(subject),
+    expectedRevision: current?.revision ?? null,
+    value: Object.freeze({
+      kind: "investment-indication-ownership-witness",
+      schemaVersion: PARTICIPANT_OWNERSHIP_WITNESS_SCHEMA_VERSION,
+      revision,
+      indications: Object.freeze(indications.map(ownershipEntryDocument)),
+    }),
+  });
+}
+
+function ownershipInitializationResult(
+  indications: readonly ParticipantIndicationOwnershipEntry[],
+  replayed: boolean,
+): ParticipantInvestmentOwnershipInitializationResult {
+  return Object.freeze({
+    replayed,
+    indicationCount: indications.length,
+    activeCount: indications.filter((entry) =>
+      entry.lifecycleStatus === "active"
+    ).length,
+  });
+}
+
+function verifyInitializationTransactionResult(
+  result: unknown,
+  mutations: readonly StorageMutation[],
+): void {
+  const source = exactRecord(result, TRANSACTION_RESULT_KEYS);
+  if (typeof source.replayed !== "boolean") unavailable();
+  const records = exactDenseArray(source.records, mutations.length);
+  if (records.length !== mutations.length) unavailable();
+  for (let index = 0; index < mutations.length; index += 1) {
+    const mutation = mutations[index];
+    if (mutation === undefined || mutation.type !== "put") unavailable();
+    const expected = Object.freeze({
+      key: mutation.key,
+      revision: (mutation.expectedRevision ?? 0) + 1,
+      value: mutation.value,
+    });
+    if (!sameRecord(records[index], expected)) unavailable();
+  }
+}
+
+function replaceOwnershipEntry(
+  current: readonly ParticipantIndicationOwnershipEntry[],
+  indication: InvestmentIndication,
+  create: boolean,
+): readonly ParticipantIndicationOwnershipEntry[] {
+  const entry = ownershipEntryFromIndication(indication);
+  const existing = current.find((candidate) =>
+    candidate.indicationId === indication.id
+  );
+  if (create) {
+    if (existing !== undefined) conflict();
+    return Object.freeze([...current, entry].sort(compareOwnershipEntries));
+  }
+  if (existing === undefined) unavailable();
+  return Object.freeze(current.map((candidate) =>
+    candidate.indicationId === indication.id ? entry : candidate
+  ));
+}
+
+function ownershipEntryFromIndication(
+  indication: InvestmentIndication,
+): ParticipantIndicationOwnershipEntry {
+  return Object.freeze({
+    indicationId: indication.id,
+    indicationRevision: indication.revision,
+    lifecycleStatus: indication.lifecycle.status,
+  });
+}
+
+function ownershipEntryDocument(
+  entry: ParticipantIndicationOwnershipEntry,
+): StorageDocument {
+  return Object.freeze({
+    indicationId: entry.indicationId,
+    indicationRevision: entry.indicationRevision,
+    lifecycleStatus: entry.lifecycleStatus,
+  });
+}
+
+function ownershipEntryIds(
+  indications: readonly ParticipantIndicationOwnershipEntry[],
+): readonly InvestmentIndicationId[] {
+  return Object.freeze(indications.map(({ indicationId }) => indicationId));
+}
+
+function sameOwnershipEntries(
+  left: readonly ParticipantIndicationOwnershipEntry[],
+  right: readonly ParticipantIndicationOwnershipEntry[],
+): boolean {
+  return left.length === right.length && left.every((entry, index) => {
+    const candidate = right[index];
+    return candidate !== undefined &&
+      entry.indicationId === candidate.indicationId &&
+      entry.indicationRevision === candidate.indicationRevision &&
+      entry.lifecycleStatus === candidate.lifecycleStatus;
+  });
+}
+
+function compareOwnershipEntries(
+  left: ParticipantIndicationOwnershipEntry,
+  right: ParticipantIndicationOwnershipEntry,
+): number {
+  return compareIds(left.indicationId, right.indicationId);
+}
+
+function isOwnershipLifecycleStatus(
+  value: unknown,
+): value is InvestmentIndication["lifecycle"]["status"] {
+  return value === "active" || value === "withdrawn" || value === "rejected";
+}
+
 async function readCompleteParticipantIndex(
   storage: Pick<StorageAdapter, "read">,
   subject: ActorSubject,
 ): Promise<CompleteParticipantIndex> {
-  for (
-    let attempt = 0;
-    attempt < MAX_PARTICIPANT_INDEX_SNAPSHOT_ATTEMPTS;
-    attempt += 1
-  ) {
-    const witnessBefore = await readParticipantIndicationCompletenessWitness(
-      storage,
-      subject,
-    );
-    const index = await readParticipantIndex(storage, subject);
-    const witnessAfter = await readParticipantIndicationCompletenessWitness(
-      storage,
-      subject,
-    );
-    if (!sameWitness(witnessBefore, witnessAfter)) continue;
-    if (
-      (index.record === null) !== (witnessAfter.record === null) ||
-      !sameStrings(index.ids, witnessAfter.indicationIds)
-    ) unavailable();
-    return Object.freeze({ index, witness: witnessAfter });
-  }
-  return unavailable();
+  if (await readParticipantOwnershipRoot(storage, subject) === null) unavailable();
+  const witnessBefore = await readParticipantIndicationCompletenessWitness(
+    storage,
+    subject,
+  );
+  const index = await readParticipantIndex(storage, subject);
+  if (witnessBefore.record === null || index.record === null) unavailable();
+  const witnessIds = ownershipEntryIds(witnessBefore.indications);
+  if (!sameStrings(index.ids, witnessIds)) unavailable();
+  if (
+    witnessBefore.indications.filter((entry) =>
+      entry.lifecycleStatus === "active"
+    ).length > MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS
+  ) unavailable();
+  await verifyOwnershipHeads(storage, subject, witnessBefore.indications);
+  const witnessAfter = await readParticipantIndicationCompletenessWitness(
+    storage,
+    subject,
+  );
+  if (!sameWitness(witnessBefore, witnessAfter)) unavailable();
+  return Object.freeze({ index, witness: witnessAfter });
 }
 
 async function readParticipantCapacity(
   storage: Pick<StorageAdapter, "read">,
-  indications: Pick<
-    DevelopmentInMemoryIndicationRepository,
-    "readCurrentParticipantProjection"
-  >,
   subject: ActorSubject,
 ): Promise<Readonly<{
   index: ParticipantIndex;
@@ -670,19 +1154,12 @@ async function readParticipantCapacity(
   activeCount: number;
 }>> {
   const complete = await readCompleteParticipantIndex(storage, subject);
-  let activeCount = 0;
-  for (const id of complete.index.ids) {
-    const indication = await indications.readCurrentParticipantProjection(id);
-    if (
-      indication === null ||
-      indication.id !== id ||
-      indication.participantSubject !== subject
-    ) {
-      unavailable();
-    }
-    if (indication.lifecycle.status === "active") activeCount += 1;
-  }
-  return Object.freeze({ ...complete, activeCount });
+  return Object.freeze({
+    ...complete,
+    activeCount: complete.witness.indications.filter((entry) =>
+      entry.lifecycleStatus === "active"
+    ).length,
+  });
 }
 
 async function participantIndexMutation(
@@ -722,7 +1199,7 @@ function sameWitness(
     return left.record === null && right.record === null;
   }
   return left.record.revision === right.record.revision &&
-    sameStrings(left.indicationIds, right.indicationIds);
+    sameOwnershipEntries(left.indications, right.indications);
 }
 
 class StagedStorageTransaction implements StorageAdapter {
@@ -1001,6 +1478,26 @@ async function participantIndexKey(subject: ActorSubject): Promise<StorageKey> {
   return key(PARTICIPANT_INDEXES, `participant-index:${await digest(subject)}`);
 }
 
+async function participantOwnershipRootKey(
+  subject: ActorSubject,
+): Promise<StorageKey> {
+  return key(
+    PARTICIPANT_OWNERSHIP_ROOTS,
+    `participant-ownership-root:${await digest(subject)}`,
+  );
+}
+
+async function participantOwnershipWitnessKey(
+  subject: ActorSubject,
+): Promise<StorageKey> {
+  return key(
+    PARTICIPANT_OWNERSHIP_WITNESSES,
+    `indication-ownership:${
+      await digest(`indication-ownership\u0000${subject}`)
+    }`,
+  );
+}
+
 async function operationReceiptKey(
   operationId: StorageOperationId,
 ): Promise<StorageKey> {
@@ -1098,6 +1595,18 @@ function exactRecord(
   value: unknown,
   keys: ReadonlySet<string>,
 ): Record<string, unknown> {
+  const source = exactDataRecord(value);
+  const actual = Reflect.ownKeys(source);
+  if (
+    actual.length !== keys.size ||
+    actual.some((candidate) =>
+      typeof candidate !== "string" || !keys.has(candidate)
+    )
+  ) unavailable();
+  return source;
+}
+
+function exactDataRecord(value: unknown): Record<string, unknown> {
   if (
     typeof value !== "object" ||
     value === null ||
@@ -1107,13 +1616,9 @@ function exactRecord(
   ) unavailable();
   const source = value as Record<string, unknown>;
   const actual = Reflect.ownKeys(source);
-  if (
-    actual.length !== keys.size ||
-    actual.some((candidate) =>
-      typeof candidate !== "string" || !keys.has(candidate)
-    )
-  ) unavailable();
-  for (const candidate of keys) {
+  if (actual.some((candidate) => typeof candidate !== "string")) unavailable();
+  for (const candidate of actual) {
+    if (typeof candidate !== "string") unavailable();
     const descriptor = Object.getOwnPropertyDescriptor(source, candidate);
     if (
       descriptor === undefined ||

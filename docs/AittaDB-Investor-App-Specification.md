@@ -142,7 +142,9 @@ The form collects:
 
 The app enforces one active company indication per normalized country and identifier pair. Duplicate rejection must not reveal who controls the existing record.
 
-One participant can have at most four active indications across personal and company records. Withdrawn and rejected historical indications do not consume this active limit. Persistent ownership materialization requires matching bounded subject-index and ownership-witness evidence; missing, incomplete, corrupt, or continuously changing evidence fails closed without scanning another participant's records.
+One participant can have at most four active indications across personal and company records. Withdrawn and rejected historical indications do not consume this active limit. Persistent ownership materialization requires matching bounded subject root, index, summary, current-head, and terminal-transition evidence; missing, incomplete, corrupt, or continuously changing evidence fails closed without scanning another participant's records.
+
+Persistent ownership must be explicitly initialized or migrated from a complete subject-bound inventory. An immutable subject root, the sorted index, and an at-most-100-entry revision/status summary must all exist and agree with each indication's current record and immutable terminal transition. Correlated metadata absence is never an empty account. Capacity evaluation performs no collection scan or ancestry replay and is bounded to 204 storage reads at 100 owned records; first initialization is bounded to 203 reads, initialized restart to 205, and concurrent exact initialization recovery to 407. A production Worker must reserve at least 407 remaining AittaDB read subrequests for this boundary and must use a larger whole-request limit for authentication, token, protocol, and route work.
 
 ### UC-INV-004: Edit Indication
 

@@ -224,6 +224,35 @@ cannot enter hosted composition. The older direct HTTP campaign repository is
 not used because it cannot atomically commit campaign revision, history,
 operation index, public projection, and audit evidence.
 
+## Participant Investment Ownership Runtime
+
+Hosted participant investment persistence is unavailable until the exact
+subject has passed `initializeParticipantInvestmentOwnership`. New-account
+provisioning may supply an empty inventory only when it authoritatively knows
+that no indication record exists for that subject. Migration must instead
+supply the complete sorted inventory of at most 100 indication IDs, current
+revisions, and lifecycle statuses. The function verifies each current and
+terminal record, rejects more than four active entries, and atomically creates
+the immutable subject root, index, and summary. Ordinary request composition
+must never call this function as an absence fallback. Existing-root corruption
+is unavailable and requires operator investigation rather than automatic
+reinitialization.
+
+The exact adapter-read ceilings are 204 for capacity, 203 for first
+initialization, 205 for an initialized restart, and 407 for a maximum-size
+initialization that loses a concurrent exact race and verifies the winner. A
+fresh create rejected at capacity uses 207 reads after including its target
+lookup and two operation-receipt checks. These paths issue no collection list,
+field-chunk read, or ancestry reconstruction. Because an AittaDB HTTP read is a
+Worker Fetch subrequest, at least 407 subrequests must remain when this boundary
+starts; authentication, token acquisition, protocol discovery, route reads,
+and writes require additional whole-request headroom. Cloudflare's
+[Worker subrequest limits](https://developers.cloudflare.com/workers/platform/limits/#subrequests)
+give external requests only 50 subrequests on Workers Free, which is unsupported
+for this feature. Production must use Workers Paid or a higher equivalent limit;
+the paid default of 10,000 leaves ample capacity-proof headroom unless deployment
+configuration lowers it.
+
 Private schema-version-4 setup values are normalized and deterministically
 serialized, then SHA-256 addressed and staged as immutable 45,000-byte raw
 chunks. Their encoded storage records are explicitly bounded to 61,440 bytes,

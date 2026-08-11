@@ -81,6 +81,7 @@ const ACTIVE_UNIQUENESS_KEYS = storageCollection(
 const OWNERSHIP_WITNESSES = storageCollection(
   "investment-indication-ownership-witnesses",
 );
+const OWNERSHIP_WITNESS_SCHEMA_VERSION = 2;
 export const MAX_INDICATION_STORAGE_RECORD_BYTES = 65_536;
 export const MAX_INDICATION_STORAGE_TRANSACTION_BYTES = 1_048_576;
 export const MAX_SERIALIZED_INDICATION_FIELDS_BYTES = 65_536;
@@ -193,7 +194,12 @@ const OWNERSHIP_WITNESS_DOCUMENT_KEYS = new Set([
   "kind",
   "schemaVersion",
   "revision",
-  "indicationIds",
+  "indications",
+]);
+const OWNERSHIP_ENTRY_DOCUMENT_KEYS = new Set([
+  "indicationId",
+  "indicationRevision",
+  "lifecycleStatus",
 ]);
 
 export type IndicationMutationResult<
@@ -204,9 +210,21 @@ export type IndicationMutationResult<
   replayed: boolean;
 }>;
 
+export type ParticipantIndicationOwnershipEntry = Readonly<{
+  indicationId: InvestmentIndicationId;
+  indicationRevision: number;
+  lifecycleStatus: InvestmentIndication["lifecycle"]["status"];
+}>;
+
 export type ParticipantIndicationCompletenessWitness = Readonly<{
   record: StorageRecord | null;
-  indicationIds: readonly InvestmentIndicationId[];
+  indications: readonly ParticipantIndicationOwnershipEntry[];
+}>;
+
+export type ParticipantIndicationOwnershipHead = Readonly<{
+  indicationId: InvestmentIndicationId;
+  indicationRevision: number;
+  lifecycleStatus: InvestmentIndication["lifecycle"]["status"];
 }>;
 
 type IndicationMutationRequest = Readonly<{
@@ -468,7 +486,7 @@ export async function readParticipantIndicationCompletenessWitness(
   if (record === null) {
     return Object.freeze({
       record: null,
-      indicationIds: Object.freeze([]),
+      indications: Object.freeze([]),
     });
   }
   const source = exactStoredDocument(
@@ -476,23 +494,44 @@ export async function readParticipantIndicationCompletenessWitness(
     key,
     OWNERSHIP_WITNESS_DOCUMENT_KEYS,
     "investment-indication-ownership-witness",
+    OWNERSHIP_WITNESS_SCHEMA_VERSION,
   );
   if (
+    source.schemaVersion !== OWNERSHIP_WITNESS_SCHEMA_VERSION ||
     !Number.isSafeInteger(source.revision) ||
     (source.revision as number) < 1 ||
     source.revision !== record.revision
   ) unavailable();
   const values = exactDenseArray(
-    source.indicationIds,
+    source.indications,
     MAX_OWNED_INVESTMENT_INDICATIONS,
   );
-  const indicationIds: InvestmentIndicationId[] = [];
+  const indications: ParticipantIndicationOwnershipEntry[] = [];
   for (const value of values) {
-    const parsed = parseStableId<"investment-indication">(value);
-    if (!parsed.ok || indicationIds.includes(parsed.value)) unavailable();
-    indicationIds.push(parsed.value);
+    const entry = exactRecord(value, OWNERSHIP_ENTRY_DOCUMENT_KEYS);
+    const parsed = parseStableId<"investment-indication">(entry.indicationId);
+    if (
+      !parsed.ok ||
+      indications.some((candidate) =>
+        candidate.indicationId === parsed.value
+      ) ||
+      !Number.isSafeInteger(entry.indicationRevision) ||
+      (entry.indicationRevision as number) < 1 ||
+      (entry.indicationRevision as number) > MAX_INVESTMENT_INDICATION_REVISIONS ||
+      !isInvestmentIndicationLifecycleStatus(entry.lifecycleStatus)
+    ) unavailable();
+    indications.push(Object.freeze({
+      indicationId: parsed.value,
+      indicationRevision: entry.indicationRevision as number,
+      lifecycleStatus: entry.lifecycleStatus,
+    }));
   }
-  if (!sameStrings(indicationIds, [...indicationIds].sort(compareStrings))) {
+  if (
+    !sameStrings(
+      indications.map(({ indicationId }) => indicationId),
+      indications.map(({ indicationId }) => indicationId).sort(compareStrings),
+    )
+  ) {
     unavailable();
   }
   return Object.freeze({
@@ -501,7 +540,49 @@ export async function readParticipantIndicationCompletenessWitness(
       revision: record.revision,
       value: source as StorageDocument,
     }),
-    indicationIds: Object.freeze(indicationIds),
+    indications: Object.freeze(indications),
+  });
+}
+
+/** Read the exact current and terminal ownership heads without replaying ancestry. */
+export async function readParticipantIndicationOwnershipHead(
+  storage: Pick<StorageAdapter, "read">,
+  participantSubject: ActorSubject,
+  id: InvestmentIndicationId,
+): Promise<ParticipantIndicationOwnershipHead | null> {
+  const subject = requiredActorSubject(participantSubject);
+  const indicationId = requiredIndicationId(id);
+  const key = await currentIndicationKey(indicationId);
+  const record = await storage.read(key);
+  if (record === null) return null;
+  if (peekParticipantSubject(record) !== subject) return null;
+  const current = decodeStoredCurrent(record, key, indicationId, subject);
+  const transitionKey = await indicationHistoryKey(
+    indicationId,
+    current.revision,
+  );
+  const transitionRecord = await storage.read(transitionKey);
+  if (transitionRecord === null) unavailable();
+  const transition = decodeStoredTransition(
+    transitionRecord,
+    transitionKey,
+    subject,
+    indicationId,
+    current.revision,
+  );
+  if (
+    transition.operationId !== current.operationId ||
+    transition.operationFingerprint !== current.operationFingerprint ||
+    transition.requestFingerprint !== current.requestFingerprint ||
+    canonicalJson(transition.fields) !== canonicalJson(current.fields) ||
+    (current.revision === 1) !== (transition.transitionKind === "created")
+  ) unavailable();
+  const lifecycleStatus = lifecycleStatusForTransition(transition.transitionKind);
+  await verifyOwnershipTransition(transition, lifecycleStatus);
+  return Object.freeze({
+    indicationId: current.indicationId,
+    indicationRevision: current.revision,
+    lifecycleStatus,
   });
 }
 
@@ -1100,9 +1181,8 @@ export class DevelopmentInMemoryIndicationRepository
     );
     const ownershipMutation = await participantOwnershipWitnessMutation(
       this.#storage,
-      indication.participantSubject,
-      indication.id,
-      previous === null,
+      previous?.indication ?? null,
+      indication,
     );
     const mutations: readonly StorageMutation[] = Object.freeze([
       Object.freeze({
@@ -2063,6 +2143,7 @@ function exactStoredDocument(
   expectedKey: StorageKey,
   expectedKeys: ReadonlySet<string>,
   expectedKind: string,
+  expectedSchemaVersion = INDICATION_SCHEMA_VERSION,
 ): Record<string, unknown> {
   const envelope = exactRecord(record, STORAGE_RECORD_KEYS);
   const key = exactRecord(envelope.key, STORAGE_KEY_KEYS);
@@ -2073,7 +2154,7 @@ function exactStoredDocument(
     !Number.isSafeInteger(envelope.revision) ||
     envelope.revision !== record.revision ||
     source.kind !== expectedKind ||
-    source.schemaVersion !== INDICATION_SCHEMA_VERSION ||
+    source.schemaVersion !== expectedSchemaVersion ||
     jsonByteLength(source) > MAX_INDICATION_STORAGE_RECORD_BYTES
   ) unavailable();
   return source;
@@ -2859,36 +2940,51 @@ function verifyLeaseRecord(
 
 async function participantOwnershipWitnessMutation(
   storage: Pick<StorageAdapter, "read">,
-  participantSubject: ActorSubject,
-  indicationId: InvestmentIndicationId,
-  create: boolean,
+  previous: InvestmentIndication | null,
+  next: InvestmentIndication,
 ): Promise<StorageMutation> {
+  const participantSubject = next.participantSubject;
+  const indicationId = next.id;
+  if (
+    previous !== null &&
+    (previous.id !== indicationId ||
+      previous.participantSubject !== participantSubject)
+  ) unavailable();
   const current = await readParticipantIndicationCompletenessWitness(
     storage,
     participantSubject,
   );
-  let indicationIds: readonly InvestmentIndicationId[];
-  if (create) {
+  const currentEntry = current.indications.find((entry) =>
+    entry.indicationId === indicationId
+  );
+  let indications: readonly ParticipantIndicationOwnershipEntry[];
+  if (previous === null) {
     if (
-      current.indicationIds.includes(indicationId) ||
-      current.indicationIds.length >= MAX_OWNED_INVESTMENT_INDICATIONS
+      currentEntry !== undefined ||
+      current.indications.length >= MAX_OWNED_INVESTMENT_INDICATIONS
     ) {
       throw new StorageFailure("CONFLICT");
     }
-    indicationIds = Object.freeze(
-      [...current.indicationIds, indicationId].sort(compareStrings),
+    indications = Object.freeze(
+      [...current.indications, ownershipEntry(next)].sort(compareOwnershipEntries),
     );
   } else {
-    if (!current.indicationIds.includes(indicationId)) unavailable();
-    indicationIds = current.indicationIds;
+    if (
+      currentEntry === undefined ||
+      currentEntry.indicationRevision !== previous.revision ||
+      currentEntry.lifecycleStatus !== previous.lifecycle.status
+    ) unavailable();
+    indications = Object.freeze(current.indications.map((entry) =>
+      entry.indicationId === indicationId ? ownershipEntry(next) : entry
+    ));
   }
   const revision = (current.record?.revision ?? 0) + 1;
   if (!Number.isSafeInteger(revision)) unavailable();
   const value = Object.freeze({
     kind: "investment-indication-ownership-witness",
-    schemaVersion: INDICATION_SCHEMA_VERSION,
+    schemaVersion: OWNERSHIP_WITNESS_SCHEMA_VERSION,
     revision,
-    indicationIds: Object.freeze([...indicationIds]),
+    indications: Object.freeze(indications.map(ownershipEntryDocument)),
   });
   requireBoundedRecord(value);
   return Object.freeze({
@@ -2908,7 +3004,118 @@ async function requireParticipantOwnershipWitness(
     storage,
     participantSubject,
   );
-  if (!witness.indicationIds.includes(indicationId)) unavailable();
+  if (
+    !witness.indications.some((entry) =>
+      entry.indicationId === indicationId
+    )
+  ) unavailable();
+}
+
+function ownershipEntry(
+  indication: InvestmentIndication,
+): ParticipantIndicationOwnershipEntry {
+  return Object.freeze({
+    indicationId: indication.id,
+    indicationRevision: indication.revision,
+    lifecycleStatus: indication.lifecycle.status,
+  });
+}
+
+function ownershipEntryDocument(
+  entry: ParticipantIndicationOwnershipEntry,
+): StorageDocument {
+  return Object.freeze({
+    indicationId: entry.indicationId,
+    indicationRevision: entry.indicationRevision,
+    lifecycleStatus: entry.lifecycleStatus,
+  });
+}
+
+function compareOwnershipEntries(
+  left: ParticipantIndicationOwnershipEntry,
+  right: ParticipantIndicationOwnershipEntry,
+): number {
+  return compareStrings(left.indicationId, right.indicationId);
+}
+
+function lifecycleStatusForTransition(
+  transition: InvestmentIndicationHistoryEntry["transition"],
+): InvestmentIndication["lifecycle"]["status"] {
+  if (transition === "withdrawn") return "withdrawn";
+  if (transition === "rejected") return "rejected";
+  return "active";
+}
+
+async function verifyOwnershipTransition(
+  transition: StoredTransition,
+  lifecycleStatus: InvestmentIndication["lifecycle"]["status"],
+): Promise<void> {
+  const source = exactRecord(transition.document, TRANSITION_DOCUMENT_KEYS);
+  const acknowledgment = storedAcknowledgment(source.acknowledgment);
+  if (acknowledgment.participantSubject !== transition.participantSubject) {
+    unavailable();
+  }
+  const request = Object.freeze({
+    operationId: transition.operationId,
+    id: transition.indicationId,
+    occurredAt: transition.occurredAt,
+    historyEntryId: transition.historyEntryId,
+    expectedRevision: transition.revision - 1,
+  });
+  if (lifecycleStatus === "active") {
+    const actor = storedParticipantActor(source.actor);
+    if (
+      actor.subject !== transition.participantSubject ||
+      source.rejection !== null
+    ) unavailable();
+    if (transition.transitionKind !== "reactivated") return;
+    const fingerprint = await operationFingerprint(
+      "reactivate",
+      actor,
+      request,
+      transition.requestFingerprint,
+    );
+    if (fingerprint !== transition.operationFingerprint) unavailable();
+    return;
+  }
+  let fingerprint: string;
+  if (transition.transitionKind === "withdrawn") {
+    const actor = storedParticipantActor(source.actor);
+    if (
+      actor.subject !== transition.participantSubject ||
+      source.rejection !== null
+    ) unavailable();
+    fingerprint = await operationFingerprint(
+      "withdraw",
+      actor,
+      request,
+      transition.requestFingerprint,
+    );
+  } else if (transition.transitionKind === "rejected") {
+    const actor = storedOwnerActor(source.actor);
+    const rejection = exactRecord(source.rejection, new Set([
+      "reason",
+      "rejectedAt",
+      "rejectedBy",
+    ]));
+    const rejectedAt = parseTimestamp(rejection.rejectedAt);
+    const rejectedBy = storedOwnerActor(rejection.rejectedBy);
+    if (
+      typeof rejection.reason !== "string" ||
+      !rejectedAt.ok ||
+      rejectedAt.value !== transition.occurredAt ||
+      rejectedBy.subject !== actor.subject
+    ) unavailable();
+    fingerprint = await operationFingerprint(
+      "reject",
+      actor,
+      Object.freeze({ ...request, reason: rejection.reason }),
+      transition.requestFingerprint,
+    );
+  } else {
+    return unavailable();
+  }
+  if (fingerprint !== transition.operationFingerprint) unavailable();
 }
 
 async function currentIndicationKey(
@@ -3127,6 +3334,12 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
 
 function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function isInvestmentIndicationLifecycleStatus(
+  value: unknown,
+): value is InvestmentIndication["lifecycle"]["status"] {
+  return value === "active" || value === "withdrawn" || value === "rejected";
 }
 
 function isSha256(value: string): boolean {
