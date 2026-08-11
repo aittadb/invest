@@ -3475,6 +3475,7 @@ test("hosted investment creation and reactivation recheck phase and package poli
     withdrawProof.document,
     "withdraw-investment-interest",
   );
+  await configureHostedInvestmentCampaign(service, "closed");
   const withdrawn = await submitInvestmentMutation(
     hostedPackageWorker(service),
     env,
@@ -3487,6 +3488,7 @@ test("hosted investment creation and reactivation recheck phase and package poli
     }),
   );
   assert.equal(withdrawn.status, 200);
+  await configureHostedInvestmentCampaign(service, "open");
   const reactivateProof = await investmentResource(
     hostedPackageWorker(service),
     env,
