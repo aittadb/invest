@@ -71,7 +71,7 @@ export {
   MAX_OWNER_INDICATION_REVIEW_CURSOR_LENGTH,
 } from "../services/owner-indication-review-tokens.ts";
 
-const INDICATION_SCHEMA_VERSION = 4;
+const INDICATION_SCHEMA_VERSION = 5;
 const CURRENT_INDICATIONS = storageCollection("investment-indications");
 const INDICATION_HISTORY = storageCollection("investment-indication-history");
 const INDICATION_FIELDS = storageCollection("investment-indication-fields");
@@ -2419,21 +2419,7 @@ async function prepareStoredFields(
   revision: number,
   fields: InvestmentIndicationFields,
 ): Promise<StoredFields> {
-  const bytes = new TextEncoder().encode(canonicalJson(fieldsDocument(fields)));
-  if (
-    bytes.byteLength < 1 ||
-    bytes.byteLength > MAX_SERIALIZED_INDICATION_FIELDS_BYTES
-  ) invalidRequest();
-  const reference = Object.freeze({
-    revision,
-    hash: `sha256:${await sha256BytesHex(bytes)}`,
-    bytes: bytes.byteLength,
-    chunks: Math.ceil(bytes.byteLength / INDICATION_FIELDS_CHUNK_RAW_BYTES),
-  });
-  if (
-    reference.chunks < 1 ||
-    reference.chunks > MAX_INDICATION_FIELDS_CHUNKS
-  ) invalidRequest();
+  const { bytes, reference } = await prepareStoredFieldsPayload(revision, fields);
   const chunks: PreparedFieldsChunk[] = [];
   for (let index = 0; index < reference.chunks; index += 1) {
     const start = index * INDICATION_FIELDS_CHUNK_RAW_BYTES;
@@ -2459,6 +2445,31 @@ async function prepareStoredFields(
     fields,
     chunks: Object.freeze(chunks),
   });
+}
+
+async function prepareStoredFieldsPayload(
+  revision: number,
+  fields: InvestmentIndicationFields,
+): Promise<Readonly<{
+  bytes: Uint8Array;
+  reference: StoredFieldsReference;
+}>> {
+  const bytes = new TextEncoder().encode(canonicalJson(fieldsDocument(fields)));
+  if (
+    bytes.byteLength < 1 ||
+    bytes.byteLength > MAX_SERIALIZED_INDICATION_FIELDS_BYTES
+  ) invalidRequest();
+  const reference = Object.freeze({
+    revision,
+    hash: `sha256:${await sha256BytesHex(bytes)}`,
+    bytes: bytes.byteLength,
+    chunks: Math.ceil(bytes.byteLength / INDICATION_FIELDS_CHUNK_RAW_BYTES),
+  });
+  if (
+    reference.chunks < 1 ||
+    reference.chunks > MAX_INDICATION_FIELDS_CHUNKS
+  ) invalidRequest();
+  return Object.freeze({ bytes, reference });
 }
 
 async function readStoredFields(
@@ -2813,6 +2824,28 @@ async function operationFingerprint(
   request: ParsedMutationRequest,
   requestFingerprint: string,
 ): Promise<string> {
+  const fields = request.fields === undefined
+    ? undefined
+    : (await prepareStoredFieldsPayload(
+        nextRevision(request.expectedRevision),
+        request.fields,
+      )).reference;
+  return compactOperationFingerprint(
+    kind,
+    actor,
+    request,
+    requestFingerprint,
+    fields,
+  );
+}
+
+async function compactOperationFingerprint(
+  kind: MutationKind,
+  actor: ParticipantIndicationActor | OwnerIndicationActor,
+  request: Omit<ParsedMutationRequest, "fields">,
+  requestFingerprint: string,
+  fields: StoredFieldsReference | undefined,
+): Promise<string> {
   const payload: StorageDocument = {
     kind,
     operationId: request.operationId,
@@ -2822,9 +2855,7 @@ async function operationFingerprint(
     occurredAt: request.occurredAt,
     historyEntryId: request.historyEntryId,
     requestFingerprint,
-    ...(request.fields === undefined
-      ? {}
-      : { fields: fieldsDocument(request.fields) }),
+    ...(fields === undefined ? {} : { fields: fieldsReferenceDocument(fields) }),
     ...(request.reason === undefined ? {} : { reason: request.reason }),
   };
   return hashDocument(payload);
@@ -3052,7 +3083,11 @@ async function verifyOwnershipTransition(
 ): Promise<void> {
   const source = exactRecord(transition.document, TRANSITION_DOCUMENT_KEYS);
   const acknowledgment = storedAcknowledgment(source.acknowledgment);
-  if (acknowledgment.participantSubject !== transition.participantSubject) {
+  if (
+    acknowledgment.participantSubject !== transition.participantSubject ||
+    canonicalJson(acknowledgmentDocument(acknowledgment)) !==
+      canonicalJson(source.acknowledgment)
+  ) {
     unavailable();
   }
   const request = Object.freeze({
@@ -3060,36 +3095,56 @@ async function verifyOwnershipTransition(
     id: transition.indicationId,
     occurredAt: transition.occurredAt,
     historyEntryId: transition.historyEntryId,
-    expectedRevision: transition.revision - 1,
+    expectedRevision: transition.revision === 1 ? null : transition.revision - 1,
   });
+  let fingerprint: string;
   if (lifecycleStatus === "active") {
     const actor = storedParticipantActor(source.actor);
     if (
       actor.subject !== transition.participantSubject ||
-      source.rejection !== null
+      source.rejection !== null ||
+      canonicalJson(actorDocument(actor)) !== canonicalJson(source.actor)
     ) unavailable();
-    if (transition.transitionKind !== "reactivated") return;
-    const fingerprint = await operationFingerprint(
-      "reactivate",
-      actor,
-      request,
-      transition.requestFingerprint,
-    );
-    if (fingerprint !== transition.operationFingerprint) unavailable();
-    return;
-  }
-  let fingerprint: string;
-  if (transition.transitionKind === "withdrawn") {
+    if (transition.transitionKind === "created") {
+      fingerprint = await compactOperationFingerprint(
+        "create",
+        actor,
+        request,
+        transition.requestFingerprint,
+        transition.fields,
+      );
+    } else if (transition.transitionKind === "edited") {
+      fingerprint = await compactOperationFingerprint(
+        "edit",
+        actor,
+        request,
+        transition.requestFingerprint,
+        transition.fields,
+      );
+    } else if (transition.transitionKind === "reactivated") {
+      fingerprint = await compactOperationFingerprint(
+        "reactivate",
+        actor,
+        request,
+        transition.requestFingerprint,
+        undefined,
+      );
+    } else {
+      return unavailable();
+    }
+  } else if (transition.transitionKind === "withdrawn") {
     const actor = storedParticipantActor(source.actor);
     if (
       actor.subject !== transition.participantSubject ||
-      source.rejection !== null
+      source.rejection !== null ||
+      canonicalJson(actorDocument(actor)) !== canonicalJson(source.actor)
     ) unavailable();
-    fingerprint = await operationFingerprint(
+    fingerprint = await compactOperationFingerprint(
       "withdraw",
       actor,
       request,
       transition.requestFingerprint,
+      undefined,
     );
   } else if (transition.transitionKind === "rejected") {
     const actor = storedOwnerActor(source.actor);
@@ -3104,18 +3159,33 @@ async function verifyOwnershipTransition(
       typeof rejection.reason !== "string" ||
       !rejectedAt.ok ||
       rejectedAt.value !== transition.occurredAt ||
-      rejectedBy.subject !== actor.subject
+      rejectedBy.subject !== actor.subject ||
+      canonicalJson(actorDocument(actor)) !== canonicalJson(source.actor) ||
+      canonicalJson(rejectionDocument(Object.freeze({
+        reason: rejection.reason,
+        rejectedAt: rejectedAt.value,
+        rejectedBy,
+      }))) !== canonicalJson(source.rejection)
     ) unavailable();
-    fingerprint = await operationFingerprint(
+    fingerprint = await compactOperationFingerprint(
       "reject",
       actor,
       Object.freeze({ ...request, reason: rejection.reason }),
       transition.requestFingerprint,
+      undefined,
     );
   } else {
     return unavailable();
   }
   if (fingerprint !== transition.operationFingerprint) unavailable();
+  if (
+    transition.transitionKind === "created"
+      ? transition.revision !== 1 || transition.fields.revision !== 1
+      : transition.revision <= 1 ||
+        (transition.transitionKind === "edited"
+          ? transition.fields.revision !== transition.revision
+          : transition.fields.revision >= transition.revision)
+  ) unavailable();
 }
 
 async function currentIndicationKey(

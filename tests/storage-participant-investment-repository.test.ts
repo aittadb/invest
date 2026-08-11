@@ -41,6 +41,7 @@ import {
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
   MAX_OWNED_INVESTMENT_INDICATIONS,
+  readParticipantIndicationOwnershipHead,
   type ParticipantIndicationOwnershipEntry,
 } from "../repositories/in-memory-indication-repository.ts";
 import {
@@ -1436,6 +1437,65 @@ test("a forged non-active summary cannot hide an active terminal transition", as
   assert.equal(state.operations.size, operationsBefore);
 });
 
+test("compact ownership heads authenticate active create and edit in two reads", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "capacity-active-proof");
+  const acknowledgment = await currentContext(ALICE, "capacity-active-proof");
+  let minute = 0;
+  const service = serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      storage,
+      ALICE,
+      AMOUNT,
+    ),
+    ALICE,
+    acknowledgment,
+    () => new Date(
+      Date.parse("2026-08-12T10:00:00.000Z") + minute++ * 60_000,
+    ),
+  );
+  const created = await service.create({
+    operationId: "investment-operation:capacity-active-proof-create",
+    fields: personalFields(),
+  });
+  const createdReads = new CountingStorageAdapter(storage);
+  assert.deepEqual(
+    await readParticipantIndicationOwnershipHead(
+      createdReads,
+      ALICE,
+      created.snapshot.id,
+    ),
+    {
+      indicationId: created.snapshot.id,
+      indicationRevision: created.snapshot.revision,
+      lifecycleStatus: "active",
+    },
+  );
+  assert.equal(createdReads.readCalls, 2);
+
+  const edited = await service.edit({
+    operationId: "investment-operation:capacity-active-proof-edit",
+    indicationId: created.snapshot.id,
+    expectedRevision: created.snapshot.revision,
+    fields: personalFields({ note: "The active edit remains compactly provable." }),
+  });
+  const editedReads = new CountingStorageAdapter(storage);
+  assert.deepEqual(
+    await readParticipantIndicationOwnershipHead(
+      editedReads,
+      ALICE,
+      edited.snapshot.id,
+    ),
+    {
+      indicationId: edited.snapshot.id,
+      indicationRevision: edited.snapshot.revision,
+      lifecycleStatus: "active",
+    },
+  );
+  assert.equal(editedReads.readCalls, 2);
+});
+
 test("correlated summary and terminal-kind damage cannot hide an active edit", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
@@ -1475,6 +1535,55 @@ test("correlated summary and terminal-kind damage cannot hide an active edit", a
   const failure = await captureStorageFailure(() => service.create({
     operationId: "investment-operation:capacity-terminal-second",
     fields: personalFields({ note: "Must remain absent." }),
+  }));
+  assert.equal(failure.code, "UNAVAILABLE");
+  assert.equal(storedStateFingerprint(state), recordsBefore);
+  assert.equal(state.operations.size, operationsBefore);
+});
+
+test("withdrawn terminal rewritten as edited cannot create after correlated active damage", async () => {
+  const state = new MemoryStorageState();
+  const storage = new MemoryStorageAdapter(state);
+  await initializeEmptyOwnership(storage, ALICE, "capacity-withdrawn-active-damage");
+  const acknowledgment = await currentContext(
+    ALICE,
+    "capacity-withdrawn-active-damage",
+  );
+  let minute = 0;
+  const service = serviceFor(
+    new StorageParticipantInvestmentInterestRepository(
+      storage,
+      ALICE,
+      AMOUNT,
+    ),
+    ALICE,
+    acknowledgment,
+    () => new Date(
+      Date.parse("2026-08-12T10:00:00.000Z") + minute++ * 60_000,
+    ),
+  );
+  const created = await service.create({
+    operationId: "investment-operation:capacity-withdrawn-damage-create",
+    fields: personalFields(),
+  });
+  const withdrawn = await service.withdraw({
+    operationId: "investment-operation:capacity-withdrawn-damage-withdraw",
+    indicationId: created.snapshot.id,
+    expectedRevision: created.snapshot.revision,
+  });
+  replaceOwnershipWitnessStatus(state, withdrawn.snapshot.id, "active");
+  replaceTerminalTransitionKind(
+    state,
+    withdrawn.snapshot.id,
+    withdrawn.snapshot.revision,
+    "edited",
+  );
+  const recordsBefore = storedStateFingerprint(state);
+  const operationsBefore = state.operations.size;
+
+  const failure = await captureStorageFailure(() => service.create({
+    operationId: "investment-operation:capacity-withdrawn-damage-second",
+    fields: personalFields({ note: "Must not commit after forged activation." }),
   }));
   assert.equal(failure.code, "UNAVAILABLE");
   assert.equal(storedStateFingerprint(state), recordsBefore);

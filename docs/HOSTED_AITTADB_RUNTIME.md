@@ -246,8 +246,11 @@ must remain unavailable for a subject until the applicable prerequisite has
 completed. Exact initialization retries use immutable root evidence and return
 their original counts after later valid lifecycle activity, but every retry
 still validates the current root, index, summary, and compact ownership heads.
+Each head recomputes the terminal operation fingerprint, including the
+normalized field-reference commitment for create and edit, before its lifecycle
+status can affect capacity.
 
-The exact adapter-read ceilings are 204 for capacity, 203 for first
+The exact adapter-read ceilings remain 204 for capacity, 203 for first
 initialization, 205 for an initialized restart, and 407 for a maximum-size
 initialization that loses a concurrent exact race and verifies the winner. A
 fresh create rejected at capacity uses 207 reads after including its target

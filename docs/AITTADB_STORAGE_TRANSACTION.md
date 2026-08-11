@@ -90,9 +90,12 @@ registration, and `TASK-159` must provide the bounded operator-only migration
 path for legacy participants before hosted investment persistence is ready.
 
 One capacity proof reads the root, summary, and index, then exactly the current
-and terminal record for each owned ID, and finally re-reads the summary. It does
-not list a collection, read field chunks, or replay transition ancestry. The
-exact ceilings are 204 reads for 100 owned records, 203 reads for first
+and terminal record for each owned ID, and finally re-reads the summary. It
+recomputes every terminal operation fingerprint from the compact transition
+metadata; create and edit fingerprints commit the normalized field reference,
+whose content hash is verified during full reconstruction. It does not list a
+collection, read field chunks, or replay transition ancestry. The exact
+ceilings remain 204 reads for 100 owned records, 203 reads for first
 initialization, 205 for an initialized restart, and 407 when a maximum-size
 initialization loses a concurrent exact race and verifies the winner. A fresh
 create rejected by capacity uses 207 reads including the service's target lookup
