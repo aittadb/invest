@@ -6,6 +6,7 @@
  */
 
 import {
+  MAX_STABLE_ID_LENGTH,
   invalid,
   parseActorSubject,
   parseStableId,
@@ -185,10 +186,22 @@ const RESOURCE_TRANSITIONS = [
 ] as const;
 const EXPORT_TYPES = ["review-csv", "json-backup"] as const;
 const NOTIFICATION_ACTIVITIES = ["template-copied", "sent-marked"] as const;
+export const MANUAL_NOTIFICATION_ACTIVITY_EVIDENCE_PREFIXES = Object.freeze({
+  templateCopied: "notification-copy-operation:v1:",
+  sentMarked: "notification-sent-operation:v1:",
+});
+const MAX_MANUAL_NOTIFICATION_ACTIVITY_EVIDENCE_PREFIX_LENGTH = Math.max(
+  ...Object.values(MANUAL_NOTIFICATION_ACTIVITY_EVIDENCE_PREFIXES).map(
+    (value) => value.length,
+  ),
+);
 export const MANUAL_NOTIFICATION_LIMITS = Object.freeze({
   subjectLength: 200,
   bodyLength: 20_000,
   copyEvidence: 64,
+  activityOperationIdLength:
+    MAX_STABLE_ID_LENGTH -
+    MAX_MANUAL_NOTIFICATION_ACTIVITY_EVIDENCE_PREFIX_LENGTH,
 });
 
 type UnknownRecord = Readonly<Record<string, unknown>>;

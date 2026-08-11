@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MANUAL_NOTIFICATION_LIMITS,
   createManualNotificationRecord,
   markManualNotificationSent,
   parseManualNotificationTemplate,
@@ -303,6 +304,21 @@ test("notification copy and sent markers use separate guarded atomic actions", a
   assert.match(html, /href="\/">View campaign<\/a>/u);
 
   const copyAction = requiredAction(document, "record-notification-template-copy");
+  const operationField = copyAction.fields.find((field) =>
+    field.name === "operation-id"
+  );
+  assert.equal(
+    operationField?.max_length,
+    MANUAL_NOTIFICATION_LIMITS.activityOperationIdLength,
+  );
+  const oversizedOperation = await fixture.submit(copyAction, {
+    "operation-id": "a".repeat(
+      MANUAL_NOTIFICATION_LIMITS.activityOperationIdLength + 1,
+    ),
+  });
+  assert.equal(oversizedOperation.status, 400);
+  assert.equal(fixture.notifications.current("notification:activity")?.revision, 1);
+
   const rejected = await fixture.submit(copyAction, {
     extra: "must-not-be-accepted",
   });

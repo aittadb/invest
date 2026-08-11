@@ -1,4 +1,5 @@
 import {
+  MANUAL_NOTIFICATION_ACTIVITY_EVIDENCE_PREFIXES,
   MANUAL_NOTIFICATION_LIMITS,
   createManualNotificationRecord,
   markManualNotificationSent,
@@ -71,8 +72,6 @@ export const MAX_MANUAL_NOTIFICATION_STORAGE_READS =
   1 + MAX_MANUAL_NOTIFICATION_REVISIONS;
 export const MAX_OWNER_NOTIFICATION_PAGE_SIZE = 25;
 export const MAX_OWNER_NOTIFICATION_CURSOR_LENGTH = 512;
-const COPY_OPERATION_EVIDENCE_PREFIX = "notification-copy-operation:v1:";
-const SENT_OPERATION_EVIDENCE_PREFIX = "notification-sent-operation:v1:";
 
 export type AuditAppendResult = Readonly<{
   event: AuditEvent;
@@ -449,7 +448,7 @@ export class StorageManualNotificationRepository
     request: AuditedManualNotificationActivityRequest,
     activity: "template-copied" | "sent-marked",
   ): Promise<AuditedManualNotificationMutationResult> {
-    const operationId = requiredOperationId(request.operationId);
+    const operationId = requiredActivityOperationId(request.operationId);
     const notificationId = requiredNotificationId(request.notificationId);
     const expectedRevision = requiredExpectedRevision(request.expectedRevision);
     const ownerSubject = requiredOwnerSubject(request.ownerSubject);
@@ -1547,8 +1546,8 @@ function activityOperationEvidenceId<Entity extends string>(
   operationId: StorageOperationId,
 ): StableId<Entity> {
   const prefix = activity === "template-copied"
-    ? COPY_OPERATION_EVIDENCE_PREFIX
-    : SENT_OPERATION_EVIDENCE_PREFIX;
+    ? MANUAL_NOTIFICATION_ACTIVITY_EVIDENCE_PREFIXES.templateCopied
+    : MANUAL_NOTIFICATION_ACTIVITY_EVIDENCE_PREFIXES.sentMarked;
   return requiredStableId<Entity>(`${prefix}${operationId}`);
 }
 
@@ -1557,8 +1556,8 @@ function operationIdFromActivityEvidence(
   evidenceId: unknown,
 ): StorageOperationId | null {
   const prefix = activity === "template-copied"
-    ? COPY_OPERATION_EVIDENCE_PREFIX
-    : SENT_OPERATION_EVIDENCE_PREFIX;
+    ? MANUAL_NOTIFICATION_ACTIVITY_EVIDENCE_PREFIXES.templateCopied
+    : MANUAL_NOTIFICATION_ACTIVITY_EVIDENCE_PREFIXES.sentMarked;
   if (typeof evidenceId !== "string" || !evidenceId.startsWith(prefix)) {
     return null;
   }
@@ -1605,6 +1604,16 @@ function requiredOperationId(value: unknown): StorageOperationId {
   const parsed = parseStorageOperationId(value);
   if (!parsed.ok) invalidRequest();
   return parsed.value;
+}
+
+function requiredActivityOperationId(value: unknown): StorageOperationId {
+  const operationId = requiredOperationId(value);
+  if (
+    operationId.length > MANUAL_NOTIFICATION_LIMITS.activityOperationIdLength
+  ) {
+    invalidRequest();
+  }
+  return operationId;
 }
 
 function requiredOwnerSubject(value: unknown): ActorSubject {

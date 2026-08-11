@@ -313,7 +313,9 @@ evidence merely retained by a later activity revision cannot satisfy recovery.
 The original server timestamp is retained without another transaction. A
 changed retry conflicts, a stale new operation fails its revision precondition,
 and a failed transaction changes neither history.
-The fully terminal retry receives a version-2 browser proof scoped to the exact
+Activity operation IDs are capped at 97 characters so their versioned evidence
+fits the shared 128-character stable-ID boundary. The fully terminal retry
+receives a version-2 browser proof scoped to the exact
 notification, activity, operation, and prior revision. Changed requests cannot
 claim that proof, foreign callers never receive the private resource, and one
 successful exact use consumes it.

@@ -316,7 +316,7 @@ function activityControl(
         location: "body",
         required: true,
         minLength: 1,
-        maxLength: 128,
+        maxLength: MANUAL_NOTIFICATION_LIMITS.activityOperationIdLength,
         value: operationId,
         presentation: "hidden",
       },

@@ -683,6 +683,49 @@ test("fully terminal notification state recovers the exact final activity", asyn
   }
 });
 
+test("audited notification activity fits its exact operation evidence budget", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const repository = new DevelopmentInMemoryManualNotificationRepository(storage);
+  const notificationId = "notification:activity-operation-bound";
+  await repository.create({
+    operationId: "notification-operation:activity-operation-bound-create",
+    template: templateInput(notificationId),
+  });
+
+  const operationId = "a".repeat(
+    MANUAL_NOTIFICATION_LIMITS.activityOperationIdLength,
+  );
+  const request = {
+    operationId,
+    notificationId,
+    expectedRevision: 1,
+    ownerSubject: OWNER.subject,
+    occurredAt: COPIED_AT,
+  } as const;
+  const result = await repository.recordCopyWithAudit(request);
+  assert.equal(result.revision, 2);
+  assert.equal(result.record.copyEvidence[0]?.id.length, 128);
+  assert.equal((await repository.recordCopyWithAudit(request)).replayed, true);
+
+  await expectStorageFailure(
+    () => repository.recordCopyWithAudit({
+      ...request,
+      operationId: "b".repeat(
+        MANUAL_NOTIFICATION_LIMITS.activityOperationIdLength + 1,
+      ),
+      expectedRevision: 2,
+    }),
+    "INVALID_REQUEST",
+  );
+  assert.equal((await repository.get(notificationId))?.revision, 2);
+  assert.equal(
+    (await new DevelopmentInMemoryAuditRepository(storage).list({ limit: 10 }))
+      .items.length,
+    1,
+  );
+});
+
 test("manual notification collection rejects corrupt finite pages", async () => {
   const state = new MemoryStorageState();
   const storage = new DeterministicMemoryStorageAdapter(state, true);

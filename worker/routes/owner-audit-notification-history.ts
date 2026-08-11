@@ -1,3 +1,6 @@
+import {
+  MANUAL_NOTIFICATION_LIMITS,
+} from "../../domain/audit-notification.ts";
 import { chatGPTSignInPath } from "../../domain/auth-navigation.ts";
 import { parseStableId } from "../../domain/foundation.ts";
 import {
@@ -564,7 +567,11 @@ function parseMutation(
     throw new StorageFailure("INVALID_REQUEST");
   }
   const operationId = parseStorageOperationId(body["operation-id"]);
-  if (!operationId.ok) throw new StorageFailure("INVALID_REQUEST");
+  if (
+    !operationId.ok ||
+    operationId.value.length >
+      MANUAL_NOTIFICATION_LIMITS.activityOperationIdLength
+  ) throw new StorageFailure("INVALID_REQUEST");
   const candidate = mediaType === "application/x-www-form-urlencoded"
     ? typeof body["expected-revision"] === "string" &&
         /^[1-9]\d*$/.test(body["expected-revision"])
@@ -650,7 +657,11 @@ function checkedOperationIssuer(
       throw new StorageFailure("UNAVAILABLE");
     }
     const parsed = parseStorageOperationId(value);
-    if (!parsed.ok) throw new StorageFailure("UNAVAILABLE");
+    if (
+      !parsed.ok ||
+      parsed.value.length >
+        MANUAL_NOTIFICATION_LIMITS.activityOperationIdLength
+    ) throw new StorageFailure("UNAVAILABLE");
     return parsed.value;
   };
 }

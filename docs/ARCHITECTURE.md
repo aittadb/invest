@@ -418,8 +418,10 @@ persistent proof-claim verification and requires a valid cleanup instruction
 before mutation; the explicit legacy mode preserves only the historical
 non-claiming verifier contract. Owner-subject continuity suppresses actions and
 fails direct mutation after configured-owner replacement.
-Audited activity evidence uses a versioned operation-bearing identifier, so a
-fully terminal record can recover whether its final transition was the last
+Audited activity operation IDs are capped at 97 characters so the versioned
+operation-bearing evidence identifier remains within the shared 128-character
+stable-ID boundary. This evidence lets a fully terminal record recover whether
+its final transition was the last
 copy or the sent marker and retain the exact operation and prior revision. The
 resource exposes only that retry, and hosted composition issues a version-2
 proof whose encrypted state contains only the hash of the notification,

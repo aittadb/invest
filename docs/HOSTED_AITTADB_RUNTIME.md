@@ -434,7 +434,9 @@ result revision's transition introduced that operation evidence. A changed
 expected revision cannot adopt a later activity revision; owner rotation,
 changed work, stale revisions, and missing or corrupt history fail closed.
 When the final allowed copy or sent transition makes a notification fully
-terminal, verified operation-bearing evidence reconstructs one exact retry
+terminal, the 97-character activity-operation ceiling keeps its versioned
+operation-bearing evidence within the 128-character stable-ID boundary and
+reconstructs one exact retry
 action. The Worker uses `issueExactReplay` and the route's exact scope resolver,
 binding the one-use proof to notification, activity, operation, and prior
 revision; a changed or foreign request cannot consume it. Older evidence
