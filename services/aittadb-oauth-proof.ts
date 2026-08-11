@@ -27,24 +27,26 @@ export type AittaDBOAuthFetch = (
   init: RequestInit,
 ) => Promise<Response>;
 export type OAuthRandomBytes = (length: number) => Uint8Array;
+export const OAUTH_AVAILABILITY_FAILURE_PHASES = Object.freeze([
+  "fetch",
+  "status_redirect",
+  "status_unauthorized",
+  "status_not_found",
+  "status_rate_limited",
+  "status_server",
+  "status_other",
+  "content_type",
+  "declared_size",
+  "body",
+  "body_size",
+  "encoding",
+  "json",
+  "document",
+  "contract",
+  "internal",
+] as const);
 export type OAuthAvailabilityFailurePhase =
-  | "request"
-  | "fetch"
-  | "status_redirect"
-  | "status_unauthorized"
-  | "status_not_found"
-  | "status_rate_limited"
-  | "status_server"
-  | "status_other"
-  | "content_type"
-  | "declared_size"
-  | "body"
-  | "body_size"
-  | "encoding"
-  | "json"
-  | "document"
-  | "contract"
-  | "internal";
+  typeof OAUTH_AVAILABILITY_FAILURE_PHASES[number];
 export type OAuthAvailabilityFailureObserver = (
   phase: OAuthAvailabilityFailurePhase,
 ) => void;

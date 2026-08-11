@@ -194,6 +194,7 @@ test("discovery must advertise the exact confidential S256 authorization path", 
     await t.test(name, async () => {
       const harness = await createHarness({ discovery });
       assert.equal(await harness.service.availability(), false);
+      assert.deepEqual(harness.availabilityFailures, ["contract"]);
       await assert.rejects(
         harness.service.begin(OWNER_SUBJECT),
         publicFailure("service_unavailable"),
@@ -336,6 +337,118 @@ test("availability reports one fixed non-secret discovery failure phase", async 
   });
   assert.equal(await throwingObserver.service.availability(), false);
   assert.deepEqual(throwingObserver.availabilityFailures, ["contract"]);
+});
+
+test("availability classifies every HTTP status boundary without retaining provider data", async (t) => {
+  const cases = [
+    [201, "status_other"],
+    [299, "status_other"],
+    [300, "status_redirect"],
+    [399, "status_redirect"],
+    [400, "status_other"],
+    [401, "status_unauthorized"],
+    [403, "status_unauthorized"],
+    [404, "status_not_found"],
+    [405, "status_other"],
+    [428, "status_other"],
+    [429, "status_rate_limited"],
+    [430, "status_other"],
+    [499, "status_other"],
+    [500, "status_server"],
+    [599, "status_server"],
+  ] as const;
+
+  for (const [status, phase] of cases) {
+    await t.test(String(status), async () => {
+      const harness = await createHarness({
+        discoveryResponse: new Response(CLIENT_SECRET, {
+          status,
+          headers: {
+            location: `${ISSUER}/private?token=${ACCESS_TOKEN}`,
+            "content-type": "application/json",
+          },
+        }),
+      });
+      assert.equal(await harness.service.availability(), false);
+      assert.deepEqual(harness.availabilityFailures, [phase]);
+      assert.equal(
+        JSON.stringify(harness.availabilityFailures).includes(CLIENT_SECRET),
+        false,
+      );
+    });
+  }
+});
+
+test("availability reports alternate media, size, body, document, and internal failures once", async (t) => {
+  const failingStream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.error(new Error(`${CLIENT_SECRET} ${ACCESS_TOKEN}`));
+    },
+  });
+  const internalResponse = Object.defineProperty({}, "status", {
+    get() {
+      throw new Error(`${CLIENT_SECRET} ${ISSUER}`);
+    },
+  }) as Response;
+  const cases: readonly Readonly<{
+    name: string;
+    phase: string;
+    response: Response;
+  }>[] = [
+    {
+      name: "missing media type",
+      phase: "content_type",
+      response: new Response("{}"),
+    },
+    {
+      name: "oversized media type",
+      phase: "content_type",
+      response: new Response("{}", {
+        headers: { "content-type": `application/json;${"a".repeat(1_025)}` },
+      }),
+    },
+    {
+      name: "malformed size declaration",
+      phase: "declared_size",
+      response: new Response("{}", {
+        headers: {
+          "content-length": "16x",
+          "content-type": "application/json",
+        },
+      }),
+    },
+    {
+      name: "stream read failure",
+      phase: "body",
+      response: new Response(failingStream, {
+        headers: { "content-type": "application/json" },
+      }),
+    },
+    {
+      name: "document field ceiling",
+      phase: "document",
+      response: jsonResponse(Object.fromEntries(
+        Array.from({ length: 33 }, (_, index) => [`field-${index}`, index]),
+      )),
+    },
+    {
+      name: "unexpected response boundary",
+      phase: "internal",
+      response: internalResponse,
+    },
+  ];
+
+  for (const { name, phase, response } of cases) {
+    await t.test(name, async () => {
+      const harness = await createHarness({ discoveryResponse: response });
+      assert.equal(await harness.service.availability(), false);
+      assert.deepEqual(harness.availabilityFailures, [phase]);
+      const evidence = JSON.stringify(harness.availabilityFailures);
+      for (const forbidden of [CLIENT_SECRET, ACCESS_TOKEN, ISSUER]) {
+        assert.equal(evidence.includes(forbidden), false);
+      }
+    });
+  }
 });
 
 test("provider redirects are returned manually and rejected without following", async () => {

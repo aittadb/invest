@@ -14,8 +14,9 @@ import type {
   D1OAuthProofStatement,
   D1OAuthProofValue,
 } from "../repositories/d1-oauth-proof-store.ts";
-import type {
-  OAuthAvailabilityFailurePhase,
+import {
+  OAUTH_AVAILABILITY_FAILURE_PHASES,
+  type OAuthAvailabilityFailurePhase,
 } from "../services/aittadb-oauth-proof.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
 import type {
@@ -287,25 +288,8 @@ test("absent, partial, malformed, or unbound deployments keep OAuth absent", asy
 });
 
 test("hosted availability evidence is fixed and credential-free", async (t) => {
-  const phases: OAuthAvailabilityFailurePhase[] = [
-    "request",
-    "fetch",
-    "status_redirect",
-    "status_unauthorized",
-    "status_not_found",
-    "status_rate_limited",
-    "status_server",
-    "status_other",
-    "content_type",
-    "declared_size",
-    "body",
-    "body_size",
-    "encoding",
-    "json",
-    "document",
-    "contract",
-    "internal",
-  ];
+  const phases: readonly OAuthAvailabilityFailurePhase[] =
+    OAUTH_AVAILABILITY_FAILURE_PHASES;
   assert.deepEqual(
     phases.map(hostedOAuthAvailabilityEvidence),
     phases.map((phase) => `investor_app.oauth.discovery.${phase}`),

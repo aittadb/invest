@@ -124,7 +124,6 @@ function secureRandomBytes(length: number): Uint8Array {
 const HOSTED_OAUTH_AVAILABILITY_EVIDENCE: Readonly<
   Record<OAuthAvailabilityFailurePhase, string>
 > = Object.freeze({
-  request: "investor_app.oauth.discovery.request",
   fetch: "investor_app.oauth.discovery.fetch",
   status_redirect: "investor_app.oauth.discovery.status_redirect",
   status_unauthorized: "investor_app.oauth.discovery.status_unauthorized",
