@@ -12,6 +12,7 @@ import { StorageFailure, type StorageCursor } from "../../domain/storage-adapter
 import { negotiateRepresentation } from "../../http/content-negotiation.ts";
 import type {
   FounderApplicationReviewCollectionRepository,
+  FounderApplicationReviewDetailRepository,
   FounderApplicationReviewRepository,
 } from "../../repositories/in-memory-founder-application-repository.ts";
 import {
@@ -40,12 +41,22 @@ export function createOwnerFounderReviewRouteHandler(
   return createFounderReviewHandler(repository, repository);
 }
 
+export function createOwnerFounderReviewDetailRouteHandler(
+  repository: FounderApplicationReviewDetailRepository,
+): ApplicationRouteHandler {
+  return createFounderReviewHandler(null, repository);
+}
+
 function createFounderReviewHandler(
-  collection: FounderApplicationReviewCollectionRepository,
-  detail: FounderApplicationReviewRepository | null,
+  collection: FounderApplicationReviewCollectionRepository | null,
+  detail: FounderApplicationReviewDetailRepository | null,
 ): ApplicationRouteHandler {
   return async (context) => {
-    const route = parseRoute(context.url, detail !== null);
+    const route = parseRoute(
+      context.url,
+      collection !== null,
+      detail !== null,
+    );
     if (route === null) return null;
     const safeResourceUrl = safeFounderReviewResourceUrl(
       context.resourceUrl,
@@ -85,6 +96,7 @@ function createFounderReviewHandler(
 
     try {
       if (route.kind === "collection") {
+        if (collection === null) return null;
         const request = parsePageRequest(context.url);
         const resourceUrl = canonicalCollectionResourceUrl(
           context.resourceUrl,
@@ -144,10 +156,11 @@ type FounderReviewRoute =
 
 function parseRoute(
   url: URL,
+  collectionAvailable: boolean,
   detailAvailable: boolean,
 ): FounderReviewRoute | null {
   if (url.pathname === OWNER_FOUNDER_REVIEW_COLLECTION_PATH) {
-    return { kind: "collection" };
+    return collectionAvailable ? { kind: "collection" } : null;
   }
   if (!detailAvailable) return null;
   const prefix = `${OWNER_FOUNDER_REVIEW_COLLECTION_PATH}/`;

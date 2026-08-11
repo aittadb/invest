@@ -23,7 +23,6 @@ import {
   type Timestamp,
 } from "../domain/foundation.ts";
 import {
-  MAX_STORAGE_PAGE_SIZE,
   MAX_STORAGE_TRANSACTION_MUTATIONS,
   StorageFailure,
   assertStorageListBoundary,
@@ -70,6 +69,8 @@ export const MAX_FOUNDER_APPLICATION_REVIEW_CURSOR_CHARACTERS = 2_048;
 export const MAX_FOUNDER_APPLICATION_REVIEW_PAGE_RECORD_READS =
   MAX_FOUNDER_APPLICATION_REVIEW_PAGE_SIZE *
   (1 + MAX_FOUNDER_APPLICATION_FIELDS_CHUNKS);
+export const MAX_FOUNDER_APPLICATION_REVIEW_DETAIL_RECORD_READS =
+  1 + MAX_FOUNDER_APPLICATION_MATERIALIZATION_READS;
 
 const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const CURRENT_DOCUMENT_KEYS = new Set([
@@ -233,12 +234,15 @@ export interface FounderApplicationReviewCollectionRepository {
   ): Promise<FounderApplicationReviewPage>;
 }
 
-/** Development contract that also retains the pending detail lookup. */
-export interface FounderApplicationReviewRepository
-  extends FounderApplicationReviewCollectionRepository
-{
+/** Direct opaque lookup of one bounded, fully verified founder application. */
+export interface FounderApplicationReviewDetailRepository {
   get(reviewId: unknown): Promise<FounderApplicationReviewItem | null>;
 }
+
+/** Configured-owner development contract over collection and detail reads. */
+export interface FounderApplicationReviewRepository
+  extends FounderApplicationReviewCollectionRepository,
+    FounderApplicationReviewDetailRepository {}
 
 type MutationKind = "create" | "edit" | "withdraw";
 type TransitionKind = "created" | "edited" | "withdrawn";
@@ -887,6 +891,31 @@ implements FounderApplicationReviewCollectionRepository {
   }
 }
 
+/** Persistent direct detail projection over one opaque current-record key. */
+export class StorageFounderApplicationReviewDetailRepository
+implements FounderApplicationReviewDetailRepository {
+  readonly #storage: StorageAdapter;
+
+  constructor(storage: StorageAdapter) {
+    this.#storage = requiredStorageAdapter(storage);
+    Object.freeze(this);
+  }
+
+  async get(reviewId: unknown): Promise<FounderApplicationReviewItem | null> {
+    try {
+      return await loadFounderReviewDetail(this.#storage, reviewId);
+    } catch (error) {
+      if (
+        error instanceof StorageFailure &&
+        error.code === "INVALID_REQUEST"
+      ) {
+        throw new StorageFailure("INVALID_REQUEST");
+      }
+      throw new StorageFailure("UNAVAILABLE");
+    }
+  }
+}
+
 /**
  * Development owner-review projection over the same adapter records.
  * Opaque review IDs keep applicant subjects out of owner navigation URLs.
@@ -939,25 +968,7 @@ implements FounderApplicationReviewRepository {
 
   async get(reviewId: unknown): Promise<FounderApplicationReviewItem | null> {
     if (!this.#permitted) return null;
-    const expectedReviewId = requiredReviewId(reviewId);
-    const cursors = new Set<string>();
-    let cursor: StorageCursor | undefined;
-
-    while (true) {
-      const page = await this.#storage.list({
-        collection: CURRENT_APPLICATIONS,
-        limit: MAX_STORAGE_PAGE_SIZE,
-        ...(cursor === undefined ? {} : { cursor }),
-      });
-      for (const record of page.items) {
-        const item = await this.#decodeReviewItem(record);
-        if (item.reviewId === expectedReviewId) return item;
-      }
-      if (page.nextCursor === null) return null;
-      if (cursors.has(page.nextCursor)) unavailable();
-      cursors.add(page.nextCursor);
-      cursor = page.nextCursor;
-    }
+    return loadFounderReviewDetail(this.#storage, reviewId);
   }
 
   async #decodeReviewItem(
@@ -1138,6 +1149,33 @@ function projectFounderReviewCollectionItem(
       item.application.fields.primaryContributionAreaId,
     updatedAt: item.application.updatedAt,
     revision: item.application.revision,
+  });
+}
+
+async function loadFounderReviewDetail(
+  storage: StorageAdapter,
+  reviewId: unknown,
+): Promise<FounderApplicationReviewItem | null> {
+  const expectedReviewId = requiredReviewId(reviewId);
+  const key = currentApplicationKeyFromReviewId(expectedReviewId);
+  const record = await storage.read(key);
+  if (record === null) return null;
+
+  const coordinates = storedApplicationCoordinates(record.value);
+  const stored = await loadCurrentApplication(
+    storage,
+    record,
+    coordinates.subject,
+    coordinates.id,
+  );
+  const actualReviewId = await founderReviewId(
+    coordinates.subject,
+    coordinates.id,
+  );
+  if (actualReviewId !== expectedReviewId) unavailable();
+  return Object.freeze({
+    reviewId: actualReviewId,
+    application: stored.application,
   });
 }
 
@@ -2303,10 +2341,10 @@ async function founderReviewId(
   subject: ActorSubject,
   id: FounderApplicationId,
 ): Promise<string> {
-  const digest = await hashBytes(
-    new TextEncoder().encode(`founder-review\u0000${subject}\u0000${id}`),
-  );
-  return `founder-review:${digest.slice("sha256:".length)}`;
+  const key = await currentApplicationKey(subject, id);
+  const prefix = "founder-current:";
+  if (!key.id.startsWith(prefix)) unavailable();
+  return `founder-review:${key.id.slice(prefix.length)}`;
 }
 
 function requiredReviewId(value: unknown): string {
@@ -2317,6 +2355,13 @@ function requiredReviewId(value: unknown): string {
     invalidRequest();
   }
   return value;
+}
+
+function currentApplicationKeyFromReviewId(reviewId: string): StorageKey {
+  return requiredStorageKey(
+    CURRENT_APPLICATIONS,
+    `founder-current:${reviewId.slice("founder-review:".length)}`,
+  );
 }
 
 /** Compatibility name retained for deterministic development fixtures. */
@@ -2440,6 +2485,19 @@ function storageCollection(value: string): StorageCollection {
   const parsed = parseStorageCollection(value);
   if (!parsed.ok) throw new Error("Invalid founder repository collection.");
   return parsed.value;
+}
+
+function requiredStorageAdapter(value: unknown): StorageAdapter {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    typeof (value as StorageAdapter).read !== "function" ||
+    typeof (value as StorageAdapter).list !== "function" ||
+    typeof (value as StorageAdapter).transact !== "function"
+  ) {
+    invalidRequest();
+  }
+  return value as StorageAdapter;
 }
 
 function requiredActorSubject(value: unknown): ActorSubject {
