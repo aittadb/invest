@@ -1177,6 +1177,34 @@ test("later profiles reject corrupted immutable registration notice anchors", as
             })
           : record,
     },
+    {
+      name: "revision one contains a terminal marketing withdrawal",
+      transform: (record) =>
+        storedParticipantProfileRevision(record) === 1
+          ? mutateStoredProfile(record, (profile) => {
+              profile.marketingConsent = {
+                state: "withdrawn",
+                grantedAt: REGISTERED_AT,
+                withdrawnAt: CONSENT_WITHDRAWN_AT,
+              };
+              profile.updatedAt = CONSENT_WITHDRAWN_AT;
+            })
+          : record,
+    },
+    {
+      name: "revision one contains a terminal deletion request",
+      transform: (record) =>
+        storedParticipantProfileRevision(record) === 1
+          ? mutateStoredProfile(record, (profile) => {
+              profile.accountDeletionRequest = {
+                state: "requested",
+                requestedAt: DELETION_REQUESTED_AT,
+                activeInterestDisposition: "withdraw",
+              };
+              profile.updatedAt = DELETION_REQUESTED_AT;
+            })
+          : record,
+    },
   ];
 
   for (const candidate of cases) {

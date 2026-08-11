@@ -407,6 +407,30 @@ test("concurrent refreshes use independent cookies and remain independently usab
   assert.equal(harness.claims.claimed.size, 2);
 });
 
+test("a valid target proof survives many accumulated valid proof cookies", async () => {
+  const harness = await configuredHarness();
+  const proofs: BrowserMutationProof[] = [];
+  for (let index = 0; index < 32; index += 1) {
+    proofs.push(await issue(harness.session));
+  }
+  const target = proofs.at(-1);
+  assert(target);
+  const browserCookies = proofs.map(cookieHeader).join("; ");
+  assert(browserCookies.length > 8_192);
+
+  const verified = await harness.session.verifyMutation(
+    jsonRequest(target, { action: "target" }, "POST", {
+      cookie: browserCookies,
+    }),
+    PARTICIPANT,
+    APP_ORIGIN,
+  );
+
+  assert.equal(verified.body.action, "target");
+  assert.equal(harness.claims.calls.length, 1);
+  assert.equal(harness.claims.claimed.size, 1);
+});
+
 test("malformed and oversized requests fail closed without consuming proof", async () => {
   const harness = await configuredHarness({ maxBodyBytes: 192 });
   const jsonProof = await issue(harness.session);
@@ -480,6 +504,24 @@ test("malformed and oversized requests fail closed without consuming proof", asy
       harness.session.verifyMutation(
         jsonRequest(cookieProof, {}, "POST", {
           cookie: `padding=${"x".repeat(8_300)}; ${cookieHeader(cookieProof)}`,
+        }),
+        PARTICIPANT,
+        APP_ORIGIN,
+      )
+    )).code,
+    "REQUEST_REJECTED",
+  );
+
+  const excessiveCookieCountProof = await issue(harness.session);
+  const excessiveCookieCount = [
+    ...Array.from({ length: 128 }, (_, index) => `padding_${index}=x`),
+    cookieHeader(excessiveCookieCountProof),
+  ].join("; ");
+  assert.equal(
+    (await captureFailure(() =>
+      harness.session.verifyMutation(
+        jsonRequest(excessiveCookieCountProof, {}, "POST", {
+          cookie: excessiveCookieCount,
         }),
         PARTICIPANT,
         APP_ORIGIN,

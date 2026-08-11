@@ -18,7 +18,9 @@ import {
   type VerifiedMutationRequest,
 } from "./mutation-security.ts";
 
-const COOKIE_HEADER_MAX_LENGTH = 8_192;
+const COOKIE_HEADER_MAX_LENGTH = 65_536;
+const COOKIE_PAIR_MAX_COUNT = 128;
+const COOKIE_PAIR_MAX_LENGTH = 4_096;
 const COOKIE_VALUE_MAX_LENGTH = 2_048;
 const COOKIE_PLAINTEXT_MAX_BYTES = 1_024;
 const MIN_SESSION_TTL_SECONDS = 60;
@@ -644,11 +646,26 @@ function findSessionCookie(
   }
 
   const values: string[] = [];
-  for (const raw of header.split(";")) {
+  let pairCount = 0;
+  let offset = 0;
+  while (offset <= header.length) {
+    pairCount += 1;
+    const delimiter = header.indexOf(";", offset);
+    const end = delimiter < 0 ? header.length : delimiter;
+    if (
+      pairCount > COOKIE_PAIR_MAX_COUNT ||
+      end - offset > COOKIE_PAIR_MAX_LENGTH
+    ) {
+      return Object.freeze({ kind: "invalid" });
+    }
+    const raw = header.slice(offset, end);
     const part = raw.trim();
     const separator = part.indexOf("=");
-    if (separator < 1 || part.slice(0, separator) !== cookieName) continue;
-    values.push(part.slice(separator + 1));
+    if (separator >= 1 && part.slice(0, separator) === cookieName) {
+      values.push(part.slice(separator + 1));
+    }
+    if (delimiter < 0) break;
+    offset = delimiter + 1;
   }
   if (values.length === 0) return Object.freeze({ kind: "missing" });
   const value = values[0];

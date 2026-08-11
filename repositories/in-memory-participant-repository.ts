@@ -885,9 +885,9 @@ function decodeParticipantRecord(
     validateLastMutation(source.lastMutation);
 
     const profile = decodeParticipantProfile(source.profile, trustedSubject);
-    return profile === null
-      ? null
-      : profileSnapshot(profileRevision, profile);
+    if (profile === null) return null;
+    validateParticipantProfileRevision(profileRevision, profile);
+    return profileSnapshot(profileRevision, profile);
   } catch {
     unavailable();
   }
@@ -969,6 +969,20 @@ function decodeParticipantProfile(
     accountDeletionRequest,
     updatedAt,
   });
+}
+
+function validateParticipantProfileRevision(
+  revision: number,
+  profile: ParticipantProfile,
+): void {
+  if (revision !== 1) return;
+  if (
+    profile.updatedAt !== profile.registeredAt ||
+    profile.marketingConsent.state === "withdrawn" ||
+    profile.accountDeletionRequest.state !== "not-requested"
+  ) {
+    unavailable();
+  }
 }
 
 function decodeMarketingConsent(
