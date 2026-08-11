@@ -14,12 +14,14 @@ import {
   assertNoActiveIndicationConflict,
   createInvestmentIndication,
   editInvestmentIndication,
+  participantInvestmentIndicationSummary,
   reactivateInvestmentIndication,
   withdrawInvestmentIndication,
   type ActiveInvestmentIndication,
   type InvestmentIndication,
   type InvestmentIndicationId,
   type ParticipantIndicationActor,
+  type ParticipantInvestmentIndicationSummary,
 } from "../../domain/investment-indication.ts";
 import { StorageFailure } from "../../domain/storage-adapter.ts";
 import type {
@@ -99,11 +101,11 @@ export class InvestmentInterestRepositoryFixture
     }
   }
 
-  async listOwned(): Promise<readonly InvestmentIndication[]> {
+  async listOwned(): Promise<readonly ParticipantInvestmentIndicationSummary[]> {
     return Object.freeze(
       [...this.#state.indications.values()].filter(
         (indication) => indication.participantSubject === this.#subject,
-      ),
+      ).map(participantInvestmentIndicationSummary),
     );
   }
 

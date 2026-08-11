@@ -1366,12 +1366,16 @@ test("maximum indication payloads stay within record, transaction, restart, and 
     withdrawn.snapshot,
   );
 
-  for (const record of [
-    ...recordsIn(state, "investment-indications"),
-    ...recordsIn(state, "investment-indication-history"),
-  ]) {
+  for (const record of recordsIn(state, "investment-indications")) {
     assert.equal(Object.hasOwn(record.value, "history"), false);
     assert.equal(Object.hasOwn(record.value, "snapshot"), false);
+    assert.equal(Object.hasOwn(record.value, "participantSummary"), true);
+    assert.ok(jsonBytes(record.value) <= MAX_INDICATION_STORAGE_RECORD_BYTES);
+  }
+  for (const record of recordsIn(state, "investment-indication-history")) {
+    assert.equal(Object.hasOwn(record.value, "history"), false);
+    assert.equal(Object.hasOwn(record.value, "snapshot"), false);
+    assert.equal(Object.hasOwn(record.value, "participantSummary"), false);
     assert.ok(jsonBytes(record.value) < 4_096);
   }
 });

@@ -6,6 +6,7 @@ import type { StoredInvestmentAggregateSnapshot } from "../domain/investment-agg
 import type {
   InvestmentIndication,
   InvestmentIndicationId,
+  ParticipantInvestmentIndicationSummary,
   TrustedPackageAcknowledgmentContext,
 } from "../domain/investment-indication.ts";
 import type {
@@ -22,7 +23,7 @@ export const PARTICIPANT_INVESTMENT_MUTATION_CONSISTENCY =
 /** Subject-bound reads stay independent from the stronger mutation capability. */
 export interface ParticipantInvestmentInterestReader {
   get(id: InvestmentIndicationId): Promise<InvestmentIndication | null>;
-  listOwned(): Promise<readonly InvestmentIndication[]>;
+  listOwned(): Promise<readonly ParticipantInvestmentIndicationSummary[]>;
   /**
    * Return only whether a fresh mutation can use the configured currency.
    * Implementations must not expose the private aggregate snapshot.

@@ -49,6 +49,7 @@ import {
   type InvestmentInterestItemDocument,
 } from "../domain/participant-investment-interest-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
+import { MAX_INVESTMENT_INDICATION_REVISIONS } from "../domain/investment-indication.ts";
 import {
   parseActorSubject,
   parseStableId,
@@ -2776,7 +2777,7 @@ for (
   );
 }
 
-test("hosted maximum investment collection stays inside the shared request budget", async () => {
+test("hosted maximum-history investment collection stays inside the shared request budget", async () => {
   const service = new SyntheticAittaDBService();
   const env = configuredEnvironment({ OWNER_EMAIL });
   await configureHostedInvestmentFixture(service);
@@ -2816,19 +2817,17 @@ test("hosted maximum investment collection stays inside the shared request budge
     env,
     itemPath,
   );
-  assert.deepEqual(actionNames(item.document), [
-    "edit-investment-interest",
-    "withdraw-investment-interest",
-  ]);
+  assert.equal(item.document.data.revision, MAX_INVESTMENT_INDICATION_REVISIONS - 1);
+  assert.deepEqual(actionNames(item.document), ["withdraw-investment-interest"]);
   const itemHtml = await investmentHtmlResource(
     hostedPackageWorker(service),
     env,
     itemPath,
   );
-  assert.deepEqual(investmentHtmlActionNames(itemHtml.html), [
-    "edit-investment-interest",
-    "withdraw-investment-interest",
-  ]);
+  assert.deepEqual(
+    investmentHtmlActionNames(itemHtml.html),
+    ["withdraw-investment-interest"],
+  );
 });
 
 test("hosted investment state and mutation proofs remain participant-bound and non-disclosing", async () => {
@@ -5671,7 +5670,7 @@ async function seedHostedMaximumInvestmentCollection(
     index += 1
   ) {
     const suffix = String(index).padStart(3, "0");
-    await interestService.create({
+    const created = await interestService.create({
       operationId: `investment-operation:maximum-collection-${suffix}`,
       fields: {
         kind: "company",
@@ -5684,6 +5683,37 @@ async function seedHostedMaximumInvestmentCollection(
         availabilityPeriod: "Within twelve months.",
       },
     });
+    for (
+      let revision = 1;
+      revision < MAX_INVESTMENT_INDICATION_REVISIONS - 1;
+      revision += 1
+    ) {
+      await interestService.edit({
+        operationId:
+          `investment-operation:maximum-collection-${suffix}-edit-${revision}`,
+        indicationId: created.snapshot.id,
+        expectedRevision: revision,
+        fields: {
+          kind: "company",
+          companyName: `Maximum collection company ${suffix}`,
+          registrationCountry: "FI",
+          companyIdentifier: `SYNTHETIC-${suffix}`,
+          representativeName: `Representative ${suffix}`,
+          representativeAuthorityDeclared: true,
+          amount: 25_000,
+          availabilityPeriod: "Within twelve months.",
+          note: `Private revision ${revision}`,
+        },
+      });
+    }
+    if (index % 2 === 1) {
+      await interestService.withdraw({
+        operationId:
+          `investment-operation:maximum-collection-${suffix}-withdraw`,
+        indicationId: created.snapshot.id,
+        expectedRevision: MAX_INVESTMENT_INDICATION_REVISIONS - 1,
+      });
+    }
   }
 }
 

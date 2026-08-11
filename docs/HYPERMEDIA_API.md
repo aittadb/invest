@@ -275,7 +275,7 @@ not present.
 
 ## Participant Investment Interest
 
-`/participant/investment-interests` is the authenticated participant's collection. `/participant/investment-interests/{id}` is one participant-owned indication. Both URIs negotiate native HTML and versioned hypermedia JSON from the same capability models, authorization decision, validation, and repository services. Collection data includes bounded current summaries; item data includes the current personal or company fields and immutable revision history without participant subjects, owner identity, acknowledgment hashes, or storage keys.
+`/participant/investment-interests` is the authenticated participant's collection. `/participant/investment-interests/{id}` is one participant-owned indication. Both URIs negotiate native HTML and versioned hypermedia JSON from the same capability models, authorization decision, validation, and repository services. Collection data includes every owned bounded current summary, independent of immutable history depth; item data includes the current personal or company fields and immutable revision history without participant subjects, owner identity, acknowledgment hashes, or storage keys.
 
 The collection may expose:
 

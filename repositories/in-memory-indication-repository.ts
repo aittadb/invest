@@ -17,6 +17,7 @@ import {
   editInvestmentIndication,
   MAX_INVESTMENT_INDICATION_REVISIONS,
   parseInvestmentIndicationFields,
+  participantInvestmentIndicationSummary,
   reactivateInvestmentIndication,
   rejectInvestmentIndication,
   withdrawInvestmentIndication,
@@ -31,6 +32,7 @@ import {
   type InvestmentIndicationParsingOptions,
   type OwnerIndicationActor,
   type ParticipantIndicationActor,
+  type ParticipantInvestmentIndicationSummary,
   type RejectedInvestmentIndication,
   type TrustedPackageAcknowledgmentContext,
   type WithdrawnInvestmentIndication,
@@ -72,6 +74,7 @@ export {
 } from "../services/owner-indication-review-tokens.ts";
 
 const INDICATION_SCHEMA_VERSION = 4;
+const CURRENT_INDICATION_SCHEMA_VERSION = 5;
 const CURRENT_INDICATIONS = storageCollection("investment-indications");
 const INDICATION_HISTORY = storageCollection("investment-indication-history");
 const INDICATION_FIELDS = storageCollection("investment-indication-fields");
@@ -97,6 +100,7 @@ export const MAX_INDICATION_STORAGE_MUTATIONS =
 export const MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE = 25;
 export const MAX_OWNER_INDICATION_REVIEW_ITEM_READS =
   2 + MAX_INDICATION_FIELDS_CHUNKS;
+export const MAX_PARTICIPANT_INDICATION_SUMMARY_READS = 4;
 export const MAX_OWNER_INDICATION_REVIEW_PAGE_RECORD_READS =
   MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE *
   MAX_OWNER_INDICATION_REVIEW_ITEM_READS;
@@ -117,6 +121,15 @@ const CURRENT_DOCUMENT_KEYS = new Set([
   "participantSubject",
   "revision",
   "fields",
+  "participantSummary",
+]);
+const PARTICIPANT_SUMMARY_DOCUMENT_KEYS = new Set([
+  "kind",
+  "status",
+  "createdAt",
+  "updatedAt",
+  "fields",
+  "rejectionReason",
 ]);
 const TRANSITION_DOCUMENT_KEYS = new Set([
   "kind",
@@ -418,6 +431,7 @@ type StoredCurrent = Readonly<{
   participantSubject: ActorSubject;
   revision: number;
   fields: StoredFieldsReference;
+  participantSummary: StorageDocument;
   document: StorageDocument;
   record: StorageRecord;
 }>;
@@ -608,18 +622,56 @@ export class DevelopmentInMemoryIndicationRepository
     return mutationResult(materialized.indication, true);
   }
 
-  /** Read one current collection item through its bounded immutable ancestry. */
-  async readCurrentParticipantProjection(
+  /** Read one current collection row without traversing immutable ancestry. */
+  async readCurrentParticipantSummary(
     id: InvestmentIndicationId,
-  ): Promise<InvestmentIndication | null> {
+  ): Promise<ParticipantInvestmentIndicationSummary | null> {
     const subject = this.#authenticatedSubject;
     if (subject === null || subject === this.#configuredOwnerSubject) return null;
-    const stored = await this.#readCurrent(
-      requiredIndicationId(id),
-      "participant",
+    const indicationId = requiredIndicationId(id);
+    const currentKey = await currentIndicationKey(indicationId);
+    const currentRecord = await this.#storage.read(currentKey);
+    if (currentRecord === null) return null;
+    if (peekParticipantSubject(currentRecord) !== subject) return null;
+    const current = decodeStoredCurrent(
+      currentRecord,
+      currentKey,
+      indicationId,
       subject,
     );
-    return stored?.indication ?? null;
+    const terminalKey = await indicationHistoryKey(indicationId, current.revision);
+    const createdKey = await indicationHistoryKey(indicationId, 1);
+    const [terminalRecord, createdRecord] = await Promise.all([
+      this.#storage.read(terminalKey),
+      current.revision === 1
+        ? Promise.resolve(null)
+        : this.#storage.read(createdKey),
+    ]);
+    if (terminalRecord === null) unavailable();
+    const terminal = decodeStoredTransition(
+      terminalRecord,
+      terminalKey,
+      subject,
+      indicationId,
+      current.revision,
+    );
+    const created = current.revision === 1
+      ? terminal
+      : createdRecord === null
+      ? unavailable()
+      : decodeStoredTransition(
+          createdRecord,
+          createdKey,
+          subject,
+          indicationId,
+          1,
+        );
+    return decodeParticipantIndicationSummary(
+      this.#storage,
+      current,
+      terminal,
+      created,
+    );
   }
 
   async edit(
@@ -1272,15 +1324,20 @@ async function decodeOwnerIndicationReviewSummary(
     coordinates.id,
     current.fields,
   );
-  const status = await verifyOwnerReviewTerminal(
+  const lifecycle = await verifyOwnerReviewTerminal(
     terminal,
     fields.fields,
   );
-  await verifyOwnerReviewActiveLease(storage, current, fields.fields, status);
+  await verifyOwnerReviewActiveLease(
+    storage,
+    current,
+    fields.fields,
+    lifecycle.status,
+  );
   return Object.freeze({
     reviewId: await tokens.reviewIdForCurrentKey(currentKey, ownerSubject),
     kind: fields.fields.kind,
-    status,
+    status: lifecycle.status,
     amount: fields.fields.amount,
     currency: fields.fields.currency,
     updatedAt: terminal.occurredAt,
@@ -1317,10 +1374,102 @@ function requireCurrentMatchesTerminal(
   }
 }
 
+type VerifiedTerminalLifecycle = Readonly<{
+  status: InvestmentIndication["lifecycle"]["status"];
+  rejectionReason: string | null;
+}>;
+
+async function decodeParticipantIndicationSummary(
+  storage: Pick<StorageAdapter, "read">,
+  current: StoredCurrent,
+  terminal: StoredTransition,
+  created: StoredTransition,
+): Promise<ParticipantInvestmentIndicationSummary> {
+  requireCurrentMatchesTerminal(current, terminal);
+  const source = exactRecord(
+    current.participantSummary,
+    PARTICIPANT_SUMMARY_DOCUMENT_KEYS,
+  );
+  const fieldsSource = storedFieldsDocument(source.fields);
+  const amount = storedAmountConfigurationFromDocument(fieldsSource);
+  const parsedFields = parseInvestmentIndicationFields(
+    storedDomainFieldsInput(fieldsSource),
+    amount,
+    storedParsingOptions(),
+  );
+  if (
+    !parsedFields.ok ||
+    canonicalJson(fieldsDocument(parsedFields.value)) !==
+      canonicalJson(fieldsSource)
+  ) unavailable();
+  const preparedFields = await prepareStoredFields(
+    current.participantSubject,
+    current.indicationId,
+    current.fields.revision,
+    parsedFields.value,
+  );
+  if (
+    canonicalJson(fieldsReferenceDocument(preparedFields.reference)) !==
+      canonicalJson(fieldsReferenceDocument(current.fields))
+  ) unavailable();
+
+  const createdAt = storedTimestamp(source.createdAt);
+  const updatedAt = storedTimestamp(source.updatedAt);
+  if (
+    source.kind !== parsedFields.value.kind ||
+    created.transitionKind !== "created" ||
+    created.revision !== 1 ||
+    created.fields.revision !== 1 ||
+    created.occurredAt !== createdAt ||
+    terminal.occurredAt !== updatedAt ||
+    createdAt > updatedAt
+  ) unavailable();
+  verifyParticipantCreatedTransition(created);
+
+  const lifecycle = await verifyOwnerReviewTerminal(
+    terminal,
+    parsedFields.value,
+  );
+  if (
+    source.status !== lifecycle.status ||
+    source.rejectionReason !== lifecycle.rejectionReason
+  ) unavailable();
+  await verifyOwnerReviewActiveLease(
+    storage,
+    current,
+    parsedFields.value,
+    lifecycle.status,
+  );
+  return Object.freeze({
+    id: current.indicationId,
+    participantSubject: current.participantSubject,
+    kind: parsedFields.value.kind,
+    fields: parsedFields.value,
+    lifecycle: Object.freeze(lifecycle),
+    createdAt,
+    updatedAt,
+    revision: current.revision,
+  });
+}
+
+function verifyParticipantCreatedTransition(created: StoredTransition): void {
+  const source = exactRecord(created.document, TRANSITION_DOCUMENT_KEYS);
+  const actor = storedParticipantActor(source.actor);
+  const acknowledgment = storedAcknowledgment(source.acknowledgment);
+  if (
+    actor.subject !== created.participantSubject ||
+    acknowledgment.participantSubject !== created.participantSubject ||
+    source.rejection !== null ||
+    canonicalJson(actorDocument(actor)) !== canonicalJson(source.actor) ||
+    canonicalJson(acknowledgmentDocument(acknowledgment)) !==
+      canonicalJson(source.acknowledgment)
+  ) unavailable();
+}
+
 async function verifyOwnerReviewTerminal(
   terminal: StoredTransition,
   fields: InvestmentIndicationFields,
-): Promise<InvestmentIndication["lifecycle"]["status"]> {
+): Promise<VerifiedTerminalLifecycle> {
   const source = exactRecord(terminal.document, TRANSITION_DOCUMENT_KEYS);
   const acknowledgment = storedAcknowledgment(source.acknowledgment);
   if (
@@ -1401,7 +1550,10 @@ async function verifyOwnerReviewTerminal(
     unavailable();
   }
 
-  return status;
+  return Object.freeze({
+    status,
+    rejectionReason: reason ?? null,
+  });
 }
 
 async function verifyOwnerReviewActiveLease(
@@ -1766,6 +1918,7 @@ function decodeStoredCurrent(
     expectedKey,
     CURRENT_DOCUMENT_KEYS,
     "investment-indication-current",
+    CURRENT_INDICATION_SCHEMA_VERSION,
   );
   const operationId = storedOperationId(source.operationId);
   const operationFingerprint = storedFingerprint(source.operationFingerprint);
@@ -1774,6 +1927,10 @@ function decodeStoredCurrent(
   const participantSubject = storedActorSubject(source.participantSubject);
   const revision = storedRevision(source.revision);
   const fields = storedFieldsReference(source.fields);
+  const participantSummary = exactRecord(
+    source.participantSummary,
+    PARTICIPANT_SUMMARY_DOCUMENT_KEYS,
+  ) as StorageDocument;
   if (
     indicationId !== expectedId ||
     (expectedSubject !== null && participantSubject !== expectedSubject) ||
@@ -1787,6 +1944,7 @@ function decodeStoredCurrent(
     participantSubject,
     revision,
     fields,
+    participantSummary,
     document: record.value,
     record,
   });
@@ -1988,6 +2146,7 @@ function exactStoredDocument(
   expectedKey: StorageKey,
   expectedKeys: ReadonlySet<string>,
   expectedKind: string,
+  expectedSchemaVersion = INDICATION_SCHEMA_VERSION,
 ): Record<string, unknown> {
   const envelope = exactRecord(record, STORAGE_RECORD_KEYS);
   const key = exactRecord(envelope.key, STORAGE_KEY_KEYS);
@@ -1998,7 +2157,7 @@ function exactStoredDocument(
     !Number.isSafeInteger(envelope.revision) ||
     envelope.revision !== record.revision ||
     source.kind !== expectedKind ||
-    source.schemaVersion !== INDICATION_SCHEMA_VERSION ||
+    source.schemaVersion !== expectedSchemaVersion ||
     jsonByteLength(source) > MAX_INDICATION_STORAGE_RECORD_BYTES
   ) unavailable();
   return source;
@@ -2418,7 +2577,7 @@ function currentIndicationDocument(
 ): StorageDocument {
   return Object.freeze({
     kind: "investment-indication-current",
-    schemaVersion: INDICATION_SCHEMA_VERSION,
+    schemaVersion: CURRENT_INDICATION_SCHEMA_VERSION,
     operationId,
     operationFingerprint: fingerprint,
     requestFingerprint,
@@ -2426,6 +2585,21 @@ function currentIndicationDocument(
     participantSubject: indication.participantSubject,
     revision: indication.revision,
     fields: fieldsReferenceDocument(fields),
+    participantSummary: participantSummaryDocument(indication),
+  });
+}
+
+function participantSummaryDocument(
+  indication: InvestmentIndication,
+): StorageDocument {
+  const summary = participantInvestmentIndicationSummary(indication);
+  return Object.freeze({
+    kind: summary.kind,
+    status: summary.lifecycle.status,
+    createdAt: summary.createdAt,
+    updatedAt: summary.updatedAt,
+    fields: fieldsDocument(summary.fields),
+    rejectionReason: summary.lifecycle.rejectionReason,
   });
 }
 

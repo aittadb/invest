@@ -10,10 +10,13 @@ import {
   parseStableId,
   type ActorSubject,
 } from "../domain/foundation.ts";
-import type {
-  InvestmentIndicationParsingOptions,
-  InvestmentIndicationId,
-  TrustedPackageAcknowledgmentContext,
+import {
+  INVESTMENT_INDICATION_LIMITS,
+  MAX_INVESTMENT_INDICATION_REVISIONS,
+  participantInvestmentIndicationSummary,
+  type InvestmentIndicationParsingOptions,
+  type InvestmentIndicationId,
+  type TrustedPackageAcknowledgmentContext,
 } from "../domain/investment-indication.ts";
 import {
   createPackageAcceptance,
@@ -33,7 +36,10 @@ import {
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
 } from "../repositories/in-memory-indication-repository.ts";
-import { StorageParticipantInvestmentInterestRepository } from "../repositories/storage-participant-investment-repository.ts";
+import {
+  MAX_PARTICIPANT_INVESTMENT_COLLECTION_STORAGE_READS,
+  StorageParticipantInvestmentInterestRepository,
+} from "../repositories/storage-participant-investment-repository.ts";
 import {
   createParticipantInvestmentInterestService,
   type InvestmentInterestPermissions,
@@ -148,7 +154,7 @@ test("storage participant investment repository commits one persistent atomic li
   assert.deepEqual(reopened, reactivated.snapshot);
   assert.deepEqual(
     await restartedRepository.listOwned(),
-    [reactivated.snapshot],
+    [participantInvestmentIndicationSummary(reactivated.snapshot)],
   );
   const foreign = new StorageParticipantInvestmentInterestRepository(
     new MemoryStorageAdapter(state),
@@ -677,7 +683,7 @@ test("atomic contribution work stays constant-read with unrelated indications", 
   assertAggregate(state, 25, 31_250, 25);
 });
 
-test("participant index has an observed 100-item read and write ceiling", async () => {
+test("maximum collection and history stay within the bounded summary read ceiling", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
   const context = await currentContext(ALICE, "storage-index-ceiling");
@@ -692,6 +698,9 @@ test("participant index has an observed 100-item read and write ceiling", async 
     context,
     () => new Date("2026-08-12T10:00:00.000Z"),
   );
+  const maximumNote = "\u{10000}".repeat(
+    INVESTMENT_INDICATION_LIMITS.noteLength / 2,
+  );
   for (let index = 0; index < 100; index += 1) {
     await service.create({
       operationId: `investment-operation:index-ceiling-${index}`,
@@ -699,6 +708,25 @@ test("participant index has an observed 100-item read and write ceiling", async 
         companyName: `Synthetic company ${index}`,
         companyIdentifier: `SYNTHETIC-${index}`,
       }),
+    });
+    for (let revision = 1; revision < MAX_INVESTMENT_INDICATION_REVISIONS - 1; revision += 1) {
+      await service.edit({
+        operationId: `investment-operation:index-ceiling-${index}-edit-${revision}`,
+        indicationId: `investment-operation:index-ceiling-${index}`,
+        expectedRevision: revision,
+        fields: companyFields({
+          companyName: `Synthetic company ${index}`,
+          companyIdentifier: `SYNTHETIC-${index}`,
+          note: revision === MAX_INVESTMENT_INDICATION_REVISIONS - 2
+            ? maximumNote
+            : `Private revision ${revision}`,
+        }),
+      });
+    }
+    await service.withdraw({
+      operationId: `investment-operation:index-ceiling-${index}-withdraw`,
+      indicationId: `investment-operation:index-ceiling-${index}`,
+      expectedRevision: MAX_INVESTMENT_INDICATION_REVISIONS - 1,
     });
   }
 
@@ -710,9 +738,21 @@ test("participant index has an observed 100-item read and write ceiling", async 
     ALICE,
     AMOUNT,
   );
-  assert.equal((await reopened.listOwned()).length, 100);
+  const listed = await reopened.listOwned();
+  assert.equal(MAX_PARTICIPANT_INVESTMENT_COLLECTION_STORAGE_READS, 401);
+  assert.equal(listed.length, 100);
+  assert.equal(
+    listed.filter((indication) =>
+      indication.revision === MAX_INVESTMENT_INDICATION_REVISIONS
+    ).length,
+    100,
+  );
+  assert.equal(listed.every((indication) => indication.fields.note === maximumNote), true);
   assert.equal(counted.listCalls, 0);
-  assert.equal(counted.readCalls, 401);
+  assert.equal(counted.readCalls, 301);
+  assert.ok(
+    counted.readCalls <= MAX_PARTICIPANT_INVESTMENT_COLLECTION_STORAGE_READS,
+  );
 
   const recordsBefore = state.records.size;
   const operationsBefore = state.operations.size;
@@ -726,7 +766,111 @@ test("participant index has an observed 100-item read and write ceiling", async 
   assert.equal(failure.code, "CONFLICT");
   assert.equal(state.records.size, recordsBefore);
   assert.equal(state.operations.size, operationsBefore);
-  assertAggregate(state, 100, 200_000, 100);
+  assertAggregate(state, 1_600, 0, 0);
+});
+
+test("participant collection summaries fail closed at corruption boundaries", async (context) => {
+  const privateSentinel = "PRIVATE SUMMARY CORRUPTION";
+  const cases: readonly Readonly<{
+    name: string;
+    collection: string;
+    transform(record: StorageRecord): unknown;
+  }>[] = [
+    {
+      name: "missing current summary",
+      collection: "investment-indications",
+      transform: (record) => {
+        const value = { ...record.value };
+        delete value.participantSummary;
+        return { ...record, value };
+      },
+    },
+    {
+      name: "extra current summary member",
+      collection: "investment-indications",
+      transform: (record) => mapParticipantSummary(record, (summary) => ({
+        ...summary,
+        privateDetail: privateSentinel,
+      })),
+    },
+    {
+      name: "current fields do not match their hash",
+      collection: "investment-indications",
+      transform: (record) => mapParticipantSummary(record, (summary) => ({
+        ...summary,
+        fields: {
+          ...(summary.fields as Readonly<Record<string, unknown>>),
+          note: privateSentinel,
+        },
+      })),
+    },
+    {
+      name: "current lifecycle does not match terminal transition",
+      collection: "investment-indications",
+      transform: (record) => mapParticipantSummary(record, (summary) => ({
+        ...summary,
+        status: "withdrawn",
+      })),
+    },
+    {
+      name: "creation timestamp does not match immutable creation",
+      collection: "investment-indications",
+      transform: (record) => mapParticipantSummary(record, (summary) => ({
+        ...summary,
+        createdAt: "2026-08-12T09:00:00.000Z",
+      })),
+    },
+    {
+      name: "missing immutable creation transition",
+      collection: "investment-indication-history",
+      transform: (record) =>
+        record.value.revision === 1 ? null : record,
+    },
+  ];
+
+  for (const [index, candidate] of cases.entries()) {
+    await context.test(candidate.name, async () => {
+      const state = new MemoryStorageState();
+      const original = new StorageParticipantInvestmentInterestRepository(
+        new MemoryStorageAdapter(state),
+        ALICE,
+        AMOUNT,
+      );
+      const service = serviceFor(
+        original,
+        ALICE,
+        await currentContext(ALICE, `summary-corruption-${index}`),
+        () => new Date("2026-08-12T10:00:00.000Z"),
+      );
+      const created = await service.create({
+        operationId: `investment-operation:summary-corruption-${index}`,
+        fields: personalFields(),
+      });
+      await service.edit({
+        operationId: `investment-operation:summary-corruption-${index}-edit`,
+        indicationId: created.snapshot.id,
+        expectedRevision: 1,
+        fields: personalFields({ note: "Current private note." }),
+      });
+      const recordsBefore = state.records.size;
+      const operationsBefore = state.operations.size;
+      const repository = new StorageParticipantInvestmentInterestRepository(
+        new ReadTransformStorageAdapter(
+          new MemoryStorageAdapter(state),
+          candidate.collection,
+          candidate.transform,
+        ),
+        ALICE,
+        AMOUNT,
+      );
+
+      const failure = await captureStorageFailure(() => repository.listOwned());
+      assert.equal(failure.code, "UNAVAILABLE");
+      assert.doesNotMatch(String(failure), /PRIVATE|summary|creation/iu);
+      assert.equal(state.records.size, recordsBefore);
+      assert.equal(state.operations.size, operationsBefore);
+    });
+  }
 });
 
 test("a failed outer transaction leaves no indication, aggregate, audit, index, or receipt", async () => {
@@ -1079,6 +1223,27 @@ function recordsIn(state: MemoryStorageState, collection: string) {
   return [...state.records.values()].filter(
     (record) => record.key.collection === collection,
   );
+}
+
+function mapParticipantSummary(
+  record: StorageRecord,
+  transform: (
+    summary: Readonly<Record<string, unknown>>,
+  ) => Readonly<Record<string, unknown>>,
+): StorageRecord {
+  const value = record.value as Readonly<Record<string, unknown>>;
+  const summary = value.participantSummary;
+  assert.equal(typeof summary, "object");
+  assert.notEqual(summary, null);
+  return {
+    ...record,
+    value: {
+      ...value,
+      participantSummary: transform(
+        summary as Readonly<Record<string, unknown>>,
+      ),
+    } as StorageDocument,
+  };
 }
 
 function assertAggregate(

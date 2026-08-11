@@ -23,6 +23,7 @@ import type {
   InvestmentIndication,
   InvestmentIndicationId,
   InvestmentIndicationParsingOptions,
+  ParticipantInvestmentIndicationSummary,
 } from "../domain/investment-indication.ts";
 import {
   MAX_STORAGE_TRANSACTION_MUTATIONS,
@@ -60,6 +61,7 @@ import {
   DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
+  MAX_PARTICIPANT_INDICATION_SUMMARY_READS,
   prepareParticipantIndicationMutation,
   prepareParticipantIndicationReplay,
   type IndicationMutationResult,
@@ -105,6 +107,10 @@ const TRANSACTION_RESULT_KEYS = new Set(["replayed", "records"]);
 const STORAGE_RECORD_KEYS = new Set(["key", "revision", "value"]);
 const STORAGE_KEY_KEYS = new Set(["collection", "id"]);
 const MAX_INVESTMENT_POLICY_ASSERTIONS = 4;
+export const MAX_PARTICIPANT_INVESTMENT_COLLECTION_STORAGE_READS =
+  1 +
+  MAX_PARTICIPANT_INVESTMENT_INTERESTS *
+    MAX_PARTICIPANT_INDICATION_SUMMARY_READS;
 
 export type InvestmentPolicyAssertionProvider =
   () => readonly StorageCheckMutation[];
@@ -188,13 +194,13 @@ export class StorageParticipantInvestmentInterestRepository
     }
   }
 
-  async listOwned(): Promise<readonly InvestmentIndication[]> {
+  async listOwned(): Promise<readonly ParticipantInvestmentIndicationSummary[]> {
     try {
       const index = await readParticipantIndex(this.#storage, this.#subject);
-      const indications: InvestmentIndication[] = [];
+      const indications: ParticipantInvestmentIndicationSummary[] = [];
       for (const id of index.ids) {
         const indication = await this.#indications
-          .readCurrentParticipantProjection(id);
+          .readCurrentParticipantSummary(id);
         if (
           indication === null ||
           indication.id !== id ||

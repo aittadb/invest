@@ -92,6 +92,12 @@ test("owner rejection persists every effect once and replays across restart", as
   );
   const persisted = await reopenedParticipant.get(seeded.indication.id);
   assert.equal(persisted?.lifecycle.status, "rejected");
+  const [summary] = await reopenedParticipant.listOwned();
+  assert.equal(summary?.lifecycle.status, "rejected");
+  assert.equal(
+    summary?.lifecycle.rejectionReason,
+    "Outside the current review scope.",
+  );
   assert.equal(
     (await new DevelopmentInMemoryAggregateRepository(
       new MemoryStorageAdapter(state),

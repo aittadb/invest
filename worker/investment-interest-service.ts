@@ -22,6 +22,7 @@ import {
   type InvestmentIndication,
   type InvestmentIndicationHistoryEntryId,
   type InvestmentIndicationId,
+  type ParticipantInvestmentIndicationSummary,
   type ParticipantVisibleIndicationTransition,
   type TrustedPackageAcknowledgmentContext,
   type WithdrawnInvestmentIndication,
@@ -64,7 +65,7 @@ export type InvestmentInterestPermissions = Readonly<{
 }>;
 
 export type InvestmentInterestCollectionState = Readonly<{
-  indications: readonly InvestmentIndication[];
+  indications: readonly ParticipantInvestmentIndicationSummary[];
   amountConfiguration: AmountConfiguration;
   acknowledgmentCurrent: boolean;
   canCreatePersonal: boolean;
@@ -194,7 +195,8 @@ export function createParticipantInvestmentInterestService(
     return indication;
   };
 
-  const listOwned = async (): Promise<readonly InvestmentIndication[]> => {
+  const listOwned = async ():
+    Promise<readonly ParticipantInvestmentIndicationSummary[]> => {
     let values: unknown;
     try {
       values = await options.reader.listOwned();
@@ -210,8 +212,10 @@ export function createParticipantInvestmentInterestService(
     }
 
     const seen = new Set<string>();
-    const indications: InvestmentIndication[] = [];
-    for (const candidate of values as readonly InvestmentIndication[]) {
+    const indications: ParticipantInvestmentIndicationSummary[] = [];
+    for (
+      const candidate of values as readonly ParticipantInvestmentIndicationSummary[]
+    ) {
       if (
         typeof candidate !== "object" ||
         candidate === null ||

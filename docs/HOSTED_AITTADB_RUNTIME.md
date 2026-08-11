@@ -309,10 +309,13 @@ investment repository starts the route counter, and every later read spends
 from both counters; unused authorization capacity cannot widen route work. This covers a
 profile mutation's current state, two historical samples, failed first attempt,
 recovery state and history, retry, and final projection. Package GET uses one
-cached-head read, acknowledgment GET uses at most four, and an ordinary
-maximum-count investment collection plus its one-record aggregate compatibility
-projection remains bounded; unusually deep combined
-indication histories fail closed at the same ceiling. Route read 513 or total
+cached-head read and acknowledgment GET uses at most four. The investment
+collection reads its participant index once and each of at most 100 current
+summaries in at most four records, independent of the indication's 16-revision
+history; current fields, terminal lifecycle, creation time, and any active lease
+must agree. Its one-record aggregate compatibility projection and policy reads
+therefore remain inside the unchanged route ceiling even at the valid count and
+history maxima. Route read 513 or total
 read 1,064 fails
 before adapter access. General public campaign reads and storage transactions
 are outside this participant read counter. Investment policy opens its private
