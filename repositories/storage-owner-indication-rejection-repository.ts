@@ -1,6 +1,7 @@
 import {
   parseAmountAggregateConfiguration,
   type AmountConfiguration,
+  type CurrencyCode,
 } from "../domain/amount-aggregate-configuration.ts";
 import {
   createManualNotificationRecord,
@@ -53,8 +54,8 @@ import type {
   RejectIndicationWithEffectsResult,
 } from "../services/owner-indication-moderation.ts";
 import {
-  DevelopmentInMemoryAggregateRepository,
   prepareAtomicAggregateContribution,
+  readAtomicAggregateContributionHead,
   readAtomicAggregateContributionReplay,
 } from "./in-memory-aggregate-repository.ts";
 import {
@@ -248,16 +249,18 @@ export class StorageOwnerIndicationRejectionRepository
     if (indication.replayed) conflict();
     const rejected = requiredRejected(indication.snapshot, request);
 
-    const aggregateBefore = await new DevelopmentInMemoryAggregateRepository(
+    const operationCurrency = rejected.fields.currency;
+    const aggregateBefore = await readAtomicAggregateContributionHead(
       staged,
-      this.#amount.currency,
-    ).readStored();
+      operationCurrency,
+      "strict",
+    );
     const contribution = projectInvestmentIndicationForAggregation(rejected);
     const aggregate = await prepareAtomicAggregateContribution(staged, {
       operationId: request.operationId,
       expectedStoredRevision: aggregateBefore.revision,
       contribution,
-    }, this.#amount.currency);
+    }, operationCurrency, "strict");
     await staged.stage(aggregate.mutations);
 
     const notificationExpected = await notificationSnapshot(request, rejected);
@@ -290,9 +293,14 @@ export class StorageOwnerIndicationRejectionRepository
     const receipt = decodeReceipt(
       transaction.records.at(-1),
       receiptKey,
-      this.#amount,
     );
-    requireMatchingReceipt(receipt, request, audit, notificationExpected);
+    requireMatchingReceipt(
+      receipt,
+      request,
+      audit,
+      notificationExpected,
+      aggregate.result.stored,
+    );
     const auditEvent = verifyPreparedAuditAppend(
       audit,
       transaction.records[auditIndex],
@@ -314,7 +322,7 @@ export class StorageOwnerIndicationRejectionRepository
     const receiptKey = await operationReceiptKey(request.operationId);
     const stored = await this.#storage.read(receiptKey);
     if (stored === null) return null;
-    const receipt = decodeReceipt(stored, receiptKey, this.#amount);
+    const receipt = decodeReceipt(stored, receiptKey);
     if (
       receipt.operationFingerprint !== request.operationFingerprint ||
       receipt.indicationId !== request.indicationId ||
@@ -351,7 +359,7 @@ export class StorageOwnerIndicationRejectionRepository
         expectedStoredRevision: receipt.aggregate.revision - 1,
         contribution: projectInvestmentIndicationForAggregation(rejected),
       },
-      this.#amount.currency,
+      rejected.fields.currency,
     );
     if (
       aggregate === null ||
@@ -372,7 +380,13 @@ export class StorageOwnerIndicationRejectionRepository
     );
     if (notification === null) unavailable();
     requireMatchingNotification(notification, expectedNotification);
-    requireMatchingReceipt(receipt, effective, audit, expectedNotification);
+    requireMatchingReceipt(
+      receipt,
+      effective,
+      audit,
+      expectedNotification,
+      aggregate.stored,
+    );
 
     return result(
       request.reviewId,
@@ -549,7 +563,6 @@ function receiptMutation(
 function decodeReceipt(
   value: StorageRecord | null | undefined,
   expectedKey: StorageKey,
-  amount: AmountConfiguration,
 ): StoredReceipt {
   if (!value) unavailable();
   const envelope = exactRecord(value, STORAGE_RECORD_KEYS);
@@ -583,7 +596,7 @@ function decodeReceipt(
     indicationId: indicationId.value,
     indicationRevision: source.indicationRevision,
     occurredAt: occurredAt.value,
-    aggregate: decodeAggregate(source.aggregate, amount),
+    aggregate: decodeAggregate(source.aggregate),
     auditEventId: auditEventId.value,
     notificationId: notificationId.value,
     notificationRevision: 1,
@@ -595,12 +608,14 @@ function requireMatchingReceipt(
   request: ParsedRejection,
   audit: PreparedAuditAppend,
   notification: OwnerIndicationNotificationSnapshot,
+  aggregate: StoredInvestmentAggregateSnapshot,
 ): void {
   if (
     receipt.operationFingerprint !== request.operationFingerprint ||
     receipt.indicationId !== request.indicationId ||
     receipt.indicationRevision !== request.expectedRevision + 1 ||
     receipt.occurredAt !== request.occurredAt ||
+    !sameAggregate(receipt.aggregate, aggregate) ||
     receipt.auditEventId !== audit.event.id ||
     receipt.notificationId !== notification.record.template.id ||
     receipt.notificationRevision !== notification.revision
@@ -653,22 +668,26 @@ function requireMatchingNotification(
 
 function decodeAggregate(
   value: unknown,
-  amount: AmountConfiguration,
 ): StoredInvestmentAggregateSnapshot {
   const source = exactRecord(value, AGGREGATE_KEYS);
   const totalAmount = parseMinorUnits(source.totalAmount);
+  const currency = requiredStoredCurrency(source.currency);
   if (
     !nonNegativeInteger(source.revision) ||
     !totalAmount.ok ||
-    source.currency !== amount.currency ||
     !nonNegativeInteger(source.contributingIndicationCount)
   ) unavailable();
   return Object.freeze({
     revision: source.revision,
     totalAmount: totalAmount.value,
-    currency: amount.currency,
+    currency,
     contributingIndicationCount: source.contributingIndicationCount,
   });
+}
+
+function requiredStoredCurrency(value: unknown): CurrencyCode {
+  if (typeof value !== "string" || !/^[A-Z]{3}$/u.test(value)) unavailable();
+  return value as CurrencyCode;
 }
 
 function aggregateDocument(

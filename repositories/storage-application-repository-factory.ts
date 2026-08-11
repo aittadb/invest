@@ -154,6 +154,7 @@ export type ParticipantRequestRepositoryScope = Readonly<{
  * wiring task after that repository contract is proven.
  */
 export class StorageApplicationRepositoryFactory {
+  readonly #storage: StorageAdapter;
   readonly #claimBrowserMutationReplay: BrowserMutationReplayClaimer;
   readonly #campaignRepository: AtomicCampaignAuditRepository;
   readonly #publicCampaignReader: PublicCampaignPresentationReader;
@@ -171,6 +172,7 @@ export class StorageApplicationRepositoryFactory {
 
   constructor(storage: StorageAdapter, now: () => Date) {
     const adapter = requiredStorageAdapter(storage);
+    this.#storage = adapter;
     const clock = requiredClock(now);
     const packageVersions = new StoragePackageVersionRepository(adapter);
     this.#ownerPackageWorkspace = new RepositoryOwnerPackageWorkspaceService(

@@ -236,9 +236,6 @@ export function createApplicationWorker(
           runtimeOwnerFounderReview(applicationRuntime)
         : undefined;
       const ownerFounderReviewAvailable = ownerFounderReview !== undefined;
-      const participantInvestmentInterestsAvailable =
-        dependencies.dispatchRoute === undefined &&
-        dependencies.participantInvestmentInterests !== undefined;
       const ownerOAuthProof = dependencies.dispatchRoute === undefined
         ? await resolveOwnerOAuthProof(dependencies, env)
         : null;

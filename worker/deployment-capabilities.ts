@@ -15,10 +15,6 @@ import type { OwnerCampaignEditorRepository } from "../services/owner-campaign-e
 import type { OwnerPackageWorkspaceService } from "../services/owner-package-workspace.ts";
 import type { AuditEventReader } from "../repositories/in-memory-audit-notification-repositories.ts";
 import type { PublicCampaignStateReader } from "../repositories/storage-public-campaign-state-reader.ts";
-import type {
-  AtomicParticipantInvestmentInterestMutationPort,
-  ParticipantInvestmentInterestReader,
-} from "./participant-investment-mutation-port.ts";
 
 export type CampaignWorkspaceOperationKind =
   | "setup"

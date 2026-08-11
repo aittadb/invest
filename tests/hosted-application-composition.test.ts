@@ -4115,6 +4115,7 @@ test("hosted signed-in entry advances through registration and trusted participa
     "read-private-package",
     "open-participant-profile",
     "open-founder-interest",
+    "open-investment-interests",
     "sign-out",
   ]);
 

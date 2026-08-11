@@ -55,6 +55,7 @@ const OWNER = subject("issuer.invalid/owner:rejection");
 const FOREIGN_OWNER = subject("issuer.invalid/owner:foreign-rejection");
 const PARTICIPANT = subject("issuer.invalid/participant:rejection");
 const AMOUNT = amountConfiguration();
+const CHANGED_AMOUNT = amountConfiguration("USD");
 const FIRST_TIME = timestamp("2026-08-12T12:00:00.000Z");
 const RETRY_TIME = timestamp("2026-08-12T13:00:00.000Z");
 
@@ -138,6 +139,30 @@ test("owner rejection persists every effect once and replays across restart", as
   assert.equal(changed.code, "CONFLICT");
   assert.equal(recordsIn(state, "investment-indication-history"), 2);
   assert.equal(recordsIn(state, "audit-events"), 2);
+});
+
+test("owner rejection preserves indication currency across policy evolution", async () => {
+  const state = new MemoryStorageState();
+  const seeded = await seedActiveIndication(state);
+  const request = await rejectionRequest(seeded.indication, "currency-evolution");
+
+  const rejected = await rejectionRepository(
+    new MemoryStorageAdapter(state),
+    CHANGED_AMOUNT,
+  ).rejectWithEffects(request);
+  assert.equal(rejected.aggregate.stored.currency, "EUR");
+  assert.equal(rejected.aggregate.stored.totalAmount, 0);
+
+  const replay = await rejectionRepository(
+    new MemoryStorageAdapter(state),
+    CHANGED_AMOUNT,
+  ).rejectWithEffects(Object.freeze({ ...request, occurredAt: RETRY_TIME }));
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.aggregate, rejected.aggregate);
+  assert.equal(
+    replay.item.indication.lifecycle.status,
+    "rejected",
+  );
 });
 
 test("concurrent exact rejection has one commit and two stable results", async () => {
@@ -606,12 +631,13 @@ async function seedActiveIndication(
 
 function rejectionRepository(
   storage: StorageAdapter,
+  amount: AmountConfiguration = AMOUNT,
 ): StorageOwnerIndicationRejectionRepository {
   return new StorageOwnerIndicationRejectionRepository(
     storage,
     OWNER,
     OWNER,
-    AMOUNT,
+    amount,
     REVIEW_IDS,
   );
 }
@@ -749,10 +775,12 @@ function serializedState(state: MemoryStorageState): string {
   });
 }
 
-function amountConfiguration(): AmountConfiguration {
+function amountConfiguration(
+  currency: "EUR" | "USD" = "EUR",
+): AmountConfiguration {
   const parsed = parseAmountAggregateConfiguration({
     amount: {
-      currency: "EUR",
+      currency,
       minimum: 1_000,
       increment: 250,
       maximum: 10_000,
