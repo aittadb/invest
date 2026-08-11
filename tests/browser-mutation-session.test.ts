@@ -492,22 +492,30 @@ test("exact-replay proofs are bounded, route-scoped, actor-bound, and one-use", 
 });
 
 test("fixed-size exact replay scopes support the maximum actor subject", async () => {
-  const harness = await configuredHarness();
+  const appOrigin = `https://${"a".repeat(504)}`;
+  assert.equal(appOrigin.length, 512);
+  const harness = await configuredHarness({ appOrigin });
   const identity = Object.freeze({
     type: "participant",
-    subject: "s".repeat(255),
+    subject: "\u0800".repeat(255),
   }) satisfies TrustedSitesMutationIdentity;
   const scope = `participant-investment-withdrawal-replay:v1:sha256:${"a".repeat(64)}`;
   const proof = await harness.session.issueExactReplay(
-    new Request(`${APP_ORIGIN}/participant/investment-interests/id/withdrawal-replay`),
+    new Request(`${appOrigin}/participant/investment-interests/id/withdrawal-replay`),
     identity,
-    APP_ORIGIN,
+    appOrigin,
     scope,
   );
+  assert.ok(proof.setCookie.length < 4_096);
   const verified = await harness.session.verifyMutation(
-    jsonRequest(proof, { "operation-id": "o".repeat(127) }, "DELETE"),
+    jsonRequest(
+      proof,
+      { "operation-id": "o".repeat(127) },
+      "DELETE",
+      { requestOrigin: appOrigin },
+    ),
     identity,
-    APP_ORIGIN,
+    appOrigin,
     {
       exactReplayScopeFor: () => Promise.resolve(scope),
       requireExactReplayScope: true,
