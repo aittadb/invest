@@ -152,7 +152,7 @@ test("empty deletion remains replayable after independent consent withdrawal", a
   const fixture = await seededFixture({ founder: false, activeInvestments: 0 });
   const request = deletionRequest("participant-operation:deletion-empty", 1);
   const first = await fixture.coordinator.requestAccountDeletion(request);
-  assert.equal(first.mutationCount, 4);
+  assert.equal(first.mutationCount, 6);
   assert.equal(first.founderApplication, null);
   assert.deepEqual(first.investmentWithdrawals, []);
   assert.deepEqual(first.aggregate, {
@@ -161,6 +161,17 @@ test("empty deletion remains replayable after independent consent withdrawal", a
     currency: "EUR",
     contributingIndicationCount: 0,
   });
+  assert.equal(
+    recordsIn(fixture.state, "participant-investment-indexes")[0]?.revision,
+    2,
+  );
+  assert.equal(
+    recordsIn(
+      fixture.state,
+      "investment-indication-ownership-witnesses",
+    )[0]?.revision,
+    2,
+  );
 
   const participant = new StorageParticipantRepository(fixture.storage, ALICE);
   const consent = await participant.withdrawMarketingConsent({
@@ -180,6 +191,52 @@ test("empty deletion remains replayable after independent consent withdrawal", a
     (await participant.current())?.snapshot.marketingConsent.state,
     "withdrawn",
   );
+});
+
+test("inactive and founder-only deletion preserve the bounded empty barrier", async (t) => {
+  await t.test("inactive investment", async () => {
+    const fixture = await seededFixture({
+      founder: false,
+      activeInvestments: 0,
+      inactiveInvestments: 1,
+    });
+    const before = await new StorageParticipantInvestmentInterestRepository(
+      fixture.storage,
+      ALICE.subject,
+      AMOUNT,
+    ).listOwned();
+    const result = await fixture.coordinator.requestAccountDeletion(
+      deletionRequest("participant-operation:deletion-inactive", 1),
+    );
+    assert.equal(result.mutationCount, 6);
+    assert.deepEqual(result.investmentWithdrawals, []);
+    assert.deepEqual(
+      await new StorageParticipantInvestmentInterestRepository(
+        fixture.storage,
+        ALICE.subject,
+        AMOUNT,
+      ).listOwned(),
+      before,
+    );
+    assert.equal(
+      recordsIn(fixture.state, "investment-aggregate-contributions")[0]
+        ?.revision,
+      2,
+    );
+  });
+
+  await t.test("founder only", async () => {
+    const fixture = await seededFixture({
+      founder: true,
+      activeInvestments: 0,
+    });
+    const result = await fixture.coordinator.requestAccountDeletion(
+      deletionRequest("participant-operation:deletion-founder-only", 1),
+    );
+    assert.equal(result.mutationCount, 8);
+    assert.equal(result.founderApplication?.status, "withdrawn");
+    assert.deepEqual(result.investmentWithdrawals, []);
+  });
 });
 
 test("concurrent exact deletion has one commit and two stable results", async () => {
@@ -206,19 +263,90 @@ test("concurrent exact deletion has one commit and two stable results", async ()
 
 test("response loss and malformed commit evidence recover from the receipt", async (t) => {
   for (const mode of ["throw", "malformed"] as const) {
-    await t.test(mode, async () => {
-      const fixture = await seededFixture({ founder: true, activeInvestments: 1 });
-      const unreliable = new CommitEvidenceAdapter(fixture.storage, mode);
-      const result = await coordinator(unreliable, ALICE).requestAccountDeletion(
-        deletionRequest(`participant-operation:deletion-${mode}`, 1),
-      );
-      assert.equal(result.replayed, true);
-      assert.equal(result.mutationCount, 13);
-      assert.equal(result.founderApplication?.status, "withdrawn");
-      assert.equal(result.investmentWithdrawals.length, 1);
-      assert.doesNotMatch(JSON.stringify(result), /PRIVATE_PROVIDER_BODY/u);
-    });
+    for (const scenario of [
+      Object.freeze({ name: "active", founder: true, active: 1, inactive: 0, mutations: 13 }),
+      Object.freeze({ name: "empty", founder: false, active: 0, inactive: 0, mutations: 6 }),
+      Object.freeze({ name: "inactive", founder: false, active: 0, inactive: 1, mutations: 6 }),
+    ]) {
+      await t.test(`${mode} ${scenario.name}`, async () => {
+        const fixture = await seededFixture({
+          founder: scenario.founder,
+          activeInvestments: scenario.active,
+          inactiveInvestments: scenario.inactive,
+        });
+        const unreliable = new CommitEvidenceAdapter(fixture.storage, mode);
+        const result = await coordinator(unreliable, ALICE)
+          .requestAccountDeletion(
+            deletionRequest(
+              `participant-operation:deletion-${mode}-${scenario.name}`,
+              1,
+            ),
+          );
+        assert.equal(result.replayed, true);
+        assert.equal(result.mutationCount, scenario.mutations);
+        assert.equal(result.investmentWithdrawals.length, scenario.active);
+        assert.doesNotMatch(JSON.stringify(result), /PRIVATE_PROVIDER_BODY/u);
+      });
+    }
   }
+});
+
+test("account deletion survives amount and currency evolution", async (t) => {
+  const evolvedAmount = amountConfiguration({
+    currency: "USD",
+    minimum: 5_000,
+    increment: 500,
+  });
+
+  await t.test("new terminal cleanup uses persisted aggregate currency", async () => {
+    const fixture = await seededFixture({ founder: false, activeInvestments: 1 });
+    const request = deletionRequest(
+      "participant-operation:deletion-currency-evolution",
+      1,
+    );
+    const result = await coordinator(
+      fixture.storage,
+      ALICE,
+      evolvedAmount,
+    ).requestAccountDeletion(request);
+    assert.equal(result.replayed, false);
+    assert.equal(result.aggregate.currency, "EUR");
+    assert.equal(result.investmentWithdrawals[0]?.fields.currency, "EUR");
+
+    const replay = await coordinator(
+      new MemoryStorageAdapter(fixture.state),
+      ALICE,
+      evolvedAmount,
+    ).requestAccountDeletion(request);
+    assert.equal(replay.replayed, true);
+    assert.deepEqual({ ...replay, replayed: false }, result);
+  });
+
+  await t.test("empty delayed replay derives immutable receipt currency", async () => {
+    const fixture = await seededFixture({ founder: false, activeInvestments: 0 });
+    const request = deletionRequest(
+      "participant-operation:deletion-empty-currency-evolution",
+      1,
+    );
+    const first = await fixture.coordinator.requestAccountDeletion(request);
+    const replay = await coordinator(
+      new MemoryStorageAdapter(fixture.state),
+      ALICE,
+      evolvedAmount,
+    ).requestAccountDeletion(request);
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.aggregate.currency, "EUR");
+    assert.deepEqual({ ...replay, replayed: false }, first);
+
+    const changed = await captureStorageFailure(() =>
+      coordinator(fixture.storage, ALICE, evolvedAmount)
+        .requestAccountDeletion({
+          ...request,
+          requestedAt: "2026-08-12T12:01:00.000Z",
+        })
+    );
+    assert.equal(changed.code, "CONFLICT");
+  });
 });
 
 test("exact replay rejects corrupted persisted deletion evidence", async (t) => {
@@ -261,6 +389,28 @@ test("exact replay rejects corrupted persisted deletion evidence", async (t) => 
       },
     );
     fixture.state.records.delete(identity);
+
+    const failure = await captureStorageFailure(() =>
+      coordinator(fixture.storage, ALICE).requestAccountDeletion(request)
+    );
+    assert.equal(failure.code, "UNAVAILABLE");
+  });
+
+  await t.test("changed aggregate contribution", async () => {
+    const fixture = await seededFixture({ founder: false, activeInvestments: 1 });
+    const request = deletionRequest(
+      "participant-operation:deletion-aggregate-evidence",
+      1,
+    );
+    await fixture.coordinator.requestAccountDeletion(request);
+    const [identity, record] = requiredStoredRecord(
+      fixture.state,
+      "investment-aggregate-contributions",
+    );
+    fixture.state.records.set(identity, Object.freeze({
+      ...record,
+      value: Object.freeze({ ...record.value, amount: 9_999 }),
+    }));
 
     const failure = await captureStorageFailure(() =>
       coordinator(fixture.storage, ALICE).requestAccountDeletion(request)
@@ -340,6 +490,102 @@ test("transaction failure, stale input, and foreign access change nothing", asyn
       );
     }
     assert.equal(stateFingerprint(fixture.state), before);
+  });
+});
+
+test("concurrent direct activation rolls back every deletion effect", async (t) => {
+  await t.test("create", async () => {
+    const fixture = await seededFixture({ founder: true, activeInvestments: 0 });
+    const context = await currentContext(ALICE.subject, "deletion-race-create");
+    const racing = new BeforeTransactionStorageAdapter(
+      fixture.storage,
+      async () => {
+        await new DevelopmentInMemoryIndicationRepository(
+          fixture.storage,
+          ALICE.subject,
+          OWNER,
+          AMOUNT,
+        ).create({
+          operationId: "indication-operation:deletion-race-create",
+          id: "investment-indication:deletion-race-create",
+          expectedRevision: null,
+          occurredAt: "2026-08-12T12:01:00.000Z",
+          historyEntryId: "indication-history:deletion-race-create",
+          fields: companyFields({
+            companyIdentifier: "DELETION-RACE-CREATE",
+          }),
+        }, context);
+      },
+    );
+    const failure = await captureStorageFailure(() =>
+      coordinator(racing, ALICE).requestAccountDeletion(
+        deletionRequest("participant-operation:deletion-race-create", 1),
+      )
+    );
+    assert.equal(failure.code, "PRECONDITION_FAILED");
+    assert.equal(racing.injected, true);
+    assert.equal(
+      (await new StorageParticipantRepository(fixture.storage, ALICE).current())
+        ?.snapshot.accountDeletionRequest.state,
+      "not-requested",
+    );
+    assert.equal(
+      recordsIn(fixture.state, "participant-account-deletion-operations").length,
+      0,
+    );
+    assert.equal(deletionAuditCount(fixture.state), 0);
+  });
+
+  await t.test("reactivation", async () => {
+    const fixture = await seededFixture({
+      founder: false,
+      activeInvestments: 0,
+      inactiveInvestments: 1,
+    });
+    const [withdrawn] = await new StorageParticipantInvestmentInterestRepository(
+      fixture.storage,
+      ALICE.subject,
+      AMOUNT,
+    ).listOwned();
+    assert(withdrawn);
+    const context = await currentContext(
+      ALICE.subject,
+      "deletion-race-reactivation",
+    );
+    const racing = new BeforeTransactionStorageAdapter(
+      fixture.storage,
+      async () => {
+        await new DevelopmentInMemoryIndicationRepository(
+          fixture.storage,
+          ALICE.subject,
+          OWNER,
+          AMOUNT,
+        ).reactivate({
+          operationId: "indication-operation:deletion-race-reactivation",
+          id: withdrawn.id,
+          expectedRevision: withdrawn.revision,
+          occurredAt: "2026-08-12T12:01:00.000Z",
+          historyEntryId: "indication-history:deletion-race-reactivation",
+        }, context);
+      },
+    );
+    const failure = await captureStorageFailure(() =>
+      coordinator(racing, ALICE).requestAccountDeletion(
+        deletionRequest("participant-operation:deletion-race-reactivation", 1),
+      )
+    );
+    assert.equal(failure.code, "PRECONDITION_FAILED");
+    assert.equal(racing.injected, true);
+    assert.equal(
+      (await new StorageParticipantRepository(fixture.storage, ALICE).current())
+        ?.snapshot.accountDeletionRequest.state,
+      "not-requested",
+    );
+    assert.equal(
+      recordsIn(fixture.state, "participant-account-deletion-operations").length,
+      0,
+    );
+    assert.equal(deletionAuditCount(fixture.state), 0);
   });
 });
 
@@ -430,6 +676,7 @@ test("maximum 100-record ownership inventory stays inside the atomic boundary", 
 type SeedOptions = Readonly<{
   founder: boolean;
   activeInvestments: number;
+  inactiveInvestments?: number;
 }>;
 
 async function seededFixture(options: SeedOptions) {
@@ -438,6 +685,8 @@ async function seededFixture(options: SeedOptions) {
       options.activeInvestments <= MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS,
     true,
   );
+  const inactiveInvestments = options.inactiveInvestments ?? 0;
+  assert.equal(inactiveInvestments >= 0, true);
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
   await registerParticipant(storage, ALICE);
@@ -469,14 +718,25 @@ async function seededFixture(options: SeedOptions) {
       Date.parse("2026-08-12T10:00:00.000Z") + minute++ * 60_000,
     ),
   });
-  for (let index = 0; index < options.activeInvestments; index += 1) {
-    await investmentService.create({
+  for (
+    let index = 0;
+    index < options.activeInvestments + inactiveInvestments;
+    index += 1
+  ) {
+    const created = await investmentService.create({
       operationId: `investment-operation:account-deletion-${index}`,
       fields: companyFields({
         companyName: `Deletion fixture company ${index}`,
         companyIdentifier: `ACCOUNT-DELETION-${index}`,
       }),
     });
+    if (index >= options.activeInvestments) {
+      await investmentService.withdraw({
+        operationId: `investment-operation:account-deletion-${index}-withdraw`,
+        indicationId: created.snapshot.id,
+        expectedRevision: created.snapshot.revision,
+      });
+    }
   }
   return Object.freeze({
     state,
@@ -529,12 +789,13 @@ async function createFounderApplication(
 function coordinator(
   storage: StorageAdapter,
   participant: ParticipantAccount | null,
+  amount: AmountConfiguration = AMOUNT,
 ): StorageParticipantAccountDeletionRepository {
   return new StorageParticipantAccountDeletionRepository(
     storage,
     participant,
     FOUNDER_APPLICATION_ID,
-    AMOUNT,
+    amount,
   );
 }
 
@@ -646,6 +907,18 @@ function recordsIn(state: MemoryStorageState, collection: string) {
   );
 }
 
+function deletionAuditCount(state: MemoryStorageState): number {
+  return recordsIn(state, "audit-events").filter((record) => {
+    const event = record.value.event as
+      | Readonly<Record<string, unknown>>
+      | undefined;
+    const detail = event?.detail as
+      | Readonly<Record<string, unknown>>
+      | undefined;
+    return detail?.transition === "deletion-requested";
+  }).length;
+}
+
 function requiredStoredRecord(
   state: MemoryStorageState,
   collection: string,
@@ -673,13 +946,16 @@ function contributionAreaChoices(): readonly ContributionAreaChoice[] {
   return parsed.value;
 }
 
-function amountConfiguration(): AmountConfiguration {
+function amountConfiguration(
+  overrides: Readonly<Record<string, unknown>> = {},
+): AmountConfiguration {
   const parsed = parseAmountAggregateConfiguration({
     amount: {
       currency: "EUR",
       minimum: 1_000,
       increment: 250,
       maximum: 10_000,
+      ...overrides,
     },
     publicAggregate: { visibility: "hidden" },
   });
@@ -772,6 +1048,38 @@ class CommitEvidenceAdapter implements StorageAdapter {
     this.#first = false;
     if (this.#mode === "throw") throw new Error("PRIVATE_PROVIDER_BODY");
     return Object.freeze({ replayed: false, records: Object.freeze([]) });
+  }
+}
+
+class BeforeTransactionStorageAdapter implements StorageAdapter {
+  readonly #delegate: StorageAdapter;
+  readonly #beforeTransaction: () => Promise<void>;
+  injected = false;
+
+  constructor(
+    delegate: StorageAdapter,
+    beforeTransaction: () => Promise<void>,
+  ) {
+    this.#delegate = delegate;
+    this.#beforeTransaction = beforeTransaction;
+  }
+
+  read(key: Parameters<StorageAdapter["read"]>[0]) {
+    return this.#delegate.read(key);
+  }
+
+  list(request: StorageListRequest): Promise<StoragePage> {
+    return this.#delegate.list(request);
+  }
+
+  async transact(
+    request: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    if (!this.injected) {
+      this.injected = true;
+      await this.#beforeTransaction();
+    }
+    return this.#delegate.transact(request);
   }
 }
 

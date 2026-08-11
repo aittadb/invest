@@ -437,6 +437,39 @@ export async function prepareAtomicAggregateWithdrawalSet(
   return deepFreeze({ contributions, stored: nextStored, mutations });
 }
 
+/** Read the current aggregate using its own immutable persisted currency. */
+export async function readImmutableInvestmentAggregateSnapshot(
+  storage: Pick<StorageAdapter, "read">,
+): Promise<StoredInvestmentAggregateSnapshot | null> {
+  const record = await storage.read(CURRENT_AGGREGATE_KEY);
+  if (record === null) return null;
+  const currency = immutableAggregateCurrency(record);
+  return decodeAggregateDocument(record, currency).snapshot;
+}
+
+/** Verify only the affected contribution effects of a completed withdrawal set. */
+export async function verifyAtomicAggregateWithdrawalSetReplay(
+  storage: Pick<StorageAdapter, "read">,
+  values: unknown,
+  currency: CurrencyCode,
+): Promise<void> {
+  const expectedCurrency = requiredCurrency(currency);
+  const contributions = requiredAggregateWithdrawalContributions(
+    values,
+    expectedCurrency,
+  );
+  for (const contribution of contributions) {
+    const key = contributionStorageKey(contribution.indicationId);
+    const record = await storage.read(key);
+    if (record === null) unavailable();
+    const stored = decodeContributionRecord(record, expectedCurrency);
+    if (
+      record.revision !== contribution.indicationRevision ||
+      !sameContribution(stored, contribution)
+    ) unavailable();
+  }
+}
+
 /** Verify the immutable aggregate receipt for a completed atomic operation. */
 export async function readAtomicAggregateContributionReplay(
   storage: Pick<StorageAdapter, "read">,

@@ -130,7 +130,13 @@ receipt replay unavailable; changed operation reuse conflicts, and
 response-loss recovery reads the receipt without repeating a write. Replay
 authenticates every compact ownership head and reconstructs only the receipt's
 at-most-four withdrawn indications, keeping a 100-record account finite without
-reloading every complete historical indication.
+reloading every complete historical indication. Terminal cleanup uses the
+aggregate record's immutable persisted currency with permissive historical
+amount validation, so later campaign currency, increment, or limit changes do
+not invalidate a new deletion or an exact delayed retry. Replay also verifies
+the final stored contribution for each affected indication; an empty or
+inactive set still verifies its two ownership-barrier mutations through the
+receipt's exact mutation count.
 
 The machine-readable `transaction_shape` declares:
 

@@ -55,6 +55,7 @@ import {
   prepareAtomicAggregateContribution,
   prepareAtomicAggregateWithdrawalSet,
   readAtomicAggregateContributionReplay,
+  verifyAtomicAggregateWithdrawalSetReplay,
 } from "./in-memory-aggregate-repository.ts";
 import {
   prepareAuditAppend,
@@ -657,15 +658,21 @@ export async function verifyParticipantAccountDeletionInvestmentWithdrawalSet(
         indication: current as WithdrawnInvestmentIndication,
       }));
     }
+    await verifyAtomicAggregateWithdrawalSetReplay(
+      adapter,
+      Object.freeze(withdrawals.map(({ indication }) =>
+        projectInvestmentIndicationForAggregation(indication)
+      )),
+      amount.currency,
+    );
     return Object.freeze({
       participantSubject: subject,
       operationId: parsed.operationId,
       requestedAt: parsed.requestedAt,
       withdrawals: Object.freeze(withdrawals),
       aggregate: parsed.aggregate,
-      mutationCount: withdrawals.length === 0
-        ? 0
-        : 4 * withdrawals.length + 3,
+      mutationCount: 4 * withdrawals.length +
+        (withdrawals.length === 0 ? 2 : 3),
     });
   } catch (error) {
     return mapRepositoryError(error);

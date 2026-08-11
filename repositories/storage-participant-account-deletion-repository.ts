@@ -46,6 +46,9 @@ import {
   StorageFounderApplicationRepository,
 } from "./in-memory-founder-application-repository.ts";
 import {
+  readImmutableInvestmentAggregateSnapshot,
+} from "./in-memory-aggregate-repository.ts";
+import {
   prepareAuditAppend,
   verifyPreparedAuditAppend,
   type PreparedAuditAppend,
@@ -103,7 +106,7 @@ const MAX_PROFILE_DELETION_COMMIT_READS = 6;
 const MAX_PROFILE_DELETION_REPLAY_READS = 5;
 const MAX_ACCOUNT_DELETION_AUDIT_AND_RECEIPT_READS = 2;
 const MAX_ACCOUNT_DELETION_COMMIT_READS =
-  1 +
+  2 +
   MAX_PROFILE_DELETION_COMMIT_READS +
   MAX_FOUNDER_APPLICATION_STORAGE_READS +
   MAX_PARTICIPANT_ACCOUNT_DELETION_WITHDRAWAL_SET_READS +
@@ -233,6 +236,10 @@ export class StorageParticipantAccountDeletionRepository
     request: ParsedAccountDeletionRequest,
   ): Promise<ParticipantAccountDeletionResult> {
     const account = this.#requiredAccount();
+    const deletionAmount = await deletionAmountConfiguration(
+      this.#storage,
+      this.#amount,
+    );
     const staged = new StagedStorageTransaction(
       this.#storage,
       request.operationId,
@@ -273,7 +280,7 @@ export class StorageParticipantAccountDeletionRepository
       await stageParticipantAccountDeletionInvestmentWithdrawalSet(
         staged,
         account.subject,
-        this.#amount,
+        deletionAmount,
         {
           operationId: request.operationId,
           requestedAt: request.requestedAt,
@@ -309,7 +316,6 @@ export class StorageParticipantAccountDeletionRepository
     const storedReceipt = decodeReceipt(
       committed.records.at(-1),
       receiptKey,
-      this.#amount,
     );
     requireMatchingReceipt(
       storedReceipt,
@@ -341,10 +347,13 @@ export class StorageParticipantAccountDeletionRepository
     );
     const record = await this.#storage.read(receiptKey);
     if (record === null) return null;
-    const receipt = decodeReceipt(record, receiptKey, this.#amount);
+    const receipt = decodeReceipt(record, receiptKey);
     if (receipt.operationFingerprint !== request.operationFingerprint) {
       conflict();
     }
+    const replayAmount = historicalAmountConfiguration(
+      receipt.aggregate.currency,
+    );
     const audit = await preparedAudit(account.subject, request);
     requireMatchingReceipt(
       receipt,
@@ -365,7 +374,7 @@ export class StorageParticipantAccountDeletionRepository
       const investments = await verifyInvestmentReplay(
         this.#storage,
         account.subject,
-        this.#amount,
+        replayAmount,
         this.#parsingOptions,
         request,
         receipt,
@@ -606,7 +615,6 @@ function receiptMutation(
 function decodeReceipt(
   value: unknown,
   expectedKey: StorageKey,
-  amount: AmountConfiguration,
 ): StoredAccountDeletionReceipt {
   const record = exactRecord(value, STORAGE_RECORD_KEYS);
   const key = exactRecord(record.key, STORAGE_KEY_KEYS);
@@ -637,7 +645,7 @@ function decodeReceipt(
     requestedAt: requestedAt.value,
     founderApplication,
     investmentWithdrawals,
-    aggregate: decodeAggregate(source.aggregate, amount),
+    aggregate: decodeAggregate(source.aggregate),
     auditEventId: auditEventId.value,
     mutationCount: source.mutationCount,
   });
@@ -699,14 +707,13 @@ function decodeInvestmentWithdrawals(
 
 function decodeAggregate(
   value: unknown,
-  amount: AmountConfiguration,
 ): StoredInvestmentAggregateSnapshot {
   const source = exactRecord(value, AGGREGATE_KEYS);
   const totalAmount = parseMinorUnits(source.totalAmount);
+  const amount = historicalAmountConfiguration(source.currency);
   if (
     !nonNegativeInteger(source.revision) ||
     !totalAmount.ok ||
-    source.currency !== amount.currency ||
     !nonNegativeInteger(source.contributingIndicationCount)
   ) unavailable();
   return Object.freeze({
@@ -725,9 +732,8 @@ function requireMatchingReceipt(
 ): void {
   const expectedMutations = 2 +
     (receipt.founderApplication?.changed ? 2 : 0) +
-    (receipt.investmentWithdrawals.length === 0
-      ? 0
-      : 4 * receipt.investmentWithdrawals.length + 3) +
+    4 * receipt.investmentWithdrawals.length +
+    (receipt.investmentWithdrawals.length === 0 ? 2 : 3) +
     2;
   if (
     receipt.operationFingerprint !== request.operationFingerprint ||
@@ -931,6 +937,32 @@ function requiredAmountConfiguration(value: unknown): AmountConfiguration {
     publicAggregate: { visibility: "hidden" },
   });
   if (!parsed.ok) invalidRequest();
+  return parsed.value.amount;
+}
+
+async function deletionAmountConfiguration(
+  storage: StorageAdapter,
+  current: AmountConfiguration,
+): Promise<AmountConfiguration> {
+  const stored = await readImmutableInvestmentAggregateSnapshot(storage);
+  return stored === null
+    ? current
+    : historicalAmountConfiguration(stored.currency);
+}
+
+function historicalAmountConfiguration(
+  currency: unknown,
+): AmountConfiguration {
+  const parsed = parseAmountAggregateConfiguration({
+    amount: {
+      currency,
+      minimum: 0,
+      increment: 1,
+      maximum: null,
+    },
+    publicAggregate: { visibility: "hidden" },
+  });
+  if (!parsed.ok) unavailable();
   return parsed.value.amount;
 }
 
