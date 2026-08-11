@@ -289,6 +289,85 @@ test("audited campaign creation atomically records one unpublished draft", async
   assert.equal(state.records.size, 7);
 });
 
+test("schema-4 audited saves replay after schema-5 publication without changing current state", async () => {
+  const state = new MemoryStorageState();
+  const adapter = new DeterministicMemoryStorageAdapter(state, true);
+  const repository = new DevelopmentInMemoryCampaignRepository(adapter);
+  const legacyRequest = {
+    operationId: "campaign-operation:legacy-cross-version",
+    ownerSubject: "owner-subject",
+    recordedAt: FIRST_SAVE,
+    expectedRevision: null,
+    setup: {
+      ...explicitSetup(),
+      publicCampaign: { ...syntheticPublicCampaign, published: false },
+    },
+    transition: "created" as const,
+  };
+  const legacyResult = await repository.saveSetupWithAudit(legacyRequest);
+  downgradeCommittedPublicPresentationToSchema4(
+    state,
+    legacyRequest.operationId,
+  );
+
+  const currentResult = await repository.saveSetupWithAudit({
+    operationId: "campaign-operation:schema-5-publication",
+    ownerSubject: "owner-subject",
+    recordedAt: SECOND_SAVE,
+    expectedRevision: 1,
+    setup: {
+      ...legacyRequest.setup,
+      publicCampaign: { ...syntheticPublicCampaign, published: true },
+    },
+    transition: "published",
+  });
+  assert.equal(currentResult.campaign.revision, 2);
+  const publicReader = new DevelopmentInMemoryPublicCampaignPresentationReader(
+    adapter,
+  );
+  assert.deepEqual(await publicReader.readPublishedProjection(), {
+    revision: 2,
+    publicCampaign: syntheticPublicCampaign,
+    amountAggregate: currentResult.campaign.setup.amountAggregate,
+  });
+
+  const recordsBeforeReplay = JSON.stringify([...state.records.entries()]);
+  const operationsBeforeReplay = JSON.stringify([...state.operations.entries()]);
+  const unverified = await captureStorageFailure(() =>
+    new DevelopmentInMemoryCampaignRepository(
+      withNonReplayLegacyResult(adapter),
+    ).saveSetupWithAudit(legacyRequest)
+  );
+  assert.equal(unverified.code, "UNAVAILABLE");
+  assert.equal(JSON.stringify([...state.records.entries()]), recordsBeforeReplay);
+  assert.equal(
+    JSON.stringify([...state.operations.entries()]),
+    operationsBeforeReplay,
+  );
+
+  const replay = await new DevelopmentInMemoryCampaignRepository(adapter)
+    .saveSetupWithAudit(legacyRequest);
+
+  assert.deepEqual(replay.campaign, legacyResult.campaign);
+  assert.deepEqual(replay.auditEvent, legacyResult.auditEvent);
+  assert.equal(replay.replayed, true);
+  assert.equal((await repository.readSetup())?.revision, 2);
+  assert.equal(
+    (await publicReader.readPublishedProjection())?.revision,
+    2,
+  );
+  assert.equal(JSON.stringify([...state.records.entries()]), recordsBeforeReplay);
+  assert.equal(
+    JSON.stringify([...state.operations.entries()]),
+    operationsBeforeReplay,
+  );
+  assert.equal(
+    (await new DevelopmentInMemoryAuditRepository(adapter).list({ limit: 10 }))
+      .items.length,
+    2,
+  );
+});
+
 test("audited campaign creation rejects invalid and changed transitions", async () => {
   for (const [label, setup, transition] of [
     [
@@ -1614,6 +1693,94 @@ function freezeRecord(input: Readonly<{
     key: Object.freeze({ ...input.key }),
     revision: input.revision,
     value: deepFreeze(cloneDocument(input.value)),
+  });
+}
+
+function downgradeCommittedPublicPresentationToSchema4(
+  state: MemoryStorageState,
+  operationId: string,
+): void {
+  const committed = state.operations.get(operationId);
+  assert(committed);
+  const request = JSON.parse(committed.fingerprint) as StorageTransactionRequest;
+  const publicMutationIndex = request.mutations.findIndex((mutation) =>
+    mutation.type === "put" &&
+    mutation.key.collection === "campaign-public-presentation"
+  );
+  assert.notEqual(publicMutationIndex, -1);
+  const publicMutation = request.mutations[publicMutationIndex];
+  assert(publicMutation?.type === "put");
+  const legacyValue = legacyPublicPresentation(publicMutation.value);
+  const legacyRequest = {
+    ...request,
+    mutations: request.mutations.map((mutation, index) =>
+      index === publicMutationIndex
+        ? { ...publicMutation, value: legacyValue }
+        : mutation
+    ),
+  } satisfies StorageTransactionRequest;
+  assertStorageTransactionBoundary(legacyRequest);
+
+  const publicResultRecord = requiredTransactionRecord(
+    committed.result,
+    publicMutationIndex,
+  );
+  const legacyResult = Object.freeze({
+    replayed: false,
+    records: Object.freeze(committed.result.records.map((record, index) =>
+      index === publicMutationIndex
+        ? freezeRecord({
+            key: publicResultRecord.key,
+            revision: publicResultRecord.revision,
+            value: legacyValue,
+          })
+        : cloneRecord(record)
+    )),
+  });
+  state.operations.set(operationId, Object.freeze({
+    fingerprint: JSON.stringify(legacyRequest),
+    result: legacyResult,
+  }));
+
+  const publicEntry = [...state.records.entries()].find(([, record]) =>
+    record.key.collection === "campaign-public-presentation"
+  );
+  assert(publicEntry);
+  const [key, record] = publicEntry;
+  state.records.set(key, freezeRecord({
+    key: record.key,
+    revision: record.revision,
+    value: legacyValue,
+  }));
+}
+
+function withNonReplayLegacyResult(storage: StorageAdapter): StorageAdapter {
+  return Object.freeze({
+    read: storage.read.bind(storage),
+    list: storage.list.bind(storage),
+    async transact(request: StorageTransactionRequest) {
+      const result = await storage.transact(request);
+      const legacy = request.mutations.some((mutation) =>
+        mutation.type === "put" &&
+        mutation.value.kind === "campaign-public-presentation" &&
+        mutation.value.schemaVersion === 4
+      );
+      return legacy ? Object.freeze({ ...result, replayed: false }) : result;
+    },
+  });
+}
+
+function legacyPublicPresentation(value: StorageDocument): StorageDocument {
+  assert.equal(value.kind, "campaign-public-presentation");
+  assert.equal(value.schemaVersion, 5);
+  assert.equal(typeof value.revision, "number");
+  assert.equal(typeof value.publicCampaign, "object");
+  assert.notEqual(value.publicCampaign, null);
+  return deepFreeze({
+    kind: "campaign-public-presentation",
+    schemaVersion: 4,
+    revision: value.revision,
+    publicCampaign: value.publicCampaign,
   });
 }
 

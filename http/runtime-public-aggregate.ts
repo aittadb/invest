@@ -2,10 +2,36 @@ import {
   parseSanitizedPublicInvestmentAggregate,
   type SanitizedPublicInvestmentAggregate,
 } from "../domain/investment-aggregate.ts";
+import {
+  MAX_PUBLIC_AGGREGATE_LABEL_LENGTH,
+  MAX_PUBLIC_AGGREGATE_QUALIFIER_LENGTH,
+} from "../domain/amount-aggregate-configuration.ts";
 
 export const PUBLIC_AGGREGATE_HEADER =
   "x-investor-app-public-aggregate";
-const MAX_PUBLIC_AGGREGATE_HEADER_LENGTH = 2_048;
+// A lone UTF-16 code unit can serialize as a six-byte \uXXXX JSON escape.
+const MAX_JSON_STRING_BYTES_PER_CODE_UNIT = 6;
+const MAX_PUBLIC_AGGREGATE_ENVELOPE_BYTES = new TextEncoder().encode(
+  JSON.stringify({
+    amount: Number.MAX_SAFE_INTEGER,
+    currency: "XXX",
+    label: "",
+    qualifier: "",
+    oversubscription: {
+      status: "oversubscribed",
+      targetAmount: Number.MAX_SAFE_INTEGER,
+      remainingAmount: Number.MAX_SAFE_INTEGER,
+      amountOverTarget: Number.MAX_SAFE_INTEGER,
+    },
+  }),
+).byteLength;
+const MAX_PUBLIC_AGGREGATE_JSON_BYTES =
+  MAX_PUBLIC_AGGREGATE_ENVELOPE_BYTES +
+  MAX_JSON_STRING_BYTES_PER_CODE_UNIT *
+    (MAX_PUBLIC_AGGREGATE_LABEL_LENGTH +
+      MAX_PUBLIC_AGGREGATE_QUALIFIER_LENGTH);
+export const MAX_PUBLIC_AGGREGATE_HEADER_LENGTH =
+  4 * Math.ceil(MAX_PUBLIC_AGGREGATE_JSON_BYTES / 3);
 
 export function withRuntimePublicAggregate(
   request: Request,

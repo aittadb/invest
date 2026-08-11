@@ -331,7 +331,10 @@ reader is bound to `campaign-public-presentation/configured-campaign` and the
 sanitized aggregate projection; it cannot read the private current setup,
 immutable history, operation receipts, or audit records. Exact schema-4 public
 presentation records remain readable without an aggregate lookup or write, and
-only a later owner save emits the schema-5 aggregate policy.
+only a fresh owner save emits the schema-5 aggregate policy. An exact delayed
+retry of a pre-upgrade owner operation may replay its original closed schema-4
+transaction only after matching immutable operation evidence; it cannot migrate
+the projection or replace a newer campaign revision.
 Owner reads use the separate atomic repository only after trusted owner
 authorization. Anonymous callers receive `401`; authenticated non-owners receive
 the generic `404` surface before a private repository read.

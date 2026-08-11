@@ -54,8 +54,8 @@ const VISIBLE_DISPLAY_KEYS = new Set([
   "qualifier",
 ]);
 const CURRENCY_PATTERN = /^[A-Z]{3}$/;
-const MAX_LABEL_LENGTH = 120;
-const MAX_QUALIFIER_LENGTH = 500;
+export const MAX_PUBLIC_AGGREGATE_LABEL_LENGTH = 120;
+export const MAX_PUBLIC_AGGREGATE_QUALIFIER_LENGTH = 500;
 
 /** Parses untrusted settings without supplying currency, amount, or visibility defaults. */
 export function parseAmountAggregateConfiguration(
@@ -255,13 +255,13 @@ function parsePublicAggregateConfiguration(
   const label = parsePublicDisplayText(
     source,
     "label",
-    MAX_LABEL_LENGTH,
+    MAX_PUBLIC_AGGREGATE_LABEL_LENGTH,
     issues,
   );
   const qualifier = parsePublicDisplayText(
     source,
     "qualifier",
-    MAX_QUALIFIER_LENGTH,
+    MAX_PUBLIC_AGGREGATE_QUALIFIER_LENGTH,
     issues,
   );
   return label === null || qualifier === null

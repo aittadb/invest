@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseAmountAggregateConfiguration } from "../domain/amount-aggregate-configuration.ts";
+import {
+  MAX_PUBLIC_AGGREGATE_LABEL_LENGTH,
+  MAX_PUBLIC_AGGREGATE_QUALIFIER_LENGTH,
+  parseAmountAggregateConfiguration,
+} from "../domain/amount-aggregate-configuration.ts";
 import type { MinorUnits } from "../domain/foundation.ts";
 import { createSanitizedPublicInvestmentAggregate } from "../domain/investment-aggregate.ts";
 import {
+  MAX_PUBLIC_AGGREGATE_HEADER_LENGTH,
   publicAggregateFromRuntimeHeader,
   PUBLIC_AGGREGATE_HEADER,
   withRuntimePublicAggregate,
@@ -46,7 +51,7 @@ test("runtime aggregate headers round-trip only the closed public projection", (
 
   for (const malformed of [
     "not-base64",
-    "A".repeat(2_049),
+    "A".repeat(MAX_PUBLIC_AGGREGATE_HEADER_LENGTH + 1),
     btoa("{"),
     btoa(JSON.stringify({ ...aggregate, participantSubject: "private" })),
     btoa(JSON.stringify({ ...aggregate, amount: 0 })),
@@ -64,7 +69,33 @@ test("runtime aggregate headers round-trip only the closed public projection", (
   }
 });
 
-function publicAggregate() {
+test("runtime aggregate headers preserve maximum-length Unicode display text", () => {
+  const aggregate = publicAggregate({
+    label: "界".repeat(MAX_PUBLIC_AGGREGATE_LABEL_LENGTH),
+    qualifier: "界".repeat(MAX_PUBLIC_AGGREGATE_QUALIFIER_LENGTH),
+    totalAmount: Number.MAX_SAFE_INTEGER,
+    targetAmount: 1,
+  });
+  const request = withRuntimePublicAggregate(
+    new Request("https://invest.example.test/"),
+    aggregate,
+  );
+  const encoded = request.headers.get(PUBLIC_AGGREGATE_HEADER);
+
+  assert(encoded);
+  assert(encoded.length > 2_048);
+  assert(encoded.length <= MAX_PUBLIC_AGGREGATE_HEADER_LENGTH);
+  assert.deepEqual(publicAggregateFromRuntimeHeader(encoded), aggregate);
+});
+
+function publicAggregate(
+  options: Readonly<{
+    label?: string;
+    qualifier?: string;
+    totalAmount?: number;
+    targetAmount?: number;
+  }> = {},
+) {
   const configuration = parseAmountAggregateConfiguration({
     amount: {
       currency: "EUR",
@@ -74,16 +105,16 @@ function publicAggregate() {
     },
     publicAggregate: {
       visibility: "non_zero",
-      label: "Indicated interest",
-      qualifier: "Current self-declared interest.",
+      label: options.label ?? "Indicated interest",
+      qualifier: options.qualifier ?? "Current self-declared interest.",
     },
   });
   assert(configuration.ok);
   const aggregate = createSanitizedPublicInvestmentAggregate({
-    totalAmount: 12_500 as MinorUnits,
+    totalAmount: (options.totalAmount ?? 12_500) as MinorUnits,
     currency: configuration.value.amount.currency,
     contributingIndicationCount: 2,
-  }, configuration.value, 10_000);
+  }, configuration.value, options.targetAmount ?? 10_000);
   assert(aggregate.ok);
   assert(aggregate.value);
   return aggregate.value;

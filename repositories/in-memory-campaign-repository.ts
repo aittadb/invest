@@ -32,8 +32,11 @@ import {
   type StorageCursor,
   type StorageDocument,
   type StorageKey,
+  type StorageMutation,
   type StorageOperationId,
+  type StoragePutMutation,
   type StorageRecord,
+  type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
 import {
   prepareAuditAppend,
@@ -130,6 +133,7 @@ const PUBLIC_PRESENTATION_KEYS = new Set([
   ...LEGACY_PUBLIC_PRESENTATION_KEYS,
   "amountAggregate",
 ]);
+type PublicPresentationSchema = "legacy" | "current";
 
 /** All campaign-specific setup that must be supplied explicitly by a deployment. */
 export type CampaignSetup = Readonly<{
@@ -267,32 +271,13 @@ export class StorageCampaignRepository implements AtomicCampaignAuditRepository 
       await persistCampaignOperationIntent(this.#storage, intent);
     }
     await stageSetupChunks(this.#storage, prepared.chunks);
-    const result = await this.#storage.transact({
-      operationId: prepared.revision.operationId,
-      mutations: [
-        {
-          type: "put",
-          key: CURRENT_SETUP_KEY,
-          expectedRevision: prepared.expectedRevision,
-          value: prepared.value,
-        },
-        {
-          type: "put",
-          key: prepared.historyKey,
-          expectedRevision: null,
-          value: prepared.value,
-        },
-        {
-          type: "put",
-          key: prepared.operationKey,
-          expectedRevision: null,
-          value: prepared.value,
-        },
-        publicPresentationMutation(prepared, prepared.expectedRevision),
-      ],
-    });
+    const transaction = await transactCampaignSave(this.#storage, prepared);
 
-    return verifyCampaignSaveTransactionResult(result, prepared);
+    return verifyCampaignSaveTransactionResult(
+      transaction.result,
+      prepared,
+      transaction.publicPresentationSchema,
+    );
   }
 
   async saveSetupWithAudit(
@@ -369,36 +354,17 @@ export class StorageCampaignRepository implements AtomicCampaignAuditRepository 
     }
 
     await stageSetupChunks(this.#storage, prepared.chunks);
-    const result = await this.#storage.transact({
-      operationId: prepared.revision.operationId,
-      mutations: [
-        {
-          type: "put",
-          key: CURRENT_SETUP_KEY,
-          expectedRevision: prepared.expectedRevision,
-          value: prepared.value,
-        },
-        {
-          type: "put",
-          key: prepared.historyKey,
-          expectedRevision: null,
-          value: prepared.value,
-        },
-        {
-          type: "put",
-          key: prepared.operationKey,
-          expectedRevision: null,
-          value: prepared.value,
-        },
-        publicPresentationMutation(prepared, prepared.expectedRevision),
-        audit.mutation,
-      ],
-    });
+    const transaction = await transactCampaignSave(
+      this.#storage,
+      prepared,
+      audit.mutation,
+    );
 
     return verifyAuditedCampaignSaveTransactionResult(
-      result,
+      transaction.result,
       prepared,
       audit,
+      transaction.publicPresentationSchema,
     );
   }
 
@@ -758,19 +724,116 @@ function encodeCampaignOperationIntent(
   });
 }
 
+type CampaignSaveTransaction = Readonly<{
+  result: StorageTransactionResult;
+  publicPresentationSchema: PublicPresentationSchema;
+}>;
+
+async function transactCampaignSave(
+  storage: StorageAdapter,
+  prepared: PreparedCampaignSave,
+  auditMutation?: StoragePutMutation,
+): Promise<CampaignSaveTransaction> {
+  try {
+    return Object.freeze({
+      result: await storage.transact({
+        operationId: prepared.revision.operationId,
+        mutations: campaignSaveMutations(
+          prepared,
+          "current",
+          auditMutation,
+        ),
+      }),
+      publicPresentationSchema: "current" as const,
+    });
+  } catch (error) {
+    if (!(error instanceof StorageFailure) || error.code !== "CONFLICT") {
+      throw error;
+    }
+
+    const completedOperation = await storage.read(prepared.operationKey);
+    if (completedOperation === null) throw error;
+    verifyExactStorageRecord(
+      completedOperation,
+      prepared.operationKey,
+      1,
+      prepared.value,
+    );
+
+    // Only a previously committed schema-4 request can return this as a replay.
+    return Object.freeze({
+      result: await storage.transact({
+        operationId: prepared.revision.operationId,
+        mutations: campaignSaveMutations(
+          prepared,
+          "legacy",
+          auditMutation,
+        ),
+      }),
+      publicPresentationSchema: "legacy" as const,
+    });
+  }
+}
+
+function campaignSaveMutations(
+  prepared: PreparedCampaignSave,
+  publicPresentationSchema: PublicPresentationSchema,
+  auditMutation?: StoragePutMutation,
+): readonly StorageMutation[] {
+  const mutations: StorageMutation[] = [
+    {
+      type: "put",
+      key: CURRENT_SETUP_KEY,
+      expectedRevision: prepared.expectedRevision,
+      value: prepared.value,
+    },
+    {
+      type: "put",
+      key: prepared.historyKey,
+      expectedRevision: null,
+      value: prepared.value,
+    },
+    {
+      type: "put",
+      key: prepared.operationKey,
+      expectedRevision: null,
+      value: prepared.value,
+    },
+    publicPresentationMutation(
+      prepared,
+      prepared.expectedRevision,
+      publicPresentationSchema,
+    ),
+  ];
+  if (auditMutation !== undefined) mutations.push(auditMutation);
+  return Object.freeze(mutations);
+}
+
 function verifyCampaignSaveTransactionResult(
   result: unknown,
   prepared: PreparedCampaignSave,
+  publicPresentationSchema: PublicPresentationSchema = "current",
 ): CampaignSetupRevision {
   const transaction = exactStorageTransactionResult(result, 4);
+  if (
+    publicPresentationSchema === "legacy" &&
+    transaction.replayed !== true
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
   const [currentRecord, historyRecord, operationRecord, publicRecord] =
-    campaignSaveRecords(transaction.records, prepared);
+    campaignSaveRecords(
+      transaction.records,
+      prepared,
+      publicPresentationSchema,
+    );
   return verifyCampaignSaveRecords(
     prepared,
     currentRecord,
     historyRecord,
     operationRecord,
     publicRecord,
+    publicPresentationSchema,
   );
 }
 
@@ -778,10 +841,21 @@ function verifyAuditedCampaignSaveTransactionResult(
   result: unknown,
   prepared: PreparedCampaignSave,
   audit: PreparedAuditAppend,
+  publicPresentationSchema: PublicPresentationSchema = "current",
 ): AuditedCampaignSetupSaveResult {
   const transaction = exactStorageTransactionResult(result, 5);
+  if (
+    publicPresentationSchema === "legacy" &&
+    transaction.replayed !== true
+  ) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
   const [currentRecord, historyRecord, operationRecord, publicRecord] =
-    campaignSaveRecords(transaction.records, prepared);
+    campaignSaveRecords(
+      transaction.records,
+      prepared,
+      publicPresentationSchema,
+    );
   const auditRecord = verifyExactStorageRecord(
     transaction.records[4],
     audit.mutation.key,
@@ -795,6 +869,7 @@ function verifyAuditedCampaignSaveTransactionResult(
       historyRecord,
       operationRecord,
       publicRecord,
+      publicPresentationSchema,
     ),
     auditEvent: verifyPreparedAuditAppend(audit, auditRecord),
     replayed: transaction.replayed,
@@ -804,6 +879,7 @@ function verifyAuditedCampaignSaveTransactionResult(
 function campaignSaveRecords(
   records: readonly unknown[],
   prepared: PreparedCampaignSave,
+  publicPresentationSchema: PublicPresentationSchema,
 ): readonly [StorageRecord, StorageRecord, StorageRecord, StorageRecord] {
   return Object.freeze([
     verifyExactStorageRecord(
@@ -828,7 +904,10 @@ function campaignSaveRecords(
       records[3],
       PUBLIC_PRESENTATION_KEY,
       prepared.revision.revision,
-      encodePublicPresentation(prepared.revision),
+      encodePublicPresentation(
+        prepared.revision,
+        publicPresentationSchema,
+      ),
     ),
   ]);
 }
@@ -839,6 +918,7 @@ function verifyCampaignSaveRecords(
   historyRecord: StorageRecord,
   operationRecord: StorageRecord,
   publicRecord: StorageRecord,
+  publicPresentationSchema: PublicPresentationSchema,
 ): CampaignSetupRevision {
   const current = decodeCurrentRevision(currentRecord);
   const history = decodeHistoryRevision(historyRecord);
@@ -852,7 +932,9 @@ function verifyCampaignSaveRecords(
     JSON.stringify({
       revision: prepared.revision.revision,
       publicCampaign: prepared.revision.setup.publicCampaign,
-      amountAggregate: prepared.revision.setup.amountAggregate,
+      amountAggregate: publicPresentationSchema === "legacy"
+        ? null
+        : prepared.revision.setup.amountAggregate,
     }) !== JSON.stringify(publicProjection)
   ) {
     throw new StorageFailure("UNAVAILABLE");
@@ -1262,18 +1344,28 @@ function decodeOperationRevision(record: StorageRecord): StoredCampaignSetupRevi
 function publicPresentationMutation(
   prepared: PreparedCampaignSave,
   expectedRevision: number | null,
+  schema: PublicPresentationSchema,
 ) {
   return Object.freeze({
     type: "put" as const,
     key: PUBLIC_PRESENTATION_KEY,
     expectedRevision,
-    value: encodePublicPresentation(prepared.revision),
+    value: encodePublicPresentation(prepared.revision, schema),
   });
 }
 
 function encodePublicPresentation(
   revision: CampaignSetupRevision,
+  schema: PublicPresentationSchema,
 ): StorageDocument {
+  if (schema === "legacy") {
+    return deepFreeze({
+      kind: "campaign-public-presentation",
+      schemaVersion: LEGACY_PUBLIC_PRESENTATION_SCHEMA_VERSION,
+      revision: revision.revision,
+      publicCampaign: revision.setup.publicCampaign,
+    });
+  }
   return deepFreeze({
     kind: "campaign-public-presentation",
     schemaVersion: PUBLIC_PRESENTATION_SCHEMA_VERSION,
