@@ -14,8 +14,6 @@ export type OwnerHomeDocument = Readonly<{
   type: "owner-home";
   id: "owner";
   data: Readonly<{
-    display_name: string;
-    email: string;
     setup_status: "configured" | "required";
     campaign_name: string | null;
     publication: "published" | "unpublished" | "not-configured";
@@ -40,7 +38,6 @@ export type OwnerHomeCapabilities = Readonly<{
 
 export function createOwnerHomeDocument(
   requestUrl: string,
-  owner: Readonly<{ displayName: string; email: string }>,
   campaign: PublicCampaignConfiguration | null,
   capabilities: OwnerHomeCapabilities = {},
 ): OwnerHomeDocument {
@@ -68,8 +65,6 @@ export function createOwnerHomeDocument(
     type: "owner-home",
     id: "owner",
     data: {
-      display_name: owner.displayName,
-      email: owner.email,
       setup_status: campaign ? "configured" : "required",
       campaign_name: campaign?.name ?? null,
       publication: campaign

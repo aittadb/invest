@@ -206,6 +206,15 @@ Founder history contains at most 16 transitions and reserves its final slot for 
 
 HTML and JSON mutations use the same origin-bound, actor-bound, one-use browser proof. The founder route narrows the shared mutation envelope and is the only route that permits repeated `secondary-contribution-area-ids`. Ordinary actions receive the existing version-1 general proof. The terminal replay action receives a version-2 proof whose encrypted cookie contains only a digest of the exact founder-withdrawal scope; every other route rejects that proof, and the founder verifier reconstructs the same scope from the verified `DELETE`, operation ID, and prior revision before its one replay claim. Changed, stale, foreign, and reused proofs therefore fail before any founder write. Oversized bodies are rejected before proof claim, while a bounded malformed command consumes and expires its claimed proof without changing founder state. Founder mutations call only the subject-bound founder repository, so an account's investment indications and aggregates are neither prerequisites nor side effects.
 
+## Owner Home
+
+`GET /owner` uses the trusted authenticated account and configured deployment
+owner only for authorization. Its HTML and `owner-home` JSON data expose setup,
+campaign, and publication state plus currently installed owner capabilities;
+neither representation serializes the configured owner value, authenticated
+account email, display label, or subject. Anonymous and foreign callers retain
+their existing non-disclosing authentication and not-found boundaries.
+
 ## Owner Founder-Application Review
 
 `GET /owner/founder-applications` is the configured owner's persistent founder-review collection. It accepts no query fields on the first default page, or an exact `page_size` from 1 through 25 and optional opaque `cursor`; a cursor is accepted only together with its page size. Duplicate fields, unknown fields, non-canonical integers, empty or control-bearing cursors, and cursors above 2,048 characters return a generic `400` without reflecting the rejected query.

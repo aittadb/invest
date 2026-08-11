@@ -39,7 +39,7 @@ export const metadata: Metadata = {
 };
 
 export default async function OwnerHome() {
-  const owner = await requireOwnerUser("/owner");
+  await requireOwnerUser("/owner");
   const requestHeaders = await headers();
   const campaign = campaignFromRuntimeHeader(
     requestHeaders.get(CAMPAIGN_CONFIGURATION_HEADER),
@@ -133,14 +133,6 @@ export default async function OwnerHome() {
             <h2 id="setup-status-title">{setupState}</h2>
           </div>
           <dl>
-            <div>
-              <dt>Owner</dt>
-              <dd>{owner.displayName}</dd>
-            </div>
-            <div>
-              <dt>Account</dt>
-              <dd>{owner.email}</dd>
-            </div>
             <div>
               <dt>Campaign</dt>
               <dd>{campaign?.name ?? "Not configured"}</dd>

@@ -662,7 +662,9 @@ test("the owner resource enforces equivalent HTML and JSON authorization", async
     "owner@example.com",
   );
   assert.equal(ownerHtmlResponse.status, 200);
-  assert.match(await ownerHtmlResponse.text(), /<h1>Campaign workspace<\/h1>/i);
+  const ownerHtml = await ownerHtmlResponse.text();
+  assert.match(ownerHtml, /<h1>Campaign workspace<\/h1>/i);
+  assert.doesNotMatch(ownerHtml, /owner@example\.com/iu);
 
   const ownerJsonResponse = await render(
     { ...ownerHeaders, accept: "application/json" },
@@ -673,7 +675,8 @@ test("the owner resource enforces equivalent HTML and JSON authorization", async
   assert.equal(ownerJsonResponse.status, 200);
   const ownerDocument = await ownerJsonResponse.json();
   assert.equal(ownerDocument.type, "owner-home");
-  assert.equal(ownerDocument.data.email, "OWNER@example.com");
+  assert.equal("email" in ownerDocument.data, false);
+  assert.equal("display_name" in ownerDocument.data, false);
   assert.equal(ownerDocument.data.campaign_name, "Northstar Robotics");
   assert.equal(ownerDocument.data.publication, "published");
 

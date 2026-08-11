@@ -406,7 +406,16 @@ test("owner routes preserve authentication, authorization, and representation be
     ),
   );
   assert.equal(owner.status, 200);
-  assert.equal((await owner.json()).type, "owner-home");
+  const ownerDocument = await owner.json() as {
+    type: string;
+    data: Record<string, unknown>;
+  };
+  assert.equal(ownerDocument.type, "owner-home");
+  assert.deepEqual(Object.keys(ownerDocument.data).sort(), [
+    "campaign_name",
+    "publication",
+    "setup_status",
+  ]);
 
   const unsupported = requiredResponse(
     await handleOwnerRoutes(

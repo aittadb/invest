@@ -161,14 +161,14 @@ cache a short-lived token in one Worker isolate; each acquisition has its own
 abort deadline, and failed or timed-out renewal is cleared for a later retry.
 That transient cache is neither persistence nor authorization state.
 
-Release verification scans all tracked inputs and the complete built tree after
-`npm run sites:package`. The exact generated archive is scanned separately by
-setting `SITES_ARCHIVE_PATH` for `npm run runtime-secrets:check`; only regular
-entries below `dist/` are accepted. An operator can supply exact private values
-through a temporary `INVEST_SECRET_SCAN_VALUES_FILE`. Matches identify only the
-value category and file location, never the value itself. The Sites project ID
-is allowed only as opaque routing metadata in the ignored active binding and
-generated archive; application runtime values remain absent from both.
+`npm run sites:package` scans all tracked inputs and the complete built tree,
+creates `work/sites-package.tar.gz` with mode `0600`, and scans its contents,
+names, and raw metadata. Only regular, unique entries below `dist/` are
+accepted. An operator can supply exact private values through a temporary
+`INVEST_SECRET_SCAN_VALUES_FILE`. Matches identify only the value category and
+file location, never the value itself. The active binding and packaged manifest
+contain exactly `project_id`, `d1`, and `r2`. The Sites project ID is allowed
+only as opaque routing metadata; application runtime values remain absent.
 
 The logical issuer validates every discovered hypermedia control. The optional
 transport origin changes only backend network routing. Requests follow no

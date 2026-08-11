@@ -5,6 +5,9 @@ import test from "node:test";
 import {
   SyntheticAittaDBStorageService,
 } from "./support/synthetic-aittadb-storage-service.ts";
+import {
+  createOwnerReviewExportRouteHandler,
+} from "../worker/routes/owner-review-exports.ts";
 
 const APP_ORIGIN = "https://invest.example.test";
 const ISSUER = "https://storage.example.test";
@@ -86,7 +89,11 @@ test("built Worker representations, redirects, CSP, errors, and logs do not disc
         ...ownerHeaders,
         accept: "text/html",
       }),
-      request("owner JSON fixed error", "/owner", {
+      request("owner setup CSP HTML", "/owner/setup", {
+        ...ownerHeaders,
+        accept: "text/html",
+      }),
+      request("owner JSON", "/owner", {
         ...ownerHeaders,
         accept: mediaType(),
       }),
@@ -101,6 +108,7 @@ test("built Worker representations, redirects, CSP, errors, and logs do not disc
 
     for (const [label, current] of requests) {
       const response = await worker.fetch(current, environment, executionContext());
+      assertBoundaryResponse(label, response);
       const material = await responseMaterial(label, response);
       assertNoCanaries(material, label);
       assert.ok(response.status >= 200 && response.status <= 599, label);
@@ -112,6 +120,73 @@ test("built Worker representations, redirects, CSP, errors, and logs do not disc
     globalThis.fetch = originalFetch;
     restoreConsole(originalConsole);
   }
+});
+
+test("successful private download does not reflect closed runtime values", async () => {
+  const ownerSubject = "task111-owner-subject";
+  const bytes = new TextEncoder().encode("field\nclean export value\n");
+  const closedRuntimeValues = Object.freeze([...SYNTHETIC_CANARIES]);
+  const route = createOwnerReviewExportRouteHandler({
+    service: {
+      limits: {
+        maxRows: 1,
+        maxBytes: 1_024,
+        maxRecordBytes: 512,
+        maxHistoryEntries: 1,
+        pageSize: 1,
+      },
+      createReviewCsv: async () => {
+        assert.equal(closedRuntimeValues.length, SYNTHETIC_CANARIES.length);
+        return {
+          exportType: "review-csv",
+          filename: "investor-review.csv",
+          contentType: "text/csv; charset=utf-8",
+          chunks: [bytes],
+          byteLength: bytes.byteLength,
+          auditEvent: {},
+        };
+      },
+      createJsonBackup: async () => {
+        throw new Error("Unexpected backup request");
+      },
+    },
+    guardMutation: async () => ({
+      method: "POST",
+      actor: { type: "owner", subject: ownerSubject },
+      body: { "operation-id": "task111-download-operation" },
+    }),
+    csrfToken: async () => "task111_csrf_0123456789abcdefghijklmnop",
+  });
+  const url = new URL("/owner/exports/review.csv", APP_ORIGIN);
+  const response = await route({
+    request: new Request(url, {
+      method: "POST",
+      headers: { accept: "text/csv", origin: APP_ORIGIN },
+    }),
+    url,
+    resourceUrl: url.href,
+    actor: {
+      userId: ownerSubject,
+      email: OWNER_ACTOR_EMAIL,
+      displayName: OWNER_ACTOR_EMAIL,
+    },
+    isOwner: true,
+    campaign: null,
+    renderApplication: async () => new Response("unused"),
+  });
+  assert.notEqual(response, null);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "text/csv; charset=utf-8");
+  assert.equal(
+    response.headers.get("content-disposition"),
+    'attachment; filename="investor-review.csv"',
+  );
+  assert.equal(
+    response.headers.get("content-security-policy"),
+    "default-src 'none'; sandbox",
+  );
+  const material = await responseMaterial("successful private download", response);
+  assertNoCanaries(material, "successful private download");
 });
 
 function request(label, pathname, headers) {
@@ -130,6 +205,34 @@ function executionContext() {
     waitUntil() {},
     passThroughOnException() {},
   };
+}
+
+function assertBoundaryResponse(label, response) {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (label === "public HTML" || label === "owner HTML" ||
+    label === "owner setup CSP HTML" ||
+    label === "participant HTML failure") {
+    assert.match(contentType, /^text\/html(?:;|$)/u, label);
+  }
+  if (label === "public JSON" || label === "participant JSON failure" ||
+    label === "owner JSON") {
+    assert.match(contentType, /^application\/vnd\.aittadb-invest\+json(?:;|$)/u,
+      label);
+  }
+  if (label === "owner setup CSP HTML") {
+    assert.notEqual(response.headers.get("content-security-policy"), null, label);
+  }
+  if (label.endsWith("authentication redirect")) {
+    assert.ok(response.status >= 300 && response.status < 400, label);
+    assert.notEqual(response.headers.get("location"), null, label);
+  }
+  if (label === "download route fixed failure") {
+    assert.ok(response.status >= 400, label);
+    assert.equal(response.headers.get("content-disposition"), null, label);
+  }
+  if (label === "unsupported representation error") {
+    assert.equal(response.status, 406, label);
+  }
 }
 
 async function responseMaterial(label, response) {
@@ -160,9 +263,10 @@ function restoreConsole(original) {
 }
 
 function assertNoCanaries(value, boundary) {
+  const normalized = value.toLocaleLowerCase("en-US");
   for (const canary of SYNTHETIC_CANARIES) {
     assert.equal(
-      value.includes(canary),
+      normalized.includes(canary.toLocaleLowerCase("en-US")),
       false,
       `synthetic private value crossed the built Worker ${boundary}`,
     );

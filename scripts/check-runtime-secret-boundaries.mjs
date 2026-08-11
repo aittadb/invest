@@ -7,6 +7,9 @@ import {
 } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { extname, isAbsolute, join, relative, resolve } from "node:path";
+import { gunzipSync } from "node:zlib";
+
+import { parseActiveSitesHostingConfiguration } from "./sites-hosting-config.mjs";
 
 const PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const PRODUCTION_ROOTS = [
@@ -24,6 +27,7 @@ const BUILD_ROOT = "dist";
 const ENV_EXAMPLE = ".env.example";
 const ACTIVE_HOSTING_PATH = ".openai/hosting.json";
 const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
+const MAX_ARCHIVE_UNCOMPRESSED_BYTES = 256 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 5_000;
 const MAX_ARCHIVE_LIST_BYTES = 4 * 1024 * 1024;
 
@@ -96,6 +100,8 @@ const HIGH_CONFIDENCE_CREDENTIAL_PATTERNS = Object.freeze([
 const TEXT_EXTENSIONS = new Set([
   "",
   ".css",
+  ".cjs",
+  ".cts",
   ".html",
   ".js",
   ".json",
@@ -103,10 +109,13 @@ const TEXT_EXTENSIONS = new Set([
   ".map",
   ".md",
   ".mjs",
+  ".mts",
+  ".sh",
   ".sql",
   ".svg",
   ".ts",
   ".tsx",
+  ".toml",
   ".txt",
   ".xml",
   ".yaml",
@@ -122,10 +131,12 @@ const ENVIRONMENT_DEFAULT =
 const findings = [];
 const findingKeys = new Set();
 const scannedFiles = new Set();
-const options = parseArguments(process.argv.slice(2));
-const suppliedCanaries = loadSuppliedCanaries();
+let options = Object.freeze({ scanPath: null, archivePath: null });
+let suppliedCanaries = Object.freeze([]);
 
 try {
+  options = parseArguments(process.argv.slice(2));
+  suppliedCanaries = loadSuppliedCanaries();
   if (options.scanPath !== null) {
     scanExternalPath(options.scanPath, suppliedCanaries);
   } else {
@@ -185,7 +196,16 @@ function requiredArgument(value) {
 function loadSuppliedCanaries() {
   const path = process.env.INVEST_SECRET_SCAN_VALUES_FILE;
   if (path === undefined || path === "") return Object.freeze([]);
-  const parsed = JSON.parse(readFileSync(resolve(path), "utf8"));
+  const resolvedPath = resolve(path);
+  const stats = statSync(resolvedPath);
+  if (
+    !stats.isFile() ||
+    (stats.mode & 0o077) !== 0 ||
+    typeof process.getuid === "function" && stats.uid !== process.getuid()
+  ) {
+    throw new Error("Unsafe supplied canary file.");
+  }
+  const parsed = JSON.parse(readFileSync(resolvedPath, "utf8"));
   if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 32) {
     throw new Error("Invalid supplied canary file.");
   }
@@ -227,10 +247,7 @@ function scanTrackedRepository(externalCanaries) {
     scanExactCanaries(projectPath, text, externalCanaries);
     scanPatterns(projectPath, text, PRIVATE_REPOSITORY_IDENTITY_PATTERNS,
       "contains private");
-    if (!projectPath.startsWith("tests/")) {
-      scanPatterns(projectPath, text, HIGH_CONFIDENCE_CREDENTIAL_PATTERNS,
-        "contains");
-    }
+    scanRepositoryCredentialPatterns(projectPath, text);
     if (isReleaseInputPath(projectPath) && isTextFile(projectPath, bytes)) {
       if (projectPath !== "scripts/check-runtime-secret-boundaries.mjs") {
         scanExactCanaries(projectPath, text, SYNTHETIC_CANARIES);
@@ -252,12 +269,13 @@ function isSensitiveTrackedPath(path) {
 }
 
 function isReleaseInputPath(path) {
-  return PRODUCTION_ROOTS.some((root) => path === root || path.startsWith(`${root}/`)) ||
-    path.startsWith("scripts/") ||
-    /^\.(?:openai\/hosting\.example\.json|env\.example)$/u.test(path) ||
-    /^(?:eslint\.config\.mjs|next-env\.d\.ts|package(?:-lock)?\.json|postcss\.config\.mjs|tsconfig\.json|vinext\.config\.ts)$/u.test(
-      path,
-    );
+  if (
+    path.startsWith("tests/") ||
+    path.startsWith("docs/") ||
+    path.endsWith(".md")
+  ) return false;
+  return TEXT_EXTENSIONS.has(extname(path).toLowerCase()) ||
+    path === ENV_EXAMPLE;
 }
 
 function scanTree(root, canaries) {
@@ -291,6 +309,13 @@ function scanReleaseFile(path, bytes, canaries) {
   scanPatterns(path, text, ACTIVE_ARTIFACT_PATTERNS, "contains active");
   scanPatterns(path, text, HIGH_CONFIDENCE_CREDENTIAL_PATTERNS, "contains");
   if (isTextFile(path, bytes)) scanCommittedSecretAssignments(path, text);
+  if (isActiveHostingManifest(path)) {
+    try {
+      parseActiveSitesHostingConfiguration(text);
+    } catch {
+      addFinding(path, 0, "contains an invalid active hosting manifest");
+    }
+  }
 }
 
 function scanArchive(archivePath, canaries) {
@@ -298,6 +323,11 @@ function scanArchive(archivePath, canaries) {
   if (!archiveStats.isFile() || archiveStats.size > MAX_ARCHIVE_BYTES) {
     throw new Error("Invalid archive.");
   }
+  const archiveBytes = readFileSync(archivePath);
+  const expandedArchive = gunzipSync(archiveBytes, {
+    maxOutputLength: MAX_ARCHIVE_UNCOMPRESSED_BYTES,
+  }).toString("utf8");
+  scanReleaseMetadata("archive:raw-metadata", expandedArchive, canaries);
   const entries = execFileSync("tar", ["-tzf", archivePath], {
     encoding: "utf8",
     maxBuffer: MAX_ARCHIVE_LIST_BYTES,
@@ -313,8 +343,16 @@ function scanArchive(archivePath, canaries) {
   ) {
     throw new Error("Invalid archive.");
   }
+  const seenEntries = new Set();
   for (let index = 0; index < entries.length; index += 1) {
     const entry = entries[index];
+    scanReleaseMetadata(`archive:name:${index}`, entry, canaries);
+    scanReleaseMetadata(`archive:metadata:${index}`, verbose[index] ?? "", canaries);
+    if (seenEntries.has(entry)) {
+      addFinding(`archive:${entry}`, 0, "duplicates an archive entry");
+      continue;
+    }
+    seenEntries.add(entry);
     if (!isSafeArchiveEntry(entry)) {
       addFinding("sites-archive", 0, "contains an unsafe archive entry");
       continue;
@@ -336,16 +374,29 @@ function scanArchive(archivePath, canaries) {
   }
 }
 
+function scanReleaseMetadata(path, text, canaries) {
+  scanExactCanaries(path, text, canaries);
+  scanPatterns(path, text, ACTIVE_ARTIFACT_PATTERNS, "contains active");
+  scanPatterns(path, text, HIGH_CONFIDENCE_CREDENTIAL_PATTERNS, "contains");
+}
+
 function isSafeArchiveEntry(entry) {
   if (
     entry === "" ||
     isAbsolute(entry) ||
     entry.includes("\\") ||
     entry.startsWith("-") ||
+    !/^[A-Za-z0-9._~/-]+$/u.test(entry) ||
     !entry.startsWith("dist/") && entry !== "dist"
   ) return false;
   const parts = entry.split("/");
   return parts.every((part) => part !== ".." && part !== ".");
+}
+
+function isActiveHostingManifest(path) {
+  const releasePath = path.startsWith("archive:") ? path.slice(8) : path;
+  return releasePath === "dist/.openai/hosting.json" ||
+    releasePath.endsWith("/dist/.openai/hosting.json");
 }
 
 function filesBelow(directory) {
@@ -418,6 +469,25 @@ function scanPatterns(path, text, patterns, prefix) {
       addFinding(path, match.index, `${prefix} ${boundary.label}`, text);
     }
   }
+}
+
+function scanRepositoryCredentialPatterns(path, text) {
+  for (const boundary of HIGH_CONFIDENCE_CREDENTIAL_PATTERNS) {
+    boundary.pattern.lastIndex = 0;
+    for (const match of text.matchAll(boundary.pattern)) {
+      if (isApprovedSyntheticCredentialFixture(path, boundary.label, match[0])) {
+        continue;
+      }
+      addFinding(path, match.index, `contains ${boundary.label}`, text);
+    }
+  }
+}
+
+function isApprovedSyntheticCredentialFixture(path, label, value) {
+  const expected = ["https://user", "password@assets.example"].join(":");
+  return path === "tests/public-campaign-configuration.test.ts" &&
+    label === "credential-bearing URL" &&
+    value === expected;
 }
 
 function scanCommittedSecretAssignments(path, text) {

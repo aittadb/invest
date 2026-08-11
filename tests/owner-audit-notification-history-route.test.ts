@@ -120,7 +120,6 @@ test("persistent audit-only route keeps HTML and hypermedia equivalent", async (
 
   const home = createOwnerHomeDocument(
     `${APP_ORIGIN}/owner`,
-    { displayName: "Owner", email: OWNER_EMAIL },
     null,
     { auditHistory: true },
   );
@@ -256,7 +255,6 @@ test("owner audit and notification collections are finite, canonical, and non-di
 
   const home = createOwnerHomeDocument(
     `${APP_ORIGIN}/owner`,
-    { displayName: "Owner", email: OWNER_EMAIL },
     null,
     { auditNotificationHistory: true },
   );

@@ -140,7 +140,6 @@ test("owner indication resources are finite, canonical, equivalent, and non-disc
 
   const home = createOwnerHomeDocument(
     `${APP_ORIGIN}/owner`,
-    { displayName: "Owner", email: OWNER_EMAIL },
     null,
     { indicationModeration: true },
   );

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   symlinkSync,
@@ -70,6 +71,7 @@ test("scanner consumes external private values without retaining or echoing them
   const directory = mkdtempSync(join(tmpdir(), "invest-secret-supplied-"));
   const sentinel = `task111-external-${process.pid}-${Date.now()}-private-value`;
   const sentinelFile = join(directory, "sentinels.json");
+  const malformedFile = join(directory, "malformed-sentinels.json");
   const leakedFile = join(directory, "artifact.js");
   const cleanFile = join(directory, "clean.js");
   writeFileSync(
@@ -84,11 +86,30 @@ test("scanner consumes external private values without retaining or echoing them
     INVEST_SECRET_SCAN_VALUES_FILE: sentinelFile,
   };
 
+  chmodSync(sentinelFile, 0o644);
+  const unsafe = runScanner(["--scan-path", leakedFile], environment);
+  assert.equal(unsafe.status, 1);
+  assert.equal(output(unsafe).includes(sentinel), false);
+  chmodSync(sentinelFile, 0o600);
   const rejected = runScanner(["--scan-path", leakedFile], environment);
   assert.equal(rejected.status, 1);
   assert.equal(output(rejected).includes(sentinel), false);
   const accepted = runScanner(["--scan-path", cleanFile], environment);
   assert.equal(accepted.status, 0, output(accepted));
+
+  writeFileSync(
+    malformedFile,
+    `[{"kind":"private value","value":"${sentinel}"`,
+    "utf8",
+  );
+  chmodSync(malformedFile, 0o600);
+  const malformed = runScanner(["--scan-path", cleanFile], {
+    ...process.env,
+    INVEST_SECRET_SCAN_VALUES_FILE: malformedFile,
+  });
+  assert.equal(malformed.status, 1);
+  assert.equal(output(malformed).includes(sentinel), false);
+  assert.match(output(malformed), /inspection failed closed/u);
 });
 
 test("scanner verifies complete Sites archive contents and rejects unsafe entry types", () => {
@@ -96,19 +117,37 @@ test("scanner verifies complete Sites archive contents and rejects unsafe entry 
   const cleanStage = join(directory, "clean");
   const leakedStage = join(directory, "leaked");
   const linkedStage = join(directory, "linked");
+  const namedStage = join(directory, "named");
+  const privateManifestStage = join(directory, "private-manifest");
   const cleanArchive = join(directory, "clean.tar.gz");
   const leakedArchive = join(directory, "leaked.tar.gz");
   const linkedArchive = join(directory, "linked.tar.gz");
+  const namedArchive = join(directory, "named.tar.gz");
+  const privateManifestArchive = join(directory, "private-manifest.tar.gz");
   const probe = join(directory, "probe.txt");
   writeFileSync(probe, "clean probe\n", "utf8");
 
   stageArchive(cleanStage, "export default {};\n");
   stageArchive(leakedStage, `export default ${JSON.stringify(CANARIES[2])};\n`);
   stageArchive(linkedStage, "export default {};\n");
+  stageArchive(namedStage, "export default {};\n");
+  stageArchive(privateManifestStage, "export default {};\n", {
+    project_id: "appgprj_synthetic",
+    d1: null,
+    r2: null,
+    internal_owner_alias: "private deployment value",
+  });
   symlinkSync("server/index.js", join(linkedStage, "dist", "linked-worker.js"));
+  writeFileSync(
+    join(namedStage, "dist", `${CANARIES[0]}.txt`),
+    "clean body\n",
+    "utf8",
+  );
   createArchive(cleanStage, cleanArchive);
   createArchive(leakedStage, leakedArchive);
   createArchive(linkedStage, linkedArchive);
+  createArchive(namedStage, namedArchive);
+  createArchive(privateManifestStage, privateManifestArchive);
 
   const clean = runScanner(["--scan-path", probe, "--archive", cleanArchive]);
   assert.equal(clean.status, 0, output(clean));
@@ -118,9 +157,24 @@ test("scanner verifies complete Sites archive contents and rejects unsafe entry 
   const linked = runScanner(["--scan-path", probe, "--archive", linkedArchive]);
   assert.equal(linked.status, 1);
   assert.match(output(linked), /unsafe type/u);
+  const named = runScanner(["--scan-path", probe, "--archive", namedArchive]);
+  assert.equal(named.status, 1);
+  assertNoCanary(output(named));
+  const privateManifest = runScanner([
+    "--scan-path",
+    probe,
+    "--archive",
+    privateManifestArchive,
+  ]);
+  assert.equal(privateManifest.status, 1);
+  assert.match(output(privateManifest), /invalid active hosting manifest/u);
 });
 
-function stageArchive(stage, worker) {
+function stageArchive(stage, worker, hosting = {
+  project_id: "appgprj_synthetic",
+  d1: null,
+  r2: null,
+}) {
   mkdirSync(join(stage, "dist", "server"), { recursive: true });
   mkdirSync(join(stage, "dist", ".openai", "drizzle"), { recursive: true });
   writeFileSync(join(stage, "dist", "server", "index.js"), worker, "utf8");
@@ -131,7 +185,7 @@ function stageArchive(stage, worker) {
   );
   writeFileSync(
     join(stage, "dist", ".openai", "hosting.json"),
-    JSON.stringify({ project_id: "appgprj_synthetic", d1: null, r2: null }),
+    JSON.stringify(hosting),
     "utf8",
   );
   writeFileSync(

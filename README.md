@@ -79,7 +79,7 @@ npm run sites:package
 npm run validate
 ```
 
-`npm run build` works from a clean checkout with the inert hosting example. Before packaging or publishing, create an ignored `.openai/hosting.json` containing the exact Sites project identifier for that deployment; `npm run sites:package` refuses to proceed without it and scans the complete generated release tree after building. After the Sites packaging helper creates an archive, run `SITES_ARCHIVE_PATH=/absolute/path/to/site.tar.gz npm run runtime-secrets:check` before saving a version. The scanner validates every regular archive entry without printing matched private values.
+`npm run build` works from a clean checkout with the inert hosting example. Before packaging or publishing, create an ignored `.openai/hosting.json` containing exactly the Sites `project_id`, `d1`, and `r2` values for that deployment. `npm run sites:package` refuses any other field, builds the release, creates the mode-`0600` archive at `work/sites-package.tar.gz`, and scans the complete tracked, built, archive-content, filename, and metadata boundary without printing matched private values. Set `SITES_ARCHIVE_PATH` only when independently checking another exact Sites archive.
 
 ## Planning Workflow
 

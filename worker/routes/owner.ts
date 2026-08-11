@@ -44,7 +44,6 @@ export function createOwnerHomeRouteHandler(
       return hypermediaResponse(
         createOwnerHomeDocument(
           context.resourceUrl,
-          context.actor,
           context.campaign,
           capabilities,
         ),
