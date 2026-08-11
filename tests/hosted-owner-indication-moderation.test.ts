@@ -20,7 +20,10 @@ import { MUTATION_CSRF_HEADER } from "../http/mutation-security.ts";
 import { OWNER_INDICATION_MODERATION_HEADER } from "../http/runtime-capabilities.ts";
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
 import { StorageCampaignRepository } from "../repositories/in-memory-campaign-repository.ts";
-import { StorageParticipantInvestmentInterestRepository } from "../repositories/storage-participant-investment-repository.ts";
+import {
+  StorageParticipantInvestmentInterestRepository,
+  initializeParticipantInvestmentOwnership,
+} from "../repositories/storage-participant-investment-repository.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
 import type {
   InvestorAppEnv,
@@ -126,6 +129,16 @@ test("hosted owner moderation persists opaque review and atomic rejection", asyn
   assert.equal(detail.data.status, "active");
   assert.equal(detail.data.participant_subject, PARTICIPANT);
   assert.equal(detail.data.note, PRIVATE_NOTE);
+  const retryProofResponse = await restartedWorker.fetch(
+    ownerRequest(detailPath),
+    env,
+    executionContext,
+  );
+  assert.equal(retryProofResponse.status, 200);
+  const retryCsrf = retryProofResponse.headers.get(MUTATION_CSRF_HEADER);
+  const retrySetCookie = retryProofResponse.headers.get("set-cookie");
+  assert(retryCsrf);
+  assert(retrySetCookie);
   const reject = detail.actions.find((action) =>
     action.name === "reject-investment-indication"
   );
@@ -165,6 +178,43 @@ test("hosted owner moderation persists opaque review and atomic rejection", asyn
   );
   assert.deepEqual(rejected.actions, []);
   assert.equal(service.transactionRequests, transactionsBefore + 2);
+  const nonReplayRecordsAfterCommit = service.recordKeys()
+    .filter((key) => !key.startsWith("browser-mutation-replays/"))
+    .sort();
+  const retriedResponse = await hostedWorker(service, []).fetch(
+    new Request(reject.href, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        cookie: cookieHeader(retrySetCookie),
+        origin: APP_ORIGIN,
+        [MUTATION_CSRF_HEADER]: retryCsrf,
+        "oai-authenticated-user-id": OWNER_SUBJECT,
+        "oai-authenticated-user-email": OWNER_EMAIL,
+      },
+      body: JSON.stringify({
+        "operation-id": operationId,
+        "expected-revision": expectedRevision,
+        reason: "Outside the current review scope.",
+      }),
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(retriedResponse.status, 200);
+  assert.match(retriedResponse.headers.get("set-cookie") ?? "", /Max-Age=0/iu);
+  assert.equal(
+    (await retriedResponse.json() as OwnerIndicationDetailDocument).data.status,
+    "rejected",
+  );
+  assert.equal(service.transactionRequests, transactionsBefore + 3);
+  assert.deepEqual(
+    service.recordKeys()
+      .filter((key) => !key.startsWith("browser-mutation-replays/"))
+      .sort(),
+    nonReplayRecordsAfterCommit,
+  );
   for (const collectionName of [
     "investment-indications",
     "investment-aggregate-states",
@@ -447,6 +497,17 @@ async function seedIndication(storage: AittaDBStorageAdapter): Promise<void> {
   );
   assert(parsedAmount.ok);
   const amount = parsedAmount.value.amount;
+  const ownership = await initializeParticipantInvestmentOwnership(
+    storage,
+    PARTICIPANT,
+    {
+      operationId:
+        "investment-ownership-initialization:hosted-owner-moderation",
+      indications: [],
+    },
+  );
+  assert.equal(ownership.indicationCount, 0);
+  assert.equal(ownership.activeCount, 0);
   const repository = new StorageParticipantInvestmentInterestRepository(
     storage,
     PARTICIPANT,
