@@ -66,6 +66,17 @@ const MAX_PACKAGE_HEAD_READS_PER_PROJECTION_ATTEMPT = 2;
 const MAX_ACCEPTANCE_READS_PER_GATE_ATTEMPT = 4;
 const MAX_ACKNOWLEDGMENT_ROUTE_STATE_READS = 4;
 const MAX_ACKNOWLEDGMENT_ROUTE_OPERATION_READS = 4;
+const MAX_PROFILE_ROUTE_CURRENT_READS = 3;
+const MAX_PROFILE_ROUTE_REVISION_READS = 2;
+const MAX_PROFILE_ROUTE_MUTATION_READS = 3;
+const MAX_PROFILE_ROUTE_STORAGE_READS =
+  MAX_PROFILE_ROUTE_CURRENT_READS +
+  2 * MAX_PROFILE_ROUTE_REVISION_READS +
+  MAX_PROFILE_ROUTE_MUTATION_READS +
+  MAX_PROFILE_ROUTE_CURRENT_READS +
+  2 * MAX_PROFILE_ROUTE_REVISION_READS +
+  MAX_PROFILE_ROUTE_MUTATION_READS +
+  MAX_PROFILE_ROUTE_CURRENT_READS;
 export const PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT =
   PACKAGE_STORAGE_READ_LIMITS.maxReconstructionReads - 1 +
   MAX_PARTICIPANT_PROJECTION_ATTEMPTS *
@@ -74,8 +85,11 @@ export const PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT =
       MAX_ACCEPTANCE_GATE_READ_ATTEMPTS *
         MAX_ACCEPTANCE_READS_PER_GATE_ATTEMPT);
 export const PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT =
-  MAX_ACKNOWLEDGMENT_ROUTE_STATE_READS +
-  MAX_ACKNOWLEDGMENT_ROUTE_OPERATION_READS;
+  Math.max(
+    MAX_ACKNOWLEDGMENT_ROUTE_STATE_READS +
+      MAX_ACKNOWLEDGMENT_ROUTE_OPERATION_READS,
+    MAX_PROFILE_ROUTE_STORAGE_READS,
+  );
 export const PARTICIPANT_REQUEST_STORAGE_READ_LIMIT =
   PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT +
   PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT;
@@ -95,6 +109,7 @@ export type ParticipantFounderApplicationRepositories = Readonly<{
 
 export type ParticipantRequestRepositoryScope = Readonly<{
   participantAccessReader(): ParticipantAccessStateReader;
+  participantProfileRepository(): ParticipantRepository;
   participantPackageReader(
     participantSubject: ActorSubject,
   ): Pick<PackageVersionRepository, "current">;
@@ -204,6 +219,10 @@ function createParticipantRequestRepositoryScope(
   const readStorage = participantRequestStorage(storage, budget, false);
   const mutationStorage = participantRequestStorage(storage, budget, true);
   const participant = new StorageParticipantRepository(readStorage, account);
+  const participantProfile = new StorageParticipantRepository(
+    mutationStorage,
+    account,
+  );
   const packages = StoragePackageVersionRepository.requestScopedReader(
     readStorage,
   );
@@ -256,6 +275,7 @@ function createParticipantRequestRepositoryScope(
   };
   return Object.freeze({
     participantAccessReader: () => accessReader,
+    participantProfileRepository: () => participantProfile,
     participantPackageReader: (participantSubject: ActorSubject) => {
       requireSubject(participantSubject);
       return packageReader;

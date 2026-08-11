@@ -249,24 +249,23 @@ current/latest/current attempt and fails its precondition on change rather than
 running that bounded loop.
 
 Hosted composition calls `participantRequest(account)` once for each eligible
-participant HTTP request. Authorization and the subsequently selected package
-or acknowledgment route receive the same subject-bound scope; route repository
-factories cannot reopen the underlying uncapped adapter. A second HTTP request
-receives a new scope.
+participant HTTP request. Authorization and the subsequently selected profile,
+package, acknowledgment, or founder route receive the same subject-bound scope;
+route repository factories cannot reopen the underlying uncapped adapter. A
+second HTTP request receives a new scope.
 
-That scope admits at most 559 participant-private storage-record reads. The
+That scope admits at most 574 participant-private storage-record reads. The
 maximum valid authorization envelope is 551: 511 unique immutable package
 records plus two outer attempts, each containing six profile reads, two package
 head reads, and three four-read accepted gate attempts. The profile reads cover
 current, matching latest history, and immutable registration revision 1 for
-each sample. The selected route owns
-the remaining eight reads. Package GET uses one cached-head read;
-acknowledgment GET uses at most four; the eight-read maximum also covers
-acknowledgment operation lookup, record preconditions, and conflict recovery.
-The next read fails before adapter access. Public campaign reads and storage
-transactions are outside this participant read counter, while all profile,
-package, gate, acceptance-head, acceptance-record, and acknowledgment-route
-reads are inside it.
+each sample. The selected route owns the remaining 23 reads. This covers a
+profile mutation's current state, two historical samples, failed first attempt,
+recovery state and history, retry, and final projection. Package GET uses one
+cached-head read and acknowledgment GET uses at most four. The next read fails
+before adapter access. Public campaign reads and storage transactions are
+outside this participant read counter, while all profile, package, gate,
+acceptance-head, acceptance-record, and participant-route reads are inside it.
 
 Within the scope, one read-only package reader reuses up to 64 verified immutable
 version reconstructions. Cache hits recharge complete ancestry and logical read

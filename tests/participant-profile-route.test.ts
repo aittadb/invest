@@ -457,6 +457,7 @@ test("delayed replays reject mutations unavailable from their immutable historic
       processEmailNoticeAcknowledged: true,
       marketingConsent: true,
     },
+    noticeEvidence: testParticipantRegistrationNoticeEvidence(),
   });
   await persisted.requestAccountDeletion({
     operationId: "participant-profile-operation:historical-deletion",
@@ -573,6 +574,7 @@ test("post-replay projection rejects a regressed latest snapshot without issuing
       processEmailNoticeAcknowledged: true,
       marketingConsent: true,
     },
+    noticeEvidence: testParticipantRegistrationNoticeEvidence(),
   });
   const updateBody = {
     "operation-id": "participant-profile-operation:projection-update",
@@ -668,6 +670,7 @@ test("post-replay projection rejects well-formed higher revisions with illegal a
       processEmailNoticeAcknowledged: true,
       marketingConsent: true,
     },
+    noticeEvidence: testParticipantRegistrationNoticeEvidence(),
   });
   const updateBody = {
     "operation-id": "participant-profile-operation:ancestry-update",

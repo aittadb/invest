@@ -234,6 +234,7 @@ export function createApplicationWorker(
             participantAccess,
             resourceUrl,
             url.pathname,
+            participantRequest,
           )
         : null;
       const participantFounderInterest = dependencies.dispatchRoute === undefined
@@ -482,6 +483,7 @@ function runtimeParticipantProfileRoute(
   participantAccess: AuthorizedParticipantAccess | null,
   resourceUrl: string,
   pathname: string,
+  participantRequest: ParticipantRequestRepositoryScope | null,
 ): ParticipantProfileRouteDependencies | null {
   if (
     pathname !== PARTICIPANT_PROFILE_PATH ||
@@ -505,7 +507,8 @@ function runtimeParticipantProfileRoute(
   }
 
   try {
-    const repositories = runtime.repositoryFactory;
+    const participant = requiredParticipantRequest(participantRequest)
+      .participantProfileRepository();
     const appOrigin = new URL(resourceUrl).origin;
     const identity = Object.freeze({
       type: "participant" as const,
@@ -520,7 +523,7 @@ function runtimeParticipantProfileRoute(
         if (!sameAccount(candidate)) {
           throw new Error("Participant profile is unavailable.");
         }
-        return repositories.participantRepository(account.value);
+        return participant;
       },
       verifyMutation: (request: Request) =>
         runtime.mutationSession.verifyMutation(

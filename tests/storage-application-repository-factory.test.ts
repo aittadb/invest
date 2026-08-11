@@ -230,6 +230,7 @@ test("factory exposes only named application repository capabilities", async () 
   );
   assert.deepEqual(Object.keys(participantRequest), [
     "participantAccessReader",
+    "participantProfileRepository",
     "participantPackageReader",
     "participantPackageAcknowledgments",
     "participantFounderApplications",
@@ -251,6 +252,13 @@ test("factory exposes only named application repository capabilities", async () 
   assert.equal(participantRequest.participantAccessReader(), accessReader);
   assert.deepEqual(Object.keys(accessReader), ["read"]);
   assert.equal(Object.isFrozen(accessReader), true);
+  const profileRepository = participantRequest.participantProfileRepository();
+  assert.equal(
+    participantRequest.participantProfileRepository(),
+    profileRepository,
+  );
+  assert.deepEqual(Object.keys(profileRepository), ["storageKind"]);
+  assert.equal(Object.values(profileRepository).includes(storage), false);
   assert.throws(
     () => participantRequest.participantPackageReader(foreignSubject.value),
     (error) => storageFailure(error, "UNAVAILABLE"),

@@ -689,8 +689,8 @@ test("participant access keeps nested package retry reads inside one budget", as
 
 test("participant request scope enforces exact maximum route and retry read budgets", async () => {
   assert.equal(PARTICIPANT_AUTHORIZATION_STORAGE_READ_LIMIT, 551);
-  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 8);
-  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 559);
+  assert.equal(PARTICIPANT_REQUEST_ROUTE_STORAGE_READ_LIMIT, 23);
+  assert.equal(PARTICIPANT_REQUEST_STORAGE_READ_LIMIT, 574);
 
   const service = new SyntheticAittaDBService();
   await registerHostedParticipant(
@@ -871,13 +871,21 @@ test("participant request scope enforces exact maximum route and retry read budg
   assert.equal(combinedState?.currentPackage?.id, current.snapshot.id);
   assert.equal(combinedReads.count(), 551);
 
+  const scopedProfile = await combinedRequest.participantProfileRepository()
+    .current();
+  assert.equal(
+    scopedProfile?.snapshot.displayName,
+    "Maximum combined retry participant",
+  );
+  assert.equal(combinedReads.count(), 554);
+
   const combinedAcknowledgments =
     combinedRequest.participantPackageAcknowledgments(subject.value);
   await combinedAcknowledgments.packages.current();
   await combinedAcknowledgments.acknowledgments.latest();
   await combinedAcknowledgments.packages.current();
-  assert.equal(combinedReads.count(), 555);
-  for (let index = 0; index < 4; index += 1) {
+  assert.equal(combinedReads.count(), 558);
+  for (let index = 0; index < 16; index += 1) {
     await combinedRequest.participantPackageReader(subject.value).current();
   }
   assert.equal(combinedReads.count(), PARTICIPANT_REQUEST_STORAGE_READ_LIMIT);
@@ -2408,7 +2416,7 @@ test("hosted participant profile self-service persists bounded actions across re
     hostedPackageWorker(service, () => new Date(restartEpoch + 60_000)),
     env,
   );
-  assert.equal(service.readRequests, delayedHtmlProofReads + 9);
+  assert.equal(service.readRequests, delayedHtmlProofReads + 12);
 
   const delayedJsonReads = service.readRequests;
   const delayedAfterWithdrawalResponse = await submitProfile(
@@ -2419,7 +2427,7 @@ test("hosted participant profile self-service persists bounded actions across re
     updateBody,
   );
   assert.equal(delayedAfterWithdrawalResponse.status, 200);
-  assert.equal(service.readRequests, delayedJsonReads + 17);
+  assert.equal(service.readRequests, delayedJsonReads + 22);
   assertProfileMutationCookieLifecycle(
     delayedAfterWithdrawalResponse,
     true,
@@ -2450,7 +2458,7 @@ test("hosted participant profile self-service persists bounded actions across re
     updateBody,
   );
   assert.equal(delayedAfterWithdrawalHtmlResponse.status, 200);
-  assert.equal(service.readRequests, delayedHtmlReads + 17);
+  assert.equal(service.readRequests, delayedHtmlReads + 22);
   assertProfileMutationCookieLifecycle(
     delayedAfterWithdrawalHtmlResponse,
     true,
@@ -2555,7 +2563,7 @@ test("hosted participant profile self-service persists bounded actions across re
     updateBody,
   );
   assert.equal(delayedAfterDeletionResponse.status, 200);
-  assert.equal(service.readRequests, delayedTerminalJsonReads + 17);
+  assert.equal(service.readRequests, delayedTerminalJsonReads + 22);
   assert.equal(
     delayedAfterDeletionResponse.headers.get(MUTATION_CSRF_HEADER),
     null,
@@ -2584,7 +2592,7 @@ test("hosted participant profile self-service persists bounded actions across re
     updateBody,
   );
   assert.equal(delayedAfterDeletionHtmlResponse.status, 200);
-  assert.equal(service.readRequests, delayedTerminalHtmlReads + 17);
+  assert.equal(service.readRequests, delayedTerminalHtmlReads + 22);
   assert.equal(
     delayedAfterDeletionHtmlResponse.headers.get(MUTATION_CSRF_HEADER),
     null,
@@ -2670,7 +2678,7 @@ test("hosted delayed profile replays reject impossible consent ancestry and pres
     PARTICIPANT_EMAIL,
     "No-consent hosted participant",
     "participant-operation:no-consent-hosted-register",
-    false,
+    { marketingConsent: false },
   );
   const impossibleEpoch = Date.parse("2026-08-12T12:00:00.000Z");
   const impossibleWorker = hostedPackageWorker(
@@ -2764,7 +2772,7 @@ test("hosted delayed profile replays reject impossible consent ancestry and pres
     commitUpdateBody,
   );
   assert.equal(impossibleJsonResponse.status, 503);
-  assert.equal(impossibleService.readRequests, impossibleJsonReads + 17);
+  assert.equal(impossibleService.readRequests, impossibleJsonReads + 22);
   assert.equal(impossibleJsonResponse.headers.get(MUTATION_CSRF_HEADER), null);
   assertProfileMutationCookieLifecycle(
     impossibleJsonResponse,
@@ -2789,7 +2797,7 @@ test("hosted delayed profile replays reject impossible consent ancestry and pres
     commitUpdateBody,
   );
   assert.equal(impossibleHtmlResponse.status, 503);
-  assert.equal(impossibleService.readRequests, impossibleHtmlReads + 17);
+  assert.equal(impossibleService.readRequests, impossibleHtmlReads + 22);
   assert.equal(impossibleHtmlResponse.headers.get(MUTATION_CSRF_HEADER), null);
   assertProfileMutationCookieLifecycle(
     impossibleHtmlResponse,
@@ -2818,7 +2826,7 @@ test("hosted delayed profile replays reject impossible consent ancestry and pres
     PARTICIPANT_EMAIL,
     "Granted hosted participant",
     "participant-operation:granted-hosted-register",
-    true,
+    { marketingConsent: true },
   );
   const validEpoch = Date.parse("2026-08-13T12:00:00.000Z");
   const validWorker = hostedPackageWorker(
@@ -2905,7 +2913,7 @@ test("hosted delayed profile replays reject impossible consent ancestry and pres
     commitWithdrawalBody,
   );
   assert.equal(validJsonResponse.status, 200);
-  assert.equal(validService.readRequests, validJsonReads + 17);
+  assert.equal(validService.readRequests, validJsonReads + 22);
   assert.notEqual(validJsonResponse.headers.get(MUTATION_CSRF_HEADER), null);
   assertProfileMutationCookieLifecycle(
     validJsonResponse,
@@ -2930,7 +2938,7 @@ test("hosted delayed profile replays reject impossible consent ancestry and pres
     commitWithdrawalBody,
   );
   assert.equal(validHtmlResponse.status, 200);
-  assert.equal(validService.readRequests, validHtmlReads + 17);
+  assert.equal(validService.readRequests, validHtmlReads + 22);
   assert.equal(validHtmlResponse.headers.get(MUTATION_CSRF_HEADER), null);
   assertProfileMutationCookieLifecycle(
     validHtmlResponse,
