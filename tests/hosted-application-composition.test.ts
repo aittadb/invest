@@ -20,6 +20,7 @@ import {
   OWNER_PACKAGE_WORKSPACE_HEADER,
   PARTICIPANT_FOUNDER_INTEREST_HEADER,
   PARTICIPANT_PROFILE_SELF_SERVICE_HEADER,
+  PARTICIPANT_INVESTMENT_INTERESTS_HEADER,
   hasParticipantProfileSelfService,
 } from "../http/runtime-capabilities.ts";
 import {
@@ -41,6 +42,11 @@ import {
   PARTICIPANT_PROFILE_PATH,
   type ParticipantProfileDocument,
 } from "../domain/participant-profile-resource.ts";
+import {
+  INVESTMENT_INTEREST_PATH,
+  type InvestmentInterestCollectionDocument,
+  type InvestmentInterestItemDocument,
+} from "../domain/participant-investment-interest-resource.ts";
 import { parseParticipantAccount } from "../domain/participant-profile.ts";
 import {
   parseActorSubject,
@@ -1948,6 +1954,500 @@ test("hosted founder state and mutation proofs remain participant-bound", async 
   const unchanged = await founderResource(hostedPackageWorker(service), env);
   assert.equal(unchanged.document.data.revision, 1);
   assert.equal(unchanged.document.data.history.length, 1);
+});
+
+test("hosted investment interests persist their full lifecycle across workers and representations", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedInvestmentFixture(service);
+  const firstWorker = hostedPackageWorker(service);
+
+  const initial = await investmentResource(firstWorker, env);
+  assert.deepEqual(actionNames(initial.document), [
+    "create-personal-investment-interest",
+    "create-company-investment-interest",
+  ]);
+  assert.equal(initial.document.data.acknowledgment_current, true);
+  assert.deepEqual(initial.document.data.amount, {
+    currency: "SEK",
+    minimum: 25_000,
+    increment: 5_000,
+    maximum: 500_000,
+  });
+
+  const rendered: Request[] = [];
+  const homeWorker = createApplicationWorker({
+    fetchApplication: async (request) => {
+      rendered.push(request);
+      return new Response("participant application");
+    },
+    fetchOptimizedImage: async () => new Response("image"),
+    resolveApplicationRuntime: createHostedApplicationRuntimeResolver({
+      fetch: service.fetch,
+      now: () => NOW,
+    }),
+  });
+  const participantHome = await homeWorker.fetch(
+    participantHtmlRequest("/participant"),
+    env,
+    executionContext,
+  );
+  assert.equal(participantHome.status, 200);
+  assert.equal(
+    rendered[0]?.headers.get(PARTICIPANT_INVESTMENT_INTERESTS_HEADER),
+    "available",
+  );
+
+  const htmlResponse = await firstWorker.fetch(
+    participantHtmlRequest(INVESTMENT_INTEREST_PATH),
+    env,
+    executionContext,
+  );
+  assert.equal(htmlResponse.status, 200);
+  const html = await htmlResponse.text();
+  assert.deepEqual(investmentHtmlActionNames(html), actionNames(initial.document));
+  assert.doesNotMatch(html, /TASK-|implementation|features to build/iu);
+
+  const personalOperation = "investment-operation:hosted-personal-create";
+  const personalAction = requiredAction(
+    initial.document,
+    "create-personal-investment-interest",
+  );
+  const personalBody = actionBody(personalAction, {
+    "operation-id": personalOperation,
+    "residence-country": "fi",
+    amount: 25_000,
+    "availability-period": "Within the next twelve months.",
+    note: "Private hosted investment note.",
+  });
+  const createdResponse = await submitInvestmentMutation(
+    firstWorker,
+    env,
+    initial,
+    personalAction,
+    personalBody,
+  );
+  assert.equal(createdResponse.status, 201);
+  const created = await createdResponse.json() as InvestmentInterestItemDocument;
+  assert.equal(created.id, personalOperation);
+  assert.equal(created.data.status, "active");
+  assert.equal(created.data.revision, 1);
+  assert.deepEqual(actionNames(created), [
+    "edit-investment-interest",
+    "withdraw-investment-interest",
+  ]);
+
+  const replayProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  const replayResponse = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    replayProof,
+    personalAction,
+    personalBody,
+  );
+  assert.equal(replayResponse.status, 200);
+  assert.equal(
+    (await replayResponse.json() as InvestmentInterestItemDocument).data.history
+      .length,
+    1,
+  );
+
+  const itemPath = investmentItemPath(personalOperation);
+  const editProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  const editAction = requiredAction(editProof.document, "edit-investment-interest");
+  const editBody = actionBody(editAction, {
+    "operation-id": "investment-operation:hosted-personal-edit",
+    "expected-revision": 1,
+    amount: 30_000,
+    note: "Updated private hosted investment note.",
+  });
+  const editedResponse = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    editProof,
+    editAction,
+    editBody,
+  );
+  assert.equal(editedResponse.status, 200);
+  const edited = await editedResponse.json() as InvestmentInterestItemDocument;
+  assert.equal(edited.data.revision, 2);
+  assert.deepEqual(
+    edited.data.history.map(({ transition }) => transition),
+    ["created", "edited"],
+  );
+
+  const staleProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  const staleAction = requiredAction(staleProof.document, "edit-investment-interest");
+  const staleResponse = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    staleProof,
+    staleAction,
+    actionBody(staleAction, {
+      "operation-id": "investment-operation:hosted-personal-stale",
+      "expected-revision": 1,
+      note: "A stale hosted value must not be stored.",
+    }),
+  );
+  assert.equal(staleResponse.status, 412);
+
+  const withdrawProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  const withdrawAction = requiredAction(
+    withdrawProof.document,
+    "withdraw-investment-interest",
+  );
+  const withdrawnResponse = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    withdrawProof,
+    withdrawAction,
+    actionBody(withdrawAction, {
+      "operation-id": "investment-operation:hosted-personal-withdraw",
+      "expected-revision": 2,
+      "confirm-withdrawal": true,
+    }),
+  );
+  assert.equal(withdrawnResponse.status, 200);
+  const withdrawn = await withdrawnResponse.json() as InvestmentInterestItemDocument;
+  assert.equal(withdrawn.data.status, "withdrawn");
+  assert.deepEqual(actionNames(withdrawn), ["reactivate-investment-interest"]);
+
+  const reactivateProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  const reactivateAction = requiredAction(
+    reactivateProof.document,
+    "reactivate-investment-interest",
+  );
+  const reactivatedResponse = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    reactivateProof,
+    reactivateAction,
+    actionBody(reactivateAction, {
+      "operation-id": "investment-operation:hosted-personal-reactivate",
+      "expected-revision": 3,
+      "confirm-reactivation": true,
+    }),
+  );
+  assert.equal(reactivatedResponse.status, 200);
+  const reactivated = await reactivatedResponse.json() as
+    InvestmentInterestItemDocument;
+  assert.equal(reactivated.data.status, "active");
+  assert.equal(reactivated.data.revision, 4);
+
+  const companyProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  const companyAction = requiredAction(
+    companyProof.document,
+    "create-company-investment-interest",
+  );
+  const companyBody = actionBody(companyAction, {
+    "operation-id": "investment-operation:hosted-company-create",
+    "company-name": "Hosted Example Oy",
+    "registration-country": "FI",
+    "company-identifier": "FI-123 456",
+    "representative-name": "Hosted Representative",
+    "representative-authority-declared": true,
+    amount: 50_000,
+    "availability-period": "Within the next twelve months.",
+    note: "Private company interest note.",
+  });
+  const companyHtmlProof = await investmentHtmlResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  assert.ok(
+    investmentHtmlActionNames(companyHtmlProof.html).includes(
+      "create-company-investment-interest",
+    ),
+  );
+  const companyResponse = await submitInvestmentForm(
+    hostedPackageWorker(service),
+    env,
+    companyHtmlProof,
+    companyAction,
+    companyBody,
+  );
+  assert.equal(companyResponse.status, 201);
+  const companyHtml = await companyResponse.text();
+  assert.match(companyHtml, /Hosted Example Oy/u);
+  assert.match(companyHtml, /Private company interest note/u);
+  assert.equal(recordsIn(service, "investment-indications").length, 2);
+  assert.equal(recordsIn(service, "investment-indication-history").length, 5);
+  assert.equal(recordsIn(service, "participant-investment-indexes").length, 1);
+  assert.equal(recordsIn(service, "investment-aggregate-states").length, 1);
+});
+
+test("hosted investment creation and reactivation recheck phase and package policy", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  await configureHostedInvestmentFixture(service);
+
+  const openProof = await investmentResource(hostedPackageWorker(service), env);
+  const openAction = requiredAction(
+    openProof.document,
+    "create-personal-investment-interest",
+  );
+  await configureHostedInvestmentCampaign(service, "closed");
+  const closedResponse = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    openProof,
+    openAction,
+    actionBody(openAction, {
+      "operation-id": "investment-operation:hosted-closed-create",
+      "residence-country": "FI",
+      amount: 25_000,
+      "availability-period": "Within twelve months.",
+    }),
+  );
+  assert.equal(closedResponse.status, 412);
+  const closed = await investmentResource(hostedPackageWorker(service), env);
+  assert.deepEqual(actionNames(closed.document), []);
+
+  await configureHostedInvestmentCampaign(service, "open");
+  const lifecycleProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  const lifecycleCreate = requiredAction(
+    lifecycleProof.document,
+    "create-personal-investment-interest",
+  );
+  const lifecycleOperation = "investment-operation:hosted-policy-lifecycle";
+  const lifecycleCreated = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    lifecycleProof,
+    lifecycleCreate,
+    actionBody(lifecycleCreate, {
+      "operation-id": lifecycleOperation,
+      "residence-country": "FI",
+      amount: 25_000,
+      "availability-period": "Within twelve months.",
+    }),
+  );
+  assert.equal(lifecycleCreated.status, 201);
+  const lifecyclePath = investmentItemPath(lifecycleOperation);
+  const withdrawProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    lifecyclePath,
+  );
+  const withdrawAction = requiredAction(
+    withdrawProof.document,
+    "withdraw-investment-interest",
+  );
+  const withdrawn = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    withdrawProof,
+    withdrawAction,
+    actionBody(withdrawAction, {
+      "operation-id": "investment-operation:hosted-policy-withdraw",
+      "expected-revision": 1,
+      "confirm-withdrawal": true,
+    }),
+  );
+  assert.equal(withdrawn.status, 200);
+  const reactivateProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    lifecyclePath,
+  );
+  const reactivateAction = requiredAction(
+    reactivateProof.document,
+    "reactivate-investment-interest",
+  );
+  await configureHostedInvestmentCampaign(service, "closed");
+  const closedReactivation = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    reactivateProof,
+    reactivateAction,
+    actionBody(reactivateAction, {
+      "operation-id": "investment-operation:hosted-closed-reactivate",
+      "expected-revision": 2,
+      "confirm-reactivation": true,
+    }),
+  );
+  assert.equal(closedReactivation.status, 412);
+  const retained = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    lifecyclePath,
+  );
+  assert.equal(retained.document.data.status, "withdrawn");
+  assert.deepEqual(actionNames(retained.document), []);
+
+  await configureHostedInvestmentCampaign(service, "open");
+  const currentProof = await investmentResource(hostedPackageWorker(service), env);
+  const currentAction = requiredAction(
+    currentProof.document,
+    "create-personal-investment-interest",
+  );
+  await appendHostedPackageVersion(service, 2, 1);
+  const stalePackageResponse = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    currentProof,
+    currentAction,
+    actionBody(currentAction, {
+      "operation-id": "investment-operation:hosted-stale-package-create",
+      "residence-country": "FI",
+      amount: 25_000,
+      "availability-period": "Within twelve months.",
+    }),
+  );
+  assert.equal(stalePackageResponse.status, 412);
+  const stalePackage = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+  );
+  assert.equal(stalePackage.document.data.acknowledgment_current, false);
+  assert.deepEqual(actionNames(stalePackage.document), []);
+  assert.equal(recordsIn(service, "investment-indications").length, 1);
+  assert.equal(recordsIn(service, "investment-indication-history").length, 2);
+  assert.equal(recordsIn(service, "investment-aggregate-states").length, 1);
+});
+
+test("hosted investment state and mutation proofs remain participant-bound and non-disclosing", async () => {
+  const service = new SyntheticAittaDBService();
+  const env = configuredEnvironment({ OWNER_EMAIL });
+  const packageVersionId = await configureHostedInvestmentFixture(service);
+  const foreignSubject = "sites-foreign-investor";
+  const foreignEmail = "foreign-investor@example.test";
+  await registerHostedAcceptedInvestor(
+    service,
+    foreignSubject,
+    foreignEmail,
+    packageVersionId,
+    "foreign",
+  );
+
+  const initial = await investmentResource(hostedPackageWorker(service), env);
+  const createAction = requiredAction(
+    initial.document,
+    "create-personal-investment-interest",
+  );
+  const privateNote = "PRIVATE HOSTED INVESTMENT SENTINEL";
+  const createResponse = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    initial,
+    createAction,
+    actionBody(createAction, {
+      "operation-id": "investment-operation:hosted-private-create",
+      "residence-country": "FI",
+      amount: 25_000,
+      "availability-period": "Within twelve months.",
+      note: privateNote,
+    }),
+  );
+  assert.equal(createResponse.status, 201);
+  const itemPath = investmentItemPath(
+    "investment-operation:hosted-private-create",
+  );
+
+  for (const request of [
+    ownerRequest(itemPath),
+    participantRequestFor(itemPath, foreignSubject, foreignEmail),
+  ]) {
+    const response = await hostedPackageWorker(service).fetch(
+      request,
+      env,
+      executionContext,
+    );
+    assert.equal(response.status, 404);
+    assert.doesNotMatch(await response.text(), new RegExp(privateNote, "u"));
+  }
+
+  const editProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  const editAction = requiredAction(editProof.document, "edit-investment-interest");
+  const editBody = actionBody(editAction, {
+    "operation-id": "investment-operation:hosted-proof-edit",
+    "expected-revision": 1,
+    note: "Proof failure private value.",
+  });
+  const missingCookie = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    editProof,
+    editAction,
+    editBody,
+    { cookie: null },
+  );
+  assert.equal(missingCookie.status, 403);
+  assert.doesNotMatch(await missingCookie.text(), /Proof failure private value/u);
+
+  const originProof = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  const crossOrigin = await submitInvestmentMutation(
+    hostedPackageWorker(service),
+    env,
+    originProof,
+    requiredAction(originProof.document, "edit-investment-interest"),
+    editBody,
+    { origin: "https://attacker.example.test" },
+  );
+  assert.equal(crossOrigin.status, 403);
+
+  const unchanged = await investmentResource(
+    hostedPackageWorker(service),
+    env,
+    itemPath,
+  );
+  assert.equal(unchanged.document.data.revision, 1);
+  assert.equal(unchanged.document.data.history.length, 1);
+  const disclosureProbe = JSON.stringify({
+    owner: await (await hostedPackageWorker(service).fetch(
+      ownerRequest(itemPath),
+      env,
+      executionContext,
+    )).text(),
+    foreign: await (await hostedPackageWorker(service).fetch(
+      participantRequestFor(itemPath, foreignSubject, foreignEmail),
+      env,
+      executionContext,
+    )).text(),
+  });
+  for (const secret of [
+    privateNote,
+    SERVICE_CLIENT_SECRET,
+    ACCESS_TOKEN,
+    MUTATION_KEY,
+    SERVICE_CLIENT_ID,
+    TRANSPORT_ORIGIN,
+  ]) {
+    assert.equal(disclosureProbe.includes(secret), false);
+  }
 });
 
 test("hosted participant registration persists policy-bound submissions across retries and restarts", async () => {
@@ -4551,6 +5051,65 @@ async function updateHostedParticipantInterest(
   assert.equal(result.snapshot.declaredInterest, declaredInterest);
 }
 
+async function configureHostedInvestmentFixture(
+  service: SyntheticAittaDBService,
+): Promise<StableId<"package-version">> {
+  await configureHostedInvestmentCampaign(service, "open");
+  const packageVersion = await appendHostedPackageVersion(service, 1, 0);
+  await registerHostedAcceptedInvestor(
+    service,
+    PARTICIPANT_SUBJECT,
+    PARTICIPANT_EMAIL,
+    packageVersion.snapshot.id,
+    "primary",
+  );
+  return packageVersion.snapshot.id;
+}
+
+async function registerHostedAcceptedInvestor(
+  service: SyntheticAittaDBService,
+  subjectValue: string,
+  email: string,
+  packageVersionId: StableId<"package-version">,
+  suffix: string,
+): Promise<void> {
+  await registerHostedParticipant(
+    service,
+    subjectValue,
+    email,
+    `Hosted investor ${suffix}`,
+    `participant-operation:hosted-investor-${suffix}`,
+    { declaredInterest: "investor" },
+  );
+  const subject = parseActorSubject(subjectValue);
+  assert(subject.ok);
+  await recordHostedAcceptance(
+    service,
+    subject.value,
+    packageVersionId,
+    `package-acceptance:hosted-investor-${suffix}`,
+    `package-acceptance-operation:hosted-investor-${suffix}`,
+  );
+}
+
+async function configureHostedInvestmentCampaign(
+  service: SyntheticAittaDBService,
+  phaseState: "closed" | "open",
+): Promise<void> {
+  const repository = new StorageCampaignRepository(hostedStorageAdapter(service));
+  const current = await repository.readSetup();
+  const expectedRevision = current?.revision ?? null;
+  const result = await repository.saveSetup({
+    operationId: `campaign-operation:hosted-investment-${phaseState}-${
+      expectedRevision ?? "new"
+    }`,
+    expectedRevision,
+    recordedAt: "2026-08-10T10:30:00.000Z",
+    setup: explicitCampaignSetup({ phaseState }),
+  });
+  assert.equal(result.setup.phases[0]?.state, phaseState);
+}
+
 async function configureHostedFounderCampaign(
   service: SyntheticAittaDBService,
   phaseState: "closed" | "open" = "open",
@@ -4614,11 +5173,172 @@ type FounderResourceResponse = Readonly<{
   cookie: string | null;
 }>;
 
+type InvestmentCollectionResponse = Readonly<{
+  document: InvestmentInterestCollectionDocument;
+  csrfToken: string | null;
+  cookie: string | null;
+}>;
+
+type InvestmentItemResponse = Readonly<{
+  document: InvestmentInterestItemDocument;
+  csrfToken: string | null;
+  cookie: string | null;
+}>;
+
+type InvestmentHtmlResponse = Readonly<{
+  html: string;
+  csrfToken: string;
+  cookie: string;
+}>;
+
 type OwnerWorkspaceResponse = Readonly<{
   document: OwnerPackageDocument;
   csrfToken: string;
   cookie: string;
 }>;
+
+function investmentResource(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+): Promise<InvestmentCollectionResponse>;
+function investmentResource(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  pathname: string,
+): Promise<InvestmentItemResponse>;
+async function investmentResource(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  pathname = INVESTMENT_INTEREST_PATH,
+): Promise<InvestmentCollectionResponse | InvestmentItemResponse> {
+  const response = await worker.fetch(
+    participantRequest(pathname),
+    env,
+    executionContext,
+  );
+  assert.equal(response.status, 200);
+  const setCookie = response.headers.get("set-cookie");
+  const proof = Object.freeze({
+    document: await response.json() as
+      | InvestmentInterestCollectionDocument
+      | InvestmentInterestItemDocument,
+    csrfToken: response.headers.get(MUTATION_CSRF_HEADER),
+    cookie: setCookie === null ? null : cookieHeader(setCookie),
+  });
+  return proof as InvestmentCollectionResponse | InvestmentItemResponse;
+}
+
+async function submitInvestmentMutation(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  resource: Readonly<{ csrfToken: string | null; cookie: string | null }>,
+  action: TestAction,
+  body: Readonly<Record<string, unknown>>,
+  options: Readonly<{
+    cookie?: string | null;
+    csrfToken?: string | null;
+    origin?: string;
+    subject?: string;
+    email?: string;
+    accept?: "application/json" | "text/html";
+  }> = {},
+): Promise<Response> {
+  const cookie = Object.hasOwn(options, "cookie")
+    ? options.cookie ?? null
+    : resource.cookie;
+  const csrfToken = Object.hasOwn(options, "csrfToken")
+    ? options.csrfToken ?? null
+    : resource.csrfToken;
+  const headers = new Headers({
+    accept: options.accept ?? "application/json",
+    "content-type": "application/json",
+    origin: options.origin ?? APP_ORIGIN,
+    "oai-authenticated-user-id": options.subject ?? PARTICIPANT_SUBJECT,
+    "oai-authenticated-user-email": options.email ?? PARTICIPANT_EMAIL,
+  });
+  if (cookie !== null) headers.set("cookie", cookie);
+  if (csrfToken !== null) headers.set(MUTATION_CSRF_HEADER, csrfToken);
+  return worker.fetch(
+    new Request(action.href, {
+      method: action.method,
+      headers,
+      body: JSON.stringify(body),
+    }),
+    env,
+    executionContext,
+  );
+}
+
+async function investmentHtmlResource(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  pathname = INVESTMENT_INTEREST_PATH,
+): Promise<InvestmentHtmlResponse> {
+  const response = await worker.fetch(
+    participantHtmlRequest(pathname),
+    env,
+    executionContext,
+  );
+  assert.equal(response.status, 200);
+  const setCookie = response.headers.get("set-cookie");
+  assert(setCookie);
+  const html = await response.text();
+  const tokens = [...html.matchAll(
+    new RegExp(
+      `<input name="${MUTATION_CSRF_FIELD}" type="hidden" value="([^"]+)">`,
+      "gu",
+    ),
+  )].map((match) => match[1] ?? "");
+  assert.ok(tokens.length > 0);
+  assert.equal(new Set(tokens).size, 1);
+  const csrfToken = tokens[0];
+  assert(csrfToken);
+  return Object.freeze({
+    html,
+    csrfToken,
+    cookie: cookieHeader(setCookie),
+  });
+}
+
+async function submitInvestmentForm(
+  worker: TestWorker,
+  env: InvestorAppEnv,
+  resource: InvestmentHtmlResponse,
+  action: TestAction,
+  body: Readonly<Record<string, unknown>>,
+): Promise<Response> {
+  const form = new URLSearchParams();
+  form.set(MUTATION_CSRF_FIELD, resource.csrfToken);
+  if (action.method !== "POST") form.set(MUTATION_METHOD_FIELD, action.method);
+  for (const [name, value] of Object.entries(body)) {
+    if (value !== null && value !== undefined) form.set(name, String(value));
+  }
+  return worker.fetch(
+    new Request(action.href, {
+      method: "POST",
+      headers: {
+        accept: "text/html",
+        "content-type": "application/x-www-form-urlencoded",
+        cookie: resource.cookie,
+        origin: APP_ORIGIN,
+        "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+        "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+      },
+      body: form,
+    }),
+    env,
+    executionContext,
+  );
+}
+
+function investmentItemPath(operationId: string): string {
+  return `${INVESTMENT_INTEREST_PATH}/${encodeURIComponent(operationId)}`;
+}
+
+function investmentHtmlActionNames(html: string): string[] {
+  return [...html.matchAll(/\bdata-action-name="([^"]+)"/gu)]
+    .map((match) => match[1] ?? "");
+}
 
 async function founderResource(
   worker: TestWorker,
@@ -5253,6 +5973,16 @@ function participantRequest(pathname: string): Request {
     PARTICIPANT_SUBJECT,
     PARTICIPANT_EMAIL,
   );
+}
+
+function participantHtmlRequest(pathname: string): Request {
+  return new Request(`${APP_ORIGIN}${pathname}`, {
+    headers: {
+      accept: "text/html",
+      "oai-authenticated-user-id": PARTICIPANT_SUBJECT,
+      "oai-authenticated-user-email": PARTICIPANT_EMAIL,
+    },
+  });
 }
 
 function participantRequestFor(

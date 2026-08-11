@@ -3,10 +3,15 @@ import {
   parseStableId,
   type ActorSubject,
 } from "../domain/foundation.ts";
+import type { AmountConfiguration } from "../domain/amount-aggregate-configuration.ts";
 import type {
   ContributionAreaChoice,
   FounderApplicationId,
 } from "../domain/founder-application.ts";
+import type {
+  InvestmentIndicationId,
+  TrustedPackageAcknowledgmentContext,
+} from "../domain/investment-indication.ts";
 import { isConfiguredOwner } from "../domain/owner-identity.ts";
 import {
   authorizeParticipantAccess,
@@ -30,6 +35,7 @@ import {
   FOUNDER_INTEREST_PATH,
   FOUNDER_SECONDARY_AREAS_FIELD,
 } from "../domain/participant-founder-interest-resource.ts";
+import { INVESTMENT_INTEREST_PATH } from "../domain/participant-investment-interest-resource.ts";
 import { resolveAppOrigin, withAppOrigin } from "../http/app-origin.ts";
 import { withRuntimeCapabilities } from "../http/runtime-capabilities.ts";
 import { withRuntimeCampaign } from "../http/runtime-campaign.ts";
@@ -46,7 +52,10 @@ import type {
   PublicCampaignStateReader,
   PublishedPublicCampaignState,
 } from "../repositories/storage-public-campaign-state-reader.ts";
-import type { ParticipantRequestRepositoryScope } from "../repositories/storage-application-repository-factory.ts";
+import type {
+  ParticipantPackageAcknowledgmentRepositories,
+  ParticipantRequestRepositoryScope,
+} from "../repositories/storage-application-repository-factory.ts";
 import type { ParticipantRepository } from "../repositories/in-memory-participant-repository.ts";
 import {
   StorageFailure,
@@ -112,6 +121,10 @@ import {
   type ParticipantRegistrationRouteDependencies,
 } from "./routes/participant.ts";
 import { createParticipantFounderInterestService } from "./founder-interest-service.ts";
+import {
+  createParticipantInvestmentInterestService,
+  type InvestmentInterestPermissions,
+} from "./investment-interest-service.ts";
 import {
   createOwnerOAuthProofRouteHandler,
   type OwnerOAuthProofRouteDependencies,
@@ -289,6 +302,22 @@ export function createApplicationWorker(
       const participantFounderInterestAvailable =
         participantFounderInterest !== undefined &&
         participantFounderInterest !== null;
+      const participantInvestmentInterests =
+        dependencies.dispatchRoute === undefined
+          ? dependencies.participantInvestmentInterests ??
+            await runtimeParticipantInvestmentInterestRoute(
+              applicationRuntime,
+              actor,
+              isOwner,
+              participantAccess,
+              resourceUrl,
+              url.pathname,
+              participantRequest,
+            )
+          : undefined;
+      const participantInvestmentInterestsAvailable =
+        participantInvestmentInterests !== undefined &&
+        participantInvestmentInterests !== null;
       const renderEnvironment = applicationRenderEnvironment(env);
       const campaignEditorAvailable = campaignWorkspace !== null;
       const renderApplication: ApplicationRouteContext["renderApplication"] = (
@@ -364,6 +393,7 @@ export function createApplicationWorker(
               ownerAuditHistory,
               ownerFounderReview,
               participantFounderInterest ?? null,
+              participantInvestmentInterests ?? null,
               {
                 owner: ownerPackage,
                 participantReader: participantPackageReader,
@@ -450,6 +480,7 @@ function createInjectedRouteDispatcher(
     | FounderApplicationReviewCollectionRepository
     | undefined,
   participantFounderInterest: FounderInterestRouteDependencies | null,
+  participantInvestmentInterests: InvestmentInterestRouteDependencies | null,
   packageRoutes: ResolvedPackageRoutes,
   available: InjectedRouteAvailability,
 ): ApplicationRouteHandler {
@@ -481,9 +512,9 @@ function createInjectedRouteDispatcher(
               participantFounderInterest,
             )]
           : []),
-        ...(dependencies.participantInvestmentInterests
+        ...(participantInvestmentInterests
           ? [createInvestmentInterestRouteHandler(
-              dependencies.participantInvestmentInterests,
+              participantInvestmentInterests,
             )]
           : []),
       ],
@@ -804,6 +835,219 @@ function unavailableFounderInterestRoute(): FounderInterestRouteDependencies {
     },
     csrfTokenFor: () => null,
   });
+}
+
+async function runtimeParticipantInvestmentInterestRoute(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  participantAccess: AuthorizedParticipantAccess | null,
+  resourceUrl: string,
+  pathname: string,
+  participantRequest: ParticipantRequestRepositoryScope | null,
+): Promise<InvestmentInterestRouteDependencies | null> {
+  const investmentResource = pathname === INVESTMENT_INTEREST_PATH ||
+    pathname.startsWith(`${INVESTMENT_INTEREST_PATH}/`);
+  if (
+    runtime === null ||
+    (pathname !== "/participant" && !investmentResource)
+  ) {
+    return null;
+  }
+  const unavailableRoute = investmentResource
+    ? unavailableInvestmentInterestRoute()
+    : null;
+  if (
+    actor === null ||
+    isOwner ||
+    participantAccess === null ||
+    participantAccess.subject !== actor.userId ||
+    participantAccess.accountStatus !== "active" ||
+    (participantAccess.declaredInterest !== "investor" &&
+      participantAccess.declaredInterest !== "both")
+  ) {
+    return unavailableRoute;
+  }
+
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (
+    !account.ok ||
+    participantAccess.email !== account.value.accountEmailLabel
+  ) {
+    return unavailableRoute;
+  }
+
+  try {
+    const repositories = runtime.repositoryFactory;
+    const campaign = await repositories.campaignRepository().readSetup();
+    if (campaign === null) return unavailableRoute;
+    const amountConfiguration = campaign.setup.amountAggregate.amount;
+    const participantScope = requiredParticipantRequest(participantRequest);
+    const participant = participantScope.participantProfileRepository();
+    const acknowledgments = participantScope.participantPackageAcknowledgments(
+      account.value.subject,
+    );
+    const interests = repositories.participantInvestmentRepository(
+      account.value.subject,
+      amountConfiguration,
+    );
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "participant" as const,
+      subject: account.value.subject,
+    });
+
+    return Object.freeze({
+      serviceFor(candidateSubject) {
+        if (candidateSubject !== account.value.subject) {
+          throw new Error("Investment interests are unavailable.");
+        }
+        return createParticipantInvestmentInterestService({
+          actorSubject: account.value.subject,
+          amountConfiguration,
+          reader: interests,
+          mutations: interests,
+          loadAcknowledgmentContext: () =>
+            loadInvestmentAcknowledgmentContext(
+              acknowledgments,
+              account.value.subject,
+            ),
+          loadPermissions: () => investmentInterestPermissions(
+            repositories,
+            participant,
+            account.value.subject,
+            campaign.revision,
+            amountConfiguration,
+          ),
+          indicationIdForOperation: investmentIndicationIdForOperation,
+          now: runtime.now,
+        });
+      },
+      verifyMutation: (request, limits) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          limits,
+        ),
+      csrfTokenFor: (request, candidateSubject) =>
+        candidateSubject === account.value.subject
+          ? runtime.mutationSession.issue(request, identity, appOrigin)
+          : Promise.resolve(null),
+      createOperationId: () => randomOperationId("investment-operation"),
+    });
+  } catch {
+    return unavailableRoute;
+  }
+}
+
+function unavailableInvestmentInterestRoute(): InvestmentInterestRouteDependencies {
+  return Object.freeze({
+    serviceFor() {
+      throw new StorageFailure("NOT_FOUND");
+    },
+    async verifyMutation() {
+      throw new StorageFailure("NOT_FOUND");
+    },
+    csrfTokenFor: () => null,
+  });
+}
+
+async function loadInvestmentAcknowledgmentContext(
+  repositories: ParticipantPackageAcknowledgmentRepositories,
+  subject: ActorSubject,
+): Promise<TrustedPackageAcknowledgmentContext | null> {
+  const first = await repositories.packages.current();
+  if (first === null) return null;
+  const latest = await repositories.acknowledgments.latest();
+  const second = await repositories.packages.current();
+  if (
+    second === null ||
+    first.revision !== second.revision ||
+    first.snapshot.id !== second.snapshot.id ||
+    first.snapshot.contentHash !== second.snapshot.contentHash ||
+    first.snapshot.requiredAcceptanceHash !==
+      second.snapshot.requiredAcceptanceHash ||
+    (latest !== null && latest.snapshot.participantSubject !== subject)
+  ) {
+    throw new StorageFailure("PRECONDITION_FAILED");
+  }
+  return Object.freeze({
+    currentVersion: second.snapshot,
+    latestAcceptance: latest?.snapshot ?? null,
+  });
+}
+
+async function investmentInterestPermissions(
+  repositories: ApplicationRuntimeDeploymentCapability["repositoryFactory"],
+  participant: Pick<ParticipantRepository, "current">,
+  subject: ActorSubject,
+  expectedCampaignRevision: number,
+  expectedAmountConfiguration: AmountConfiguration,
+): Promise<InvestmentInterestPermissions> {
+  const [campaign, currentParticipant] = await Promise.all([
+    repositories.campaignRepository().readSetup(),
+    participant.current(),
+  ]);
+  const permitted = campaign !== null &&
+    campaign.revision === expectedCampaignRevision &&
+    sameAmountConfiguration(
+      campaign.setup.amountAggregate.amount,
+      expectedAmountConfiguration,
+    ) &&
+    currentParticipant !== null &&
+    profilePermitsInvestor(currentParticipant.snapshot, subject) &&
+    campaign.setup.publicCampaign.published === true &&
+    campaign.setup.publicCampaign.status === "open" &&
+    campaign.setup.phases.some((phase) => {
+      const result = isPhaseAcceptingParticipation(
+        phase,
+        "investor",
+        currentParticipant.snapshot.country,
+      );
+      return result.ok && result.value;
+    });
+  return Object.freeze({
+    createPersonal: permitted,
+    createCompany: permitted,
+    reactivatePersonal: permitted,
+    reactivateCompany: permitted,
+  });
+}
+
+function profilePermitsInvestor(
+  profile: Readonly<{
+    subject: ActorSubject;
+    declaredInterest: string;
+    accountDeletionRequest: Readonly<{ state: string }>;
+  }>,
+  subject: ActorSubject,
+): boolean {
+  return profile.subject === subject &&
+    profile.accountDeletionRequest.state === "not-requested" &&
+    (profile.declaredInterest === "investor" ||
+      profile.declaredInterest === "both");
+}
+
+function sameAmountConfiguration(
+  left: AmountConfiguration,
+  right: AmountConfiguration,
+): boolean {
+  return left.currency === right.currency &&
+    left.minimum === right.minimum &&
+    left.increment === right.increment &&
+    left.maximum === right.maximum;
+}
+
+function investmentIndicationIdForOperation(
+  operationId: StorageOperationId,
+): InvestmentIndicationId {
+  const parsed = parseStableId<"investment-indication">(operationId);
+  if (!parsed.ok) throw new StorageFailure("UNAVAILABLE");
+  return parsed.value;
 }
 
 async function founderCreationAllowed(
