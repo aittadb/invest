@@ -45,7 +45,12 @@ import {
   parseCampaignSetup,
   type CampaignSetupRevision,
 } from "../repositories/in-memory-campaign-repository.ts";
-import { parseStorageOperationId } from "../domain/storage-adapter.ts";
+import {
+  parseStorageOperationId,
+  StorageFailure,
+  type StorageAdapter,
+} from "../domain/storage-adapter.ts";
+import { StoragePublicCampaignStateReader } from "../repositories/storage-public-campaign-state-reader.ts";
 import { explicitCampaignSetup } from "./support/campaign-repository-contract.ts";
 
 const executionContext: WorkerExecutionContext = {
@@ -676,6 +681,96 @@ test("public HTML and hypermedia share one sanitized aggregate projection", asyn
   );
 });
 
+test("the Worker renders schema-4 published campaign state without an aggregate", async () => {
+  const rendered: Request[] = [];
+  const legacy = legacyPublicPresentationFixture(true);
+  const worker = createApplicationWorker({
+    fetchApplication: async (request) => {
+      rendered.push(request);
+      return new Response("rendered");
+    },
+    fetchOptimizedImage: async () => new Response("image"),
+    publicCampaignStateReader: new StoragePublicCampaignStateReader(
+      legacy.storage,
+    ),
+  });
+  const env = testEnvironment();
+
+  const json = await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: { accept: "application/json" },
+    }),
+    env,
+    executionContext,
+  );
+  const document = await json.json();
+  assert.equal(document.data.published, true);
+  assert.equal(document.data.name, legacy.campaign.name);
+  assert.equal(document.data.aggregate_interest, null);
+
+  const html = await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: { accept: "text/html" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(await html.text(), "rendered");
+  assert.equal(rendered.length, 1);
+  assert.deepEqual(
+    campaignFromRuntimeHeader(
+      rendered[0]?.headers.get(CAMPAIGN_CONFIGURATION_HEADER) ?? null,
+    ),
+    legacy.campaign,
+  );
+  assert.equal(rendered[0]?.headers.get(PUBLIC_AGGREGATE_HEADER), null);
+  assert.equal(legacy.reads.aggregate, 0);
+});
+
+test("the Worker keeps schema-4 unpublished campaign state unavailable", async () => {
+  const rendered: Request[] = [];
+  const legacy = legacyPublicPresentationFixture(false);
+  const worker = createApplicationWorker({
+    fetchApplication: async (request) => {
+      rendered.push(request);
+      return new Response("rendered");
+    },
+    fetchOptimizedImage: async () => new Response("image"),
+    publicCampaignStateReader: new StoragePublicCampaignStateReader(
+      legacy.storage,
+    ),
+  });
+  const env = testEnvironment();
+
+  const json = await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: { accept: "application/json" },
+    }),
+    env,
+    executionContext,
+  );
+  const document = await json.json();
+  assert.equal(document.data.published, false);
+  assert.equal(document.data.name, null);
+  assert.equal(document.data.aggregate_interest, null);
+
+  const html = await worker.fetch(
+    new Request("https://campaign.example/", {
+      headers: { accept: "text/html" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(await html.text(), "rendered");
+  assert.equal(rendered.length, 1);
+  assert.equal(
+    rendered[0]?.headers.get(CAMPAIGN_CONFIGURATION_HEADER),
+    null,
+  );
+  assert.equal(rendered[0]?.headers.get(PUBLIC_AGGREGATE_HEADER), null);
+  assert.equal(legacy.reads.aggregate, 0);
+});
+
 test("the Worker resolves participant state from the trusted actor and replaces spoofed state", async () => {
   const renderedRequests: Request[] = [];
   const state = participantAuthorizationState(
@@ -888,4 +983,41 @@ function storedCampaignRevision(
     recordedAt: recordedAt.value,
     setup: setup.value,
   };
+}
+
+function legacyPublicPresentationFixture(published: boolean) {
+  const reads = { aggregate: 0 };
+  const campaign = Object.freeze({
+    ...syntheticPublicCampaign,
+    published,
+  });
+  const storage: StorageAdapter = {
+    async read(key) {
+      if (key.collection === "investment-aggregate-states") {
+        reads.aggregate += 1;
+        return null;
+      }
+      if (
+        key.collection !== "campaign-public-presentation" ||
+        key.id !== "configured-campaign"
+      ) return null;
+      return Object.freeze({
+        key: Object.freeze({ ...key }),
+        revision: 1,
+        value: Object.freeze({
+          kind: "campaign-public-presentation",
+          schemaVersion: 4,
+          revision: 1,
+          publicCampaign: campaign,
+        }),
+      });
+    },
+    async list() {
+      throw new StorageFailure("UNAVAILABLE");
+    },
+    async transact() {
+      throw new StorageFailure("UNAVAILABLE");
+    },
+  };
+  return Object.freeze({ campaign, reads, storage });
 }

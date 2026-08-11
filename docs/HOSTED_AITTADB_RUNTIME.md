@@ -326,9 +326,12 @@ server-replaced rendering headers are presentation signals, never authorization
 boundaries; generic runtime availability adds no browser header or navigation
 item.
 
-Public route composition receives only `publicCampaignReader()`. That reader is
-bound to `campaign-public-presentation/configured-campaign`; it cannot read the
-private current setup, immutable history, operation receipts, or audit records.
+Public root composition receives only `publicCampaignStateReader()`. That
+reader is bound to `campaign-public-presentation/configured-campaign` and the
+sanitized aggregate projection; it cannot read the private current setup,
+immutable history, operation receipts, or audit records. Exact schema-4 public
+presentation records remain readable without an aggregate lookup or write, and
+only a later owner save emits the schema-5 aggregate policy.
 Owner reads use the separate atomic repository only after trusted owner
 authorization. Anonymous callers receive `401`; authenticated non-owners receive
 the generic `404` surface before a private repository read.

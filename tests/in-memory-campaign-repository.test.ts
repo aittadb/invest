@@ -1106,7 +1106,7 @@ test("public projection reads expose only published presentation state", async (
   assert.equal(await publicReader.readPublishedCampaign(), null);
 });
 
-test("public presentation schema failures do not alter private setup evolution", async () => {
+test("malformed and unknown public presentation schemas do not alter private setup evolution", async () => {
   const state = new MemoryStorageState();
   const adapter = new DeterministicMemoryStorageAdapter(state, true);
   const owner = new DevelopmentInMemoryCampaignRepository(adapter);
@@ -1125,16 +1125,18 @@ test("public presentation schema failures do not alter private setup evolution",
   );
   assert(entry);
   const [key, record] = entry;
-  state.records.set(key, freezeRecord({
-    key: record.key,
-    revision: record.revision,
-    value: { ...record.value, schemaVersion: 4 },
-  }));
+  for (const schemaVersion of [4, 6]) {
+    state.records.set(key, freezeRecord({
+      key: record.key,
+      revision: record.revision,
+      value: { ...record.value, schemaVersion },
+    }));
 
-  const failure = await captureStorageFailure(() =>
-    publicReader.readPublishedProjection()
-  );
-  assert.equal(failure.code, "UNAVAILABLE");
+    const failure = await captureStorageFailure(() =>
+      publicReader.readPublishedProjection()
+    );
+    assert.equal(failure.code, "UNAVAILABLE");
+  }
   assert.equal((await owner.readSetup())?.revision, 1);
   assert.equal(
     (([...state.records.values()].find((candidate) =>

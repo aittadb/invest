@@ -149,6 +149,33 @@ test("published public state exposes only the configured sanitized aggregate", a
   assert.equal((await reader.readPublishedState())?.aggregate, null);
 });
 
+test("schema-4 published public state preserves campaign without reading an aggregate", async () => {
+  const fixture = legacyPublicPresentationFixture(true);
+
+  assert.deepEqual(
+    await new StoragePublicCampaignStateReader(fixture.storage)
+      .readPublishedState(),
+    {
+      campaign: fixture.campaign,
+      aggregate: null,
+    },
+  );
+  assert.equal(fixture.reads.publicPresentation, 2);
+  assert.equal(fixture.reads.aggregate, 0);
+});
+
+test("schema-4 unpublished public state remains hidden without reading an aggregate", async () => {
+  const fixture = legacyPublicPresentationFixture(false);
+
+  assert.equal(
+    await new StoragePublicCampaignStateReader(fixture.storage)
+      .readPublishedState(),
+    null,
+  );
+  assert.equal(fixture.reads.publicPresentation, 1);
+  assert.equal(fixture.reads.aggregate, 0);
+});
+
 test("public state retries a concurrent published-policy change as one projection", async () => {
   const state = new MemoryStorageState();
   const storage = new MemoryStorageAdapter(state);
@@ -386,4 +413,42 @@ function contribution(
     amount: amount as InvestmentAggregateContribution["amount"],
     currency: "SEK" as InvestmentAggregateContribution["currency"],
   });
+}
+
+function legacyPublicPresentationFixture(published: boolean) {
+  const reads = { publicPresentation: 0, aggregate: 0 };
+  const campaign = Object.freeze({
+    ...explicitCampaignSetup().publicCampaign,
+    published,
+  });
+  const storage: StorageAdapter = {
+    async read(key) {
+      if (key.collection === "investment-aggregate-states") {
+        reads.aggregate += 1;
+        return null;
+      }
+      if (
+        key.collection !== "campaign-public-presentation" ||
+        key.id !== "configured-campaign"
+      ) return null;
+      reads.publicPresentation += 1;
+      return Object.freeze({
+        key: Object.freeze({ ...key }),
+        revision: 1,
+        value: Object.freeze({
+          kind: "campaign-public-presentation",
+          schemaVersion: 4,
+          revision: 1,
+          publicCampaign: campaign,
+        }),
+      });
+    },
+    async list() {
+      throw new StorageFailure("UNAVAILABLE");
+    },
+    async transact() {
+      throw new StorageFailure("UNAVAILABLE");
+    },
+  };
+  return Object.freeze({ campaign, reads, storage });
 }

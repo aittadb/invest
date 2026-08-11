@@ -35,7 +35,10 @@ export class StoragePublicCampaignStateReader
       if (before === null) return null;
 
       let aggregate: SanitizedPublicInvestmentAggregate | null = null;
-      if (before.amountAggregate.publicAggregate.visibility !== "hidden") {
+      if (
+        before.amountAggregate !== null &&
+        before.amountAggregate.publicAggregate.visibility !== "hidden"
+      ) {
         try {
           aggregate = await new DevelopmentInMemoryAggregateRepository(
             this.#storage,

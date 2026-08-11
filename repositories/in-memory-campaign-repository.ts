@@ -42,6 +42,7 @@ import {
 } from "./in-memory-audit-notification-repositories.ts";
 
 const CAMPAIGN_SETUP_SCHEMA_VERSION = 4;
+const LEGACY_PUBLIC_PRESENTATION_SCHEMA_VERSION = 4;
 const PUBLIC_PRESENTATION_SCHEMA_VERSION = 5;
 const MAX_CAMPAIGN_PHASES = 32;
 const MAX_SERIALIZED_CAMPAIGN_SETUP_BYTES = 262_144;
@@ -119,11 +120,14 @@ const STORED_AUDITED_OPERATION_INTENT_KEYS = new Set([
   "actor",
   "transition",
 ]);
-const PUBLIC_PRESENTATION_KEYS = new Set([
+const LEGACY_PUBLIC_PRESENTATION_KEYS = new Set([
   "kind",
   "schemaVersion",
   "revision",
   "publicCampaign",
+]);
+const PUBLIC_PRESENTATION_KEYS = new Set([
+  ...LEGACY_PUBLIC_PRESENTATION_KEYS,
   "amountAggregate",
 ]);
 
@@ -202,7 +206,7 @@ export interface PublicCampaignPresentationReader {
 export type PublishedCampaignProjection = Readonly<{
   revision: number;
   publicCampaign: PublicCampaignConfiguration;
-  amountAggregate: AmountAggregateConfiguration;
+  amountAggregate: AmountAggregateConfiguration | null;
 }>;
 
 /** Public-only projection contract used to bind totals to published policy. */
@@ -1283,11 +1287,17 @@ function decodePublicPresentation(
   record: StorageRecord,
 ): PublishedCampaignProjection {
   const source = recordValue(record.value);
+  const schemaVersion = source?.schemaVersion;
+  const expectedKeys = schemaVersion === LEGACY_PUBLIC_PRESENTATION_SCHEMA_VERSION
+    ? LEGACY_PUBLIC_PRESENTATION_KEYS
+    : schemaVersion === PUBLIC_PRESENTATION_SCHEMA_VERSION
+    ? PUBLIC_PRESENTATION_KEYS
+    : null;
   if (
     source === null ||
-    !hasExactKeys(source, PUBLIC_PRESENTATION_KEYS) ||
+    expectedKeys === null ||
+    !hasExactKeys(source, expectedKeys) ||
     source.kind !== "campaign-public-presentation" ||
-    source.schemaVersion !== PUBLIC_PRESENTATION_SCHEMA_VERSION ||
     !Number.isSafeInteger(source.revision) ||
     (source.revision as number) < 1 ||
     record.key.collection !== PUBLIC_PRESENTATION_KEY.collection ||
@@ -1304,14 +1314,16 @@ function decodePublicPresentation(
   }
   const campaign = parsePublicCampaignConfiguration(serialized);
   if (campaign === null) throw new StorageFailure("UNAVAILABLE");
-  const amountAggregate = parseAmountAggregateConfiguration(
-    source.amountAggregate,
-  );
-  if (!amountAggregate.ok) throw new StorageFailure("UNAVAILABLE");
+  let amountAggregate: AmountAggregateConfiguration | null = null;
+  if (schemaVersion === PUBLIC_PRESENTATION_SCHEMA_VERSION) {
+    const parsed = parseAmountAggregateConfiguration(source.amountAggregate);
+    if (!parsed.ok) throw new StorageFailure("UNAVAILABLE");
+    amountAggregate = parsed.value;
+  }
   return deepFreeze({
     revision: source.revision as number,
     publicCampaign: campaign,
-    amountAggregate: amountAggregate.value,
+    amountAggregate,
   });
 }
 

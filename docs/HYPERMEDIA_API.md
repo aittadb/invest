@@ -88,7 +88,9 @@ The public campaign resource currently has this shape:
 
 `aggregate_interest` is `null` when the published policy hides totals or the current total is zero. When present, it is built only from the published display policy and atomic current aggregate, uses integer minor units, and carries explicit self-declared, unverified, and non-binding flags. It never contains identities, companies, notes, indication counts, moderation state, storage revisions, or backend detail. HTML renders the same amount, configured label and qualifier, and verification semantics, using integer quotient and remainder formatting rather than floating-point currency conversion.
 
-The public campaign and aggregate policy are read from one independently versioned public-presentation record. A concurrent policy publication is retried against its new revision so campaign copy and aggregate labels cannot be mixed across revisions. Aggregate storage corruption omits `aggregate_interest`; unavailable or unstable public presentation returns the ordinary unavailable campaign resource, with no backend error detail in either representation.
+The public campaign and aggregate policy are read from one independently versioned public-presentation record. Exact legacy schema-4 records continue to expose their published campaign but have no aggregate policy, so HTML and hypermedia omit `aggregate_interest` without reading aggregate storage; legacy unpublished records remain unavailable. A later owner save emits schema 5 with explicit aggregate policy. Malformed, hybrid, or unknown records fail closed rather than being upgraded or mutated during a read.
+
+A concurrent policy publication is retried against its new revision so campaign copy and aggregate labels cannot be mixed across revisions. Aggregate storage corruption omits `aggregate_interest`; unavailable or unstable public presentation returns the ordinary unavailable campaign resource, with no backend error detail in either representation.
 
 ## Participant Resources
 
