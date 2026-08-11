@@ -56,6 +56,7 @@ export type AuditResourceReference = Readonly<{
 export type ResourceTransition =
   | "created"
   | "updated"
+  | "deletion-requested"
   | "published"
   | "unpublished"
   | "withdrawn"
@@ -176,6 +177,7 @@ const AUDITED_RESOURCE_TYPES = [
 const RESOURCE_TRANSITIONS = [
   "created",
   "updated",
+  "deletion-requested",
   "published",
   "unpublished",
   "withdrawn",

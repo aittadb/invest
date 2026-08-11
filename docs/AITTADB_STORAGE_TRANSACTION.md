@@ -122,8 +122,12 @@ one contribution replacement per active item: at most 19 unique mutations.
 Withdrawn and rejected entries remain unchanged. The aggregate advances once
 for the complete set, while each affected contribution advances to the exact
 withdrawn indication revision. A stale outer commit therefore changes all of
-those records or none. The final profile, founder, audit, and retry-receipt
-composition remains the separate account-deletion coordinator.
+those records or none. The subject-bound account-deletion coordinator adds the
+two profile records, at most two founder records, one closed audit event, and
+one immutable operation receipt before the shared boundary's single commit.
+The maximum shape is exactly 25 mutations. A missing or malformed effect makes
+receipt replay unavailable; changed operation reuse conflicts, and
+response-loss recovery reads the receipt without repeating a write.
 
 The machine-readable `transaction_shape` declares:
 
