@@ -181,6 +181,7 @@ test("factory exposes only named application repository capabilities", async () 
   const ownerAuditEvents = factory.ownerAuditEvents();
   const publicCampaignStateReader = factory.publicCampaignStateReader();
   const founderReviews = factory.ownerFounderApplicationReviews();
+  const ownerFounderDetail = factory.ownerFounderApplicationReviewDetail();
   const ownerManualNotificationActivity =
     factory.ownerManualNotificationActivity();
   const subject = parseActorSubject("issuer.invalid/participant:factory");
@@ -218,6 +219,7 @@ test("factory exposes only named application repository capabilities", async () 
     "ownerIndicationReviews",
     "ownerIndicationModeration",
     "ownerFounderApplicationReviews",
+    "ownerFounderApplicationReviewDetail",
     "ownerManualNotificationActivity",
     "ownerAggregateReconciliation",
     "participantRequest",
@@ -239,6 +241,10 @@ test("factory exposes only named application repository capabilities", async () 
     publicCampaignStateReader,
   );
   assert.equal(
+    factory.ownerFounderApplicationReviewDetail(),
+    ownerFounderDetail,
+  );
+  assert.equal(
     factory.ownerManualNotificationActivity(),
     ownerManualNotificationActivity,
   );
@@ -254,6 +260,7 @@ test("factory exposes only named application repository capabilities", async () 
   assert.deepEqual(Reflect.ownKeys(publicCampaignStateReader), []);
   assert.deepEqual(Reflect.ownKeys(ownerIndicationReviews), []);
   assert.deepEqual(Reflect.ownKeys(founderReviews), []);
+  assert.deepEqual(Reflect.ownKeys(ownerFounderDetail), []);
   assert.deepEqual(Reflect.ownKeys(ownerManualNotificationActivity), [
     "storageKind",
     "activityConsistency",
@@ -283,6 +290,12 @@ test("factory exposes only named application repository capabilities", async () 
     assert.equal(property in founderReviews, false, property);
   }
   assert.equal(Object.values(founderReviews).includes(storage), false);
+  assert.equal(typeof ownerFounderDetail.get, "function");
+  assert.equal(Object.isFrozen(ownerFounderDetail), true);
+  for (const property of ["adapter", "storage", "read", "list", "transact"]) {
+    assert.equal(property in ownerFounderDetail, false, property);
+  }
+  assert.equal(Object.values(ownerFounderDetail).includes(storage), false);
   assert.deepEqual(Object.values(ownerManualNotificationActivity), [
     "storage-adapter",
     "atomic-notification-audit",
