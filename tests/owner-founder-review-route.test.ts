@@ -19,6 +19,7 @@ import type {
 import type { ApplicationRouteContext } from "../worker/contracts.ts";
 import {
   createOwnerFounderReviewCollectionRouteHandler,
+  createOwnerFounderReviewDetailRouteHandler,
   createOwnerFounderReviewRouteHandler,
 } from "../worker/routes/owner-founder-review.ts";
 import { createOwnerRouteHandler } from "../worker/routes/owner.ts";
@@ -269,6 +270,48 @@ test("collection failures are finite and do not disclose adapter detail", async 
     assert.equal(response.headers.get("referrer-policy"), "no-referrer");
   }
   assert.equal(calls, 2);
+});
+
+test("detail-only routing exposes no collection or unauthorized lookup", async () => {
+  const item = reviewItem();
+  const repository = new FakeFounderReviewRepository(item);
+  const handler = createOwnerFounderReviewDetailRouteHandler(repository);
+
+  assert.equal(await handler(context(
+    "https://invest.example/owner/founder-applications",
+    { accept: "application/json" },
+  )), null);
+  assert.equal(repository.listCalls, 0);
+  assert.equal(repository.getCalls, 0);
+
+  const detailUrl =
+    `https://invest.example/owner/founder-applications/${encodeURIComponent(item.reviewId)}`;
+  const detail = await requiredResponse(await handler(context(detailUrl, {
+    accept: "application/json",
+  })));
+  assert.equal(detail.status, 200);
+  assert.equal(repository.getCalls, 1);
+
+  const queried = await requiredResponse(await handler(context(
+    `${detailUrl}?private=${encodeURIComponent(PRIVATE_NOTE)}`,
+    { accept: "application/json" },
+  )));
+  assert.equal(queried.status, 400);
+  assert.equal((await queried.text()).includes(PRIVATE_NOTE), false);
+  assert.equal(repository.getCalls, 1);
+
+  for (const options of [
+    { actor: null, isOwner: false },
+    { actor: participantActor(), isOwner: false },
+  ] as const) {
+    const denied = await requiredResponse(await handler(context(detailUrl, {
+      ...options,
+      accept: "text/html",
+    })));
+    assert.equal(denied.status, options.actor === null ? 401 : 404);
+    assert.equal((await denied.text()).includes(PRIVATE_NOTE), false);
+  }
+  assert.equal(repository.getCalls, 1);
 });
 
 class FakeFounderReviewRepository
