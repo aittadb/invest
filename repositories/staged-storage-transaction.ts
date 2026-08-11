@@ -16,6 +16,7 @@ import {
   type StorageOperationId,
   type StoragePage,
   type StorageRecord,
+  type StorageFailureCode,
   type StorageTransactionRequest,
   type StorageTransactionResult,
 } from "../domain/storage-adapter.ts";
@@ -25,6 +26,11 @@ export const MAX_STAGED_STORAGE_TRANSACTION_BYTES = 1_048_576;
 const STORAGE_RECORD_KEYS = new Set(["key", "revision", "value"]);
 const STORAGE_KEY_KEYS = new Set(["collection", "id"]);
 const TRANSACTION_RESULT_KEYS = new Set(["replayed", "records"]);
+
+type SealedCommit = Readonly<{
+  request: StorageTransactionRequest;
+  expectedRecords: readonly (StorageRecord | null)[];
+}>;
 
 /**
  * In-request transaction overlay used to compose existing repositories into
@@ -38,6 +44,10 @@ export class StagedStorageTransaction implements StorageAdapter {
   readonly #records: (StorageRecord | null)[] = [];
   readonly #listedCollections = new Set<StorageCollection>();
   readonly #mutatedCollections = new Set<StorageCollection>();
+  #lifecycleTail: Promise<void> = Promise.resolve();
+  #pendingLifecycleTransitions = 0;
+  #sealedCommit: SealedCommit | null = null;
+  #commitInFlight: Promise<StorageTransactionResult> | null = null;
   #committed: StorageTransactionResult | null = null;
 
   constructor(storage: StorageAdapter, operationId: unknown) {
@@ -65,11 +75,14 @@ export class StagedStorageTransaction implements StorageAdapter {
 
   async list(request: StorageListRequest): Promise<StoragePage> {
     try {
-      assertStorageListBoundary(request);
-      if (this.#mutatedCollections.has(request.collection)) invalidRequest();
-      const page = await this.#storage.list(request);
-      this.#listedCollections.add(request.collection);
-      return page;
+      if (this.#sealedCommit !== null) conflict();
+      const snapshot = snapshotStorageListRequest(request);
+      return await this.#serializeLifecycle(async () => {
+        if (this.#mutatedCollections.has(snapshot.collection)) invalidRequest();
+        const page = await this.#storage.list(snapshot);
+        this.#listedCollections.add(snapshot.collection);
+        return page;
+      });
     } catch (error) {
       sanitizedFailure(error);
     }
@@ -79,55 +92,10 @@ export class StagedStorageTransaction implements StorageAdapter {
     request: StorageTransactionRequest,
   ): Promise<StorageTransactionResult> {
     try {
-      if (this.#committed !== null) conflict();
+      if (this.#sealedCommit !== null) conflict();
       const next = normalizeStorageTransactionRequest(request);
       if (next.operationId !== this.#operationId) invalidRequest();
-      if (
-        this.#mutations.length + next.mutations.length >
-          MAX_STORAGE_TRANSACTION_MUTATIONS
-      ) {
-        invalidRequest();
-      }
-
-      const combined = normalizeStorageTransactionRequest({
-        operationId: this.#operationId,
-        mutations: [...this.#mutations, ...next.mutations],
-      });
-      if (transactionBytes(combined) > MAX_STAGED_STORAGE_TRANSACTION_BYTES) {
-        invalidRequest();
-      }
-
-      for (const mutation of next.mutations) {
-        if (
-          mutation.type !== "check" &&
-          this.#listedCollections.has(mutation.key.collection)
-        ) {
-          invalidRequest();
-        }
-      }
-
-      const projected: (StorageRecord | null)[] = [];
-      const stagedOverlay = new Map<string, StorageRecord | null>();
-      for (const mutation of next.mutations) {
-        const current = await this.read(mutation.key);
-        const record = projectMutation(mutation, current);
-        projected.push(record);
-        if (mutation.type !== "check") {
-          stagedOverlay.set(storageKeyString(mutation.key), record);
-        }
-      }
-
-      this.#mutations.push(...next.mutations);
-      this.#records.push(...projected);
-      for (const [identity, record] of stagedOverlay) {
-        this.#overlay.set(identity, record);
-      }
-      for (const mutation of next.mutations) {
-        if (mutation.type !== "check") {
-          this.#mutatedCollections.add(mutation.key.collection);
-        }
-      }
-      return frozenResult(false, projected);
+      return await this.#serializeLifecycle(() => this.#stage(next));
     } catch (error) {
       sanitizedFailure(error);
     }
@@ -137,20 +105,120 @@ export class StagedStorageTransaction implements StorageAdapter {
   async commit(): Promise<StorageTransactionResult> {
     try {
       if (this.#committed !== null) return this.#committed;
-      if (this.#mutations.length < 1) invalidRequest();
-      const request = normalizeStorageTransactionRequest({
-        operationId: this.#operationId,
-        mutations: this.#mutations,
-      });
-      if (transactionBytes(request) > MAX_STAGED_STORAGE_TRANSACTION_BYTES) {
+      if (this.#pendingLifecycleTransitions !== 0) conflict();
+
+      if (this.#sealedCommit === null) {
+        if (this.#mutations.length < 1) invalidRequest();
+        const request = normalizeStorageTransactionRequest({
+          operationId: this.#operationId,
+          mutations: this.#mutations,
+        });
+        if (transactionBytes(request) > MAX_STAGED_STORAGE_TRANSACTION_BYTES) {
+          invalidRequest();
+        }
+        this.#sealedCommit = Object.freeze({
+          request,
+          expectedRecords: Object.freeze([...this.#records]),
+        });
+      }
+
+      if (this.#commitInFlight === null) {
+        const sealed = this.#sealedCommit;
+        this.#commitInFlight = Promise.resolve().then(() =>
+          this.#commitSealed(sealed)
+        );
+      }
+      const inFlight = this.#commitInFlight;
+      try {
+        const result = await inFlight;
+        this.#committed = result;
+        return result;
+      } finally {
+        if (this.#commitInFlight === inFlight) this.#commitInFlight = null;
+      }
+    } catch (error) {
+      sanitizedFailure(error);
+    }
+  }
+
+  async #stage(
+    next: StorageTransactionRequest,
+  ): Promise<StorageTransactionResult> {
+    if (
+      this.#mutations.length + next.mutations.length >
+        MAX_STORAGE_TRANSACTION_MUTATIONS
+    ) {
+      invalidRequest();
+    }
+
+    const combined = normalizeStorageTransactionRequest({
+      operationId: this.#operationId,
+      mutations: [...this.#mutations, ...next.mutations],
+    });
+    if (transactionBytes(combined) > MAX_STAGED_STORAGE_TRANSACTION_BYTES) {
+      invalidRequest();
+    }
+
+    for (const mutation of next.mutations) {
+      if (
+        mutation.type !== "check" &&
+        this.#listedCollections.has(mutation.key.collection)
+      ) {
         invalidRequest();
       }
-      const result = verifyCommitResult(
-        await this.#storage.transact(request),
-        this.#records,
+    }
+
+    const projected: (StorageRecord | null)[] = [];
+    const stagedOverlay = new Map<string, StorageRecord | null>();
+    for (const mutation of next.mutations) {
+      const current = await this.read(mutation.key);
+      const record = projectMutation(mutation, current);
+      projected.push(record);
+      if (mutation.type !== "check") {
+        stagedOverlay.set(storageKeyString(mutation.key), record);
+      }
+    }
+
+    this.#mutations.push(...next.mutations);
+    this.#records.push(...projected);
+    for (const [identity, record] of stagedOverlay) {
+      this.#overlay.set(identity, record);
+    }
+    for (const mutation of next.mutations) {
+      if (mutation.type !== "check") {
+        this.#mutatedCollections.add(mutation.key.collection);
+      }
+    }
+    return frozenResult(false, projected);
+  }
+
+  async #serializeLifecycle<Result>(
+    transition: () => Promise<Result>,
+  ): Promise<Result> {
+    if (this.#sealedCommit !== null) conflict();
+    const predecessor = this.#lifecycleTail;
+    let release = (): void => undefined;
+    this.#lifecycleTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.#pendingLifecycleTransitions += 1;
+
+    await predecessor;
+    try {
+      if (this.#sealedCommit !== null) conflict();
+      return await transition();
+    } finally {
+      this.#pendingLifecycleTransitions -= 1;
+      release();
+    }
+  }
+
+  async #commitSealed(sealed: SealedCommit): Promise<StorageTransactionResult> {
+    try {
+      return verifyCommitResult(
+        await this.#storage.transact(sealed.request),
+        sealed.expectedRecords,
       );
-      this.#committed = result;
-      return result;
     } catch (error) {
       sanitizedFailure(error);
     }
@@ -255,6 +323,19 @@ function requiredStorageKey(value: unknown): StorageKey {
   const parsed = parseStorageKey(source.collection, source.id);
   if (!parsed.ok) invalidRequest();
   return Object.freeze({ ...parsed.value });
+}
+
+function snapshotStorageListRequest(
+  request: StorageListRequest,
+): StorageListRequest {
+  const collection = request.collection;
+  const limit = request.limit;
+  const cursor = request.cursor;
+  const snapshot = Object.freeze(cursor === undefined
+    ? { collection, limit }
+    : { collection, limit, cursor });
+  assertStorageListBoundary(snapshot);
+  return snapshot;
 }
 
 function snapshotStorageDocument(value: unknown): StorageDocument {
@@ -411,21 +492,41 @@ function requiredDataRecord(value: unknown): Record<string, unknown> {
 }
 
 function requiredStorageAdapter(value: StorageAdapter): StorageAdapter {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    typeof value.read !== "function" ||
-    typeof value.list !== "function" ||
-    typeof value.transact !== "function"
-  ) {
+  try {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      typeof value.read !== "function" ||
+      typeof value.list !== "function" ||
+      typeof value.transact !== "function"
+    ) {
+      invalidRequest();
+    }
+    return value;
+  } catch {
     invalidRequest();
   }
-  return value;
 }
 
 function sanitizedFailure(error: unknown): never {
-  if (error instanceof StorageFailure) throw new StorageFailure(error.code);
-  throw new StorageFailure("UNAVAILABLE");
+  let code: StorageFailureCode | null = null;
+  try {
+    if (error instanceof StorageFailure) {
+      const candidate: unknown = error.code;
+      if (isStorageFailureCode(candidate)) code = candidate;
+    }
+  } catch {
+    code = null;
+  }
+  throw new StorageFailure(code ?? "UNAVAILABLE");
+}
+
+function isStorageFailureCode(value: unknown): value is StorageFailureCode {
+  return value === "INVALID_REQUEST" ||
+    value === "NOT_FOUND" ||
+    value === "CONFLICT" ||
+    value === "PRECONDITION_FAILED" ||
+    value === "UNAVAILABLE";
 }
 
 function invalidRequest(): never {

@@ -228,9 +228,12 @@ adapter receives no mutation until `commit()`. The staging boundary keeps one
 operation ID, rejects duplicate keys across separate repository calls, permits
 at most 25 total entries and 1,048,576 serialized bytes, and refuses a list and
 write combination on the same collection because it cannot project a cursor
-page safely. The final response must contain the exact record or `null` at every
-ordered position. A lost or malformed response leaves the same immutable
-request available for an idempotent retry; only a verified response is cached.
+page safely. List and staging transitions execute serially, and callers must let
+them settle before commit. `commit()` synchronously seals one immutable request,
+rejects later list or staging work, and coalesces callers onto one in-flight
+adapter call. The final response must contain the exact record or `null` at every
+ordered position. A lost or malformed response leaves that sealed request
+available for an idempotent retry; only a verified response is cached.
 
 A successful response has type `bounded-storage-transaction`:
 
