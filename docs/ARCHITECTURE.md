@@ -358,6 +358,16 @@ Setup readiness is distinct from open or closed state: configuration may be comp
 
 An adapter instance is already bound to one backend credential and grant set. Foreign and missing records therefore have the same read and mutation shape, while fixed public failures contain no keys, values, or credentials. The reusable contract harness runs unchanged against deterministic fakes and production adapters and deliberately checks authorization, duplicate keys, stale and missing checks, maximum mutation count, atomic rollback, disclosure, idempotency, and pagination behavior.
 
+`repositories/staged-storage-transaction.ts` is the bounded request-local
+composition primitive for operations that span existing narrow repositories.
+It implements `StorageAdapter` over an immutable overlay, accepts puts,
+deletes, and non-mutating checks under one operation ID, and makes no durable
+call until its explicit commit. Duplicate keys across staged calls, stale
+revisions, same-collection list/write ambiguity, more than 25 entries, more
+than 1,048,576 serialized bytes, and malformed or reordered results fail
+closed. A final response loss can retry the identical transaction and retain
+the backend's exact `replayed` evidence; fixed failures retain no adapter cause.
+
 `repositories/aittadb-storage-adapter.ts` implements that interface over the versioned bounded AittaDB hypermedia protocol. It takes only an exact logical issuer, same-issuer discovery resource, optional backend transport origin, token-producing closure, fetch capability, and optional finite software timeout. The logical issuer remains authoritative when transport is mapped; all action targets and page identities are discovered and validated rather than hard-coded. Exact runtime mutation shapes are copied once into an immutable data-only snapshot, while operation and key grammar, finite JSON, per-record and transaction sizes, token/fetch waits, streamed bytes, chunk count, and stream time all have finite compile-time or advertised bounds. Redirects are manual and rejected, media and UTF-8 are strict, early header failures cancel their bodies, and failures retain no response or exception cause. Concurrent discovery is coalesced into one normalized result, failed discovery remains retryable, and bearer values are neither cached by the adapter nor exposed outside request headers. See `docs/AITTADB_STORAGE_ADAPTER.md`.
 
 ### Audit and manual notifications
