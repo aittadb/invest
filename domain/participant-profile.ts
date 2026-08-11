@@ -383,7 +383,8 @@ export function isParticipantProfileDescendantProjection(
   }
 
   if (ancestor.accountDeletionRequest.state === "requested") {
-    return sameEditableProfileFields(ancestor, descendant) &&
+    return revisionDelta === 1 &&
+      sameEditableProfileFields(ancestor, descendant) &&
       ancestor.marketingConsent.state === "granted" &&
       descendant.marketingConsent.state === "withdrawn" &&
       descendant.updatedAt === descendant.marketingConsent.withdrawnAt;

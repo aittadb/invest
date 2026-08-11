@@ -282,6 +282,14 @@ test("descendant projections preserve irreversible profile history", () => {
     ),
     true,
   );
+  assert.equal(
+    isParticipantProfileDescendantProjection(
+      deletionBeforeWithdrawal,
+      withdrawalAfterDeletion,
+      2,
+    ),
+    false,
+  );
 
   const laterUpdateResult = updateParticipantProfile(
     withdrawn,
