@@ -13,6 +13,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 
 import {
+  AITTADB_HYPERMEDIA_API_VERSION,
+  AITTADB_HYPERMEDIA_MEDIA_TYPE,
+} from "../domain/aittadb-storage-protocol.ts";
+import {
   StorageFailure,
   normalizeStorageTransactionRequest,
   parseStorageCollection,
@@ -40,6 +44,9 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const EXPIRY_SKEW_SECONDS = 30;
 const MAX_FIXTURES = 99;
 const GIT_PROBE_TIMEOUT_MS = 5_000;
+const SAFETY_ASSERTION_PATH = "/.well-known/aittadb-proof-safety";
+const MAX_SAFETY_ASSERTION_BYTES = 8_192;
+const MAX_SAFETY_ASSERTION_CHUNKS = 64;
 const NON_PRODUCTION_HOST_LABELS = new Set([
   "acceptance",
   "dev",
@@ -166,8 +173,9 @@ export async function runHostedStorageAdapterProof(
   configuration: HostedStorageProofConfiguration,
   dependencies: HostedStorageProofDependencies = {},
 ): Promise<HostedStorageProofReport> {
+  let runnableConfiguration: HostedStorageProofConfiguration;
   try {
-    assertRunnableConfiguration(configuration);
+    runnableConfiguration = snapshotRunnableConfiguration(configuration);
   } catch {
     return configurationFailureReport();
   }
@@ -178,8 +186,14 @@ export async function runHostedStorageAdapterProof(
   });
   let fixtureCount = 0;
   try {
+    const fetch = dependencies.fetch ?? globalThis.fetch;
+    await verifyDisposableAcceptanceTarget(
+      runnableConfiguration,
+      proof.id,
+      fetch,
+    );
     const createAdapter = dependencies.createAdapter ?? defaultAdapterFactory(
-      dependencies.fetch ?? globalThis.fetch,
+      fetch,
       dependencies.now ?? (() => new Date()),
     );
     const verifyContract = dependencies.verifyContract ?? verifyStorageAdapterContract;
@@ -191,12 +205,12 @@ export async function runHostedStorageAdapterProof(
       const operationPrefix = `${inventory.operation_prefix}${fixture}:`;
       return Object.freeze({
         owner: new ProofNamespacedStorageAdapter(
-          createAdapter("owner", configuration),
+          createAdapter("owner", runnableConfiguration),
           collectionPrefix,
           operationPrefix,
         ),
         outsider: new ProofNamespacedStorageAdapter(
-          createAdapter("outsider", configuration),
+          createAdapter("outsider", runnableConfiguration),
           collectionPrefix,
           operationPrefix,
         ),
@@ -403,9 +417,9 @@ function parseConfiguration(value: unknown): HostedStorageProofConfiguration {
   });
 }
 
-function assertRunnableConfiguration(
+function snapshotRunnableConfiguration(
   value: unknown,
-): asserts value is HostedStorageProofConfiguration {
+): HostedStorageProofConfiguration {
   const root = exactObject(value, [
     "entryHref",
     "issuer",
@@ -418,13 +432,10 @@ function assertRunnableConfiguration(
     configurationInvalid();
   }
   const issuer = exactDisposableAcceptanceOrigin(root.issuer);
-  if (
-    root.entryHref !== exactEntryHref(root.entryHref, issuer) ||
-    root.transportOrigin !== undefined &&
-      root.transportOrigin !== exactDisposableAcceptanceOrigin(
-        root.transportOrigin,
-      )
-  ) configurationInvalid();
+  const entryHref = exactEntryHref(root.entryHref, issuer);
+  const transportOrigin = root.transportOrigin === undefined
+    ? undefined
+    : exactDisposableAcceptanceOrigin(root.transportOrigin);
   const owner = exactParsedClient(root.ownerClient);
   const outsider = exactParsedClient(root.outsiderClient);
   if (new Set([
@@ -433,6 +444,132 @@ function assertRunnableConfiguration(
     outsider.clientId,
     outsider.clientSecret,
   ]).size !== 4) configurationInvalid();
+  return Object.freeze({
+    targetEnvironment: "disposable-acceptance",
+    issuer,
+    transportOrigin,
+    entryHref,
+    ownerClient: owner,
+    outsiderClient: outsider,
+  });
+}
+
+async function verifyDisposableAcceptanceTarget(
+  configuration: HostedStorageProofConfiguration,
+  proofId: string,
+  fetch: typeof globalThis.fetch,
+): Promise<void> {
+  const logicalTarget = new URL(SAFETY_ASSERTION_PATH, configuration.issuer);
+  logicalTarget.searchParams.set("challenge", proofId);
+  const transportTarget = new URL(logicalTarget);
+  if (configuration.transportOrigin !== undefined) {
+    const transportOrigin = new URL(configuration.transportOrigin);
+    transportTarget.protocol = transportOrigin.protocol;
+    transportTarget.host = transportOrigin.host;
+  }
+
+  const controller = new AbortController();
+  let rejectDeadline: (() => void) | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = () => reject(new Error("deadline"));
+  });
+  const timeout = setTimeout(() => {
+    controller.abort();
+    rejectDeadline?.();
+  }, REQUEST_TIMEOUT_MS);
+  try {
+    const response = await Promise.race([
+      fetch(transportTarget.href, {
+        method: "GET",
+        headers: {
+          Accept: AITTADB_HYPERMEDIA_MEDIA_TYPE,
+          "Cache-Control": "no-store",
+        },
+        redirect: "manual",
+        signal: controller.signal,
+      }),
+      deadline,
+    ]);
+    if (
+      !(response instanceof Response) ||
+      response.status !== 200 ||
+      response.redirected ||
+      response.url !== "" && response.url !== transportTarget.href ||
+      response.headers.get("content-type") !== AITTADB_HYPERMEDIA_MEDIA_TYPE ||
+      response.headers.get("cache-control") !== "no-store"
+    ) unavailable();
+    const length = response.headers.get("content-length");
+    if (
+      length !== null &&
+      (!/^(?:0|[1-9][0-9]*)$/u.test(length) ||
+        Number(length) > MAX_SAFETY_ASSERTION_BYTES)
+    ) unavailable();
+    const source = await Promise.race([
+      readBoundedSafetyAssertion(response),
+      deadline,
+    ]);
+    assertUniqueJsonMembers(source);
+    const document = exactObject(JSON.parse(source) as unknown, [
+      "actions",
+      "api_version",
+      "data",
+      "id",
+      "links",
+      "type",
+    ]);
+    const data = exactObject(document.data, [
+      "challenge",
+      "environment",
+      "issuer",
+      "storage_contract_proofs",
+    ]);
+    if (
+      document.api_version !== AITTADB_HYPERMEDIA_API_VERSION ||
+      document.type !== "acceptance-proof-safety" ||
+      document.id !== logicalTarget.href ||
+      data.challenge !== proofId ||
+      data.environment !== "disposable-acceptance" ||
+      data.issuer !== configuration.issuer ||
+      data.storage_contract_proofs !== "allowed" ||
+      !isExactEmptyArray(document.links) ||
+      !isExactEmptyArray(document.actions)
+    ) unavailable();
+  } catch {
+    unavailable();
+  } finally {
+    clearTimeout(timeout);
+    rejectDeadline = undefined;
+  }
+}
+
+async function readBoundedSafetyAssertion(response: Response): Promise<string> {
+  if (response.body === null) unavailable();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  let reads = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      reads += 1;
+      if (reads > MAX_SAFETY_ASSERTION_CHUNKS) unavailable();
+      if (result.done) break;
+      if (!(result.value instanceof Uint8Array)) unavailable();
+      bytes += result.value.byteLength;
+      if (bytes > MAX_SAFETY_ASSERTION_BYTES) unavailable();
+      chunks.push(result.value);
+    }
+    const body = new Uint8Array(bytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } catch {
+    void reader.cancel().catch(() => undefined);
+    unavailable();
+  }
 }
 
 function assertUniqueJsonMembers(source: string): void {
@@ -537,9 +674,29 @@ function exactObject(
     typeof value !== "object" ||
     Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Object.prototype ||
-    Object.keys(value).sort().join(",") !== [...keys].sort().join(",")
+    Object.getOwnPropertySymbols(value).length !== 0
   ) configurationInvalid();
-  return value as Record<string, unknown>;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (
+    Object.keys(descriptors).sort().join(",") !== [...keys].sort().join(",") ||
+    keys.some((key) => {
+      const descriptor = descriptors[key];
+      return descriptor === undefined ||
+        !("value" in descriptor) ||
+        descriptor.enumerable !== true;
+    })
+  ) configurationInvalid();
+  return Object.freeze(Object.fromEntries(
+    keys.map((key) => [key, descriptors[key]?.value]),
+  ));
+}
+
+function isExactEmptyArray(value: unknown): value is readonly [] {
+  return Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Array.prototype &&
+    value.length === 0 &&
+    Object.keys(value).length === 0 &&
+    Object.getOwnPropertySymbols(value).length === 0;
 }
 
 function exactClient(value: unknown): HostedStorageProofClient {

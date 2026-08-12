@@ -178,6 +178,17 @@ INVEST_HOSTED_STORAGE_PROOF_CONFIG_FILE=/private/path/invest-hosted-storage-proo
   npm run --silent hosted-storage:prove
 ```
 
+Hostname labels and the local target marker are defense in depth, not proof of
+deployment class. Before constructing an adapter or requesting a token, the
+runner sends a fresh random challenge to the actual configured transport at
+`/.well-known/aittadb-proof-safety`. The server must return an exact no-store
+versioned hypermedia assertion bound to that challenge, the logical request URL,
+the logical issuer, `disposable-acceptance`, and
+`storage_contract_proofs: allowed`, with no links or actions. A missing,
+redirected, cached, malformed, stale, crossed, or denying assertion stops the
+run before any fixture is created. Production deployments must not expose an
+allowing assertion.
+
 The command emits exactly one bounded JSON line. Success contains only a random
 synthetic proof ID, contract name, fixture count, collection prefix, and
 operation prefix. Failures contain only a fixed status code and, after fixture
@@ -194,4 +205,5 @@ contract. Preserve the output in the private acceptance evidence channel until
 all prefixed records, durable operation receipts, and both proof credentials
 are removed or intentionally retained with a bounded purpose and expiry. Delete
 the temporary configuration file after the proof. The runner rejects production
-issuer hostnames; the command is never authorized for a production deployment.
+issuer hostnames and requires the independent server assertion; the command is
+never authorized for a production deployment.

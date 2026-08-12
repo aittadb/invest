@@ -14,6 +14,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  AITTADB_HYPERMEDIA_API_VERSION,
   AITTADB_HYPERMEDIA_MEDIA_TYPE,
   storageProtocolErrorDocument,
 } from "../domain/aittadb-storage-protocol.ts";
@@ -192,9 +193,11 @@ test("proof configuration failures never repeat credential-bearing input", () =>
 });
 
 test("runner executes the unchanged contract through isolated synthetic names", async () => {
+  const configuration = parsedConfiguration();
   const states: MemoryStorageState[] = [];
-  const report = await runHostedStorageAdapterProof(parsedConfiguration(), {
+  const report = await runHostedStorageAdapterProof(configuration, {
     randomUUID: () => FIXED_UUID,
+    fetch: safetyAssertionFetch(configuration),
     createAdapter: (role) => {
       if (role === "outsider") return new DeniedStorageAdapter();
       const state = new MemoryStorageState();
@@ -259,6 +262,153 @@ test("runner rejects a programmatic production target before creating adapters",
   assert.equal(adapterCalls, 0);
 });
 
+test("runner closes one immutable configuration snapshot before async work", async () => {
+  const configuration = { ...parsedConfiguration() };
+  const observedIssuers: string[] = [];
+  const report = await runHostedStorageAdapterProof(configuration, {
+    randomUUID: () => FIXED_UUID,
+    fetch: safetyAssertionFetch(configuration, () => {
+      assert.equal(Reflect.set(configuration, "issuer", "https://aittadb.com"), true);
+      assert.equal(
+        Reflect.set(
+          configuration,
+          "entryHref",
+          "https://aittadb.com/bounded-storage",
+        ),
+        true,
+      );
+    }),
+    createAdapter: (_role, snapshot) => {
+      assert.notEqual(snapshot, configuration);
+      assert.equal(Object.isFrozen(snapshot), true);
+      observedIssuers.push(snapshot.issuer);
+      return new DeniedStorageAdapter();
+    },
+    verifyContract: async (createFixture) => {
+      createFixture();
+    },
+  });
+
+  assert.equal(report.status, "passed");
+  assert.deepEqual(observedIssuers, [
+    "https://storage.example.test",
+    "https://storage.example.test",
+  ]);
+
+  const accessorConfiguration = { ...parsedConfiguration() };
+  let targetCalls = 0;
+  Object.defineProperty(accessorConfiguration, "issuer", {
+    enumerable: true,
+    get: () => "https://storage.example.test",
+  });
+  const accessorReport = await runHostedStorageAdapterProof(accessorConfiguration, {
+    fetch: async () => {
+      targetCalls += 1;
+      return new Response(null, { status: 500 });
+    },
+  });
+  assert.deepEqual(accessorReport, {
+    status: "failed",
+    code: "configuration_invalid",
+  });
+  assert.equal(targetCalls, 0);
+});
+
+test("runner requires a fresh server assertion before adapter construction", async () => {
+  let adapterCalls = 0;
+  let requestCalls = 0;
+  const report = await runHostedStorageAdapterProof(parsedConfiguration(), {
+    randomUUID: () => FIXED_UUID,
+    fetch: async (input, init) => {
+      requestCalls += 1;
+      const request = new Request(input, init);
+      assert.equal(request.headers.get("authorization"), null);
+      assert.equal(request.headers.get("cookie"), null);
+      return new Response(null, { status: 404 });
+    },
+    createAdapter: () => {
+      adapterCalls += 1;
+      return new DeniedStorageAdapter();
+    },
+  });
+
+  assert.equal(report.status, "failed");
+  assert.equal(report.code, "proof_unavailable");
+  assert.equal(report.fixture_count, 0);
+  assert.equal(requestCalls, 1);
+  assert.equal(adapterCalls, 0);
+});
+
+test("runner rejects crossed, cached, and non-exact server assertions", async () => {
+  const configuration = parsedConfiguration();
+  const variants = [
+    {
+      name: "crossed challenge",
+      response(id: string, challenge: string) {
+        return safetyAssertionResponse(
+          configuration.issuer,
+          id,
+          `${challenge}-crossed`,
+        );
+      },
+    },
+    {
+      name: "crossed issuer",
+      response(id: string, challenge: string) {
+        return safetyAssertionResponse(
+          "https://other.example.test",
+          id,
+          challenge,
+        );
+      },
+    },
+    {
+      name: "cacheable response",
+      response(id: string, challenge: string) {
+        const response = safetyAssertionResponse(
+          configuration.issuer,
+          id,
+          challenge,
+        );
+        response.headers.set("cache-control", "max-age=60");
+        return response;
+      },
+    },
+    {
+      name: "extra document field",
+      response(id: string, challenge: string) {
+        const document = safetyAssertionDocument(
+          configuration.issuer,
+          id,
+          challenge,
+        );
+        return safetyResponse({ ...document, unexpected: true });
+      },
+    },
+  ];
+
+  for (const variant of variants) {
+    let adapterCalls = 0;
+    const report = await runHostedStorageAdapterProof(configuration, {
+      randomUUID: () => FIXED_UUID,
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        const logical = logicalProofUrl(configuration, request.url);
+        const challenge = logical.searchParams.get("challenge") ?? "";
+        return variant.response(logical.href, challenge);
+      },
+      createAdapter: () => {
+        adapterCalls += 1;
+        return new DeniedStorageAdapter();
+      },
+    });
+    assert.equal(report.status, "failed", variant.name);
+    assert.equal(report.code, "proof_unavailable", variant.name);
+    assert.equal(report.fixture_count, 0, variant.name);
+    assert.equal(adapterCalls, 0, variant.name);
+  }
+});
+
 test("default runner uses production adapters and exact role scopes", async () => {
   const configuration = parsedConfiguration();
   const ownerAccessToken = "synthetic-owner-proof-access-token";
@@ -278,6 +428,7 @@ test("default runner uses production adapters and exact role scopes", async () =
   let outsiderTokenRequests = 0;
   let outsiderDiscoveryRequests = 0;
   let outsiderDeniedRequests = 0;
+  let safetyAssertionRequests = 0;
 
   const fetch: typeof globalThis.fetch = async (input, init) => {
     const request = new Request(input, init);
@@ -287,6 +438,26 @@ test("default runner uses production adapters and exact role scopes", async () =
       logical.host = new URL(configuration.issuer).host;
     }
     const authorization = request.headers.get("authorization");
+    if (logical.pathname === "/.well-known/aittadb-proof-safety") {
+      safetyAssertionRequests += 1;
+      assert.equal(request.method, "GET");
+      assert.equal(authorization, null);
+      assert.equal(request.headers.get("cookie"), null);
+      assert.equal(
+        request.headers.get("accept"),
+        AITTADB_HYPERMEDIA_MEDIA_TYPE,
+      );
+      assert.equal(request.headers.get("cache-control"), "no-store");
+      assert.equal(
+        logical.searchParams.get("challenge"),
+        `storage-proof-${FIXED_UUID}`,
+      );
+      return safetyAssertionResponse(
+        configuration.issuer,
+        logical.href,
+        `storage-proof-${FIXED_UUID}`,
+      );
+    }
     if (logical.pathname === "/oauth/token") {
       const outsiderAuthorization =
         `Basic ${btoa(`${configuration.outsiderClient.clientId}:${configuration.outsiderClient.clientSecret}`)}`;
@@ -332,12 +503,15 @@ test("default runner uses production adapters and exact role scopes", async () =
   assert.equal(outsiderTokenRequests, 1);
   assert.equal(outsiderDiscoveryRequests, 1);
   assert.ok(outsiderDeniedRequests > 1);
+  assert.equal(safetyAssertionRequests, 1);
 });
 
 test("runner reports static failure codes and cleanup fields only", async () => {
+  const configuration = parsedConfiguration();
   const secret = syntheticSecret("contract-cause");
-  const report = await runHostedStorageAdapterProof(parsedConfiguration(), {
+  const report = await runHostedStorageAdapterProof(configuration, {
     randomUUID: () => FIXED_UUID,
+    fetch: safetyAssertionFetch(configuration),
     createAdapter: () => new DeniedStorageAdapter(),
     verifyContract: async (createFixture) => {
       createFixture();
@@ -354,8 +528,10 @@ test("runner reports static failure codes and cleanup fields only", async () => 
   assert.equal(output.includes("authorization"), false);
   assert.match(output, /cleanup_inventory/u);
 
-  const unavailable = await runHostedStorageAdapterProof(parsedConfiguration(), {
+  const unavailableConfiguration = parsedConfiguration();
+  const unavailable = await runHostedStorageAdapterProof(unavailableConfiguration, {
     randomUUID: () => FIXED_UUID,
+    fetch: safetyAssertionFetch(unavailableConfiguration),
     createAdapter: () => new DeniedStorageAdapter(),
     verifyContract: async () => {
       throw new Error(secret);
@@ -404,6 +580,74 @@ function protocolErrorResponse(): Response {
     status: 404,
     headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
   });
+}
+
+function safetyAssertionResponse(
+  issuer: string,
+  id: string,
+  challenge: string,
+): Response {
+  return safetyResponse(safetyAssertionDocument(issuer, id, challenge));
+}
+
+function safetyAssertionDocument(
+  issuer: string,
+  id: string,
+  challenge: string,
+) {
+  return {
+    api_version: AITTADB_HYPERMEDIA_API_VERSION,
+    type: "acceptance-proof-safety",
+    id,
+    data: {
+      issuer,
+      environment: "disposable-acceptance",
+      storage_contract_proofs: "allowed",
+      challenge,
+    },
+    links: [],
+    actions: [],
+  };
+}
+
+function safetyResponse(value: unknown): Response {
+  return new Response(JSON.stringify(value), {
+    headers: {
+      "cache-control": "no-store",
+      "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE,
+    },
+  });
+}
+
+function safetyAssertionFetch(
+  configuration: ReturnType<typeof parsedConfiguration>,
+  onRequest: () => void = () => undefined,
+): typeof globalThis.fetch {
+  const issuer = configuration.issuer;
+  return async (input, init) => {
+    const request = new Request(input, init);
+    const logical = logicalProofUrl(configuration, request.url);
+    assert.equal(logical.pathname, "/.well-known/aittadb-proof-safety");
+    assert.equal(request.headers.get("authorization"), null);
+    const challenge = logical.searchParams.get("challenge");
+    assert.notEqual(challenge, null);
+    onRequest();
+    return safetyAssertionResponse(issuer, logical.href, challenge ?? "");
+  };
+}
+
+function logicalProofUrl(
+  configuration: ReturnType<typeof parsedConfiguration>,
+  value: string,
+): URL {
+  const issuer = configuration.issuer;
+  const transportOrigin = configuration.transportOrigin ?? issuer;
+  const logical = new URL(value);
+  if (logical.origin === transportOrigin) {
+    logical.protocol = new URL(issuer).protocol;
+    logical.host = new URL(issuer).host;
+  }
+  return logical;
 }
 
 function jsonResponse(value: unknown): Response {
