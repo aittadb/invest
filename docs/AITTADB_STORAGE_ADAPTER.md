@@ -123,3 +123,67 @@ Hosted acceptance remains separate: the configured backend must advertise and
 implement the atomic transaction action before this adapter can be proven or
 enabled against that deployment. See `docs/HOSTED_AITTADB_RUNTIME.md` for the
 fail-closed Worker assembly and activation boundary.
+
+## Hosted contract proof command
+
+`npm run --silent hosted-storage:prove` is the operator-only bridge between the unchanged
+shared contract and one disposable hosted AittaDB acceptance deployment. It is
+not part of the Worker, the Sites package, normal CI, or production startup. The
+command creates a new production `AittaDBStorageAdapter` and service-token
+provider for every contract fixture, so discovery, token acquisition, adapter
+state, and backend durability are exercised through reconstructed clients.
+
+The command requires two distinct acceptance service clients:
+
+- an owner client authorized only for the isolated proof namespace and
+  `storage.read storage.write storage.delete`; and
+- an outsider client authorized for a separate namespace and only
+  `storage.read`.
+
+The runner itself fixes those requested scope sets. Neither client may have an
+origin or redirect URI. Put this exact JSON shape in a temporary file outside
+the repository, replace every example value through the deployment's private
+credential channel, and restrict the file before running:
+
+```json
+{
+  "issuer": "https://acceptance-database.example",
+  "transport_origin": "https://acceptance-transport.example",
+  "entry_href": "https://acceptance-database.example/bounded-storage",
+  "owner_client": {
+    "client_id": "acceptance-owner-client",
+    "client_secret": "replace-with-private-owner-secret"
+  },
+  "read_only_outsider_client": {
+    "client_id": "acceptance-outsider-client",
+    "client_secret": "replace-with-private-outsider-secret"
+  }
+}
+```
+
+Use `null` for `transport_origin` when transport and logical issuer are the same.
+The file must resolve outside the checkout, be a regular non-symlink file owned
+by the current user, and have no group or other permission bits:
+
+```sh
+chmod 600 /private/path/invest-hosted-storage-proof.json
+INVEST_HOSTED_STORAGE_PROOF_CONFIG_FILE=/private/path/invest-hosted-storage-proof.json \
+  npm run --silent hosted-storage:prove
+```
+
+The command emits exactly one bounded JSON line. Success contains only a random
+synthetic proof ID, contract name, fixture count, collection prefix, and
+operation prefix. A contract failure may additionally contain one allowlisted
+static invariant. Configuration, credentials, tokens, URLs, record keys and
+values, provider responses, exceptions, and causes are never emitted. A failed
+run still prints its cleanup prefixes because it may have committed a partial
+synthetic fixture set.
+
+Each shared-contract fixture receives a distinct physical collection and
+operation prefix while retaining the contract's logical keys and requests.
+This prevents retries or prior runs from colliding without modifying the shared
+contract. Preserve the output in the private acceptance evidence channel until
+all prefixed records, durable operation receipts, and both proof credentials
+are removed or intentionally retained with a bounded purpose and expiry. Delete
+the temporary configuration file after the proof. The command is never
+authorized for `aittadb.com` or another production deployment.

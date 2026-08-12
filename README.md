@@ -71,6 +71,7 @@ Useful checks:
 ```sh
 npm run agents:check
 npm run runtime-secrets:check
+npm run --silent hosted-storage:prove
 npm run lint
 npm run typecheck
 npm test
@@ -80,6 +81,8 @@ npm run validate
 ```
 
 `npm run build` works from a clean checkout with the inert hosting example. Before packaging or publishing, create an ignored `.openai/hosting.json` containing exactly one each of the Sites `project_id`, `d1`, and `r2` values for that deployment. `npm run sites:package` refuses duplicate or additional fields, builds the release, creates the mode-`0600` archive at `work/sites-package.tar.gz` with normalized owner/group metadata, and scans the complete tracked, built, archive-content, filename, compressed-header, and metadata boundary without printing matched private values. Set `SITES_ARCHIVE_PATH` only when independently checking another exact Sites archive.
+
+`npm run --silent hosted-storage:prove` is an operator-only acceptance command, not a local unit test or production migration. It requires the ignored external credential file and disposal workflow documented in `docs/AITTADB_STORAGE_ADAPTER.md`; never run it against production.
 
 ## Planning Workflow
 
