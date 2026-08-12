@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   closeSync,
   constants,
@@ -9,7 +10,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 
 import {
   StorageFailure,
@@ -38,7 +39,16 @@ const MAX_CONFIGURATION_BYTES = 16_384;
 const REQUEST_TIMEOUT_MS = 30_000;
 const EXPIRY_SKEW_SECONDS = 30;
 const MAX_FIXTURES = 99;
-const SAFE_INVARIANT = /^[a-z0-9.-]{1,96}$/u;
+const GIT_PROBE_TIMEOUT_MS = 5_000;
+const NON_PRODUCTION_HOST_LABELS = new Set([
+  "acceptance",
+  "dev",
+  "development",
+  "sandbox",
+  "staging",
+  "test",
+  "testing",
+]);
 
 type HostedStorageProofClient = Readonly<{
   clientId: string;
@@ -46,6 +56,7 @@ type HostedStorageProofClient = Readonly<{
 }>;
 
 export type HostedStorageProofConfiguration = Readonly<{
+  targetEnvironment: "disposable-acceptance";
   issuer: string;
   transportOrigin: string | undefined;
   entryHref: string;
@@ -79,7 +90,6 @@ export type HostedStorageProofReport =
         collection_prefix: string;
         operation_prefix: string;
       }>;
-      invariant?: string;
     }>;
 
 export type HostedStorageProofDependencies = Readonly<{
@@ -114,6 +124,7 @@ export function loadHostedStorageProofConfiguration(
     if (requestedStats.isSymbolicLink()) configurationInvalid();
     const realPath = realpathSync(requestedPath);
     if (isWithin(realPath, realpathSync(projectRoot))) configurationInvalid();
+    assertOutsideGit(realPath);
     descriptor = openSync(
       requestedPath,
       constants.O_RDONLY | constants.O_NOFOLLOW,
@@ -121,6 +132,7 @@ export function loadHostedStorageProofConfiguration(
     const stats = fstatSync(descriptor);
     if (
       !stats.isFile() ||
+      stats.nlink !== 1 ||
       stats.dev !== requestedStats.dev ||
       stats.ino !== requestedStats.ino ||
       stats.size < 2 ||
@@ -131,6 +143,15 @@ export function loadHostedStorageProofConfiguration(
       configurationInvalid();
     }
     const source = readFileSync(descriptor, "utf8");
+    const finalStats = fstatSync(descriptor);
+    if (
+      finalStats.nlink !== 1 ||
+      finalStats.dev !== stats.dev ||
+      finalStats.ino !== stats.ino ||
+      finalStats.size !== stats.size ||
+      finalStats.mtimeMs !== stats.mtimeMs ||
+      finalStats.ctimeMs !== stats.ctimeMs
+    ) configurationInvalid();
     const value = JSON.parse(source) as unknown;
     assertUniqueJsonMembers(source);
     return parseConfiguration(value);
@@ -145,6 +166,11 @@ export async function runHostedStorageAdapterProof(
   configuration: HostedStorageProofConfiguration,
   dependencies: HostedStorageProofDependencies = {},
 ): Promise<HostedStorageProofReport> {
+  try {
+    assertRunnableConfiguration(configuration);
+  } catch {
+    return configurationFailureReport();
+  }
   const proof = createProofIdentity((dependencies.randomUUID ?? randomUUID)());
   const inventory = Object.freeze({
     collection_prefix: `proof-${proof.slug}-`,
@@ -184,17 +210,14 @@ export async function runHostedStorageAdapterProof(
       cleanup_inventory: inventory,
     });
   } catch (error) {
-    const invariant = error instanceof StorageAdapterContractViolation &&
-        SAFE_INVARIANT.test(error.invariant)
-      ? error.invariant
-      : undefined;
     return Object.freeze({
       status: "failed",
-      code: invariant === undefined ? "proof_unavailable" : "contract_failed",
+      code: error instanceof StorageAdapterContractViolation
+        ? "contract_failed"
+        : "proof_unavailable",
       proof_id: proof.id,
       fixture_count: fixtureCount,
       cleanup_inventory: inventory,
-      ...(invariant === undefined ? {} : { invariant }),
     });
   }
 }
@@ -351,12 +374,16 @@ function parseConfiguration(value: unknown): HostedStorageProofConfiguration {
     "issuer",
     "owner_client",
     "read_only_outsider_client",
+    "target_environment",
     "transport_origin",
   ]);
-  const issuer = exactHttpsOrigin(root.issuer);
+  if (root.target_environment !== "disposable-acceptance") {
+    configurationInvalid();
+  }
+  const issuer = exactDisposableAcceptanceOrigin(root.issuer);
   const transportOrigin = root.transport_origin === null
     ? undefined
-    : exactHttpsOrigin(root.transport_origin);
+    : exactDisposableAcceptanceOrigin(root.transport_origin);
   const entryHref = exactEntryHref(root.entry_href, issuer);
   const ownerClient = exactClient(root.owner_client);
   const outsiderClient = exactClient(root.read_only_outsider_client);
@@ -367,12 +394,45 @@ function parseConfiguration(value: unknown): HostedStorageProofConfiguration {
     outsiderClient.clientSecret,
   ]).size !== 4) configurationInvalid();
   return Object.freeze({
+    targetEnvironment: "disposable-acceptance",
     issuer,
     transportOrigin,
     entryHref,
     ownerClient,
     outsiderClient,
   });
+}
+
+function assertRunnableConfiguration(
+  value: unknown,
+): asserts value is HostedStorageProofConfiguration {
+  const root = exactObject(value, [
+    "entryHref",
+    "issuer",
+    "outsiderClient",
+    "ownerClient",
+    "targetEnvironment",
+    "transportOrigin",
+  ]);
+  if (root.targetEnvironment !== "disposable-acceptance") {
+    configurationInvalid();
+  }
+  const issuer = exactDisposableAcceptanceOrigin(root.issuer);
+  if (
+    root.entryHref !== exactEntryHref(root.entryHref, issuer) ||
+    root.transportOrigin !== undefined &&
+      root.transportOrigin !== exactDisposableAcceptanceOrigin(
+        root.transportOrigin,
+      )
+  ) configurationInvalid();
+  const owner = exactParsedClient(root.ownerClient);
+  const outsider = exactParsedClient(root.outsiderClient);
+  if (new Set([
+    owner.clientId,
+    owner.clientSecret,
+    outsider.clientId,
+    outsider.clientSecret,
+  ]).size !== 4) configurationInvalid();
 }
 
 function assertUniqueJsonMembers(source: string): void {
@@ -490,6 +550,14 @@ function exactClient(value: unknown): HostedStorageProofClient {
   });
 }
 
+function exactParsedClient(value: unknown): HostedStorageProofClient {
+  const client = exactObject(value, ["clientId", "clientSecret"]);
+  return Object.freeze({
+    clientId: exactCredential(client.clientId, 1, 255, false),
+    clientSecret: exactCredential(client.clientSecret, 16, 512, true),
+  });
+}
+
 function exactCredential(
   value: unknown,
   minimum: number,
@@ -524,6 +592,16 @@ function exactHttpsOrigin(value: unknown): string {
     value !== url.origin && value !== url.href
   ) configurationInvalid();
   return url.origin;
+}
+
+function exactDisposableAcceptanceOrigin(value: unknown): string {
+  const origin = exactHttpsOrigin(value);
+  const labels = new URL(origin).hostname.toLowerCase().split(".");
+  if (
+    labels.at(-1) !== "test" &&
+    !labels.some((label) => NON_PRODUCTION_HOST_LABELS.has(label))
+  ) configurationInvalid();
+  return origin;
 }
 
 function exactEntryHref(value: unknown, issuer: string): string {
@@ -584,6 +662,36 @@ function exactCollection(value: unknown) {
 function isWithin(path: string, root: string): boolean {
   const relation = relative(root, path);
   return relation === "" || !relation.startsWith("..") && !isAbsolute(relation);
+}
+
+function assertOutsideGit(path: string): void {
+  const result = spawnSync(
+    "git",
+    ["-C", dirname(path), "rev-parse", "--is-inside-work-tree", "--is-inside-git-dir"],
+    {
+      encoding: "utf8",
+      env: {
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_TERMINAL_PROMPT: "0",
+        LANG: "C",
+        LC_ALL: "C",
+        NODE_ENV: process.env.NODE_ENV,
+        PATH: process.env.PATH ?? "",
+      },
+      maxBuffer: 4_096,
+      timeout: GIT_PROBE_TIMEOUT_MS,
+    },
+  );
+  if (result.status === 0) configurationInvalid();
+  if (
+    result.error !== undefined ||
+    result.signal !== null ||
+    result.status !== 128 ||
+    !result.stderr.split("\n").some((line) =>
+      line.startsWith("fatal: not a git repository")
+    )
+  ) configurationInvalid();
 }
 
 function configurationInvalid(): never {
