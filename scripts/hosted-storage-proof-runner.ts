@@ -35,7 +35,6 @@ import { createAittaDBServiceTokenProvider } from "../services/aittadb-service-t
 import {
   StorageAdapterContractViolation,
   verifyStorageAdapterContract,
-  type StorageAdapterContractFactory,
 } from "../tests/support/storage-adapter-contract.ts";
 
 const PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -99,19 +98,6 @@ export type HostedStorageProofReport =
       }>;
     }>;
 
-export type HostedStorageProofDependencies = Readonly<{
-  fetch?: typeof globalThis.fetch;
-  now?: () => Date;
-  randomUUID?: () => string;
-  verifyContract?: (
-    createFixture: StorageAdapterContractFactory,
-  ) => Promise<void>;
-  createAdapter?: (
-    role: ProofRole,
-    configuration: HostedStorageProofConfiguration,
-  ) => StorageAdapter;
-}>;
-
 export class HostedStorageProofConfigurationFailure extends Error {
   constructor() {
     super("Hosted storage proof configuration is invalid.");
@@ -171,7 +157,6 @@ export function loadHostedStorageProofConfiguration(
 
 export async function runHostedStorageAdapterProof(
   configuration: HostedStorageProofConfiguration,
-  dependencies: HostedStorageProofDependencies = {},
 ): Promise<HostedStorageProofReport> {
   let runnableConfiguration: HostedStorageProofConfiguration;
   try {
@@ -179,25 +164,24 @@ export async function runHostedStorageAdapterProof(
   } catch {
     return configurationFailureReport();
   }
-  const proof = createProofIdentity((dependencies.randomUUID ?? randomUUID)());
+  const proof = createProofIdentity(randomUUID());
   const inventory = Object.freeze({
     collection_prefix: `proof-${proof.slug}-`,
     operation_prefix: `proof:${proof.slug}:`,
   });
   let fixtureCount = 0;
   try {
-    const fetch = dependencies.fetch ?? globalThis.fetch;
+    const fetch = globalThis.fetch;
     await verifyDisposableAcceptanceTarget(
       runnableConfiguration,
       proof.id,
       fetch,
     );
-    const createAdapter = dependencies.createAdapter ?? defaultAdapterFactory(
+    const createAdapter = defaultAdapterFactory(
       fetch,
-      dependencies.now ?? (() => new Date()),
+      () => new Date(),
     );
-    const verifyContract = dependencies.verifyContract ?? verifyStorageAdapterContract;
-    await verifyContract(() => {
+    await verifyStorageAdapterContract(() => {
       fixtureCount += 1;
       if (fixtureCount > MAX_FIXTURES) unavailable();
       const fixture = String(fixtureCount).padStart(2, "0");
@@ -490,24 +474,21 @@ async function verifyDisposableAcceptanceTarget(
       }),
       deadline,
     ]);
+    if (!(response instanceof Response)) unavailable();
     if (
-      !(response instanceof Response) ||
       response.status !== 200 ||
       response.redirected ||
       response.url !== "" && response.url !== transportTarget.href ||
       response.headers.get("content-type") !== AITTADB_HYPERMEDIA_MEDIA_TYPE ||
       response.headers.get("cache-control") !== "no-store"
-    ) unavailable();
+    ) rejectSafetyResponse(response);
     const length = response.headers.get("content-length");
     if (
       length !== null &&
       (!/^(?:0|[1-9][0-9]*)$/u.test(length) ||
         Number(length) > MAX_SAFETY_ASSERTION_BYTES)
-    ) unavailable();
-    const source = await Promise.race([
-      readBoundedSafetyAssertion(response),
-      deadline,
-    ]);
+    ) rejectSafetyResponse(response);
+    const source = await readBoundedSafetyAssertion(response, deadline);
     assertUniqueJsonMembers(source);
     const document = exactObject(JSON.parse(source) as unknown, [
       "actions",
@@ -542,7 +523,17 @@ async function verifyDisposableAcceptanceTarget(
   }
 }
 
-async function readBoundedSafetyAssertion(response: Response): Promise<string> {
+function rejectSafetyResponse(response: Response): never {
+  if (response.body !== null) {
+    void response.body.cancel().catch(() => undefined);
+  }
+  unavailable();
+}
+
+async function readBoundedSafetyAssertion(
+  response: Response,
+  deadline: Promise<never>,
+): Promise<string> {
   if (response.body === null) unavailable();
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -550,7 +541,7 @@ async function readBoundedSafetyAssertion(response: Response): Promise<string> {
   let reads = 0;
   try {
     while (true) {
-      const result = await reader.read();
+      const result = await Promise.race([reader.read(), deadline]);
       reads += 1;
       if (reads > MAX_SAFETY_ASSERTION_CHUNKS) unavailable();
       if (result.done) break;
