@@ -136,16 +136,37 @@ Use feature branches. Keep intended changes checkpointed with focused commits; d
 
 Production publication is blocked until the configured backend supports the required authorization, consistency, listing, pagination, quota, and non-disclosure behavior and the production adapter passes contract and end-to-end tests.
 
-## Multi-agent execution
+## Cost-Effective Subagent Execution
 
-- GPT-5.6 Sol Ultra is the primary architect, orchestrator, integrator, and final decision-maker.
-- The primary agent owns requirements analysis, architecture, task decomposition, dependency ordering, conflict resolution, final review, and validation.
-- Use GPT-5.6 Luna Max for small, fully specified implementation tasks with clear scope, acceptance criteria, file ownership, tests, and no unresolved architectural decisions.
-- Use GPT-5.6 Terra High for read-only codebase exploration, dependency mapping, and investigation when implementation boundaries are not yet clear.
-- Use GPT-5.6 Sol High or Max for independent architecture, security, correctness, and integration review.
-- Do not delegate ambiguous product, protocol, authorization, data-integrity, concurrency, or cross-cutting architectural decisions to Luna.
-- Parallelize only independent work. Never allow concurrent write agents to modify overlapping files, shared behavior, or tightly coupled components.
-- Every delegated implementation unit must include implementation, relevant tests, and documentation as one complete task.
-- Subagents must report changed files, validation performed, assumptions, and unresolved risks.
-- The primary agent must inspect and integrate all returned work, resolve review findings, run the full relevant validation suite, and review the final combined diff before declaring completion.
-- Prefer the specified models and reasoning levels whenever explicit subagent selection is available; otherwise treat them as the intended routing policy.
+This section is authoritative for delegation, subagents, model routing, and reasoning effort. When explicit selection is available, use the exact model IDs `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` with supported `reasoning.effort` values `none`, `low`, `medium`, `high`, `xhigh`, and `max`. When it is unavailable, preserve this hierarchy with the closest available equivalent.
+
+### Main Agent and Delegation
+
+The main agent is primarily the orchestrator, integrator, and final decision-maker, not the default implementation worker. It owns requirements analysis, architecture, task decomposition, dependency ordering, conflict resolution, final review, and validation. For every nontrivial task, it splits coherent workstreams, delegates as much investigation, planning, implementation, testing, documentation, debugging, and review as practical, runs independent work in parallel, waits for needed results, resolves conflicts, and verifies the combined outcome. Subagents should perform most substantive repository work.
+
+The main agent may directly coordinate and decompose work, make small integration changes, resolve returned conflicts, perform final validation, handle inseparable work, or complete a genuinely trivial mechanically verifiable change when delegation would cost more. Do not create agents merely to meet a numeric target. Give one coherent responsibility to each agent; avoid overlapping write scopes unless independent verification is intentional.
+
+Every assignment must state its bounded scope, relevant context, file ownership, constraints, deliverables, acceptance criteria, and required tests. A delegated implementation unit includes its implementation, relevant tests, and documentation. Each subagent returns concise findings or decisions, files inspected or changed, completed work, commands and outcomes, assumptions or unresolved risks, and a recommended next action. It must report uncertainty rather than inventing a conclusion.
+
+### Model Routing
+
+Always choose the least expensive model and lowest reasoning effort likely to complete the assigned work reliably. Route by actual difficulty and risk, not by the main agent's model.
+
+- Use `gpt-5.6-luna` at `low` for file and reference searches, inventories, extraction or classification, log summaries, mechanical formatting or cleanup, straightforward documentation corrections, predefined commands or tests, and tiny verifiable edits.
+- Use `gpt-5.6-luna` at `medium` for routine implementation from a precise plan, repetitive multi-file changes, straightforward refactors, conventional tests, documentation synchronized to known behavior, simple transformations, and bugs with a known cause. Use `high` only for a narrow fully specified task with non-obvious edge cases; escalate ambiguous or architectural work instead of repeatedly increasing Luna effort.
+- Use `gpt-5.6-terra` at `medium` for ordinary multi-file features, unfamiliar-code exploration requiring interpretation, moderate refactors, routine test diagnosis, approved-architecture implementation, straightforward integration, and review of Luna work when Sol review is unnecessary. Use `high` or `xhigh` for well-scoped cross-module behavior, data flow, state or lifecycle work, concurrency, difficult integration, or multi-component debugging. Do not default to `max`; route judgment-heavy, risky, or ambiguous work to Sol.
+- Use `gpt-5.6-sol` at `high` for nontrivial planning, architecture, invariants, independent change or plan review, hard root-cause analysis, security, privacy, authentication, authorization, trust boundaries, public APIs, protocols, schemas, persistence, and intent validation. Use `xhigh` for high-risk architecture or migrations, subtle security or correctness review, multi-system failures, major tradeoffs, or release-critical validation. Use `max` only for exceptional unresolved, repeatedly failing, critical security or data-integrity, or release-blocking problems where a wrong conclusion is especially costly.
+
+Do not delegate ambiguous product, protocol, authorization, data-integrity, concurrency, or cross-cutting architectural decisions to Luna. Do not spend Sol on mechanical implementation that Luna or Terra can reliably perform.
+
+### Default Lifecycle, Escalation, and Concurrency
+
+Unless a change is genuinely trivial, use this lifecycle:
+
+1. A `gpt-5.6-sol` `high` planner defines the workstreams, boundaries, risks, and acceptance criteria.
+2. `gpt-5.6-luna` or `gpt-5.6-terra` workers complete independent investigation, implementation, tests, and documentation tasks.
+3. A different `gpt-5.6-sol` reviewer independently checks the returned diff and evidence for correctness, missed requirements, regressions, security concerns, and unnecessary complexity.
+4. The cheapest capable Luna or Terra worker addresses clear review findings; Sol re-reviews substantial, risky, or architecture-affecting corrections.
+5. The main agent integrates, resolves conflicts, runs the full relevant validation suite, and reviews the final combined diff before declaring completion.
+
+Escalate Luna to Terra for broader context or engineering judgment, and Terra to Sol for ambiguity, high risk, architecture, security, or resistant debugging. Route known hard problems directly to Sol; increase reasoning only when it is likely to improve the result. Reuse existing findings rather than repeating exploration. Parallelize only independent scopes, respecting the Planning Workflow's isolated-worktree and disjoint-file-ownership rules; never allow concurrent writers to change overlapping files, shared behavior, or tightly coupled components. Do not create custom-agent configuration solely to restate this policy.
