@@ -8,6 +8,12 @@ import type {
   WorkerExecutionContext,
 } from "../worker/contracts.ts";
 import { createApplicationWorker } from "../worker/application-worker.ts";
+import {
+  composeRequestCapabilities,
+  unavailableRequestRuntimeCapabilities,
+} from "../worker/request-capability-composition.ts";
+import type { OwnerPackageRouteDependencies } from "../worker/routes/owner-package.ts";
+import type { OwnerAggregateReconciliationRouteOptions } from "../worker/routes/owner-aggregate-reconciliation.ts";
 import { createApplicationRouteDispatcher } from "../worker/routes/application.ts";
 import {
   createOwnerRouteHandler,
@@ -17,6 +23,7 @@ import { handleParticipantHomeRoutes } from "../worker/routes/participant-home.t
 import { createParticipantRouteHandler } from "../worker/routes/participant.ts";
 import { handlePublicRoutes } from "../worker/routes/public.ts";
 import { APP_ORIGIN_HEADER } from "../http/app-origin.ts";
+import { OWNER_PACKAGE_WORKSPACE_HEADER } from "../http/runtime-capabilities.ts";
 import {
   campaignFromRuntimeHeader,
   CAMPAIGN_CONFIGURATION_HEADER,
@@ -493,6 +500,128 @@ test("the Worker keeps image dispatch separate from application fallback", async
   assert.equal(fallbackResponse.status, 418);
   assert.equal(await fallbackResponse.text(), "application fallback");
   assert.equal(applicationRequests.length, 1);
+});
+
+test("request capability composition keeps an injected dispatcher ahead of route wiring", async () => {
+  const composition = composeRequestCapabilities({
+    injectedRoute: async () => new Response("injected"),
+    participantRegistration: null,
+    participantProfile: null,
+    participantFounderInterest: null,
+    participantInvestmentInterests: null,
+    ownerOAuthProof: null,
+    campaignWorkspace: null,
+    packageRoutes: {},
+    isOwner: false,
+  });
+
+  assert.deepEqual(
+    composition.runtimeCapabilities,
+    unavailableRequestRuntimeCapabilities(),
+  );
+  const response = requiredResponse(
+    await composition.dispatchRoute(routeContext("https://campaign.example/owner")),
+  );
+  assert.equal(await response.text(), "injected");
+});
+
+test("request capability composition dispatches explicitly unavailable owner routes", async () => {
+  const unavailableAggregate: OwnerAggregateReconciliationRouteOptions = {
+    repository: {
+      correctionConsistency: "unavailable",
+      previewReconciliation: async () => {
+        throw new Error("unavailable aggregate");
+      },
+    },
+    guardMutation: async () => {
+      throw new Error("unavailable aggregate");
+    },
+    csrfToken: async () => null,
+  };
+  const composition = composeRequestCapabilities({
+    ownerAggregateReconciliation: unavailableAggregate,
+    participantRegistration: null,
+    participantProfile: null,
+    participantFounderInterest: null,
+    participantInvestmentInterests: null,
+    ownerOAuthProof: null,
+    campaignWorkspace: null,
+    packageRoutes: {},
+    isOwner: true,
+  });
+
+  assert.equal(
+    composition.runtimeCapabilities.ownerAggregateReconciliation,
+    false,
+  );
+  const response = requiredResponse(await composition.dispatchRoute(
+    routeContext("https://campaign.example/owner/aggregate-reconciliation", {
+      requestHeaders: { accept: "application/json" },
+    }),
+  ));
+  assert.equal(response.status, 401);
+});
+
+test("request capability composition keeps owner rendering capability isolated by actor", async () => {
+  const renderedRequests: Request[] = [];
+  // This resource is not requested in this test; dispatch construction must not
+  // make its opaque service available to a non-owner renderer.
+  const ownerPackage = {} as unknown as OwnerPackageRouteDependencies;
+  const worker = createApplicationWorker({
+    fetchApplication: async (request) => {
+      renderedRequests.push(request);
+      return new Response("rendered");
+    },
+    fetchOptimizedImage: async () => new Response("image"),
+    ownerPackage,
+  });
+  const env = testEnvironment({ OWNER_EMAIL: "owner@example.com" });
+
+  const ownerHome = await worker.fetch(
+    new Request("https://campaign.example/owner", {
+      headers: {
+        accept: "application/json",
+        "oai-authenticated-user-id": "owner-subject",
+        "oai-authenticated-user-email": "owner@example.com",
+      },
+    }),
+    env,
+    executionContext,
+  );
+  const ownerDocument = await ownerHome.json();
+  assert.ok(ownerDocument.actions.some((action: { name: string }) =>
+    action.name === "manage-information-package"
+  ));
+
+  await worker.fetch(
+    new Request("https://campaign.example/fallback", {
+      headers: {
+        "oai-authenticated-user-id": "owner-subject",
+        "oai-authenticated-user-email": "owner@example.com",
+      },
+    }),
+    env,
+    executionContext,
+  );
+  await worker.fetch(
+    new Request("https://campaign.example/fallback", {
+      headers: {
+        "oai-authenticated-user-id": "participant-subject",
+        "oai-authenticated-user-email": "participant@example.com",
+      },
+    }),
+    env,
+    executionContext,
+  );
+
+  assert.equal(
+    renderedRequests[0]?.headers.get(OWNER_PACKAGE_WORKSPACE_HEADER),
+    "available",
+  );
+  assert.equal(
+    renderedRequests[1]?.headers.get(OWNER_PACKAGE_WORKSPACE_HEADER),
+    null,
+  );
 });
 
 test("application rendering receives the same normalized runtime headers", async () => {

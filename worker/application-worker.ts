@@ -55,8 +55,6 @@ import type {
 import type {
   FounderApplicationReviewCollectionRepository,
   FounderApplicationReviewDetailRepository,
-  FounderApplicationReviewListRequest,
-  FounderApplicationReviewRepository,
 } from "../repositories/in-memory-founder-application-repository.ts";
 import type {
   PublicCampaignStateReader,
@@ -91,33 +89,17 @@ import type {
 } from "./deployment-capabilities.ts";
 import { hasHostedAittaDBApplicationRuntimeValues } from "./hosted-application-configuration.ts";
 import {
-  createApplicationRouteDispatcher,
-  dispatchApplicationRoute,
-} from "./routes/application.ts";
-import {
-  createOwnerIndicationModerationRouteHandler,
   MAX_OWNER_INDICATION_MODERATION_MUTATION_BYTES,
   MAX_OWNER_INDICATION_MODERATION_MUTATION_FIELDS,
   type OwnerIndicationModerationRouteDependencies,
 } from "./routes/owner-indication-moderation.ts";
 import {
-  createOwnerAuditHistoryRouteHandler,
-  createOwnerAuditNotificationHistoryRouteHandler,
   MAX_OWNER_NOTIFICATION_MUTATION_BYTES,
   ownerNotificationMutationFieldLimit,
   type OwnerAuditHistoryRouteDependencies,
   type OwnerAuditNotificationRouteDependencies,
 } from "./routes/owner-audit-notification-history.ts";
-import { createOwnerCampaignEditorRouteHandler } from "./routes/owner-campaign-editor.ts";
 import {
-  createOwnerFounderReviewCollectionRouteHandler,
-  createOwnerFounderReviewDetailRouteHandler,
-  createOwnerFounderReviewRouteHandler,
-} from "./routes/owner-founder-review.ts";
-import { createOwnerInitialSetupRouteHandler } from "./routes/owner-initial-setup.ts";
-import { createOwnerRouteHandler } from "./routes/owner.ts";
-import {
-  createOwnerAggregateReconciliationRouteHandler,
   isExactOwnerAggregateReconciliationMutation,
   MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_BYTES,
   ownerAggregateCorrectionReplayScopeFor,
@@ -125,19 +107,11 @@ import {
   type OwnerAggregateReconciliationRouteOptions,
 } from "./routes/owner-aggregate-reconciliation.ts";
 import {
-  createOwnerPackageRouteHandler,
   MAX_OWNER_PACKAGE_MUTATION_BYTES,
   MAX_OWNER_PACKAGE_MUTATION_FIELDS,
   type OwnerPackageRouteDependencies,
 } from "./routes/owner-package.ts";
 import {
-  createFounderInterestRouteHandler,
-  createInvestmentInterestRouteHandler,
-  createParticipantPackageAcknowledgmentRouteHandler,
-  createParticipantPackageReaderRouteHandler,
-  createParticipantProfileRouteHandler,
-  createParticipantRegistrationRouteHandler,
-  createParticipantRouteHandler,
   founderWithdrawalReplayScopeFor,
   investmentWithdrawalReplayScopeFor,
   investmentWithdrawalReplayScopeRequired,
@@ -161,14 +135,16 @@ import {
   type InvestmentInterestPermissions,
 } from "./investment-interest-service.ts";
 import {
-  createOwnerOAuthProofRouteHandler,
   type OwnerOAuthProofRouteDependencies,
 } from "./routes/owner-oauth-proof.ts";
 import {
-  createOwnerReviewExportRouteHandler,
   type OwnerReviewExportRouteDependencies,
 } from "./routes/owner-review-exports.ts";
-import { handlePublicRoutes } from "./routes/public.ts";
+import {
+  composeRequestCapabilities,
+  unavailableRequestRuntimeCapabilities,
+  type RequestPackageRoutes,
+} from "./request-capability-composition.ts";
 
 export type ApplicationWorkerDependencies = Readonly<{
   fetchApplication: ApplicationFetcher;
@@ -250,7 +226,6 @@ export function createApplicationWorker(
           ? dependencies.participantPackageAcknowledgment ??
             packageRoutes?.participantAcknowledgment
           : undefined;
-      const ownerPackageAvailable = ownerPackage !== undefined;
       const ownerIndicationModeration =
         dependencies.dispatchRoute === undefined
           ? dependencies.ownerIndicationModeration ??
@@ -262,11 +237,6 @@ export function createApplicationWorker(
               url.pathname,
             )
           : undefined;
-      const ownerIndicationModerationAvailable =
-        ownerIndicationModeration !== undefined;
-      const ownerReviewExportsAvailable =
-        dependencies.dispatchRoute === undefined &&
-        dependencies.ownerReviewExports !== undefined;
       const ownerAuditNotificationHistory =
         dependencies.dispatchRoute === undefined
           ? dependencies.ownerAuditNotificationHistory ??
@@ -284,25 +254,17 @@ export function createApplicationWorker(
         ? dependencies.ownerAuditHistory ??
           runtimeOwnerAuditHistory(applicationRuntime)
         : undefined;
-      const ownerNotificationHistoryAvailable =
-        ownerAuditNotificationHistory !== undefined;
-      const ownerAuditHistoryAvailable =
-        ownerNotificationHistoryAvailable || ownerAuditHistory !== undefined;
       const ownerFounderReview = dependencies.dispatchRoute === undefined
         ? dependencies.ownerFounderReview ??
           runtimeOwnerFounderReview(applicationRuntime)
         : undefined;
-      const ownerFounderReviewAvailable = ownerFounderReview !== undefined;
       const ownerFounderReviewDetail = dependencies.dispatchRoute === undefined
         ? dependencies.ownerFounderReviewDetail ??
           runtimeOwnerFounderReviewDetail(applicationRuntime)
         : undefined;
-      const ownerFounderReviewDetailAvailable =
-        ownerFounderReviewDetail !== undefined;
       const ownerOAuthProof = dependencies.dispatchRoute === undefined
         ? await resolveOwnerOAuthProof(dependencies, env)
         : null;
-      const ownerOAuthProofAvailable = ownerOAuthProof !== null;
       const campaignWorkspace = dependencies.dispatchRoute === undefined
         ? resolveCampaignWorkspace(dependencies, applicationRuntime, appOrigin)
         : null;
@@ -331,9 +293,6 @@ export function createApplicationWorker(
               url.pathname,
             )
           : undefined;
-      const ownerAggregateReconciliationAvailable =
-        ownerAggregateReconciliation?.repository.correctionConsistency ===
-          "atomic-aggregate-audit";
       const participantAccessReader = dependencies.participantAccessReader ??
         participantRequest?.participantAccessReader();
       const participantAccessResolution = await resolveParticipantAccess(
@@ -380,9 +339,6 @@ export function createApplicationWorker(
             participantRequest,
           )
         : undefined;
-      const participantFounderInterestAvailable =
-        participantFounderInterest !== undefined &&
-        participantFounderInterest !== null;
       const participantInvestmentInterests =
         dependencies.dispatchRoute === undefined
           ? dependencies.participantInvestmentInterests ??
@@ -396,11 +352,32 @@ export function createApplicationWorker(
               participantRequest,
             )
           : undefined;
-      const participantInvestmentInterestsAvailable =
-        participantInvestmentInterests !== undefined &&
-        participantInvestmentInterests !== null;
+      const capabilities = composeRequestCapabilities({
+        injectedRoute: dependencies.dispatchRoute,
+        ownerPackage,
+        ownerIndicationModeration,
+        ownerReviewExports: dependencies.dispatchRoute === undefined
+          ? dependencies.ownerReviewExports
+          : undefined,
+        ownerAuditHistory,
+        ownerFounderReview,
+        ownerFounderReviewDetail,
+        ownerAuditNotificationHistory,
+        ownerAggregateReconciliation,
+        participantRegistration,
+        participantProfile,
+        participantFounderInterest: participantFounderInterest ?? null,
+        participantInvestmentInterests: participantInvestmentInterests ?? null,
+        ownerOAuthProof,
+        campaignWorkspace,
+        packageRoutes: {
+          owner: ownerPackage,
+          participantReader: participantPackageReader,
+          participantAcknowledgment: participantPackageAcknowledgment,
+        },
+        isOwner,
+      });
       const renderEnvironment = applicationRenderEnvironment(env);
-      const campaignEditorAvailable = campaignWorkspace !== null;
       const renderApplication: ApplicationRouteContext["renderApplication"] = (
         options = {},
       ) => {
@@ -419,36 +396,9 @@ export function createApplicationWorker(
                 ? options.publicAggregate ?? null
                 : publicAggregate
               : null,
-            {
-              ownerPackageWorkspace:
-                normalApplication && ownerPackageAvailable && isOwner,
-              ownerIndicationModeration:
-                normalApplication && ownerIndicationModerationAvailable,
-              ownerReviewExports:
-                normalApplication && ownerReviewExportsAvailable,
-              ownerAuditHistory:
-                normalApplication && ownerAuditHistoryAvailable && isOwner,
-              ownerFounderReview:
-                normalApplication && ownerFounderReviewAvailable && isOwner,
-              ownerNotificationHistory:
-                normalApplication && ownerNotificationHistoryAvailable && isOwner,
-              ownerAggregateReconciliation:
-                normalApplication &&
-                ownerAggregateReconciliationAvailable &&
-                isOwner,
-              participantFounderInterest:
-                normalApplication && participantFounderInterestAvailable,
-              participantInvestmentInterests:
-                normalApplication && participantInvestmentInterestsAvailable,
-              participantProfileSelfService:
-                normalApplication && participantProfile !== null,
-              ownerCampaignEditor:
-                normalApplication && campaignEditorAvailable,
-              ownerCampaignSetup:
-                normalApplication && campaignEditorAvailable,
-              ownerAittadbConnection:
-                normalApplication && ownerOAuthProofAvailable,
-            },
+            normalApplication
+              ? capabilities.runtimeCapabilities
+              : unavailableRequestRuntimeCapabilities(),
             preview,
           ),
           renderEnvironment,
@@ -456,63 +406,7 @@ export function createApplicationWorker(
         );
       };
 
-      const hasInjectedRoutes = ownerPackageAvailable ||
-        participantRegistration !== null ||
-        participantProfile !== null ||
-        participantPackageReader !== undefined ||
-        participantPackageAcknowledgment !== undefined ||
-        ownerIndicationModerationAvailable ||
-        ownerReviewExportsAvailable ||
-        ownerAuditHistoryAvailable ||
-        ownerFounderReviewAvailable ||
-        ownerFounderReviewDetailAvailable ||
-        ownerAggregateReconciliation !== undefined ||
-        participantFounderInterestAvailable ||
-        participantInvestmentInterestsAvailable ||
-        campaignEditorAvailable ||
-        ownerOAuthProofAvailable;
-      const dispatchRoute = dependencies.dispatchRoute ??
-        (hasInjectedRoutes
-          ? createInjectedRouteDispatcher(
-              dependencies,
-              campaignWorkspace,
-              ownerOAuthProof,
-              participantRegistration,
-              participantProfile,
-              ownerIndicationModeration,
-              ownerAuditHistory,
-              ownerFounderReview,
-              ownerFounderReviewDetail,
-              ownerAuditNotificationHistory,
-              ownerAggregateReconciliation,
-              participantFounderInterest ?? null,
-              participantInvestmentInterests ?? null,
-              {
-                owner: ownerPackage,
-                participantReader: participantPackageReader,
-                participantAcknowledgment: participantPackageAcknowledgment,
-              },
-              {
-                ownerPackageAvailable,
-                participantRegistrationAvailable:
-                  participantRegistration !== null,
-                participantProfileAvailable: participantProfile !== null,
-                ownerIndicationModerationAvailable,
-                ownerReviewExportsAvailable,
-                ownerAuditHistoryAvailable,
-                ownerFounderReviewAvailable,
-                ownerNotificationHistoryAvailable,
-                ownerAggregateReconciliationAvailable,
-                participantFounderInterestAvailable,
-                participantInvestmentInterestsAvailable,
-                campaignEditorAvailable,
-                campaignSetupAvailable: campaignEditorAvailable,
-                ownerOAuthProofAvailable,
-              },
-            )
-          : dispatchApplicationRoute);
-
-      const routeResponse = await dispatchRoute({
+      const routeResponse = await capabilities.dispatchRoute({
         request,
         url,
         resourceUrl,
@@ -540,191 +434,6 @@ function applicationRenderEnvironment(
   return Object.freeze({
     ASSETS: env.ASSETS,
     IMAGES: env.IMAGES,
-  });
-}
-
-type InjectedRouteAvailability = Readonly<{
-  ownerPackageAvailable: boolean;
-  participantRegistrationAvailable: boolean;
-  participantProfileAvailable: boolean;
-  ownerIndicationModerationAvailable: boolean;
-  ownerReviewExportsAvailable: boolean;
-  ownerAuditHistoryAvailable: boolean;
-  ownerFounderReviewAvailable: boolean;
-  ownerNotificationHistoryAvailable: boolean;
-  ownerAggregateReconciliationAvailable: boolean;
-  participantFounderInterestAvailable: boolean;
-  participantInvestmentInterestsAvailable: boolean;
-  campaignEditorAvailable: boolean;
-  campaignSetupAvailable: boolean;
-  ownerOAuthProofAvailable: boolean;
-}>;
-
-type ResolvedPackageRoutes = Readonly<{
-  owner?: OwnerPackageRouteDependencies;
-  participantReader?: ParticipantPackageReaderDependencies;
-  participantAcknowledgment?: ParticipantPackageAcknowledgmentRouteDependencies;
-}>;
-
-function ownerFounderReviewRouteHandlers(
-  collection: FounderApplicationReviewCollectionRepository | undefined,
-  detail: FounderApplicationReviewDetailRepository | undefined,
-): readonly ApplicationRouteHandler[] {
-  if (collection !== undefined && detail !== undefined) {
-    const repository: FounderApplicationReviewRepository = Object.freeze({
-      list: (request: FounderApplicationReviewListRequest) =>
-        collection.list(request),
-      get: (reviewId: unknown) => detail.get(reviewId),
-    });
-    return Object.freeze([createOwnerFounderReviewRouteHandler(repository)]);
-  }
-  if (collection !== undefined) {
-    return Object.freeze([
-      createOwnerFounderReviewCollectionRouteHandler(collection),
-    ]);
-  }
-  if (detail !== undefined) {
-    return Object.freeze([
-      createOwnerFounderReviewDetailRouteHandler(detail),
-    ]);
-  }
-  return Object.freeze([]);
-}
-
-function createInjectedRouteDispatcher(
-  dependencies: ApplicationWorkerDependencies,
-  campaignWorkspace: CampaignWorkspaceDeploymentCapability | null,
-  ownerOAuthProof: OwnerOAuthProofRouteDependencies | null,
-  participantRegistration: ParticipantRegistrationRouteDependencies | null,
-  participantProfile: ParticipantProfileRouteDependencies | null,
-  ownerIndicationModeration:
-    | OwnerIndicationModerationRouteDependencies
-    | undefined,
-  ownerAuditHistory: OwnerAuditHistoryRouteDependencies | undefined,
-  ownerFounderReview:
-    | FounderApplicationReviewCollectionRepository
-    | undefined,
-  ownerFounderReviewDetail:
-    | FounderApplicationReviewDetailRepository
-    | undefined,
-  ownerAuditNotificationHistory:
-    OwnerAuditNotificationRouteDependencies | undefined,
-  ownerAggregateReconciliation:
-    OwnerAggregateReconciliationRouteOptions | undefined,
-  participantFounderInterest: FounderInterestRouteDependencies | null,
-  participantInvestmentInterests: InvestmentInterestRouteDependencies | null,
-  packageRoutes: ResolvedPackageRoutes,
-  available: InjectedRouteAvailability,
-): ApplicationRouteHandler {
-  const issueCampaignOperationId = campaignWorkspace?.issueOperationId;
-  return createApplicationRouteDispatcher({
-    public: handlePublicRoutes,
-    participant: createParticipantRouteHandler(
-      [
-        ...(participantRegistration
-          ? [createParticipantRegistrationRouteHandler(
-              participantRegistration,
-            )]
-          : []),
-        ...(participantProfile
-          ? [createParticipantProfileRouteHandler(participantProfile)]
-          : []),
-        ...(packageRoutes.participantReader
-          ? [createParticipantPackageReaderRouteHandler(
-              packageRoutes.participantReader,
-            )]
-          : []),
-        ...(packageRoutes.participantAcknowledgment
-          ? [createParticipantPackageAcknowledgmentRouteHandler(
-              packageRoutes.participantAcknowledgment,
-            )]
-          : []),
-        ...(participantFounderInterest
-          ? [createFounderInterestRouteHandler(
-              participantFounderInterest,
-            )]
-          : []),
-        ...(participantInvestmentInterests
-          ? [createInvestmentInterestRouteHandler(
-              participantInvestmentInterests,
-            )]
-          : []),
-      ],
-      {
-        registration: available.participantRegistrationAvailable,
-        profileSelfService: available.participantProfileAvailable,
-        founderInterest: available.participantFounderInterestAvailable,
-        investmentInterests: available.participantInvestmentInterestsAvailable,
-      },
-    ),
-    owner: createOwnerRouteHandler(
-      [
-        ...(packageRoutes.owner
-          ? [createOwnerPackageRouteHandler(packageRoutes.owner)]
-          : []),
-        ...(ownerIndicationModeration
-          ? [createOwnerIndicationModerationRouteHandler(
-              ownerIndicationModeration,
-            )]
-          : []),
-        ...(dependencies.ownerReviewExports
-          ? [createOwnerReviewExportRouteHandler(
-              dependencies.ownerReviewExports,
-            )]
-          : []),
-        ...(ownerAuditNotificationHistory
-          ? [createOwnerAuditNotificationHistoryRouteHandler(
-              ownerAuditNotificationHistory,
-            )]
-          : ownerAuditHistory
-          ? [createOwnerAuditHistoryRouteHandler(ownerAuditHistory)]
-          : []),
-        ...ownerFounderReviewRouteHandlers(
-          ownerFounderReview,
-          ownerFounderReviewDetail,
-        ),
-        ...(ownerAggregateReconciliation
-          ? [createOwnerAggregateReconciliationRouteHandler(
-              ownerAggregateReconciliation,
-            )]
-          : []),
-        ...(campaignWorkspace
-          ? [
-              createOwnerInitialSetupRouteHandler({
-                repository: campaignWorkspace.repository,
-                checkPublicationReadiness:
-                  campaignWorkspace.checkPublicationReadiness,
-                mutationSession: campaignWorkspace.mutationSession,
-                appOrigin: campaignWorkspace.appOrigin,
-                ...(issueCampaignOperationId
-                  ? {
-                      issueOperationId: () =>
-                        issueCampaignOperationId("setup"),
-                    }
-                  : {}),
-                ...(campaignWorkspace.now ? { now: campaignWorkspace.now } : {}),
-              }),
-              createOwnerCampaignEditorRouteHandler(campaignWorkspace),
-            ]
-          : []),
-        ...(ownerOAuthProof
-          ? [createOwnerOAuthProofRouteHandler(ownerOAuthProof)]
-          : []),
-      ],
-      {
-        managePackage: available.ownerPackageAvailable,
-        indicationModeration: available.ownerIndicationModerationAvailable,
-        reviewExports: available.ownerReviewExportsAvailable,
-        auditHistory: available.ownerAuditHistoryAvailable,
-        founderApplicationReview: available.ownerFounderReviewAvailable,
-        auditNotificationHistory: available.ownerNotificationHistoryAvailable,
-        aggregateReconciliation:
-          available.ownerAggregateReconciliationAvailable,
-        campaignEditor: available.campaignEditorAvailable,
-        campaignSetup: available.campaignSetupAvailable,
-        aittadbConnection: available.ownerOAuthProofAvailable,
-      },
-    ),
   });
 }
 
@@ -1408,7 +1117,7 @@ function runtimePackageRoutes(
   isOwner: boolean,
   resourceUrl: string,
   participantRequest: ParticipantRequestRepositoryScope | null,
-): ResolvedPackageRoutes | null {
+): RequestPackageRoutes | null {
   try {
     const appOrigin = new URL(resourceUrl).origin;
     const ownerIdentity = actor !== null && isOwner
