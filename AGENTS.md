@@ -27,16 +27,44 @@ Production persistence must use AittaDB. Browser storage, process memory, local 
 
 ## Architecture Rules
 
-- Keep domain logic framework-independent and behind narrow repository interfaces.
-- Use a `StorageAdapter` boundary; production uses AittaDB and tests use explicit fakes.
-- Parse unknown input with explicit guards and structured APIs. Avoid `any`.
-- Parse money as integer minor units. Never use floating-point arithmetic for amounts.
-- Normalize country and business identifiers deterministically before uniqueness checks.
-- Sanitize Markdown and external links before rendering private package content.
-- Every object access must be authorized by participant subject or owner subject.
-- Every state-changing browser request needs same-origin and CSRF protection before mutation.
-- Every mutation affecting indications or aggregates must be idempotent, audit-logged, and safe under retries.
-- Private package content, PII, indication notes, credentials, private totals, audit detail, and exports must not appear in public errors or logs.
+Write simple, strongly typed TypeScript and React suitable for ChatGPT Sites. Optimize for clarity, maintainability, testability, and independently owned feature work rather than cleverness or short-term convenience.
+
+### Semantic Units and Feature Ownership
+
+- Keep files as small as reasonably possible while preserving semantic cohesion: one clearly named responsibility, not an arbitrary line-count target. Do not create oversized components, services, hooks, configuration, or catch-all modules, and do not fragment trivial logic into meaningless one-line files.
+- Organize by feature or domain where practical. Keep a feature's components, types, hooks, services, and tests near one another, and use precise names instead of dumping grounds such as `utils.ts`, `helpers.ts`, `types.ts`, or `components.ts`.
+- Prefer adding or changing feature-owned files over expanding unrelated central files. Do not combine unrelated work merely because it is convenient, and keep refactors narrow unless a broader boundary is genuinely required.
+- Minimize shared hot spots. Features should normally depend on stable, narrow extension points; when extension registration or composition is needed, make it simple and declarative rather than growing a conflict-prone manual registry.
+
+### Typed Contracts and Extensible Behavior
+
+- Keep domain logic framework-independent and behind narrow repository interfaces. Use the `StorageAdapter` boundary; production uses AittaDB and tests use explicit fakes.
+- Define explicit interfaces or named type aliases for meaningful service, repository, adapter, handler, external-data, and component contracts. Program against focused contracts rather than concrete implementations; feature and infrastructure code may depend on core contracts, but core domain logic must not depend on feature implementations.
+- Pass dependencies explicitly through parameters, constructors, props, or small factories. Avoid hidden dependencies, mutable globals, implicit singleton state, circular imports, initialization-order behavior, and exports that other units do not need.
+- Parse unknown external input with explicit guards and structured APIs, then keep validated internal types simple. Avoid `any`; use `unknown`, narrowing, generics, or domain types. Prefer discriminated unions with exhaustive handling for fixed state sets.
+- Do not grow extensible behavior by repeatedly adding feature-specific `if`, `else if`, or `switch` branches to central files. When independently meaningful variants exist, use a proportionate typed strategy, handler, adapter, factory registration, injected service, or small feature module: core owns a stable contract, each feature owns its implementation, and one narrow composition point connects them.
+- Do not introduce a plugin framework, DI container, generic registry, or extra abstraction for one simple implementation with no realistic extension need.
+
+### React Components and Testability
+
+- Keep React components focused on one visible responsibility. Prefer composition and explicit typed props over large configurable components with unrelated modes; use subcomponents or registered renderers when variants are independently extensible.
+- Separate substantial domain logic, parsing, data access, and state transitions from rendering. Put reusable stateful behavior in focused hooks or services only when that creates a useful boundary; do not add wrapper components or hooks that merely rename one operation.
+- Keep state local until several units genuinely share ownership. Make loading, empty, error, unavailable, and success states explicit. Follow the existing Sites and UI rules for semantic HTML, accessibility, focus, layout, styling, and dependency limits.
+- Design meaningful units for independent tests. Keep pure logic apart from browser APIs, storage, network calls, timers, and other side effects; put side effects behind narrow replaceable contracts and prefer explicit dependency injection to global mocks.
+- Test logic, validation, state transitions, handlers, hooks, and services at their meaningful boundary. Test components through observable user behavior, add regression coverage for defects, and keep fixtures local and small rather than requiring full application initialization or one shared fixture for unrelated suites.
+
+### Domain and Trust Boundaries
+
+- Parse money as integer minor units; never use floating-point arithmetic for amounts. Normalize country and business identifiers deterministically before uniqueness checks.
+- Sanitize Markdown and external links before rendering private package content. Every object access must be authorized by participant or owner subject, and every state-changing browser request needs same-origin and CSRF protection before mutation.
+- Every mutation affecting indications or aggregates must be idempotent, audit-logged, and retry-safe. Private package content, PII, indication notes, credentials, private totals, audit detail, and exports must not appear in public errors or logs.
+
+### Naming, Simplicity, and Review
+
+- Use precise domain names for files, exports, interfaces, functions, props, and variables. Document exported contracts, extension points, invariants, edge cases, and non-obvious intent with concise TSDoc or comments; keep extension-registration requirements next to their contract or composition point, remove stale comments, and keep examples aligned with actual types and APIs.
+- Prefer direct readable code and abstractions around real semantic boundaries or repeated behavior. Do not add a library when the existing platform and dependencies solve the problem clearly, or perform a large rewrite when a bounded change is enough.
+- Before coding, identify the feature boundary, the files that truly need change, an existing interface or composition point, and how an independent feature can avoid the same files. Prefer feature-owned additions when that makes ownership clearer.
+- During review, treat mixed rendering/networking/persistence/domain components, growing central conditionals, broad shared utilities, concrete implementations imported everywhere, feature logic leaking into core, globally coupled tests, shared hot spots, and indirection without a testability or extension benefit as warning signs. Refactor proportionately toward smaller semantic units, narrow typed contracts, explicit dependencies, and independently owned modules.
 
 ## Sites and UI Rules
 
@@ -50,6 +78,7 @@ Production persistence must use AittaDB. Browser storage, process memory, local 
 - Keep letter spacing at `0`. Do not scale body text with viewport width.
 - HTML and JSON/API behavior must use the same server-side authorization and validation. Hidden browser controls are never a security boundary.
 - Use page-specific CSS classes; avoid broad global selectors that could break generated or embedded tool UIs.
+- Do not add a UI framework or dependency unless the task explicitly requires it or the repository already standardizes on it.
 
 Every application URI is a resource, not an HTML-only page. Use `Accept` for representation selection: human HTML and versioned hypermedia JSON must come from the same authorization, validation, domain, and repository services. JSON `data`, `links`, and currently available `actions` must match the state, links, forms, and buttons visible to the same caller in HTML. Never select by `User-Agent`. Explicit unsupported media-type versions return `406`; standards-defined OAuth/OIDC responses keep their protocol formats.
 
