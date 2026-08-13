@@ -23,6 +23,7 @@ import {
   parseCampaignSetup,
 } from "../repositories/in-memory-campaign-repository.ts";
 import { DevelopmentInMemoryAuditRepository } from "../repositories/in-memory-audit-notification-repositories.ts";
+import { StoragePublicCampaignPresentationReader } from "../repositories/storage-public-campaign-presentation.ts";
 import { syntheticPublicCampaign } from "./fixtures/public-campaign.ts";
 import {
   FIRST_CAMPAIGN_SAVE as FIRST_SAVE,
@@ -240,7 +241,7 @@ test("audited campaign creation atomically records one unpublished draft", async
   const state = new MemoryStorageState();
   const adapter = new DeterministicMemoryStorageAdapter(state, true);
   const repository = new DevelopmentInMemoryCampaignRepository(adapter);
-  const publicReader = new DevelopmentInMemoryPublicCampaignPresentationReader(adapter);
+  const publicReader = new StoragePublicCampaignPresentationReader(adapter);
   const request = {
     operationId: "campaign-operation:audited-create",
     ownerSubject: "owner-subject",
@@ -322,7 +323,7 @@ test("schema-4 audited saves replay after schema-5 publication without changing 
     transition: "published",
   });
   assert.equal(currentResult.campaign.revision, 2);
-  const publicReader = new DevelopmentInMemoryPublicCampaignPresentationReader(
+  const publicReader = new StoragePublicCampaignPresentationReader(
     adapter,
   );
   assert.deepEqual(await publicReader.readPublishedProjection(), {
@@ -1112,7 +1113,7 @@ test("public projection reads expose only published presentation state", async (
   const state = new MemoryStorageState();
   const adapter = new DeterministicMemoryStorageAdapter(state, true);
   const owner = new DevelopmentInMemoryCampaignRepository(adapter);
-  const publicReader = new DevelopmentInMemoryPublicCampaignPresentationReader(adapter);
+  const publicReader = new StoragePublicCampaignPresentationReader(adapter);
 
   await owner.saveSetup(saveRequest({
     operationId: "campaign-operation:public-projection",
@@ -1189,7 +1190,7 @@ test("malformed and unknown public presentation schemas do not alter private set
   const state = new MemoryStorageState();
   const adapter = new DeterministicMemoryStorageAdapter(state, true);
   const owner = new DevelopmentInMemoryCampaignRepository(adapter);
-  const publicReader = new DevelopmentInMemoryPublicCampaignPresentationReader(
+  const publicReader = new StoragePublicCampaignPresentationReader(
     adapter,
   );
   await owner.saveSetup(saveRequest({

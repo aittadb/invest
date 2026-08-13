@@ -518,10 +518,11 @@ server-replaced rendering headers are presentation signals, never authorization
 boundaries; generic runtime availability adds no browser header or navigation
 item.
 
-Public root composition receives only `publicCampaignStateReader()`. That
-reader is bound to `campaign-public-presentation/configured-campaign` and the
-sanitized aggregate projection; it cannot read the private current setup,
-immutable history, operation receipts, or audit records. Exact schema-4 public
+Public root composition receives only `publicCampaignStateReader()`. The
+storage-owned `StoragePublicCampaignPresentationReader` is bound to
+`campaign-public-presentation/configured-campaign` and the sanitized aggregate
+projection; it cannot read the private current setup, immutable history,
+operation receipts, or audit records. Exact schema-4 public
 presentation records remain readable without an aggregate lookup or write, and
 only a fresh owner save emits the schema-5 aggregate policy. An exact delayed
 retry of a pre-upgrade owner operation may replay its original closed schema-4

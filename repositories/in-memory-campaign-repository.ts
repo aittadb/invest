@@ -44,10 +44,17 @@ import {
   verifyPreparedAuditAppend,
   type PreparedAuditAppend,
 } from "./in-memory-audit-notification-repositories.ts";
+import {
+  PUBLIC_CAMPAIGN_PRESENTATION_KEY,
+  StoragePublicCampaignPresentationReader,
+  decodePublicCampaignPresentation,
+  encodePublicCampaignPresentation,
+  publicCampaignPresentationMutation,
+  type PublicCampaignPresentation,
+  type PublicCampaignPresentationSchema,
+} from "./storage-public-campaign-presentation.ts";
 
 const CAMPAIGN_SETUP_SCHEMA_VERSION = 4;
-const LEGACY_PUBLIC_PRESENTATION_SCHEMA_VERSION = 4;
-const PUBLIC_PRESENTATION_SCHEMA_VERSION = 5;
 const MAX_CAMPAIGN_PHASES = 32;
 const MAX_SERIALIZED_CAMPAIGN_SETUP_BYTES = 262_144;
 const SETUP_CHUNK_RAW_BYTES = 45_000;
@@ -75,10 +82,6 @@ const SETUP_CHUNK_COLLECTION = storageKey(
   "campaign-setup-chunks",
   `campaign-setup-chunk:${"0".repeat(64)}:0000`,
 ).collection;
-const PUBLIC_PRESENTATION_KEY = storageKey(
-  "campaign-public-presentation",
-  "configured-campaign",
-);
 
 const SETUP_KEYS = new Set([
   "publicCampaign",
@@ -125,18 +128,6 @@ const STORED_AUDITED_OPERATION_INTENT_KEYS = new Set([
   "actor",
   "transition",
 ]);
-const LEGACY_PUBLIC_PRESENTATION_KEYS = new Set([
-  "kind",
-  "schemaVersion",
-  "revision",
-  "publicCampaign",
-]);
-const PUBLIC_PRESENTATION_KEYS = new Set([
-  ...LEGACY_PUBLIC_PRESENTATION_KEYS,
-  "amountAggregate",
-]);
-type PublicPresentationSchema = "legacy" | "current";
-
 /** All campaign-specific setup that must be supplied explicitly by a deployment. */
 export type CampaignSetup = Readonly<{
   publicCampaign: PublicCampaignConfiguration;
@@ -255,22 +246,11 @@ export interface CampaignRepository {
   ): Promise<CampaignSetupHistoryPage>;
 }
 
-/** Public-only projection contract; implementations must not return setup data. */
-export interface PublicCampaignPresentationReader {
-  readPublishedCampaign(): Promise<PublicCampaignConfiguration | null>;
-}
-
-/** Public campaign and aggregate policy captured by one published revision. */
-export type PublishedCampaignProjection = Readonly<{
-  revision: number;
-  publicCampaign: PublicCampaignConfiguration;
-  amountAggregate: AmountAggregateConfiguration | null;
-}>;
-
-/** Public-only projection contract used to bind totals to published policy. */
-export interface PublishedCampaignProjectionReader {
-  readPublishedProjection(): Promise<PublishedCampaignProjection | null>;
-}
+export type {
+  PublicCampaignPresentationReader,
+  PublishedCampaignProjection,
+  PublishedCampaignProjectionReader,
+} from "./storage-public-campaign-presentation.ts";
 
 /** Campaign mutations that commit their audit evidence in the same transaction. */
 export interface AtomicCampaignAuditRepository extends CampaignRepository {
@@ -442,29 +422,6 @@ export class StorageCampaignRepository implements AtomicCampaignAuditRepository 
       )),
       nextCursor: page.nextCursor,
     });
-  }
-}
-
-/** Reader bound only to the separately stored public campaign projection. */
-export class StoragePublicCampaignPresentationReader
-  implements
-    PublicCampaignPresentationReader,
-    PublishedCampaignProjectionReader {
-  readonly #read: Pick<StorageAdapter, "read">["read"];
-
-  constructor(storage: Pick<StorageAdapter, "read">) {
-    this.#read = storage.read.bind(storage);
-  }
-
-  async readPublishedCampaign(): Promise<PublicCampaignConfiguration | null> {
-    return (await this.readPublishedProjection())?.publicCampaign ?? null;
-  }
-
-  async readPublishedProjection(): Promise<PublishedCampaignProjection | null> {
-    const record = await this.#read(PUBLIC_PRESENTATION_KEY);
-    if (record === null) return null;
-    const projection = decodePublicPresentation(record);
-    return projection.publicCampaign.published ? projection : null;
   }
 }
 
@@ -780,7 +737,7 @@ function encodeCampaignOperationIntent(
 
 type CampaignSaveTransaction = Readonly<{
   result: StorageTransactionResult;
-  publicPresentationSchema: PublicPresentationSchema;
+  publicPresentationSchema: PublicCampaignPresentationSchema;
 }>;
 
 async function transactCampaignSave(
@@ -831,7 +788,7 @@ async function transactCampaignSave(
 
 function campaignSaveMutations(
   prepared: PreparedCampaignSave,
-  publicPresentationSchema: PublicPresentationSchema,
+  publicPresentationSchema: PublicCampaignPresentationSchema,
   auditMutation?: StoragePutMutation,
 ): readonly StorageMutation[] {
   const mutations: StorageMutation[] = [
@@ -853,8 +810,8 @@ function campaignSaveMutations(
       expectedRevision: null,
       value: prepared.value,
     },
-    publicPresentationMutation(
-      prepared,
+    publicCampaignPresentationMutation(
+      publicPresentation(prepared.revision),
       prepared.expectedRevision,
       publicPresentationSchema,
     ),
@@ -866,7 +823,7 @@ function campaignSaveMutations(
 function verifyCampaignSaveTransactionResult(
   result: unknown,
   prepared: PreparedCampaignSave,
-  publicPresentationSchema: PublicPresentationSchema = "current",
+  publicPresentationSchema: PublicCampaignPresentationSchema = "current",
 ): CampaignSetupRevision {
   const transaction = exactStorageTransactionResult(result, 4);
   if (
@@ -895,7 +852,7 @@ function verifyAuditedCampaignSaveTransactionResult(
   result: unknown,
   prepared: PreparedCampaignSave,
   audit: PreparedAuditAppend,
-  publicPresentationSchema: PublicPresentationSchema = "current",
+  publicPresentationSchema: PublicCampaignPresentationSchema = "current",
 ): AuditedCampaignSetupSaveResult {
   const transaction = exactStorageTransactionResult(result, 5);
   if (
@@ -933,7 +890,7 @@ function verifyAuditedCampaignSaveTransactionResult(
 function campaignSaveRecords(
   records: readonly unknown[],
   prepared: PreparedCampaignSave,
-  publicPresentationSchema: PublicPresentationSchema,
+  publicPresentationSchema: PublicCampaignPresentationSchema,
 ): readonly [StorageRecord, StorageRecord, StorageRecord, StorageRecord] {
   return Object.freeze([
     verifyExactStorageRecord(
@@ -956,10 +913,10 @@ function campaignSaveRecords(
     ),
     verifyExactStorageRecord(
       records[3],
-      PUBLIC_PRESENTATION_KEY,
+      PUBLIC_CAMPAIGN_PRESENTATION_KEY,
       prepared.revision.revision,
-      encodePublicPresentation(
-        prepared.revision,
+      encodePublicCampaignPresentation(
+        publicPresentation(prepared.revision),
         publicPresentationSchema,
       ),
     ),
@@ -972,13 +929,13 @@ function verifyCampaignSaveRecords(
   historyRecord: StorageRecord,
   operationRecord: StorageRecord,
   publicRecord: StorageRecord,
-  publicPresentationSchema: PublicPresentationSchema,
+  publicPresentationSchema: PublicCampaignPresentationSchema,
 ): CampaignSetupRevision {
   const current = decodeCurrentRevision(currentRecord);
   const history = decodeHistoryRevision(historyRecord);
   const operation = decodeOperationRevision(operationRecord);
   const expected = decodeRevision(prepared.value);
-  const publicProjection = decodePublicPresentation(publicRecord);
+  const publicProjection = decodePublicCampaignPresentation(publicRecord);
   if (
     JSON.stringify(current) !== JSON.stringify(history) ||
     JSON.stringify(current) !== JSON.stringify(operation) ||
@@ -1395,81 +1352,13 @@ function decodeOperationRevision(record: StorageRecord): StoredCampaignSetupRevi
   return revision;
 }
 
-function publicPresentationMutation(
-  prepared: PreparedCampaignSave,
-  expectedRevision: number | null,
-  schema: PublicPresentationSchema,
-) {
-  return Object.freeze({
-    type: "put" as const,
-    key: PUBLIC_PRESENTATION_KEY,
-    expectedRevision,
-    value: encodePublicPresentation(prepared.revision, schema),
-  });
-}
-
-function encodePublicPresentation(
+function publicPresentation(
   revision: CampaignSetupRevision,
-  schema: PublicPresentationSchema,
-): StorageDocument {
-  if (schema === "legacy") {
-    return deepFreeze({
-      kind: "campaign-public-presentation",
-      schemaVersion: LEGACY_PUBLIC_PRESENTATION_SCHEMA_VERSION,
-      revision: revision.revision,
-      publicCampaign: revision.setup.publicCampaign,
-    });
-  }
-  return deepFreeze({
-    kind: "campaign-public-presentation",
-    schemaVersion: PUBLIC_PRESENTATION_SCHEMA_VERSION,
+): PublicCampaignPresentation {
+  return Object.freeze({
     revision: revision.revision,
     publicCampaign: revision.setup.publicCampaign,
     amountAggregate: revision.setup.amountAggregate,
-  });
-}
-
-function decodePublicPresentation(
-  record: StorageRecord,
-): PublishedCampaignProjection {
-  const source = recordValue(record.value);
-  const schemaVersion = source?.schemaVersion;
-  const expectedKeys = schemaVersion === LEGACY_PUBLIC_PRESENTATION_SCHEMA_VERSION
-    ? LEGACY_PUBLIC_PRESENTATION_KEYS
-    : schemaVersion === PUBLIC_PRESENTATION_SCHEMA_VERSION
-    ? PUBLIC_PRESENTATION_KEYS
-    : null;
-  if (
-    source === null ||
-    expectedKeys === null ||
-    !hasExactKeys(source, expectedKeys) ||
-    source.kind !== "campaign-public-presentation" ||
-    !Number.isSafeInteger(source.revision) ||
-    (source.revision as number) < 1 ||
-    record.key.collection !== PUBLIC_PRESENTATION_KEY.collection ||
-    record.key.id !== PUBLIC_PRESENTATION_KEY.id ||
-    record.revision !== source.revision
-  ) {
-    throw new StorageFailure("UNAVAILABLE");
-  }
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(source.publicCampaign);
-  } catch (error) {
-    throw new StorageFailure("UNAVAILABLE", { cause: error });
-  }
-  const campaign = parsePublicCampaignConfiguration(serialized);
-  if (campaign === null) throw new StorageFailure("UNAVAILABLE");
-  let amountAggregate: AmountAggregateConfiguration | null = null;
-  if (schemaVersion === PUBLIC_PRESENTATION_SCHEMA_VERSION) {
-    const parsed = parseAmountAggregateConfiguration(source.amountAggregate);
-    if (!parsed.ok) throw new StorageFailure("UNAVAILABLE");
-    amountAggregate = parsed.value;
-  }
-  return deepFreeze({
-    revision: source.revision as number,
-    publicCampaign: campaign,
-    amountAggregate,
   });
 }
 

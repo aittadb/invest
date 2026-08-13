@@ -5,7 +5,7 @@ import {
 } from "../domain/storage-adapter.ts";
 import type { PublicCampaignConfiguration } from "../domain/public-campaign-configuration.ts";
 import { DevelopmentInMemoryAggregateRepository } from "./in-memory-aggregate-repository.ts";
-import { StoragePublicCampaignPresentationReader } from "./in-memory-campaign-repository.ts";
+import { StoragePublicCampaignPresentationReader } from "./storage-public-campaign-presentation.ts";
 
 const MAX_PUBLIC_STATE_ATTEMPTS = 2;
 

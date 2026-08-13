@@ -42,14 +42,16 @@ import type {
 import {
   MAX_CAMPAIGN_SETUP_MATERIALIZATION_READS,
   StorageCampaignRepository,
-  StoragePublicCampaignPresentationReader,
   campaignSetupRevisionCheck,
   verifyCampaignSetupRevisionCheckRecord,
   type AtomicCampaignAuditRepository,
   type CampaignRepository,
   type CampaignSetupRevision,
-  type PublicCampaignPresentationReader,
 } from "./in-memory-campaign-repository.ts";
+import {
+  StoragePublicCampaignPresentationReader,
+  type PublicCampaignPresentationReader,
+} from "./storage-public-campaign-presentation.ts";
 import {
   MAX_ACCEPTANCE_GATE_READ_ATTEMPTS,
   PACKAGE_STORAGE_READ_LIMITS,
