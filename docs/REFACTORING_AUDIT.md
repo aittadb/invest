@@ -47,6 +47,12 @@ and focused collection and moderation tests. It must preserve exact owner
 authorization, cursor binding, terminal/current/lease verification, bounded
 reads, corruption handling, and non-disclosing failures.
 
+Implementation mapping found that this extraction consumes a shared verified
+indication-read codec used by collection, detail, rejection, and participant
+paths. TASK-171 establishes that neutral storage-owned codec first. TASK-168
+then consumes it and remains a narrow collection-only move; this is a direct
+contract dependency, not a preferred ordering rule.
+
 ### TASK-169: Public campaign rendering components
 
 `app/page.tsx` currently combines request-header and identity resolution with
@@ -105,11 +111,7 @@ contract.
 
 ## Execution Boundaries
 
-TASK-169 and TASK-170 can run concurrently and each can run alongside either
-repository extraction. TASK-167 and TASK-168 are semantically independent but
-both update `repositories/storage-application-repository-factory.ts`; do not
-give those two write tasks to concurrent agents. That is a file-ownership
-constraint, not a PLAN dependency.
-
-Every accepted task has `Depends on: none`. The audit and the hosted AittaDB
-proof tasks are not implementation prerequisites for these local refactors.
+TASK-169 and TASK-170 can run concurrently and each can run alongside the
+indication persistence lane. TASK-171 precedes TASK-168 because the collection
+must consume its neutral codec contract. The audit and the hosted AittaDB proof
+tasks are not implementation prerequisites for these local refactors.
