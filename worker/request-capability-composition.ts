@@ -136,16 +136,21 @@ export type RequestCapabilityComposition = Readonly<{
 export function composeRequestCapabilities(
   input: RequestCapabilityCompositionInput,
 ): RequestCapabilityComposition {
+  if (input.injectedRoute !== undefined) {
+    return Object.freeze({
+      dispatchRoute: input.injectedRoute,
+      runtimeCapabilities: unavailableRuntimeCapabilities,
+    });
+  }
   const availability = routeAvailability(input);
   const hasInjectedRoutes = Object.values(availability).some(Boolean) ||
     input.ownerFounderReviewDetail !== undefined ||
     input.ownerAggregateReconciliation !== undefined ||
     input.packageRoutes.participantReader !== undefined ||
     input.packageRoutes.participantAcknowledgment !== undefined;
-  const dispatchRoute = input.injectedRoute ??
-    (hasInjectedRoutes
-      ? createInjectedRouteDispatcher(input, availability)
-      : dispatchApplicationRoute);
+  const dispatchRoute = hasInjectedRoutes
+    ? createInjectedRouteDispatcher(input, availability)
+    : dispatchApplicationRoute;
 
   return Object.freeze({
     dispatchRoute,

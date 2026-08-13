@@ -21,6 +21,7 @@ import {
 } from "../worker/routes/owner.ts";
 import { handleParticipantHomeRoutes } from "../worker/routes/participant-home.ts";
 import { createParticipantRouteHandler } from "../worker/routes/participant.ts";
+import type { ParticipantProfileRouteDependencies } from "../worker/routes/participant.ts";
 import { handlePublicRoutes } from "../worker/routes/public.ts";
 import { APP_ORIGIN_HEADER } from "../http/app-origin.ts";
 import { OWNER_PACKAGE_WORKSPACE_HEADER } from "../http/runtime-capabilities.ts";
@@ -503,15 +504,18 @@ test("the Worker keeps image dispatch separate from application fallback", async
 });
 
 test("request capability composition keeps an injected dispatcher ahead of route wiring", async () => {
+  const ownerPackage = {} as unknown as OwnerPackageRouteDependencies;
+  const participantProfile =
+    {} as unknown as ParticipantProfileRouteDependencies;
   const composition = composeRequestCapabilities({
     injectedRoute: async () => new Response("injected"),
     participantRegistration: null,
-    participantProfile: null,
+    participantProfile,
     participantFounderInterest: null,
     participantInvestmentInterests: null,
     ownerOAuthProof: null,
     campaignWorkspace: null,
-    packageRoutes: {},
+    packageRoutes: { owner: ownerPackage },
     isOwner: false,
   });
 
