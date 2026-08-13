@@ -33,25 +33,24 @@ architecture documentation, and focused campaign/public-state tests.
 ### TASK-168: Owner indication review collection persistence
 
 `StorageOwnerIndicationReviewCollectionRepository` is a distinct
-owner-authenticated collection boundary inside the 3,615-line
-`repositories/in-memory-indication-repository.ts`. It owns sealed cursor
-binding, bounded storage-page validation, and review-summary materialization,
-but production moderation composition imports it through that development-named
-module.
+owner-authenticated collection boundary. It now lives in
+`repositories/storage-owner-indication-review-collection-repository.ts`, where
+it owns sealed cursor binding, bounded storage-page validation, and
+review-summary materialization. Production moderation composition imports that
+storage-owned module directly.
 
-The follow-up moves the collection and only the cohesive helpers it needs to a
-storage-owned module while preserving the existing service contract. Its owned
-file group is the legacy indication repository, the new collection module,
-owner moderation composition, the storage factory, architecture documentation,
-and focused collection and moderation tests. It must preserve exact owner
+The completed move preserved the existing service contract and exact owner
 authorization, cursor binding, terminal/current/lease verification, bounded
-reads, corruption handling, and non-disclosing failures.
+reads, corruption handling, and non-disclosing failures. Its focused file group
+was the legacy indication repository, the collection module, owner moderation
+composition, the storage factory, architecture documentation, and collection
+and moderation tests.
 
-Implementation mapping found that this extraction consumes a shared verified
-indication-read codec used by collection, detail, rejection, and participant
-paths. TASK-171 establishes that neutral storage-owned codec first. TASK-168
-then consumes it and remains a narrow collection-only move; this is a direct
-contract dependency, not a preferred ordering rule.
+Implementation mapping found that this extraction consumes the verified
+indication-read codec now shared by collection, detail, rejection, and
+participant paths. The codec owns schema-5 read validation; the collection
+consumes only its compact current/terminal/fields/lease operations and does not
+gain mutation or full-ancestry authority.
 
 ### TASK-169: Public campaign rendering components
 

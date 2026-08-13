@@ -8,7 +8,7 @@ import type {
   RejectIndicationWithEffectsRequest,
 } from "../services/owner-indication-moderation.ts";
 import type { OwnerIndicationReviewTokenBoundary } from "../services/owner-indication-review-tokens.ts";
-import { StorageOwnerIndicationReviewCollectionRepository } from "./in-memory-indication-repository.ts";
+import { StorageOwnerIndicationReviewCollectionRepository } from "./storage-owner-indication-review-collection-repository.ts";
 import { StorageOwnerIndicationRejectionRepository } from "./storage-owner-indication-rejection-repository.ts";
 import { StorageOwnerIndicationReviewDetailRepository } from "./storage-owner-indication-review-detail-repository.ts";
 

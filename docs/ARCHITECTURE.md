@@ -280,8 +280,11 @@ For each accepted capacity snapshot, root, summary, and index reads precede two 
 
 Full indication reads reconstruct bounded transition ancestry from exact data-only records, verify every field reference, chunk topology, byte count, content hash, normalized operation fingerprint, storage revision, required active lease, and ownership summary, then compare the reconstruction with current metadata. A separate immutable fingerprint binds the exact authoritative request fields before deployment policy or normalizers are applied, and every normalized transition fingerprint commits that raw-request fingerprint plus the compact normalized field commitment when fields change, so exact retries return their original revision after policy evolution while changed or corrupted request evidence cannot adopt the operation. Stored values with accessors, unexpected own keys, or non-data prototypes fail closed; canonical comparisons have explicit depth and node ceilings, and ownership-root, summary, participant-index, and operation-receipt reads validate their complete outer record and key envelopes before field access. Capacity uses the compact proof above rather than full reconstruction. Current owner configuration authorizes access, while immutable historical owner attribution survives an authorized owner rotation. Exported record, transaction, mutation, materialization-read, capacity-read, initialization-read, and delayed-replay-read ceilings are enforced and observed in the reusable repository contract.
 
-`StorageOwnerIndicationReviewCollectionRepository` is the narrow persistent
-collection projection over those current indication records. Construction binds
+`StorageOwnerIndicationReviewCollectionRepository`, in
+`storage-owner-indication-review-collection-repository.ts`, is the narrow
+persistent collection projection over those current indication records. It
+consumes the read-only codec rather than the mutation-capable compatibility
+repository. Construction binds
 one authenticated subject to the configured owner and accepts one separately
 injected `OwnerIndicationReviewTokenBoundary`; anonymous and different
 authenticated subjects receive the same fixed not-found failure before any

@@ -70,7 +70,7 @@ import {
   type FounderApplicationRepository,
   type FounderApplicationReviewDetailRepository,
 } from "./in-memory-founder-application-repository.ts";
-import { StorageOwnerIndicationReviewCollectionRepository } from "./in-memory-indication-repository.ts";
+import { StorageOwnerIndicationReviewCollectionRepository } from "./storage-owner-indication-review-collection-repository.ts";
 import {
   StorageParticipantRepository,
   participantProfileRevisionCheck,

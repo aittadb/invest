@@ -60,7 +60,10 @@ export const MAX_INDICATION_MATERIALIZATION_READS =
     (1 + MAX_INDICATION_FIELDS_CHUNKS);
 
 const INDICATION_SCHEMA_VERSION = 5;
-const CURRENT_INDICATIONS = collection("investment-indications");
+/** The typed collection containing current indication metadata. */
+export const INDICATION_CURRENT_STORAGE_COLLECTION = collection(
+  "investment-indications",
+);
 const INDICATION_HISTORY = collection("investment-indication-history");
 const INDICATION_FIELDS = collection("investment-indication-fields");
 const ACTIVE_UNIQUENESS_KEYS = collection("investment-indication-active-keys");
@@ -151,7 +154,7 @@ export async function indicationCurrentStorageKey(
   id: InvestmentIndicationId,
 ): Promise<StorageKey> {
   return requiredStorageKey(
-    CURRENT_INDICATIONS,
+    INDICATION_CURRENT_STORAGE_COLLECTION,
     await hashedStorageId("indication-current", id),
   );
 }
@@ -270,6 +273,107 @@ export function requireMatchingCurrentAndTerminal(
     canonicalJson(fieldsReferenceDocument(current.fields)) !==
       canonicalJson(fieldsReferenceDocument(terminal.fields))
   ) unavailable();
+}
+
+/**
+ * Verify the compact terminal transition used by bounded current-record
+ * projections. It performs no storage access or authorization decisions.
+ */
+export async function verifyStoredIndicationTerminalProjection(
+  terminal: StoredIndicationTransition,
+  fields: InvestmentIndicationFields,
+): Promise<InvestmentIndication["lifecycle"]["status"]> {
+  const source = exactRecord(terminal.document, TRANSITION_DOCUMENT_KEYS);
+  const acknowledgment = storedAcknowledgment(source.acknowledgment);
+  if (
+    acknowledgment.participantSubject !== terminal.participantSubject ||
+    canonicalJson(acknowledgmentDocument(acknowledgment)) !==
+      canonicalJson(source.acknowledgment)
+  ) {
+    unavailable();
+  }
+
+  let actor: ParticipantIndicationActor | OwnerIndicationActor;
+  let status: InvestmentIndication["lifecycle"]["status"];
+  let reason: string | undefined;
+  if (terminal.transitionKind === "rejected") {
+    actor = storedOwnerActor(source.actor);
+    const rejection = exactRecord(
+      source.rejection,
+      new Set(["reason", "rejectedAt", "rejectedBy"]),
+    );
+    const rejectedAt = storedTimestamp(rejection.rejectedAt);
+    const rejectedBy = storedOwnerActor(rejection.rejectedBy);
+    reason = parseRejectionReason(rejection.reason) ?? unavailable();
+    if (
+      rejectedAt !== terminal.occurredAt ||
+      rejectedBy.subject !== actor.subject ||
+      canonicalJson(actorDocument(actor)) !== canonicalJson(source.actor) ||
+      canonicalJson({
+        reason,
+        rejectedAt,
+        rejectedBy: actorDocument(rejectedBy),
+      }) !== canonicalJson(source.rejection)
+    ) {
+      unavailable();
+    }
+    status = "rejected";
+  } else {
+    actor = storedParticipantActor(source.actor);
+    if (
+      actor.subject !== terminal.participantSubject ||
+      source.rejection !== null ||
+      canonicalJson(actorDocument(actor)) !== canonicalJson(source.actor)
+    ) {
+      unavailable();
+    }
+    status = terminal.transitionKind === "withdrawn" ? "withdrawn" : "active";
+  }
+
+  if (
+    terminal.transitionKind === "created"
+      ? terminal.revision !== 1 || terminal.fields.revision !== 1
+      : terminal.revision <= 1 ||
+        (terminal.transitionKind === "edited"
+          ? terminal.fields.revision !== terminal.revision
+          : terminal.fields.revision >= terminal.revision)
+  ) {
+    unavailable();
+  }
+  const fieldsReference = terminal.transitionKind === "created" ||
+      terminal.transitionKind === "edited"
+    ? await fieldsReferenceForTerminalProjection(fields, terminal.revision)
+    : undefined;
+  if (
+    fieldsReference !== undefined &&
+    canonicalJson(fieldsReferenceDocument(fieldsReference)) !==
+      canonicalJson(fieldsReferenceDocument(terminal.fields))
+  ) {
+    unavailable();
+  }
+  const request = Object.freeze({
+    operationId: terminal.operationId,
+    id: terminal.indicationId,
+    occurredAt: terminal.occurredAt,
+    historyEntryId: terminal.historyEntryId,
+    expectedRevision: terminal.revision === 1 ? null : terminal.revision - 1,
+    ...(terminal.transitionKind === "created" ||
+        terminal.transitionKind === "edited"
+      ? { fields: fieldsReference ?? unavailable() }
+      : {}),
+    ...(reason === undefined ? {} : { reason }),
+  });
+  if (
+    terminal.operationFingerprint !== await compactOperationFingerprint(
+      mutationKindForTransition(terminal.transitionKind),
+      actor,
+      request,
+      terminal.requestFingerprint,
+    )
+  ) {
+    unavailable();
+  }
+  return status;
 }
 
 export async function readStoredIndicationFields(
@@ -986,6 +1090,27 @@ function storedFieldsDocument(value: unknown): Record<string, unknown> {
   return source.kind === "personal" ? exactRecord(source, PERSONAL_FIELDS_DOCUMENT_KEYS)
     : source.kind === "company" ? exactRecord(source, COMPANY_FIELDS_DOCUMENT_KEYS) : unavailable();
 }
+function parseRejectionReason(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.replace(/\r\n?/gu, "\n").trim();
+  if (normalized.length === 0 || normalized.length > 500) return null;
+  for (const character of normalized) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint === undefined || codePoint === 127) return null;
+    if (codePoint < 32 && character !== "\n" && character !== "\t") {
+      return null;
+    }
+    if (
+      (codePoint >= 0x200b && codePoint <= 0x200f) ||
+      (codePoint >= 0x202a && codePoint <= 0x202e) ||
+      (codePoint >= 0x2060 && codePoint <= 0x206f) ||
+      codePoint === 0xfeff
+    ) {
+      return null;
+    }
+  }
+  return normalized;
+}
 function storedAmountConfigurationFromDocument(value: unknown): AmountConfiguration {
   const source = objectRecord(value);
   const parsed = parseAmountAggregateConfiguration({ amount: { currency: source?.currency, minimum: 0, increment: 1, maximum: null }, publicAggregate: { visibility: "hidden" } });
@@ -1008,6 +1133,18 @@ function fieldsDocument(fields: InvestmentIndicationFields): StorageDocument {
     representativeAuthorityDeclared: fields.representativeAuthorityDeclared, amount: fields.amount,
     currency: fields.currency, availabilityPeriod: fields.availabilityPeriod, note: fields.note,
   };
+}
+async function fieldsReferenceForTerminalProjection(
+  fields: InvestmentIndicationFields,
+  revision: number,
+): Promise<StoredIndicationFieldsReference> {
+  const bytes = new TextEncoder().encode(canonicalJson(fieldsDocument(fields)));
+  return Object.freeze({
+    revision,
+    hash: `sha256:${await sha256BytesHex(bytes)}`,
+    bytes: bytes.byteLength,
+    chunks: Math.ceil(bytes.byteLength / INDICATION_FIELDS_CHUNK_RAW_BYTES),
+  });
 }
 async function hashedStorageId(namespace: string, value: string): Promise<string> {
   return `${namespace}:${await sha256Hex(`${namespace}\u0000${value}`)}`;

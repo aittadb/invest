@@ -36,12 +36,14 @@ import {
 import {
   DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_FIELDS_CHUNKS,
+} from "../repositories/in-memory-indication-repository.ts";
+import {
   MAX_OWNER_INDICATION_REVIEW_CURSOR_LENGTH,
   MAX_OWNER_INDICATION_REVIEW_ITEM_READS,
   MAX_OWNER_INDICATION_REVIEW_PAGE_RECORD_READS,
   MAX_OWNER_INDICATION_REVIEW_PAGE_SIZE,
   StorageOwnerIndicationReviewCollectionRepository,
-} from "../repositories/in-memory-indication-repository.ts";
+} from "../repositories/storage-owner-indication-review-collection-repository.ts";
 import { AittaDBStorageAdapter } from "../repositories/aittadb-storage-adapter.ts";
 import {
   MemoryStorageAdapter,
@@ -656,7 +658,7 @@ test("maximum owner indication review page has a finite observed read budget", a
 
 test("owner indication review collection implementation has no logging surface", async () => {
   const sources = await Promise.all([
-    "../repositories/in-memory-indication-repository.ts",
+    "../repositories/storage-owner-indication-review-collection-repository.ts",
     "../services/owner-indication-review-tokens.ts",
   ].map((path) => readFile(new URL(path, import.meta.url), "utf8")));
   for (const source of sources) {
