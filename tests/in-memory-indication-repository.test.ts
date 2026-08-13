@@ -55,6 +55,10 @@ import {
   type RejectIndicationRequest,
   type WithdrawIndicationRequest,
 } from "../repositories/in-memory-indication-repository.ts";
+import {
+  indicationHistoryStorageKey,
+  readParticipantStoredIndication,
+} from "../repositories/storage-indication-read-codec.ts";
 
 const ALICE_SUBJECT = actorSubject("issuer.invalid/subject:alice-indicator");
 const BOB_SUBJECT = actorSubject("issuer.invalid/subject:bob-indicator");
@@ -556,6 +560,54 @@ test("adapter-backed development repository passes the indication contract", asy
       unrelatedEvidence: () => unrelatedEvidence(state),
     };
   });
+});
+
+test("indication read codec reconstructs verified subject-bound ancestry", async () => {
+  const state = new MemoryStorageState();
+  const storage = new DeterministicMemoryStorageAdapter(state, true);
+  const contexts = await packageContexts();
+  const alice = repository(storage, ALICE_SUBJECT);
+  const created = await alice.create(createRequest({
+    operationId: "indication-operation:codec-create",
+    id: PERSONAL_ONE,
+    occurredAt: "2026-08-10T09:00:00.000Z",
+    historyEntryId: "indication-history:codec-create",
+    fields: personalFields(),
+  }), contexts.aliceCurrent);
+  const edited = await alice.edit(editRequest({
+    operationId: "indication-operation:codec-edit",
+    id: PERSONAL_ONE,
+    expectedRevision: created.revision,
+    occurredAt: "2026-08-10T10:00:00.000Z",
+    historyEntryId: "indication-history:codec-edit",
+    fields: personalFields({ note: "Codec reconstruction." }),
+  }), contexts.aliceCurrent);
+
+  const reopened = await readParticipantStoredIndication(
+    new DeterministicMemoryStorageAdapter(state, true),
+    ALICE_SUBJECT,
+    PERSONAL_ONE,
+  );
+  assert.deepEqual(reopened, edited.snapshot);
+  assert.equal(
+    await readParticipantStoredIndication(storage, BOB_SUBJECT, PERSONAL_ONE),
+    null,
+  );
+
+  const terminalKey = await indicationHistoryStorageKey(PERSONAL_ONE, 2);
+  const terminal = state.records.get(storageKeyString(terminalKey));
+  assert(terminal);
+  state.records.set(storageKeyString(terminalKey), Object.freeze({
+    ...terminal,
+    value: Object.freeze({
+      ...terminal.value,
+      operationFingerprint: "sha256:" + "0".repeat(64),
+    }),
+  }));
+  await rejectsStorage(
+    () => readParticipantStoredIndication(storage, ALICE_SUBJECT, PERSONAL_ONE),
+    "UNAVAILABLE",
+  );
 });
 
 test("foreign occupied history slots are indistinguishable from missing indications", async () => {

@@ -38,7 +38,7 @@ import {
   DevelopmentInMemoryAuditRepository,
   DevelopmentInMemoryManualNotificationRepository,
 } from "../repositories/in-memory-audit-notification-repositories.ts";
-import { ownerIndicationCurrentStorageKey } from "../repositories/in-memory-indication-repository.ts";
+import { ownerIndicationCurrentStorageKey } from "../repositories/storage-indication-read-codec.ts";
 import {
   StorageOwnerIndicationRejectionRepository,
   type OwnerIndicationReviewIdResolver,

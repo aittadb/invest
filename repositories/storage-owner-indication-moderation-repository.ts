@@ -42,7 +42,6 @@ export class StorageOwnerIndicationModerationRepository
       configuredOwnerSubject,
       amountConfiguration,
       tokens,
-      parsingOptions,
     );
     this.#rejection = new StorageOwnerIndicationRejectionRepository(
       storage,

@@ -82,6 +82,7 @@ import {
   type PreparedParticipantIndicationMutation,
   type PreparedParticipantIndicationReplay,
 } from "./in-memory-indication-repository.ts";
+import { readParticipantStoredIndication } from "./storage-indication-read-codec.ts";
 import {
   MAX_ACTIVE_OWNED_INVESTMENT_INDICATIONS,
   PARTICIPANT_INVESTMENT_MUTATION_CONSISTENCY,
@@ -738,7 +739,11 @@ export class StorageParticipantInvestmentInterestRepository
 
   async get(id: InvestmentIndicationId): Promise<InvestmentIndication | null> {
     try {
-      return await this.#indications.get(requiredIndicationId(id));
+      return await readParticipantStoredIndication(
+        this.#storage,
+        this.#subject,
+        requiredIndicationId(id),
+      );
     } catch (error) {
       return mapRepositoryError(error);
     }

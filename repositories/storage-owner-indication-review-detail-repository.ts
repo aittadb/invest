@@ -5,7 +5,6 @@ import {
 } from "../domain/foundation.ts";
 import type {
   InvestmentIndication,
-  InvestmentIndicationParsingOptions,
   RejectedInvestmentIndication,
 } from "../domain/investment-indication.ts";
 import {
@@ -30,9 +29,9 @@ import {
   MAX_MANUAL_NOTIFICATION_STORAGE_READS,
 } from "./in-memory-audit-notification-repositories.ts";
 import {
-  DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_MATERIALIZATION_READS,
-} from "./in-memory-indication-repository.ts";
+  readStoredIndicationByCurrentKey,
+} from "./storage-indication-read-codec.ts";
 
 const MAX_REVIEW_ID_LENGTH = 192;
 const STORAGE_KEY_KEYS = new Set(["collection", "id"]);
@@ -62,7 +61,6 @@ export class StorageOwnerIndicationReviewDetailRepository
   readonly #storage: StorageAdapter;
   readonly #configuredOwnerSubject: ActorSubject | null;
   readonly #reviewIds: OwnerIndicationReviewIdResolver;
-  readonly #indications: DevelopmentInMemoryIndicationRepository;
   readonly #notifications: DevelopmentInMemoryManualNotificationRepository;
   readonly #permitted: boolean;
 
@@ -70,9 +68,8 @@ export class StorageOwnerIndicationReviewDetailRepository
     storage: StorageAdapter,
     authenticatedSubject: ActorSubject | null,
     configuredOwnerSubject: ActorSubject | null,
-    amountConfiguration: AmountConfiguration,
+    _amountConfiguration: AmountConfiguration,
     reviewIds: OwnerIndicationReviewIdResolver,
-    parsingOptions: InvestmentIndicationParsingOptions = {},
   ) {
     this.#storage = requiredStorage(storage);
     const actor = optionalSubject(authenticatedSubject);
@@ -80,13 +77,6 @@ export class StorageOwnerIndicationReviewDetailRepository
     this.#reviewIds = requiredReviewIdResolver(reviewIds);
     this.#permitted = actor !== null &&
       actor === this.#configuredOwnerSubject;
-    this.#indications = new DevelopmentInMemoryIndicationRepository(
-      this.#storage,
-      actor,
-      this.#configuredOwnerSubject,
-      amountConfiguration,
-      parsingOptions,
-    );
     this.#notifications = new DevelopmentInMemoryManualNotificationRepository(
       this.#storage,
     );
@@ -115,12 +105,14 @@ export class StorageOwnerIndicationReviewDetailRepository
     }
 
     try {
-      const projection = await this.#indications
-        .getOwnerProjectionByCurrentKey(key);
+      const projection = await readStoredIndicationByCurrentKey(
+        this.#storage,
+        key,
+      );
       if (projection === null) return null;
       const notification = await this.#notificationFor(
         projection.indication,
-        projection.terminalOperationId,
+        projection.terminal.operationId,
       );
       return Object.freeze({
         reviewId: token,

@@ -69,8 +69,8 @@ import {
   DevelopmentInMemoryIndicationRepository,
   MAX_INDICATION_CANONICAL_DEPTH,
   MAX_INDICATION_CANONICAL_NODES,
-  ownerIndicationCurrentStorageKey,
 } from "./in-memory-indication-repository.ts";
+import { ownerIndicationCurrentStorageKey } from "./storage-indication-read-codec.ts";
 
 const RECEIPT_SCHEMA_VERSION = 1;
 const RECEIPTS = collection("owner-indication-moderation-operations");

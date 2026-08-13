@@ -39,7 +39,6 @@ import {
 import type {
   PackageAcceptanceRecord,
   PackageContentHash,
-  PackageVersion,
 } from "../domain/package-content.ts";
 import {
   assertStorageListBoundary,
@@ -67,6 +66,18 @@ import {
   MAX_OWNER_INDICATION_REVIEW_CURSOR_LENGTH,
   type OwnerIndicationReviewTokenBoundary,
 } from "../services/owner-indication-review-tokens.ts";
+import {
+  decodeStoredIndicationCurrent,
+  decodeStoredIndicationTransition,
+  indicationCoordinatesFromCurrentDocument,
+  indicationCurrentStorageKey,
+  indicationHistoryStorageKey,
+  materializeStoredIndication,
+  ownerIndicationCurrentStorageKey as readCodecOwnerIndicationCurrentStorageKey,
+  readStoredIndicationFields,
+  requireMatchingCurrentAndTerminal,
+  verifyStoredActiveIndicationLease,
+} from "./storage-indication-read-codec.ts";
 
 export {
   MAX_OWNER_INDICATION_REVIEW_CURSOR_LENGTH,
@@ -74,7 +85,6 @@ export {
 
 const INDICATION_SCHEMA_VERSION = 5;
 const CURRENT_INDICATIONS = storageCollection("investment-indications");
-const INDICATION_HISTORY = storageCollection("investment-indication-history");
 const INDICATION_FIELDS = storageCollection("investment-indication-fields");
 const ACTIVE_UNIQUENESS_KEYS = storageCollection(
   "investment-indication-active-keys",
@@ -142,44 +152,6 @@ const TRANSITION_DOCUMENT_KEYS = new Set([
   "acknowledgment",
   "actor",
   "rejection",
-]);
-const FIELDS_REFERENCE_KEYS = new Set([
-  "revision",
-  "hash",
-  "bytes",
-  "chunks",
-]);
-const FIELDS_CHUNK_DOCUMENT_KEYS = new Set([
-  "kind",
-  "schemaVersion",
-  "indicationId",
-  "participantSubject",
-  "fieldsRevision",
-  "fieldsHash",
-  "fieldsBytes",
-  "chunkIndex",
-  "chunkCount",
-  "data",
-]);
-const PERSONAL_FIELDS_DOCUMENT_KEYS = new Set([
-  "kind",
-  "residenceCountry",
-  "amount",
-  "currency",
-  "availabilityPeriod",
-  "note",
-]);
-const COMPANY_FIELDS_DOCUMENT_KEYS = new Set([
-  "kind",
-  "companyName",
-  "registrationCountry",
-  "companyIdentifier",
-  "representativeName",
-  "representativeAuthorityDeclared",
-  "amount",
-  "currency",
-  "availabilityPeriod",
-  "note",
 ]);
 const STORAGE_RECORD_KEYS = new Set(["key", "revision", "value"]);
 const STORAGE_KEY_KEYS = new Set(["collection", "id"]);
@@ -1491,29 +1463,29 @@ async function decodeOwnerIndicationReviewSummary(
   tokens: OwnerIndicationReviewTokenBoundary,
   ownerSubject: ActorSubject,
 ): Promise<OwnerIndicationReviewSummary> {
-  const coordinates = storedIndicationCoordinates(record.value);
-  const currentKey = await currentIndicationKey(coordinates.id);
-  const current = decodeStoredCurrent(
+  const coordinates = indicationCoordinatesFromCurrentDocument(record.value);
+  const currentKey = await indicationCurrentStorageKey(coordinates.id);
+  const current = decodeStoredIndicationCurrent(
     record,
     currentKey,
     coordinates.id,
     coordinates.subject,
   );
-  const terminalKey = await indicationHistoryKey(
+  const terminalKey = await indicationHistoryStorageKey(
     coordinates.id,
     current.revision,
   );
   const terminalRecord = await storage.read(terminalKey);
   if (terminalRecord === null) unavailable();
-  const terminal = decodeStoredTransition(
+  const terminal = decodeStoredIndicationTransition(
     terminalRecord,
     terminalKey,
     coordinates.subject,
     coordinates.id,
     current.revision,
   );
-  requireCurrentMatchesTerminal(current, terminal);
-  const fields = await readStoredFields(
+  requireMatchingCurrentAndTerminal(current, terminal);
+  const fields = await readStoredIndicationFields(
     storage,
     coordinates.subject,
     coordinates.id,
@@ -1523,7 +1495,12 @@ async function decodeOwnerIndicationReviewSummary(
     terminal,
     fields.fields,
   );
-  await verifyStoredActiveLease(storage, current, fields.fields, status);
+  await verifyStoredActiveIndicationLease(
+    storage,
+    current,
+    fields.fields,
+    status,
+  );
   return Object.freeze({
     reviewId: await tokens.reviewIdForCurrentKey(currentKey, ownerSubject),
     kind: fields.fields.kind,
@@ -1532,17 +1509,6 @@ async function decodeOwnerIndicationReviewSummary(
     currency: fields.fields.currency,
     updatedAt: terminal.occurredAt,
     revision: current.revision,
-  });
-}
-
-function storedIndicationCoordinates(value: unknown): Readonly<{
-  subject: ActorSubject;
-  id: InvestmentIndicationId;
-}> {
-  const source = exactRecord(value, CURRENT_DOCUMENT_KEYS);
-  return Object.freeze({
-    subject: storedActorSubject(source.participantSubject),
-    id: storedIndicationId(source.indicationId),
   });
 }
 
@@ -1670,36 +1636,7 @@ async function verifyStoredActiveLease(
   fields: InvestmentIndicationFields,
   status: InvestmentIndication["lifecycle"]["status"],
 ): Promise<void> {
-  if (status !== "active") return;
-  const uniquenessKey = (fields.kind === "personal"
-    ? JSON.stringify(["personal", current.participantSubject])
-    : JSON.stringify([
-        "company",
-        fields.registrationCountry,
-        fields.companyIdentifier,
-      ])) as ActiveIndicationUniquenessKey;
-  const hexadecimal = await sha256Hex(
-    `active-indication-uniqueness\u0000${uniquenessKey}`,
-  );
-  const fingerprint = `sha256:${hexadecimal}`;
-  const key = requiredStorageKey(
-    ACTIVE_UNIQUENESS_KEYS,
-    `active-key:${hexadecimal}`,
-  );
-  const lease = Object.freeze({
-    uniquenessKey,
-    key,
-    fingerprint,
-    document: Object.freeze({
-      kind: "active-indication-lease",
-      schemaVersion: INDICATION_SCHEMA_VERSION,
-      indicationId: current.indicationId,
-      uniquenessFingerprint: fingerprint,
-    }),
-  });
-  const record = await storage.read(key);
-  if (record === null) unavailable();
-  verifyLeaseRecord(record, lease, current.indicationId);
+  await verifyStoredActiveIndicationLease(storage, current, fields, status);
 }
 
 function requiredOwnerIndicationReviewCursor(
@@ -2000,56 +1937,18 @@ function domainMutation<Value>(
   }
 }
 
-function reconstructStoredTransition<Value>(
-  operation: () => ValidationResult<Value>,
-): Value {
-  try {
-    const result = operation();
-    if (!result.ok) unavailable();
-    return result.value;
-  } catch (error) {
-    if (error instanceof StorageFailure && error.code === "UNAVAILABLE") {
-      throw error;
-    }
-    throw new StorageFailure("UNAVAILABLE", { cause: error });
-  }
-}
-
 function decodeStoredCurrent(
   record: StorageRecord,
   expectedKey: StorageKey,
   expectedId: InvestmentIndicationId,
   expectedSubject: ActorSubject | null,
 ): StoredCurrent {
-  const source = exactStoredDocument(
+  return decodeStoredIndicationCurrent(
     record,
     expectedKey,
-    CURRENT_DOCUMENT_KEYS,
-    "investment-indication-current",
+    expectedId,
+    expectedSubject,
   );
-  const operationId = storedOperationId(source.operationId);
-  const operationFingerprint = storedFingerprint(source.operationFingerprint);
-  const requestFingerprint = storedFingerprint(source.requestFingerprint);
-  const indicationId = storedIndicationId(source.indicationId);
-  const participantSubject = storedActorSubject(source.participantSubject);
-  const revision = storedRevision(source.revision);
-  const fields = storedFieldsReference(source.fields);
-  if (
-    indicationId !== expectedId ||
-    (expectedSubject !== null && participantSubject !== expectedSubject) ||
-    record.revision !== revision
-  ) unavailable();
-  return Object.freeze({
-    operationId,
-    operationFingerprint,
-    requestFingerprint,
-    indicationId,
-    participantSubject,
-    revision,
-    fields,
-    document: record.value,
-    record,
-  });
 }
 
 function decodeStoredTransition(
@@ -2059,41 +1958,13 @@ function decodeStoredTransition(
   expectedId: InvestmentIndicationId,
   expectedRevision: number,
 ): StoredTransition {
-  const source = exactStoredDocument(
+  return decodeStoredIndicationTransition(
     record,
     expectedKey,
-    TRANSITION_DOCUMENT_KEYS,
-    "investment-indication-transition",
+    expectedSubject,
+    expectedId,
+    expectedRevision,
   );
-  const operationId = storedOperationId(source.operationId);
-  const operationFingerprint = storedFingerprint(source.operationFingerprint);
-  const requestFingerprint = storedFingerprint(source.requestFingerprint);
-  const indicationId = storedIndicationId(source.indicationId);
-  const participantSubject = storedActorSubject(source.participantSubject);
-  const historyEntryId = storedHistoryEntryId(source.historyEntryId);
-  const occurredAt = storedTimestamp(source.occurredAt);
-  const revision = storedRevision(source.revision);
-  const transitionKind = storedTransitionKind(source.transitionKind);
-  const fields = storedFieldsReference(source.fields);
-  if (
-    indicationId !== expectedId ||
-    (expectedSubject !== null && participantSubject !== expectedSubject) ||
-    revision !== expectedRevision ||
-    record.revision !== 1
-  ) unavailable();
-  return Object.freeze({
-    operationId,
-    operationFingerprint,
-    requestFingerprint,
-    indicationId,
-    participantSubject,
-    historyEntryId,
-    occurredAt,
-    revision,
-    transitionKind,
-    fields,
-    document: record.value,
-  });
 }
 
 async function materializeIndication(
@@ -2103,144 +1974,22 @@ async function materializeIndication(
   revision: number,
   knownTerminal: StoredTransition | null,
 ): Promise<MaterializedIndication> {
-  if (
-    !Number.isSafeInteger(revision) ||
-    revision < 1 ||
-    revision > MAX_INVESTMENT_INDICATION_REVISIONS
-  ) unavailable();
-  const transitions = await Promise.all(
-    Array.from({ length: revision }, async (_, index) => {
-      const currentRevision = index + 1;
-      if (knownTerminal !== null && currentRevision === knownTerminal.revision) {
-        return knownTerminal;
-      }
-      const key = await indicationHistoryKey(id, currentRevision);
-      const record = await storage.read(key);
-      if (record === null) unavailable();
-      return decodeStoredTransition(
-        record,
-        key,
-        subject,
-        id,
-        currentRevision,
-      );
-    }),
+  const materialized = await materializeStoredIndication(
+    storage,
+    subject,
+    id,
+    revision,
+    knownTerminal,
   );
-
-  const references = new Map<number, StoredFieldsReference>();
-  let prior: StoredFieldsReference | null = null;
-  for (const transition of transitions) {
-    if (
-      transition.transitionKind === "created" ||
-      transition.transitionKind === "edited"
-    ) {
-      if (transition.fields.revision !== transition.revision) unavailable();
-    } else if (
-      prior === null ||
-      canonicalJson(fieldsReferenceDocument(prior)) !==
-        canonicalJson(fieldsReferenceDocument(transition.fields))
-    ) unavailable();
-    const known = references.get(transition.fields.revision);
-    if (
-      known !== undefined &&
-      canonicalJson(fieldsReferenceDocument(known)) !==
-        canonicalJson(fieldsReferenceDocument(transition.fields))
-    ) unavailable();
-    references.set(transition.fields.revision, transition.fields);
-    prior = transition.fields;
-  }
-  const fieldsByRevision = new Map<number, StoredFields>(await Promise.all(
-    [...references.entries()].map(async ([fieldsRevision, reference]) => [
-      fieldsRevision,
-      await readStoredFields(storage, subject, id, reference),
-    ] as const),
-  ));
-
-  let indication: InvestmentIndication | null = null;
-  for (const transition of transitions) {
-    const storedFields = fieldsByRevision.get(transition.fields.revision);
-    if (storedFields === undefined) unavailable();
-    const source = exactRecord(transition.document, TRANSITION_DOCUMENT_KEYS);
-    const acknowledgment = storedAcknowledgment(source.acknowledgment);
-    const amount = storedAmountConfiguration(storedFields.fields);
-    const options = storedParsingOptions();
-    if (transition.transitionKind === "created") {
-      if (indication !== null) unavailable();
-      indication = reconstructStoredTransition(() => createInvestmentIndication({
-        id,
-        occurredAt: transition.occurredAt,
-        historyEntryId: transition.historyEntryId,
-        fields: domainFieldsInput(storedFields.fields),
-      }, storedParticipantActor(source.actor), amount, storedAcknowledgmentContext(
-        acknowledgment,
-      ), options));
-    } else if (transition.transitionKind === "edited") {
-      if (indication === null) unavailable();
-      indication = reconstructStoredTransition(() => editInvestmentIndication(indication!, {
-        occurredAt: transition.occurredAt,
-        historyEntryId: transition.historyEntryId,
-        fields: domainFieldsInput(storedFields.fields),
-      }, storedParticipantActor(source.actor), amount, storedAcknowledgmentContext(
-        acknowledgment,
-      ), options));
-    } else if (transition.transitionKind === "withdrawn") {
-      if (indication === null) unavailable();
-      indication = reconstructStoredTransition(() => withdrawInvestmentIndication(
-        indication!,
-        {
-        occurredAt: transition.occurredAt,
-        historyEntryId: transition.historyEntryId,
-        },
-        storedParticipantActor(source.actor),
-      ));
-    } else if (transition.transitionKind === "reactivated") {
-      if (indication === null) unavailable();
-      indication = reconstructStoredTransition(() => reactivateInvestmentIndication(
-        indication!,
-        {
-        occurredAt: transition.occurredAt,
-        historyEntryId: transition.historyEntryId,
-        },
-        storedParticipantActor(source.actor),
-        storedAcknowledgmentContext(acknowledgment),
-      ));
-    } else {
-      if (indication === null) unavailable();
-      const rejection = exactRecord(source.rejection, new Set([
-        "reason",
-        "rejectedAt",
-        "rejectedBy",
-      ]));
-      indication = reconstructStoredTransition(() => rejectInvestmentIndication(
-        indication!,
-        {
-        occurredAt: transition.occurredAt,
-        historyEntryId: transition.historyEntryId,
-        reason: rejection.reason,
-        },
-        storedOwnerActor(source.actor),
-      ));
-    }
-    const fingerprint = await fingerprintForStoredIndication(
-      indication,
-      transition.operationId,
-      transition.requestFingerprint,
-    );
-    if (
-      fingerprint !== transition.operationFingerprint ||
-      canonicalJson(transitionIndicationDocument(
-        indication,
-        transition.operationId,
-        transition.operationFingerprint,
-        transition.requestFingerprint,
-        transition.fields,
-      )) !== canonicalJson(transition.document)
-    ) unavailable();
-  }
-  if (indication === null) unavailable();
-  const terminal = transitions.at(-1);
-  if (terminal === undefined) unavailable();
-  return Object.freeze({ indication, terminal, fieldsByRevision });
+  return Object.freeze({
+    ...materialized,
+    fieldsByRevision: new Map(
+      [...materialized.fieldsByRevision.entries()].map(([fieldsRevision, fields]) => [
+        fieldsRevision,
+        Object.freeze({ ...fields, chunks: Object.freeze([]) }),
+      ]),
+    ),
+  });
 }
 
 function exactStoredDocument(
@@ -2265,33 +2014,8 @@ function exactStoredDocument(
   return source;
 }
 
-function storedOperationId(value: unknown): StorageOperationId {
-  const parsed = parseStorageOperationId(value);
-  if (!parsed.ok) unavailable();
-  return parsed.value;
-}
-
-function storedFingerprint(value: unknown): string {
-  if (typeof value !== "string" || !isSha256(value)) unavailable();
-  return value;
-}
-
 function storedIndicationId(value: unknown): InvestmentIndicationId {
   const parsed = parseStableId<"investment-indication">(value);
-  if (!parsed.ok) unavailable();
-  return parsed.value;
-}
-
-function storedActorSubject(value: unknown): ActorSubject {
-  const parsed = parseActorSubject(value);
-  if (!parsed.ok) unavailable();
-  return parsed.value;
-}
-
-function storedHistoryEntryId(
-  value: unknown,
-): InvestmentIndicationHistoryEntryId {
-  const parsed = parseStableId<"investment-indication-history-entry">(value);
   if (!parsed.ok) unavailable();
   return parsed.value;
 }
@@ -2300,52 +2024,6 @@ function storedTimestamp(value: unknown): Timestamp {
   const parsed = parseTimestamp(value);
   if (!parsed.ok) unavailable();
   return parsed.value;
-}
-
-function storedRevision(value: unknown): number {
-  if (
-    !Number.isSafeInteger(value) ||
-    (value as number) < 1 ||
-    (value as number) > MAX_INVESTMENT_INDICATION_REVISIONS
-  ) unavailable();
-  return value as number;
-}
-
-function storedTransitionKind(
-  value: unknown,
-): InvestmentIndicationHistoryEntry["transition"] {
-  if (
-    value !== "created" &&
-    value !== "edited" &&
-    value !== "withdrawn" &&
-    value !== "reactivated" &&
-    value !== "rejected"
-  ) unavailable();
-  return value;
-}
-
-function storedFieldsReference(value: unknown): StoredFieldsReference {
-  const source = exactRecord(value, FIELDS_REFERENCE_KEYS);
-  const revision = storedRevision(source.revision);
-  if (
-    typeof source.hash !== "string" ||
-    !isSha256(source.hash) ||
-    !Number.isSafeInteger(source.bytes) ||
-    (source.bytes as number) < 1 ||
-    (source.bytes as number) > MAX_SERIALIZED_INDICATION_FIELDS_BYTES ||
-    !Number.isSafeInteger(source.chunks) ||
-    (source.chunks as number) < 1 ||
-    (source.chunks as number) > MAX_INDICATION_FIELDS_CHUNKS ||
-    Math.ceil(
-      (source.bytes as number) / INDICATION_FIELDS_CHUNK_RAW_BYTES,
-    ) !== source.chunks
-  ) unavailable();
-  return Object.freeze({
-    revision,
-    hash: source.hash,
-    bytes: source.bytes as number,
-    chunks: source.chunks as number,
-  });
 }
 
 function requireBoundedRecord(value: StorageDocument): void {
@@ -2502,22 +2180,6 @@ function storedAcknowledgment(value: unknown): PackageAcceptanceRecord {
   });
 }
 
-function storedAcknowledgmentContext(
-  acknowledgment: PackageAcceptanceRecord,
-): TrustedPackageAcknowledgmentContext {
-  const version = Object.freeze({
-    id: acknowledgment.acceptedVersionId,
-    createdAt: acknowledgment.acceptedAt,
-    changeSummary: "Stored acknowledgment reconstruction",
-    materialChange: false,
-    acknowledgmentText: "Stored acknowledgment" as PackageVersion["acknowledgmentText"],
-    sections: Object.freeze([]),
-    contentHash: acknowledgment.acceptedContentHash,
-    requiredAcceptanceHash: acknowledgment.satisfiedRequirementHash,
-  }) satisfies PackageVersion;
-  return Object.freeze({ currentVersion: version, latestAcceptance: acknowledgment });
-}
-
 async function prepareStoredFields(
   subject: ActorSubject,
   id: InvestmentIndicationId,
@@ -2583,68 +2245,14 @@ async function readStoredFields(
   id: InvestmentIndicationId,
   reference: StoredFieldsReference,
 ): Promise<StoredFields> {
-  const parts = await Promise.all(
-    Array.from({ length: reference.chunks }, async (_, index) => {
-      const key = await indicationFieldsChunkKey(id, reference.revision, index);
-      const record = await storage.read(key);
-      if (record === null) unavailable();
-      const source = exactStoredDocument(
-        record,
-        key,
-        FIELDS_CHUNK_DOCUMENT_KEYS,
-        "investment-indication-fields-chunk",
-      );
-      if (
-        record.revision !== 1 ||
-        source.indicationId !== id ||
-        source.participantSubject !== subject ||
-        source.fieldsRevision !== reference.revision ||
-        source.fieldsHash !== reference.hash ||
-        source.fieldsBytes !== reference.bytes ||
-        source.chunkIndex !== index ||
-        source.chunkCount !== reference.chunks ||
-        typeof source.data !== "string"
-      ) unavailable();
-      const bytes = base64UrlDecode(source.data);
-      const expectedBytes = index === reference.chunks - 1
-        ? reference.bytes - index * INDICATION_FIELDS_CHUNK_RAW_BYTES
-        : INDICATION_FIELDS_CHUNK_RAW_BYTES;
-      if (bytes.byteLength !== expectedBytes) unavailable();
-      return bytes;
-    }),
-  );
-  const bytes = new Uint8Array(reference.bytes);
-  let offset = 0;
-  for (const part of parts) {
-    bytes.set(part, offset);
-    offset += part.byteLength;
-  }
-  if (
-    offset !== reference.bytes ||
-    `sha256:${await sha256BytesHex(bytes)}` !== reference.hash
-  ) unavailable();
-  let text: string;
-  let parsed: unknown;
-  try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    parsed = JSON.parse(text);
-  } catch {
-    return unavailable();
-  }
-  const source = storedFieldsDocument(parsed);
-  const amount = storedAmountConfigurationFromDocument(source);
-  const fields = parseInvestmentIndicationFields(
-    storedDomainFieldsInput(source),
-    amount,
-    storedParsingOptions(),
-  );
-  if (
-    !fields.ok ||
-    canonicalJson(fieldsDocument(fields.value)) !== text
-  ) unavailable();
-  return Object.freeze({
+  const decoded = await readStoredIndicationFields(
+    storage,
+    subject,
+    id,
     reference,
-    fields: fields.value,
+  );
+  return Object.freeze({
+    ...decoded,
     chunks: Object.freeze([]),
   });
 }
@@ -2775,58 +2383,8 @@ function fieldsDocument(fields: InvestmentIndicationFields): StorageDocument {
   return companyFieldsDocument(fields);
 }
 
-function storedFieldsDocument(value: unknown): Record<string, unknown> {
-  const source = objectRecord(value);
-  if (source === null) unavailable();
-  return source.kind === "personal"
-    ? exactRecord(source, PERSONAL_FIELDS_DOCUMENT_KEYS)
-    : source.kind === "company"
-    ? exactRecord(source, COMPANY_FIELDS_DOCUMENT_KEYS)
-    : unavailable();
-}
-
-function storedAmountConfiguration(
-  fields: InvestmentIndicationFields,
-): AmountConfiguration {
-  return storedAmountConfigurationFromDocument(fieldsDocument(fields));
-}
-
-function storedAmountConfigurationFromDocument(
-  value: unknown,
-): AmountConfiguration {
-  const source = objectRecord(value);
-  const parsed = parseAmountAggregateConfiguration({
-    amount: {
-      currency: source?.currency,
-      minimum: 0,
-      increment: 1,
-      maximum: null,
-    },
-    publicAggregate: { visibility: "hidden" },
-  });
-  if (!parsed.ok) unavailable();
-  return parsed.value.amount;
-}
-
-function storedParsingOptions(): InvestmentIndicationParsingOptions {
-  return Object.freeze({
-    country: Object.freeze({ normalize: (value: string) => value }),
-    companyIdentifier: Object.freeze({
-      normalize: (value: string) => value,
-    }),
-  });
-}
-
 function domainFieldsInput(fields: InvestmentIndicationFields): StorageDocument {
   const input = { ...fieldsDocument(fields) } as Record<string, unknown>;
-  delete input.currency;
-  return input as StorageDocument;
-}
-
-function storedDomainFieldsInput(value: unknown): StorageDocument {
-  const source = objectRecord(value);
-  if (source === null || !("currency" in source)) unavailable();
-  const input = { ...source };
   delete input.currency;
   return input as StorageDocument;
 }
@@ -2875,35 +2433,6 @@ function actorDocument(
   actor: ParticipantIndicationActor | OwnerIndicationActor,
 ): StorageDocument {
   return { type: actor.type, subject: actor.subject };
-}
-
-async function fingerprintForStoredIndication(
-  indication: InvestmentIndication,
-  operationId: StorageOperationId,
-  requestFingerprint: string,
-): Promise<string> {
-  const entry = indication.history[indication.history.length - 1];
-  if (entry === undefined) unavailable();
-  return operationFingerprint(
-    mutationKindForTransition(entry.transition),
-    entry.actor,
-    Object.freeze({
-      operationId,
-      id: indication.id,
-      occurredAt: entry.occurredAt,
-      historyEntryId: entry.id,
-      expectedRevision: indication.revision === 1
-        ? null
-        : indication.revision - 1,
-      ...(entry.transition === "created" || entry.transition === "edited"
-        ? { fields: entry.fields }
-        : {}),
-      ...(entry.transition === "rejected" && entry.rejection !== null
-        ? { reason: entry.rejection.reason }
-        : {}),
-    }),
-    requestFingerprint,
-  );
 }
 
 function mutationKindForTransition(
@@ -3296,17 +2825,14 @@ async function verifyOwnershipTransition(
 async function currentIndicationKey(
   id: InvestmentIndicationId,
 ): Promise<StorageKey> {
-  return requiredStorageKey(
-    CURRENT_INDICATIONS,
-    await hashedStorageId("indication-current", id),
-  );
+  return indicationCurrentStorageKey(id);
 }
 
 /** Internal current key used by owner-only opaque review resources. */
 export async function ownerIndicationCurrentStorageKey(
   id: unknown,
 ): Promise<StorageKey> {
-  return currentIndicationKey(requiredIndicationId(id));
+  return readCodecOwnerIndicationCurrentStorageKey(id);
 }
 
 function requiredCurrentIndicationStorageKey(value: unknown): StorageKey {
@@ -3333,13 +2859,7 @@ async function indicationHistoryKey(
   id: InvestmentIndicationId,
   revision: number,
 ): Promise<StorageKey> {
-  return requiredStorageKey(
-    INDICATION_HISTORY,
-    await hashedStorageId(
-      "indication-history",
-      `${id}\u0000${revision}`,
-    ),
-  );
+  return indicationHistoryStorageKey(id, revision);
 }
 
 async function indicationFieldsChunkKey(
@@ -3393,22 +2913,6 @@ function base64UrlEncode(bytes: Uint8Array): string {
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replace(/=+$/u, "");
-}
-
-function base64UrlDecode(value: string): Uint8Array {
-  if (!/^[A-Za-z0-9_-]+$/u.test(value)) unavailable();
-  const padding = (4 - value.length % 4) % 4;
-  let binary: string;
-  try {
-    binary = atob(
-      value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat(padding),
-    );
-  } catch {
-    return unavailable();
-  }
-  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  if (base64UrlEncode(bytes) !== value) unavailable();
-  return bytes;
 }
 
 function peekParticipantSubject(record: StorageRecord): ActorSubject {
