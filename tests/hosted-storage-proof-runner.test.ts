@@ -385,7 +385,7 @@ test("runner rejects and cancels crossed, cached, and non-exact assertions", asy
   assert.equal(rejectedBodyCancelled, true);
 });
 
-test("default runner uses production adapters and exact role scopes", async () => {
+test("default runner sends a canonical UUIDv4 safety challenge and uses exact role scopes", async () => {
   const configuration = parsedConfiguration();
   const transport = proofTransport(configuration);
   const report = await withGlobalFetch(
@@ -396,7 +396,12 @@ test("default runner uses production adapters and exact role scopes", async () =
   assert.equal(report.status, "passed");
   if (report.status !== "passed") return;
   assert.match(report.proof_id, /^storage-proof-[0-9a-f-]{36}$/u);
-  assert.equal(transport.challenge, report.proof_id);
+  const challenge = transport.challenge;
+  assert.match(
+    challenge ?? "",
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+  );
+  assert.equal(report.proof_id, `storage-proof-${challenge}`);
   assert.equal(transport.ownerService.tokenRequests, report.fixture_count);
   assert.equal(
     transport.ownerService.discoveryRequests,

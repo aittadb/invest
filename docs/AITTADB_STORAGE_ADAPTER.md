@@ -180,7 +180,7 @@ INVEST_HOSTED_STORAGE_PROOF_CONFIG_FILE=/private/path/invest-hosted-storage-proo
 
 Hostname labels and the local target marker are defense in depth, not proof of
 deployment class. Before constructing an adapter or requesting a token, the
-runner sends a fresh random challenge to the actual configured transport at
+runner sends a fresh canonical UUIDv4 challenge to the actual configured transport at
 `/.well-known/aittadb-proof-safety`. The server must return an exact no-store
 versioned hypermedia assertion bound to that challenge, the logical request URL,
 the logical issuer, `disposable-acceptance`, and

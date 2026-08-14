@@ -174,7 +174,7 @@ export async function runHostedStorageAdapterProof(
     const fetch = globalThis.fetch;
     await verifyDisposableAcceptanceTarget(
       runnableConfiguration,
-      proof.id,
+      proof.challenge,
       fetch,
     );
     const createAdapter = defaultAdapterFactory(
@@ -440,11 +440,11 @@ function snapshotRunnableConfiguration(
 
 async function verifyDisposableAcceptanceTarget(
   configuration: HostedStorageProofConfiguration,
-  proofId: string,
+  challenge: string,
   fetch: typeof globalThis.fetch,
 ): Promise<void> {
   const logicalTarget = new URL(SAFETY_ASSERTION_PATH, configuration.issuer);
-  logicalTarget.searchParams.set("challenge", proofId);
+  logicalTarget.searchParams.set("challenge", challenge);
   const transportTarget = new URL(logicalTarget);
   if (configuration.transportOrigin !== undefined) {
     const transportOrigin = new URL(configuration.transportOrigin);
@@ -508,7 +508,7 @@ async function verifyDisposableAcceptanceTarget(
       document.api_version !== AITTADB_HYPERMEDIA_API_VERSION ||
       document.type !== "acceptance-proof-safety" ||
       document.id !== logicalTarget.href ||
-      data.challenge !== proofId ||
+      data.challenge !== challenge ||
       data.environment !== "disposable-acceptance" ||
       data.issuer !== configuration.issuer ||
       data.storage_contract_proofs !== "allowed" ||
@@ -779,6 +779,7 @@ function createProofIdentity(value: string) {
   }
   return Object.freeze({
     id: `storage-proof-${value}`,
+    challenge: value,
     slug: value.replaceAll("-", "").slice(0, 24),
   });
 }
