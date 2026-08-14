@@ -68,6 +68,34 @@ test("scanner accepts clean release representations", () => {
   assert.match(result.stdout, /Runtime secret boundary is clean/u);
 });
 
+test("scanner distinguishes standalone credential formats from embedded task identifiers", () => {
+  const directory = mkdtempSync(join(tmpdir(), "invest-secret-lexical-boundary-"));
+  const embeddedTask = join(directory, "embedded-task.txt");
+  const standaloneCredential = join(directory, "standalone-credential.txt");
+  const underscorePrefixedCredential = join(directory, "underscore-prefixed-credential.txt");
+  const hyphenPrefixedCredential = join(directory, "hyphen-prefixed-credential.txt");
+  const prefix = ["s", "k", "-"].join("");
+  const body = "A".repeat(16);
+
+  writeFileSync(embeddedTask, `ta${prefix}${body}\n`, "utf8");
+  writeFileSync(standaloneCredential, `${prefix}${body}\n`, "utf8");
+  writeFileSync(underscorePrefixedCredential, `_${prefix}${body}\n`, "utf8");
+  writeFileSync(hyphenPrefixedCredential, `-${prefix}${body}\n`, "utf8");
+
+  const embeddedResult = runScanner(["--scan-path", embeddedTask]);
+  assert.equal(embeddedResult.status, 0, output(embeddedResult));
+
+  const standaloneResult = runScanner(["--scan-path", standaloneCredential]);
+  assert.equal(standaloneResult.status, 1, output(standaloneResult));
+  assert.match(output(standaloneResult), /known credential format/u);
+
+  for (const fixture of [underscorePrefixedCredential, hyphenPrefixedCredential]) {
+    const result = runScanner(["--scan-path", fixture]);
+    assert.equal(result.status, 1, output(result));
+    assert.match(output(result), /known credential format/u);
+  }
+});
+
 test("scanner consumes external private values without retaining or echoing them", () => {
   const directory = mkdtempSync(join(tmpdir(), "invest-secret-supplied-"));
   const sentinel = `task111-external-${process.pid}-${Date.now()}-private-value`;

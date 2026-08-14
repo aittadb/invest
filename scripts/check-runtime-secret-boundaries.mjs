@@ -85,7 +85,7 @@ const HIGH_CONFIDENCE_CREDENTIAL_PATTERNS = Object.freeze([
   Object.freeze({
     label: "known credential format",
     pattern:
-      /(?:github_pat_[A-Za-z0-9_]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|sk-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{16,}|AKIA[0-9A-Z]{16})/gu,
+      /(?:github_pat_[A-Za-z0-9_]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{16,}|AKIA[0-9A-Z]{16})/gu,
   }),
   Object.freeze({
     label: "private key material",
