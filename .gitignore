@@ -45,3 +45,6 @@ yarn-error.log*
 # ChatGPT Sites instance bindings are local deployment state.
 /.openai/hosting.json
 !/.openai/hosting.example.json
+
+# Local operator context for resuming a paused Codex thread.
+/HANDOFF.md
