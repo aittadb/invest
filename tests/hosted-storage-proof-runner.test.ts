@@ -27,9 +27,11 @@ import {
 import {
   HostedStorageProofConfigurationFailure,
   ProofNamespacedStorageAdapter,
+  formatHostedStorageCleanupDiagnostic,
   formatHostedStorageProofReport,
   loadHostedStorageProofConfiguration,
   runHostedStorageAdapterProof,
+  runHostedStorageAdapterProofWithCleanupDiagnostic,
 } from "../scripts/hosted-storage-proof-runner.ts";
 import { verifyStorageAdapterContract } from "./support/storage-adapter-contract.ts";
 import {
@@ -190,6 +192,76 @@ test("proof configuration failures never repeat credential-bearing input", () =>
     () => loadHostedStorageProofConfiguration(path, project),
     HostedStorageProofConfigurationFailure,
   );
+});
+
+test("cleanup diagnostic CLI rejects unknown or combined arguments before configuration", () => {
+  const environment = {
+    ...process.env,
+    INVEST_HOSTED_STORAGE_PROOF_CONFIG_FILE: "/not-a-proof-configuration.json",
+  };
+  for (const args of [["--unexpected"], ["--cleanup-diagnostic", "--unexpected"]]) {
+    const cli = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI, ...args],
+      { cwd: PROJECT_ROOT, encoding: "utf8", env: environment },
+    );
+    assert.equal(cli.status, 1);
+    assert.equal(cli.stdout, "");
+    assert.equal(cli.stderr, "Invalid hosted storage proof arguments.\n");
+  }
+});
+
+test("cleanup diagnostic CLI emits no configuration failure report", () => {
+  const environment = { ...process.env };
+  delete environment.INVEST_HOSTED_STORAGE_PROOF_CONFIG_FILE;
+  const cli = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI, "--cleanup-diagnostic"],
+    { cwd: PROJECT_ROOT, encoding: "utf8", env: environment },
+  );
+  assert.equal(cli.status, 1);
+  assert.equal(cli.stdout, "");
+  assert.equal(cli.stderr, "");
+});
+
+test("cleanup diagnostic CLI emits exactly the redacted correlated JSON object", () => {
+  const directory = mkdtempSync(join(tmpdir(), "invest-hosted-proof-cli-"));
+  const configurationPath = join(directory, "proof.json");
+  const loaderPath = join(directory, "mock-fetch.mjs");
+  writeFileSync(configurationPath, JSON.stringify({
+    ...validConfiguration(),
+    transport_origin: null,
+  }), "utf8");
+  chmodSync(configurationPath, 0o600);
+  writeFileSync(loaderPath, diagnosticCliFetchLoader(), "utf8");
+  const environment = {
+    ...process.env,
+    INVEST_HOSTED_STORAGE_PROOF_CONFIG_FILE: configurationPath,
+    NODE_OPTIONS: `--import=${loaderPath}`,
+  };
+  const cli = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI, "--cleanup-diagnostic"],
+    { cwd: PROJECT_ROOT, encoding: "utf8", env: environment },
+  );
+
+  assert.equal(cli.status, 1);
+  assert.equal(cli.stderr, "");
+  const output = JSON.parse(cli.stdout) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(output).sort(), [
+    "cleanup_inventory",
+    "storage_post",
+  ]);
+  assert.deepEqual(Object.keys(output.cleanup_inventory as object).sort(), [
+    "collection_prefix",
+    "operation_prefix",
+  ]);
+  assert.deepEqual(output.storage_post, {
+    http_status: 503,
+    content_type: "aittadb-hypermedia",
+    document_type: "bounded-storage-error",
+    error_code: "unavailable",
+  });
 });
 
 test("namespace adapter executes the unchanged contract through isolated names", async () => {
@@ -444,6 +516,333 @@ test("runner reports static failure codes and cleanup fields only", async () => 
   assert.equal(unavailableOutput.includes("Error"), false);
 });
 
+test("cleanup diagnostic correlates an escaping 503 storage response", async () => {
+  const configuration = parsedConfiguration();
+  let storagePosts = 0;
+  const transport = proofTransport(configuration, {
+    storagePostResponse() {
+      storagePosts += 1;
+      return new Response(JSON.stringify(storageProtocolErrorDocument("unavailable")), {
+        status: 503,
+        headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+      });
+    },
+  });
+  const run = await withGlobalFetch(
+    transport.fetch,
+    () => runHostedStorageAdapterProofWithCleanupDiagnostic(configuration),
+  );
+  const diagnostic = run.diagnostic;
+
+  assert.notEqual(diagnostic, undefined);
+  if (diagnostic === undefined) return;
+  assert.equal(storagePosts, 1);
+  assert.equal(run.report.status, "failed");
+  assert.deepEqual(Object.keys(diagnostic).sort(), [
+    "cleanup_inventory",
+    "storage_post",
+  ]);
+  assert.deepEqual(diagnostic.storage_post, {
+    http_status: 503,
+    content_type: "aittadb-hypermedia",
+    document_type: "bounded-storage-error",
+    error_code: "unavailable",
+  });
+  const output = formatHostedStorageCleanupDiagnostic(diagnostic);
+  assert.equal(output.endsWith("\n"), true);
+  assert.equal(output.includes("proof_id"), false);
+  assert.equal(output.includes("fixture_count"), false);
+  assert.equal(output.includes("contract"), false);
+  assert.equal(output.includes("cause"), false);
+  assert.ok(transport.safetyAssertionRequests > 0);
+  assert.ok(transport.ownerService.tokenRequests > 0);
+});
+
+test("cleanup diagnostic has no inventory or network activity for invalid configuration", async () => {
+  const configuration = parsedConfiguration();
+  let fetchCalls = 0;
+  const run = await withGlobalFetch(async () => {
+    fetchCalls += 1;
+    return new Response(null, { status: 500 });
+  }, () => runHostedStorageAdapterProofWithCleanupDiagnostic({
+    ...configuration,
+    issuer: "https://aittadb.com",
+    entryHref: "https://aittadb.com/bounded-storage",
+  }));
+
+  assert.equal(run.diagnostic, undefined);
+  assert.deepEqual(run.report, { status: "failed", code: "configuration_invalid" });
+  assert.equal(fetchCalls, 0);
+});
+
+test("cleanup diagnostic reduces malformed escaping storage responses to fixed sentinels", async () => {
+  const configuration = parsedConfiguration();
+  const canaries = [
+    syntheticSecret("malformed-diagnostic"),
+    "private-record-value-canary",
+    "https://private.example.test/transact?query=canary",
+    "untrusted-server-type-canary",
+    "untrusted-server-code-canary",
+    "untrusted-server-message-canary",
+    "untrusted-exception-canary",
+  ];
+  let storagePosts = 0;
+  const transport = proofTransport(configuration, {
+    storagePostResponse() {
+      storagePosts += 1;
+      return new Response(JSON.stringify({
+        api_version: AITTADB_HYPERMEDIA_API_VERSION,
+        type: "bounded-storage-error",
+        data: {
+          code: canaries[4],
+          message: canaries[5],
+          value: canaries[1],
+          authorization: canaries[0],
+        },
+        links: [],
+        actions: [],
+        id: canaries[2],
+        arbitrary_type: canaries[3],
+      }), {
+        status: 555,
+        headers: { "content-type": `text/plain; ${canaries[3]}` },
+      });
+    },
+  });
+  const run = await withGlobalFetch(
+    transport.fetch,
+    () => runHostedStorageAdapterProofWithCleanupDiagnostic(configuration),
+  );
+  const diagnostic = run.diagnostic;
+
+  assert.notEqual(diagnostic, undefined);
+  if (diagnostic === undefined) return;
+  assert.equal(storagePosts, 1);
+  assert.deepEqual(diagnostic.storage_post, {
+    http_status: 555,
+    content_type: "other",
+    document_type: "bounded-storage-error",
+    error_code: "unknown",
+  });
+  const output = formatHostedStorageCleanupDiagnostic(diagnostic);
+  for (const canary of canaries) assert.equal(output.includes(canary), false);
+});
+
+test("cleanup diagnostic emits inventory only when the storage fetch has no response", async () => {
+  const configuration = parsedConfiguration();
+  let storagePosts = 0;
+  const transport = proofTransport(configuration, {
+    storagePostResponse() {
+      storagePosts += 1;
+      throw new Error("untrusted-exception-canary");
+    },
+  });
+  const run = await withGlobalFetch(
+    transport.fetch,
+    () => runHostedStorageAdapterProofWithCleanupDiagnostic(configuration),
+  );
+  const diagnostic = run.diagnostic;
+
+  assert.notEqual(diagnostic, undefined);
+  if (diagnostic === undefined) return;
+  assert.equal(storagePosts, 1);
+  assert.deepEqual(Object.keys(diagnostic), ["cleanup_inventory"]);
+  assert.equal(
+    formatHostedStorageCleanupDiagnostic(diagnostic).includes(
+      "untrusted-exception-canary",
+    ),
+    false,
+  );
+});
+
+test("handled expected failures do not mask a later escaping storage response", async () => {
+  const configuration = parsedConfiguration();
+  let storagePosts = 0;
+  const transport = proofTransport(configuration, {
+    storagePostResponse() {
+      storagePosts += 1;
+      if (storagePosts !== 4) return undefined;
+      return new Response(JSON.stringify(storageProtocolErrorDocument("unavailable")), {
+        status: 503,
+        headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+      });
+    },
+  });
+  const run = await withGlobalFetch(
+    transport.fetch,
+    () => runHostedStorageAdapterProofWithCleanupDiagnostic(configuration),
+  );
+
+  assert.equal(run.report.status, "failed");
+  assert.equal(storagePosts, 4);
+  assert.deepEqual(run.diagnostic?.storage_post, {
+    http_status: 503,
+    content_type: "aittadb-hypermedia",
+    document_type: "bounded-storage-error",
+    error_code: "unavailable",
+  });
+});
+
+test("HTTP-200 malformed transaction response remains causally correlated", async () => {
+  const configuration = parsedConfiguration();
+  const transport = proofTransport(configuration, {
+    storagePostResponse() {
+      return new Response("{\"type\":\"untrusted-server-type-canary\"}", {
+        status: 200,
+        headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+      });
+    },
+  });
+  const run = await withGlobalFetch(
+    transport.fetch,
+    () => runHostedStorageAdapterProofWithCleanupDiagnostic(configuration),
+  );
+
+  assert.equal(run.report.status, "failed");
+  assert.deepEqual(run.diagnostic?.storage_post, {
+    http_status: 200,
+    content_type: "aittadb-hypermedia",
+    document_type: "unknown",
+    error_code: "unknown",
+  });
+  assert.equal(
+    formatHostedStorageCleanupDiagnostic(run.diagnostic ?? {
+      cleanup_inventory: { collection_prefix: "", operation_prefix: "" },
+    }).includes("untrusted-server-type-canary"),
+    false,
+  );
+});
+
+test("transaction document classification uses the fixed not-applicable error code", async () => {
+  const configuration = parsedConfiguration();
+  const transport = proofTransport(configuration, {
+    storagePostResponse() {
+      return new Response(JSON.stringify({ type: "bounded-storage-transaction" }), {
+        status: 200,
+        headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+      });
+    },
+  });
+  const run = await withGlobalFetch(
+    transport.fetch,
+    () => runHostedStorageAdapterProofWithCleanupDiagnostic(configuration),
+  );
+
+  assert.equal(run.report.status, "failed");
+  assert.deepEqual(run.diagnostic?.storage_post, {
+    http_status: 200,
+    content_type: "aittadb-hypermedia",
+    document_type: "bounded-storage-transaction",
+    error_code: "not_applicable",
+  });
+});
+
+test("duplicate diagnostic document members become fixed unknown classifications", async () => {
+  const canonical = JSON.stringify({
+    api_version: AITTADB_HYPERMEDIA_API_VERSION,
+    type: "bounded-storage-error",
+    data: { code: "unavailable", message: "Storage is temporarily unavailable." },
+    links: [],
+    actions: [],
+  });
+  const sources = [
+    canonical.replace(
+      '"type":"bounded-storage-error"',
+      '"type":"bounded-storage-error","type":"untrusted-server-type-canary"',
+    ),
+    canonical.replace(
+      '"code":"unavailable"',
+      '"code":"unavailable","code":"untrusted-server-code-canary"',
+    ),
+  ];
+  for (const source of sources) {
+    const configuration = parsedConfiguration();
+    const transport = proofTransport(configuration, {
+      storagePostResponse() {
+        return new Response(source, {
+          status: 503,
+          headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+        });
+      },
+    });
+    const run = await withGlobalFetch(
+      transport.fetch,
+      () => runHostedStorageAdapterProofWithCleanupDiagnostic(configuration),
+    );
+
+    assert.deepEqual(run.diagnostic?.storage_post, {
+      http_status: 503,
+      content_type: "aittadb-hypermedia",
+      document_type: "unknown",
+      error_code: "unknown",
+    });
+    const output = formatHostedStorageCleanupDiagnostic(run.diagnostic ?? {
+      cleanup_inventory: { collection_prefix: "", operation_prefix: "" },
+    });
+    assert.equal(output.includes("untrusted-server-type-canary"), false);
+    assert.equal(output.includes("untrusted-server-code-canary"), false);
+  }
+});
+
+test("diagnostic status classifications stay bounded and clone stalls are cancelled", async () => {
+  for (const [status, expected] of [[100, 100], [599, 599], [600, "unknown"]] as const) {
+    const configuration = parsedConfiguration();
+    const transport = proofTransport(configuration, {
+      storagePostResponse() {
+        return syntheticDiagnosticResponse(status);
+      },
+    });
+    const run = await withGlobalFetch(
+      transport.fetch,
+      () => runHostedStorageAdapterProofWithCleanupDiagnostic(configuration),
+    );
+    assert.equal(run.diagnostic?.storage_post?.http_status, expected);
+  }
+
+  let cancelled = false;
+  const configuration = parsedConfiguration();
+  const transport = proofTransport(configuration, {
+    storagePostResponse() {
+      return {
+        status: 503,
+        headers: new Headers({ "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE }),
+        clone() {
+          return new Response(new ReadableStream({
+            cancel() {
+              cancelled = true;
+            },
+          }));
+        },
+      } as unknown as Response;
+    },
+  });
+  const run = await withGlobalFetch(
+    transport.fetch,
+    () => runHostedStorageAdapterProofWithCleanupDiagnostic(configuration),
+  );
+  assert.equal(run.report.status, "failed");
+  assert.equal(run.diagnostic?.storage_post?.document_type, "unknown");
+  assert.equal(cancelled, true);
+});
+
+test("successful proof and handled expected 409/412 responses emit inventory only", async () => {
+  const configuration = parsedConfiguration();
+  const transport = proofTransport(configuration);
+  const run = await withGlobalFetch(
+    transport.fetch,
+    () => runHostedStorageAdapterProofWithCleanupDiagnostic(configuration),
+  );
+  const diagnostic = run.diagnostic;
+
+  assert.equal(run.report.status, "passed");
+  assert.notEqual(diagnostic, undefined);
+  if (diagnostic === undefined) return;
+  assert.deepEqual(Object.keys(diagnostic), ["cleanup_inventory"]);
+  assert.deepEqual(JSON.parse(formatHostedStorageCleanupDiagnostic(diagnostic)), diagnostic);
+  assert.ok(transport.safetyAssertionRequests > 0);
+  assert.ok(transport.outsiderTokenRequests > 0);
+});
+
 class DeniedStorageAdapter implements StorageAdapter {
   async read(): Promise<null> {
     return null;
@@ -480,6 +879,90 @@ function protocolErrorResponse(): Response {
     status: 404,
     headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
   });
+}
+
+function syntheticDiagnosticResponse(status: number): Response {
+  return {
+    status,
+    headers: new Headers({ "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE }),
+    clone() {
+      return new Response(JSON.stringify(storageProtocolErrorDocument("unavailable")));
+    },
+  } as unknown as Response;
+}
+
+function diagnosticCliFetchLoader(): string {
+  const protocol = new URL(
+    "../domain/aittadb-storage-protocol.ts",
+    import.meta.url,
+  ).href;
+  return `
+import {
+  AITTADB_HYPERMEDIA_API_VERSION,
+  AITTADB_HYPERMEDIA_MEDIA_TYPE,
+  defineStorageProtocolDiscovery,
+  storageProtocolErrorDocument,
+} from ${JSON.stringify(protocol)};
+
+const issuer = "https://storage.example.test";
+const entry = "https://storage.example.test/bounded-storage";
+const discovery = defineStorageProtocolDiscovery({
+  entryHref: entry,
+  readRecordHref: "https://storage.example.test/records/{collection}/{id}",
+  listRecordsHref: "https://storage.example.test/records",
+  transactRecordsHref: "https://storage.example.test/transact",
+  limits: {
+    max_record_bytes: 65536,
+    max_page_size: 100,
+    max_transaction_mutations: 25,
+    max_transaction_bytes: 1048576,
+    max_cursor_length: 2048,
+  },
+});
+globalThis.fetch = async (input, init) => {
+  const request = new Request(input, init);
+  const url = new URL(request.url);
+  if (url.pathname === "/.well-known/aittadb-proof-safety") {
+    return new Response(JSON.stringify({
+      api_version: AITTADB_HYPERMEDIA_API_VERSION,
+      type: "acceptance-proof-safety",
+      id: url.href,
+      data: {
+        issuer,
+        environment: "disposable-acceptance",
+        storage_contract_proofs: "allowed",
+        challenge: url.searchParams.get("challenge"),
+      },
+      links: [],
+      actions: [],
+    }), { headers: { "cache-control": "no-store", "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE } });
+  }
+  if (url.pathname === "/oauth/token") {
+    const form = new URLSearchParams(await request.text());
+    return new Response(JSON.stringify({
+      access_token: "synthetic-cli-access-token",
+      token_type: "Bearer",
+      expires_in: 3600,
+      scope: form.get("scope"),
+    }), { headers: { "content-type": "application/json" } });
+  }
+  if (url.href === entry) {
+    return new Response(JSON.stringify(discovery), {
+      headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+    });
+  }
+  if (url.pathname === "/transact") {
+    return new Response(JSON.stringify(storageProtocolErrorDocument("unavailable")), {
+      status: 503,
+      headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+    });
+  }
+  return new Response(JSON.stringify(storageProtocolErrorDocument("not_found")), {
+    status: 404,
+    headers: { "content-type": AITTADB_HYPERMEDIA_MEDIA_TYPE },
+  });
+};
+`;
 }
 
 function safetyAssertionResponse(
@@ -525,6 +1008,7 @@ function proofTransport(
     accessToken?: string;
     allowOutsiderOwnerAccess?: boolean;
     onSafetyRequest?: () => void;
+    storagePostResponse?: (request: Request) => Response | undefined;
   }> = {},
 ) {
   const issuer = configuration.issuer;
@@ -592,6 +1076,10 @@ function proofTransport(
       });
     }
     if (authorization === `Bearer ${ownerAccessToken}`) {
+      if (request.method === "POST") {
+        const response = options.storagePostResponse?.(request);
+        if (response !== undefined) return response;
+      }
       return ownerService.fetch(request);
     }
     assert.equal(authorization, `Bearer ${outsiderAccessToken}`);

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   closeSync,
   constants,
@@ -15,6 +16,8 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import {
   AITTADB_HYPERMEDIA_API_VERSION,
   AITTADB_HYPERMEDIA_MEDIA_TYPE,
+  storageProtocolErrorDocument,
+  storageProtocolErrorStatus,
 } from "../domain/aittadb-storage-protocol.ts";
 import {
   StorageFailure,
@@ -46,6 +49,9 @@ const GIT_PROBE_TIMEOUT_MS = 5_000;
 const SAFETY_ASSERTION_PATH = "/.well-known/aittadb-proof-safety";
 const MAX_SAFETY_ASSERTION_BYTES = 8_192;
 const MAX_SAFETY_ASSERTION_CHUNKS = 64;
+const MAX_CLEANUP_DIAGNOSTIC_BYTES = 16_384;
+const MAX_CLEANUP_DIAGNOSTIC_CHUNKS = 64;
+const CLEANUP_DIAGNOSTIC_TIMEOUT_MS = 1_000;
 const NON_PRODUCTION_HOST_LABELS = new Set([
   "acceptance",
   "dev",
@@ -97,6 +103,55 @@ export type HostedStorageProofReport =
         operation_prefix: string;
       }>;
     }>;
+
+type CleanupDiagnosticContentType =
+  | "aittadb-hypermedia"
+  | "absent"
+  | "other"
+  | "unknown";
+
+type CleanupDiagnosticDocumentType =
+  | "bounded-storage-error"
+  | "bounded-storage-transaction"
+  | "unknown";
+
+type CleanupDiagnosticErrorCode =
+  | "invalid_request"
+  | "not_found"
+  | "conflict"
+  | "precondition_failed"
+  | "quota_exceeded"
+  | "unavailable"
+  | "not_applicable"
+  | "unknown";
+
+type CleanupDiagnosticProtocolErrorCode = Exclude<
+  CleanupDiagnosticErrorCode,
+  "not_applicable" | "unknown"
+>;
+
+/**
+ * The deliberately small, private cleanup handoff for one failed storage POST.
+ * It contains classifications only; no transport or stored-data material.
+ */
+export type HostedStorageCleanupDiagnostic = Readonly<{
+  cleanup_inventory: Readonly<{
+    collection_prefix: string;
+    operation_prefix: string;
+  }>;
+  storage_post?: Readonly<{
+    http_status: number | "unknown";
+    content_type: CleanupDiagnosticContentType;
+    document_type: CleanupDiagnosticDocumentType;
+    error_code: CleanupDiagnosticErrorCode;
+  }>;
+}>;
+
+/** The unchanged proof result paired with its optional private diagnostic. */
+export type HostedStorageProofCleanupDiagnosticRun = Readonly<{
+  report: HostedStorageProofReport;
+  diagnostic?: HostedStorageCleanupDiagnostic;
+}>;
 
 export class HostedStorageProofConfigurationFailure extends Error {
   constructor() {
@@ -158,11 +213,48 @@ export function loadHostedStorageProofConfiguration(
 export async function runHostedStorageAdapterProof(
   configuration: HostedStorageProofConfiguration,
 ): Promise<HostedStorageProofReport> {
+  return (await runHostedStorageAdapterProofInternal(configuration)).report;
+}
+
+/**
+ * Runs the same proof while collecting one redacted storage-POST diagnostic.
+ * A configuration failure has no fixture inventory and therefore no diagnostic.
+ */
+export async function runHostedStorageAdapterProofWithCleanupDiagnostic(
+  configuration: HostedStorageProofConfiguration,
+): Promise<HostedStorageProofCleanupDiagnosticRun> {
+  const collector = new StoragePostDiagnosticCollector();
+  const run = await runHostedStorageAdapterProofInternal(configuration, collector);
+  if (run.report.status === "failed" && run.report.code === "configuration_invalid") {
+    return run;
+  }
+  const inventory = run.report.cleanup_inventory;
+  return Object.freeze({
+    report: run.report,
+    diagnostic: collector.diagnosticFor(run.escapingError, inventory),
+  });
+}
+
+export function formatHostedStorageCleanupDiagnostic(
+  diagnostic: HostedStorageCleanupDiagnostic,
+): string {
+  return `${JSON.stringify(diagnostic)}\n`;
+}
+
+type HostedStorageProofRun = Readonly<{
+  report: HostedStorageProofReport;
+  escapingError?: unknown;
+}>;
+
+async function runHostedStorageAdapterProofInternal(
+  configuration: HostedStorageProofConfiguration,
+  collector?: StoragePostDiagnosticCollector,
+): Promise<HostedStorageProofRun> {
   let runnableConfiguration: HostedStorageProofConfiguration;
   try {
     runnableConfiguration = snapshotRunnableConfiguration(configuration);
   } catch {
-    return configurationFailureReport();
+    return Object.freeze({ report: configurationFailureReport() });
   }
   const proof = createProofIdentity(randomUUID());
   const inventory = Object.freeze({
@@ -180,6 +272,7 @@ export async function runHostedStorageAdapterProof(
     const createAdapter = defaultAdapterFactory(
       fetch,
       () => new Date(),
+      collector,
     );
     await verifyStorageAdapterContract(() => {
       fixtureCount += 1;
@@ -187,28 +280,30 @@ export async function runHostedStorageAdapterProof(
       const fixture = String(fixtureCount).padStart(2, "0");
       const collectionPrefix = `${inventory.collection_prefix}${fixture}-`;
       const operationPrefix = `${inventory.operation_prefix}${fixture}:`;
-      return Object.freeze({
-        owner: new ProofNamespacedStorageAdapter(
+      const owner = new ProofNamespacedStorageAdapter(
           createAdapter("owner", runnableConfiguration),
           collectionPrefix,
           operationPrefix,
-        ),
-        outsider: new ProofNamespacedStorageAdapter(
+        );
+      const outsider = new ProofNamespacedStorageAdapter(
           createAdapter("outsider", runnableConfiguration),
           collectionPrefix,
           operationPrefix,
-        ),
+        );
+      return Object.freeze({
+        owner: collector === undefined ? owner : collector.wrap(owner),
+        outsider: collector === undefined ? outsider : collector.wrap(outsider),
       });
     });
-    return Object.freeze({
+    return Object.freeze({ report: Object.freeze({
       status: "passed",
       proof_id: proof.id,
       contract: "storage-adapter",
       fixture_count: fixtureCount,
       cleanup_inventory: inventory,
-    });
+    }) });
   } catch (error) {
-    return Object.freeze({
+    return Object.freeze({ report: Object.freeze({
       status: "failed",
       code: error instanceof StorageAdapterContractViolation
         ? "contract_failed"
@@ -216,7 +311,7 @@ export async function runHostedStorageAdapterProof(
       proof_id: proof.id,
       fixture_count: fixtureCount,
       cleanup_inventory: inventory,
-    });
+    }), escapingError: error });
   }
 }
 
@@ -327,9 +422,282 @@ export class ProofNamespacedStorageAdapter implements StorageAdapter {
   }
 }
 
+type StoragePostDiagnostic = Readonly<{
+  http_status: number | "unknown";
+  content_type: CleanupDiagnosticContentType;
+  document_type: CleanupDiagnosticDocumentType;
+  error_code: CleanupDiagnosticErrorCode;
+}>;
+
+type StorageTransactionDiagnosticSlot = {
+  response: Promise<StoragePostDiagnostic> | undefined;
+};
+
+/**
+ * Correlates a proof transaction's adapter response to the exact error that
+ * escapes it. OAuth, safety, discovery, request URLs, headers, and bodies are
+ * never observed.
+ */
+class StoragePostDiagnosticCollector {
+  readonly #slots = new AsyncLocalStorage<StorageTransactionDiagnosticSlot>();
+  readonly #errors = new WeakMap<object, StoragePostDiagnostic>();
+
+  wrap(adapter: StorageAdapter): StorageAdapter {
+    return new ProofTransactionDiagnosticAdapter(adapter, this);
+  }
+
+  observeStorageFetch(fetch: typeof globalThis.fetch): typeof globalThis.fetch {
+    return async (input, init) => {
+      const response = await fetch(input, init);
+      try {
+        const slot = this.#slots.getStore();
+        if (slot !== undefined && init?.method === "POST" && slot.response === undefined) {
+          slot.response = classifyStoragePostResponse(response);
+          void slot.response.catch(() => undefined);
+        }
+      } catch {
+        // Observation is intentionally unable to affect the adapter response.
+      }
+      return response;
+    };
+  }
+
+  async transact<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const slot: StorageTransactionDiagnosticSlot = { response: undefined };
+    return await this.#slots.run(slot, async () => {
+      try {
+        return await operation();
+      } catch (error) {
+        const summary = slot.response === undefined
+          ? undefined
+          : await slot.response.catch(() => undefined);
+        if (summary !== undefined && isObjectReference(error)) {
+          this.#errors.set(error, summary);
+        }
+        throw error;
+      }
+    });
+  }
+
+  diagnosticFor(
+    error: unknown,
+    inventory: HostedStorageCleanupDiagnostic["cleanup_inventory"],
+  ): HostedStorageCleanupDiagnostic {
+    const storagePost = this.#matchingSummary(error);
+    return Object.freeze({
+      cleanup_inventory: inventory,
+      ...(storagePost === undefined ? {} : { storage_post: storagePost }),
+    });
+  }
+
+  #matchingSummary(error: unknown): StoragePostDiagnostic | undefined {
+    let candidate = error;
+    for (let depth = 0; depth < 8 && isObjectReference(candidate); depth += 1) {
+      const summary = this.#errors.get(candidate);
+      if (summary !== undefined) return summary;
+      const descriptor = Object.getOwnPropertyDescriptor(candidate, "cause");
+      if (descriptor === undefined || !("value" in descriptor)) return undefined;
+      candidate = descriptor.value;
+    }
+    return undefined;
+  }
+}
+
+/** Preserves the public namespace adapter contract while giving each transact its slot. */
+class ProofTransactionDiagnosticAdapter implements StorageAdapter {
+  readonly #adapter: StorageAdapter;
+  readonly #collector: StoragePostDiagnosticCollector;
+
+  constructor(adapter: StorageAdapter, collector: StoragePostDiagnosticCollector) {
+    this.#adapter = adapter;
+    this.#collector = collector;
+  }
+
+  read(key: StorageKey): Promise<StorageRecord | null> {
+    return this.#adapter.read(key);
+  }
+
+  list(request: StorageListRequest): Promise<StoragePage> {
+    return this.#adapter.list(request);
+  }
+
+  transact(request: StorageTransactionRequest): Promise<StorageTransactionResult> {
+    return this.#collector.transact(() => this.#adapter.transact(request));
+  }
+}
+
+function isObjectReference(value: unknown): value is object {
+  return (typeof value === "object" && value !== null) || typeof value === "function";
+}
+
+function boundedHttpStatus(value: unknown): number | "unknown" {
+  return typeof value === "number" &&
+      Number.isSafeInteger(value) &&
+      value >= 100 &&
+      value <= 599
+    ? value
+    : "unknown";
+}
+
+function classifyContentType(value: string | null): CleanupDiagnosticContentType {
+  if (value === AITTADB_HYPERMEDIA_MEDIA_TYPE) return "aittadb-hypermedia";
+  return value === null ? "absent" : "other";
+}
+
+function classifyStoragePostResponse(response: Response): Promise<StoragePostDiagnostic> {
+  let snapshot: Readonly<{
+    http_status: number | "unknown";
+    content_type: CleanupDiagnosticContentType;
+  }>;
+  let clone: Response;
+  try {
+    snapshot = Object.freeze({
+      http_status: boundedHttpStatus(response.status),
+      content_type: classifyContentType(response.headers.get("content-type")),
+    });
+    clone = response.clone();
+  } catch {
+    return Promise.resolve(Object.freeze({
+      http_status: "unknown",
+      content_type: "unknown",
+      document_type: "unknown",
+      error_code: "unknown",
+    }));
+  }
+  return readBoundedCleanupDiagnosticBody(clone)
+    .then((source) => Object.freeze({
+      ...snapshot,
+      ...classifyCleanupDiagnosticDocument(source, snapshot.http_status),
+    }))
+    .catch(() => Object.freeze({
+      ...snapshot,
+      document_type: "unknown",
+      error_code: "unknown",
+    }));
+}
+
+async function readBoundedCleanupDiagnosticBody(response: Response): Promise<string> {
+  if (response.body === null) return "";
+  const reader = response.body.getReader();
+  let rejectDeadline: (() => void) | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("deadline")), CLEANUP_DIAGNOSTIC_TIMEOUT_MS);
+    rejectDeadline = () => clearTimeout(timeout);
+  });
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  let reads = 0;
+  try {
+    while (true) {
+      const result = await Promise.race([reader.read(), deadline]);
+      reads += 1;
+      if (reads > MAX_CLEANUP_DIAGNOSTIC_CHUNKS) return "";
+      if (result.done) break;
+      if (!(result.value instanceof Uint8Array)) return "";
+      bytes += result.value.byteLength;
+      if (bytes > MAX_CLEANUP_DIAGNOSTIC_BYTES) return "";
+      chunks.push(result.value);
+    }
+    const body = new Uint8Array(bytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } finally {
+    rejectDeadline?.();
+    void reader.cancel().catch(() => undefined);
+  }
+}
+
+function classifyCleanupDiagnosticDocument(
+  source: string,
+  httpStatus: number | "unknown",
+): Readonly<{
+  document_type: CleanupDiagnosticDocumentType;
+  error_code: CleanupDiagnosticErrorCode;
+}> {
+  try {
+    assertUniqueJsonMembers(source);
+    const document = JSON.parse(source) as unknown;
+    if (
+      document === null ||
+      typeof document !== "object" ||
+      Array.isArray(document) ||
+      Object.getPrototypeOf(document) !== Object.prototype ||
+      ((document as { type?: unknown }).type !== "bounded-storage-error" &&
+        (document as { type?: unknown }).type !== "bounded-storage-transaction")
+    ) {
+      return Object.freeze({ document_type: "unknown", error_code: "unknown" });
+    }
+    const type = (document as { type: CleanupDiagnosticDocumentType }).type;
+    if (type === "bounded-storage-transaction") {
+      return Object.freeze({
+        document_type: "bounded-storage-transaction",
+        error_code: "not_applicable",
+      });
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(document);
+    if (
+      Object.keys(descriptors).sort().join(",") !==
+        "actions,api_version,data,links,type" ||
+      (document as { api_version?: unknown }).api_version !==
+        AITTADB_HYPERMEDIA_API_VERSION
+    ) {
+      return Object.freeze({
+        document_type: "bounded-storage-error",
+        error_code: "unknown",
+      });
+    }
+    const data = (document as { data?: unknown }).data;
+    const code = data !== null &&
+        typeof data === "object" &&
+        !Array.isArray(data) &&
+        Object.getPrototypeOf(data) === Object.prototype &&
+        Object.keys(Object.getOwnPropertyDescriptors(data)).sort().join(",") ===
+          "code,message"
+      ? (data as { code?: unknown }).code
+      : undefined;
+    if (
+      !isCleanupDiagnosticErrorCode(code) ||
+      httpStatus !== storageProtocolErrorStatus(code) ||
+      (data as { message?: unknown }).message !==
+        storageProtocolErrorDocument(code).data.message ||
+      !isExactEmptyArray((document as { links?: unknown }).links) ||
+      !isExactEmptyArray((document as { actions?: unknown }).actions)
+    ) {
+      return Object.freeze({
+        document_type: "bounded-storage-error",
+        error_code: "unknown",
+      });
+    }
+    return Object.freeze({
+      document_type: "bounded-storage-error",
+      error_code: code,
+    });
+  } catch {
+    return Object.freeze({ document_type: "unknown", error_code: "unknown" });
+  }
+}
+
+function isCleanupDiagnosticErrorCode(
+  value: unknown,
+): value is CleanupDiagnosticProtocolErrorCode {
+  return value === "invalid_request" ||
+    value === "not_found" ||
+    value === "conflict" ||
+    value === "precondition_failed" ||
+    value === "quota_exceeded" ||
+    value === "unavailable";
+}
+
 function defaultAdapterFactory(
   fetch: typeof globalThis.fetch,
   now: () => Date,
+  collector?: StoragePostDiagnosticCollector,
 ) {
   return (
     role: ProofRole,
@@ -353,16 +721,20 @@ function defaultAdapterFactory(
       fetch,
       now,
     });
-    return new AittaDBStorageAdapter({
+    const storageFetch = collector === undefined
+      ? fetch
+      : collector.observeStorageFetch(fetch);
+    const adapter = new AittaDBStorageAdapter({
       issuer: configuration.issuer,
       entryHref: configuration.entryHref,
       ...(configuration.transportOrigin === undefined
         ? {}
         : { transportOrigin: configuration.transportOrigin }),
       accessToken: token.accessToken,
-      fetch,
+      fetch: storageFetch,
       requestTimeoutMs: REQUEST_TIMEOUT_MS,
     });
+    return adapter;
   };
 }
 

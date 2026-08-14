@@ -198,6 +198,43 @@ responses, exceptions, and causes are never emitted. A failed run still prints
 its cleanup prefixes because it may have committed a partial synthetic fixture
 set.
 
+### Private cleanup diagnostic
+
+When an authorized retry of the hosted proof fails and AittaDB needs only
+enough information to identify proof-scoped cleanup, run the same operator
+command with its exact one argument:
+
+```sh
+INVEST_HOSTED_STORAGE_PROOF_CONFIG_FILE=/private/path/invest-hosted-storage-proof.json \
+  npm run --silent hosted-storage:prove -- --cleanup-diagnostic
+```
+
+This mode is for a private support handoff only. It runs the normal proof,
+including its synthetic fixture creation and mutation, and does not change the
+default no-argument report. Use it only after the operator confirms prior
+proof-state cleanup and explicitly authorizes this retry. It accepts no other
+argument or argument combination; invalid arguments fail before configuration
+loading or network activity.
+
+After a fixture inventory exists, its one JSON line contains exactly
+`cleanup_inventory.collection_prefix`, `cleanup_inventory.operation_prefix`,
+and, only if the exact error escaping the normal proof causally matches a
+response captured for its own transaction POST,
+`storage_post.http_status`, `storage_post.content_type`,
+`storage_post.document_type`, and `storage_post.error_code`. Status is a
+bounded 100–599 integer or the fixed `unknown` sentinel; the remaining
+diagnostic values are fixed or allowlisted classifications. Handled contract
+failures and unrelated response traffic cannot qualify. If no exact causal
+match exists, the line contains only the cleanup inventory. A pre-inventory
+configuration failure produces no stdout and exits nonzero.
+
+The diagnostic never includes raw Content-Type values, URLs or query values,
+headers, credentials, identifiers, operation IDs, request or response bodies,
+stored values, exceptions, logs, or arbitrary server strings. Its observer is
+attached only to the production storage adapter's active transaction boundary:
+OAuth POSTs, the proof-safety GET, discovery requests, and handled expected
+transaction failures are not candidates.
+
 Each shared-contract fixture receives a distinct physical collection and
 operation prefix while retaining the contract's logical keys and requests.
 This prevents retries or prior runs from colliding without modifying the shared
