@@ -1,0 +1,989 @@
+import {
+  MANUAL_NOTIFICATION_LIMITS,
+} from "../../domain/audit-notification.ts";
+import { chatGPTSignInPath } from "../../domain/auth-navigation.ts";
+import { parseStableId } from "../../domain/foundation.ts";
+import {
+  createOwnerAuditCollectionDocument,
+  createOwnerNotificationCollectionDocument,
+  createOwnerNotificationDetailResource,
+  type OwnerAuditCollectionDocument,
+  type OwnerNotificationCollectionDocument,
+  type OwnerNotificationControl,
+  type OwnerNotificationDetailResource,
+  type OwnerNotificationOperationIdIssuer,
+} from "../../domain/owner-audit-notification-resource.ts";
+import type { HtmlFormAction } from "../../domain/hypermedia-action.ts";
+import { INVESTOR_APP_API_VERSION } from "../../domain/public-campaign-resource.ts";
+import {
+  StorageFailure,
+  parseStorageOperationId,
+  type StorageCursor,
+  type StorageOperationId,
+} from "../../domain/storage-adapter.ts";
+import { negotiateRepresentation } from "../../http/content-negotiation.ts";
+import type {
+  BrowserMutationExactReplayScopeResolver,
+  BrowserMutationPreReplayValidator,
+  BrowserMutationProof,
+} from "../../http/browser-mutation-session.ts";
+import {
+  MUTATION_CSRF_HEADER,
+  MutationSecurityFailure,
+  toPublicMutationSecurityFailure,
+  type MutationMediaType,
+  type VerifiedMutationRequest,
+} from "../../http/mutation-security.ts";
+import {
+  MAX_OWNER_NOTIFICATION_PAGE_SIZE,
+  type AtomicManualNotificationActivityRepository,
+  type AuditEventReader,
+  type ManualNotificationTerminalReplay,
+} from "../../repositories/in-memory-audit-notification-repositories.ts";
+import type {
+  ApplicationRouteContext,
+  ApplicationRouteHandler,
+} from "../contracts.ts";
+import {
+  hypermediaResponse,
+  notAcceptableResponse,
+} from "./responses.ts";
+
+const AUDIT_PATH = "/owner/audit-events";
+const NOTIFICATION_PATH = "/owner/manual-notifications";
+const DEFAULT_PAGE_SIZE = 25;
+const MUTATION_FIELDS = new Set(["operation-id", "expected-revision"]);
+export const MAX_OWNER_NOTIFICATION_MUTATION_BYTES = 1_024;
+export const MAX_OWNER_NOTIFICATION_JSON_FIELDS = MUTATION_FIELDS.size;
+export const MAX_OWNER_NOTIFICATION_FORM_FIELDS = MUTATION_FIELDS.size + 1;
+export type OwnerNotificationMutationVerificationMode =
+  | "persistent-claim"
+  | "legacy-non-claiming";
+
+export function ownerNotificationMutationFieldLimit(request: Request): number {
+  const contentType = request.headers.get("content-type");
+  const essence = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  return essence === "application/json"
+    ? MAX_OWNER_NOTIFICATION_JSON_FIELDS
+    : MAX_OWNER_NOTIFICATION_FORM_FIELDS;
+}
+
+type Representation = "html" | "hypermedia-json";
+type Activity = "template-copied" | "sent-marked";
+
+type HistoryRoute =
+  | Readonly<{ kind: "notification-collection" }>
+  | Readonly<{ kind: "notification-detail"; notificationId: string | null }>
+  | Readonly<{
+    kind: "notification-activity";
+    notificationId: string | null;
+    activity: Activity;
+  }>;
+
+export type OwnerAuditNotificationRouteDependencies = Readonly<{
+  audit: AuditEventReader;
+  notifications: AtomicManualNotificationActivityRepository;
+  mutationVerificationMode: OwnerNotificationMutationVerificationMode;
+  verifyMutation: (
+    request: Request,
+    validateBeforeReplayClaim?: BrowserMutationPreReplayValidator,
+    exactReplayScopeFor?: BrowserMutationExactReplayScopeResolver,
+  ) => Promise<
+    VerifiedMutationRequest & Readonly<{ clearCookie?: string }>
+  >;
+  csrfToken: (
+    request: Request,
+    exactReplayScope?: string | null,
+  ) => Promise<string | BrowserMutationProof | null>;
+  issueOperationId: OwnerNotificationOperationIdIssuer;
+  now?: () => Date;
+}>;
+
+export type OwnerAuditHistoryRouteDependencies = Readonly<{
+  audit: AuditEventReader;
+}>;
+
+/** Composes only the persistent read-only audit resource. */
+export function createOwnerAuditHistoryRouteHandler(
+  dependencies: OwnerAuditHistoryRouteDependencies,
+): ApplicationRouteHandler {
+  return async (context) => {
+    if (context.url.pathname !== AUDIT_PATH) return null;
+    return ownerAuditCollectionResponse(context, dependencies.audit, false);
+  };
+}
+
+export function createOwnerAuditNotificationHistoryRouteHandler(
+  dependencies: OwnerAuditNotificationRouteDependencies,
+): ApplicationRouteHandler {
+  const issueOperationId = checkedOperationIssuer(
+    dependencies.issueOperationId,
+  );
+  const now = dependencies.now ?? (() => new Date());
+
+  return async (context) => {
+    if (context.url.pathname === AUDIT_PATH) {
+      return ownerAuditCollectionResponse(context, dependencies.audit, true);
+    }
+    const route = parseRoute(context.url);
+    if (route === null) return null;
+    const resourceUrl = safeNotificationResourceUrl(
+      context.resourceUrl,
+      route,
+    );
+
+    const negotiated = negotiateRepresentation(
+      context.request.headers.get("accept"),
+    );
+    if (negotiated.kind === "not-acceptable") {
+      return notAcceptableResponse(resourceUrl);
+    }
+    const representation = negotiated.kind;
+    if (context.actor === null) {
+      return authenticationRequiredResponse(
+        representation,
+        resourceUrl,
+      );
+    }
+    if (!context.isOwner) {
+      return errorResponse(
+        representation,
+        resourceUrl,
+        404,
+        "not_found",
+        "The requested resource was not found.",
+      );
+    }
+
+    try {
+      if (route.kind === "notification-activity") {
+        if (context.request.method !== "POST") {
+          return methodNotAllowedResponse(representation, resourceUrl);
+        }
+        if (route.notificationId === null) {
+          throw new StorageFailure("INVALID_REQUEST");
+        }
+        if (dependencies.notifications.activityConsistency !==
+          "atomic-notification-audit") {
+          throw new StorageFailure("UNAVAILABLE");
+        }
+        return await mutateNotification(
+          { ...context, resourceUrl },
+          route,
+          representation,
+          dependencies,
+          issueOperationId,
+          now,
+        );
+      }
+      if (context.request.method !== "GET") {
+        return methodNotAllowedResponse(representation, resourceUrl);
+      }
+
+      if (route.kind === "notification-collection") {
+        const pageRequest = parsePageRequest(
+          context.url,
+          MAX_OWNER_NOTIFICATION_PAGE_SIZE,
+        );
+        const collectionUrl = canonicalNotificationCollectionResourceUrl(
+          context.resourceUrl,
+          pageRequest,
+        );
+        const document = createOwnerNotificationCollectionDocument(
+          collectionUrl,
+          await dependencies.notifications.list(pageRequest),
+          pageRequest.limit,
+        );
+        return representation === "hypermedia-json"
+          ? hypermediaResponse(document)
+          : htmlResponse(renderNotificationCollection(document));
+      }
+
+      assertNoQuery(context.url);
+      if (route.notificationId === null) {
+        throw new StorageFailure("INVALID_REQUEST");
+      }
+      const state = await dependencies.notifications.getActivityState(
+        route.notificationId,
+      );
+      if (state === null) throw new StorageFailure("NOT_FOUND");
+      const activityAllowed =
+        state.snapshot.record.template.generatedBy.subject ===
+          context.actor.userId;
+      const terminalReplay = activityAllowed ? state.terminalReplay : null;
+      return detailResponse(
+        { ...context, resourceUrl },
+        representation,
+        createOwnerNotificationDetailResource(
+          resourceUrl,
+          state.snapshot,
+          issueOperationId,
+          {
+            activityAllowed,
+            terminalReplay,
+          },
+        ),
+        dependencies.csrfToken,
+        dependencies.mutationVerificationMode,
+        [],
+        terminalReplay,
+      );
+    } catch (error) {
+      return mappedFailureResponse(
+        representation,
+        resourceUrl,
+        error,
+      );
+    }
+  };
+}
+
+async function ownerAuditCollectionResponse(
+  context: ApplicationRouteContext,
+  audit: AuditEventReader,
+  manualNotificationsAvailable: boolean,
+): Promise<Response> {
+  const negotiated = negotiateRepresentation(
+    context.request.headers.get("accept"),
+  );
+  if (negotiated.kind === "not-acceptable") {
+    return notAcceptableResponse(context.resourceUrl);
+  }
+  const representation = negotiated.kind;
+  if (context.actor === null) {
+    return authenticationRequiredResponse(
+      representation,
+      context.resourceUrl,
+    );
+  }
+  if (!context.isOwner) {
+    return errorResponse(
+      representation,
+      context.resourceUrl,
+      404,
+      "not_found",
+      "The requested resource was not found.",
+    );
+  }
+  if (context.request.method !== "GET") {
+    return methodNotAllowedResponse(representation, context.resourceUrl);
+  }
+
+  try {
+    const pageRequest = parsePageRequest(context.url);
+    const document = createOwnerAuditCollectionDocument(
+      context.resourceUrl,
+      await audit.list(pageRequest),
+      pageRequest.limit,
+      { manualNotificationsAvailable },
+    );
+    return representation === "hypermedia-json"
+      ? hypermediaResponse(document)
+      : htmlResponse(renderAuditCollection(document));
+  } catch (error) {
+    return mappedFailureResponse(
+      representation,
+      context.resourceUrl,
+      error,
+    );
+  }
+}
+
+async function mutateNotification(
+  context: ApplicationRouteContext,
+  route: Extract<HistoryRoute, Readonly<{ kind: "notification-activity" }>>,
+  representation: Representation,
+  dependencies: OwnerAuditNotificationRouteDependencies,
+  issueOperationId: OwnerNotificationOperationIdIssuer,
+  now: () => Date,
+): Promise<Response> {
+  assertNoQuery(context.url);
+  if (route.notificationId === null) {
+    return mappedFailureResponse(
+      representation,
+      context.resourceUrl,
+      new StorageFailure("INVALID_REQUEST"),
+    );
+  }
+  let clearCookie: string | null = null;
+  try {
+    const verified = await dependencies.verifyMutation(
+      context.request,
+      validNotificationMutationShape,
+      notificationReplayScopeFor(route),
+    );
+    clearCookie = requiredMutationClearCookie(
+      verified.clearCookie,
+      dependencies.mutationVerificationMode,
+    );
+    if (
+      verified.method !== "POST" ||
+      verified.actor.type !== "owner" ||
+      verified.actor.subject !== context.actor?.userId
+    ) {
+      throw new MutationSecurityFailure("REQUEST_REJECTED");
+    }
+    const mutation = parseMutation(verified.body, verified.mediaType);
+    const request = {
+      operationId: mutation.operationId,
+      notificationId: route.notificationId,
+      expectedRevision: mutation.expectedRevision,
+      ownerSubject: verified.actor.subject,
+      occurredAt: currentTimestamp(now),
+    };
+    if (route.activity === "template-copied") {
+      await dependencies.notifications.recordCopyWithAudit(request);
+    } else {
+      await dependencies.notifications.markSentWithAudit(request);
+    }
+
+    const detailUrl = new URL(
+      `${NOTIFICATION_PATH}/${encodeURIComponent(route.notificationId)}`,
+      context.resourceUrl,
+    ).href;
+    if (representation === "html") {
+      return withSetCookies(new Response(null, {
+        status: 303,
+        headers: {
+          "Cache-Control": "no-store",
+          Location: detailUrl,
+          Vary: "Accept",
+        },
+      }), [clearCookie]);
+    }
+
+    const state = await dependencies.notifications.getActivityState(
+      route.notificationId,
+    );
+    if (state === null) throw new StorageFailure("UNAVAILABLE");
+    const activityAllowed =
+      state.snapshot.record.template.generatedBy.subject ===
+        verified.actor.subject;
+    const terminalReplay = activityAllowed ? state.terminalReplay : null;
+    return detailResponse(
+      { ...context, resourceUrl: detailUrl },
+      representation,
+      createOwnerNotificationDetailResource(
+        detailUrl,
+        state.snapshot,
+        issueOperationId,
+        {
+          activityAllowed,
+          terminalReplay,
+        },
+      ),
+      dependencies.csrfToken,
+      dependencies.mutationVerificationMode,
+      [clearCookie],
+      terminalReplay,
+    );
+  } catch (error) {
+    return withSetCookies(
+      mappedFailureResponse(representation, context.resourceUrl, error),
+      [clearCookie],
+    );
+  }
+}
+
+async function detailResponse(
+  context: ApplicationRouteContext,
+  representation: Representation,
+  resource: OwnerNotificationDetailResource,
+  csrfToken: OwnerAuditNotificationRouteDependencies["csrfToken"],
+  verificationMode: OwnerNotificationMutationVerificationMode,
+  cookies: readonly (string | null)[] = [],
+  terminalReplay: ManualNotificationTerminalReplay | null = null,
+): Promise<Response> {
+  const hasMutation = resource.recordCopy !== null ||
+    resource.markSent !== null || resource.terminalRetry !== null;
+  const proof = hasMutation
+    ? requiredCsrfProof(
+        await csrfToken(
+          context.request,
+          terminalReplay === null
+            ? null
+            : notificationReplayScope(terminalReplay, resource.document.id),
+        ),
+        verificationMode,
+      )
+    : null;
+  const response = representation === "hypermedia-json"
+    ? hypermediaResponse(resource.document)
+    : htmlResponse(renderNotificationDetail(resource, proof?.token ?? null));
+  if (proof !== null) response.headers.set(MUTATION_CSRF_HEADER, proof.token);
+  return withSetCookies(response, [
+    ...cookies,
+    proof?.setCookie ?? null,
+  ]);
+}
+
+function parseRoute(url: URL): HistoryRoute | null {
+  if (url.pathname === NOTIFICATION_PATH) {
+    return { kind: "notification-collection" };
+  }
+  const prefix = `${NOTIFICATION_PATH}/`;
+  if (!url.pathname.startsWith(prefix)) return null;
+  const segments = url.pathname.slice(prefix.length).split("/");
+  if (segments.length < 1 || segments.length > 2 || segments[0] === "") {
+    return { kind: "notification-detail", notificationId: null };
+  }
+  const notificationId = decodeNotificationId(segments[0]);
+  if (segments.length === 1) {
+    return { kind: "notification-detail", notificationId };
+  }
+  if (segments[1] === "copies") {
+    return {
+      kind: "notification-activity",
+      notificationId,
+      activity: "template-copied",
+    };
+  }
+  if (segments[1] === "sent-marker") {
+    return {
+      kind: "notification-activity",
+      notificationId,
+      activity: "sent-marked",
+    };
+  }
+  return { kind: "notification-detail", notificationId: null };
+}
+
+function decodeNotificationId(value: string | undefined): string | null {
+  if (value === undefined || value.length === 0 || value.length > 384) {
+    return null;
+  }
+  try {
+    const parsed = parseStableId<"manual-notification">(
+      decodeURIComponent(value),
+    );
+    return parsed.ok ? parsed.value : null;
+  } catch {
+    return null;
+  }
+}
+
+function parsePageRequest(
+  url: URL,
+  maximumPageSize = 100,
+): Readonly<{ limit: number; cursor?: StorageCursor }> {
+  const keys = [...url.searchParams.keys()];
+  if (keys.some((key) => key !== "page_size" && key !== "cursor")) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+  const pageSizes = url.searchParams.getAll("page_size");
+  const cursors = url.searchParams.getAll("cursor");
+  if (pageSizes.length > 1 || cursors.length > 1) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+  const serializedPageSize = pageSizes[0];
+  const limit = serializedPageSize === undefined
+    ? DEFAULT_PAGE_SIZE
+    : Number(serializedPageSize);
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > maximumPageSize ||
+    (serializedPageSize !== undefined && String(limit) !== serializedPageSize)
+  ) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+  const cursor = cursors[0];
+  if (
+    cursor !== undefined &&
+    (cursor.length === 0 || cursor.length > 512 || hasControlCharacter(cursor))
+  ) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+  return {
+    limit,
+    ...(cursor === undefined ? {} : { cursor: cursor as StorageCursor }),
+  };
+}
+
+function safeNotificationResourceUrl(
+  requestUrl: string,
+  route: HistoryRoute,
+): string {
+  const safe = new URL(requestUrl);
+  if (route.kind === "notification-collection") {
+    safe.pathname = NOTIFICATION_PATH;
+  } else {
+    const id = encodeURIComponent(route.notificationId ?? "invalid");
+    const suffix = route.kind === "notification-detail"
+      ? ""
+      : route.activity === "template-copied"
+      ? "/copies"
+      : "/sent-marker";
+    safe.pathname = `${NOTIFICATION_PATH}/${id}${suffix}`;
+  }
+  safe.search = "";
+  safe.hash = "";
+  return safe.href;
+}
+
+function canonicalNotificationCollectionResourceUrl(
+  requestUrl: string,
+  request: Readonly<{ limit: number; cursor?: StorageCursor }>,
+): string {
+  const incoming = new URL(requestUrl);
+  const canonical = new URL(NOTIFICATION_PATH, incoming.origin);
+  if (incoming.searchParams.has("page_size")) {
+    canonical.searchParams.set("page_size", String(request.limit));
+  }
+  if (request.cursor !== undefined) {
+    canonical.searchParams.set("cursor", request.cursor);
+  }
+  return canonical.href;
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint !== undefined && (codePoint <= 31 || codePoint === 127)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function assertNoQuery(url: URL): void {
+  if ([...url.searchParams].length !== 0) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+}
+
+function parseMutation(
+  body: Readonly<Record<string, unknown>>,
+  mediaType: MutationMediaType,
+): Readonly<{
+  operationId: StorageOperationId;
+  expectedRevision: number;
+}> {
+  const keys = Object.keys(body);
+  if (
+    keys.length !== MUTATION_FIELDS.size ||
+    keys.some((key) => !MUTATION_FIELDS.has(key))
+  ) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+  const operationId = parseStorageOperationId(body["operation-id"]);
+  if (
+    !operationId.ok ||
+    operationId.value.length >
+      MANUAL_NOTIFICATION_LIMITS.activityOperationIdLength
+  ) throw new StorageFailure("INVALID_REQUEST");
+  const candidate = mediaType === "application/x-www-form-urlencoded"
+    ? typeof body["expected-revision"] === "string" &&
+        /^[1-9]\d*$/.test(body["expected-revision"])
+      ? Number(body["expected-revision"])
+      : Number.NaN
+    : body["expected-revision"];
+  if (
+    !Number.isSafeInteger(candidate) ||
+    (candidate as number) < 1 ||
+    (candidate as number) >= Number.MAX_SAFE_INTEGER
+  ) {
+    throw new StorageFailure("INVALID_REQUEST");
+  }
+  return Object.freeze({
+    operationId: operationId.value,
+    expectedRevision: candidate as number,
+  });
+}
+
+function validNotificationMutationShape(
+  request: VerifiedMutationRequest,
+): boolean {
+  try {
+    parseMutation(request.body, request.mediaType);
+    return request.method === "POST";
+  } catch {
+    return false;
+  }
+}
+
+function notificationReplayScopeFor(
+  route: Extract<HistoryRoute, Readonly<{ kind: "notification-activity" }>>,
+): BrowserMutationExactReplayScopeResolver {
+  return (request) => {
+    if (route.notificationId === null || request.method !== "POST") return null;
+    try {
+      const mutation = parseMutation(request.body, request.mediaType);
+      return notificationReplayScope({
+        activity: route.activity,
+        operationId: mutation.operationId,
+        expectedRevision: mutation.expectedRevision,
+      }, route.notificationId);
+    } catch {
+      return null;
+    }
+  };
+}
+
+function notificationReplayScope(
+  replay: ManualNotificationTerminalReplay,
+  notificationId: string,
+): string {
+  const parsedNotificationId = parseStableId<"manual-notification">(
+    notificationId,
+  );
+  const parsedOperationId = parseStorageOperationId(replay.operationId);
+  if (
+    !parsedNotificationId.ok ||
+    !parsedOperationId.ok ||
+    (replay.activity !== "template-copied" &&
+      replay.activity !== "sent-marked") ||
+    !Number.isSafeInteger(replay.expectedRevision) ||
+    replay.expectedRevision < 1 ||
+    replay.expectedRevision >= Number.MAX_SAFE_INTEGER
+  ) throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+  return JSON.stringify([
+    "owner-notification-terminal-replay:v1",
+    parsedNotificationId.value,
+    replay.activity,
+    parsedOperationId.value,
+    replay.expectedRevision,
+  ]);
+}
+
+function checkedOperationIssuer(
+  issueOperationId: OwnerNotificationOperationIdIssuer,
+): OwnerNotificationOperationIdIssuer {
+  return () => {
+    let value: unknown;
+    try {
+      value = issueOperationId();
+    } catch {
+      throw new StorageFailure("UNAVAILABLE");
+    }
+    const parsed = parseStorageOperationId(value);
+    if (
+      !parsed.ok ||
+      parsed.value.length >
+        MANUAL_NOTIFICATION_LIMITS.activityOperationIdLength
+    ) throw new StorageFailure("UNAVAILABLE");
+    return parsed.value;
+  };
+}
+
+function currentTimestamp(now: () => Date): string {
+  let value: Date;
+  try {
+    value = now();
+  } catch {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  if (!(value instanceof Date) || Number.isNaN(value.valueOf())) {
+    throw new StorageFailure("UNAVAILABLE");
+  }
+  return value.toISOString();
+}
+
+function validCsrfToken(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length >= 32 &&
+    value.length <= 256 &&
+    /^[A-Za-z0-9_-]+$/u.test(value);
+}
+
+function requiredCsrfProof(
+  value: string | BrowserMutationProof | null,
+  verificationMode: OwnerNotificationMutationVerificationMode,
+): Readonly<{ token: string; setCookie: string | null }> {
+  if (verificationMode === "legacy-non-claiming" && typeof value === "string") {
+    if (!validCsrfToken(value)) throw new StorageFailure("UNAVAILABLE");
+    return Object.freeze({ token: value, setCookie: null });
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !validCsrfToken(value.token) ||
+    !validSetCookie(value.setCookie)
+  ) throw new StorageFailure("UNAVAILABLE");
+  return Object.freeze({ token: value.token, setCookie: value.setCookie });
+}
+
+function requiredMutationClearCookie(
+  value: unknown,
+  verificationMode: OwnerNotificationMutationVerificationMode,
+): string | null {
+  if (verificationMode === "legacy-non-claiming") {
+    if (value !== undefined) {
+      throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+    }
+    return null;
+  }
+  if (!validSetCookie(value)) {
+    throw new MutationSecurityFailure("SERVICE_UNAVAILABLE");
+  }
+  return value;
+}
+
+function validSetCookie(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 4_096 &&
+    !/[\r\n]/u.test(value);
+}
+
+function withSetCookies(
+  response: Response,
+  cookies: readonly (string | null)[],
+): Response {
+  const selected = cookies.filter(validSetCookie);
+  if (selected.length === 0) return response;
+  const headers = new Headers(response.headers);
+  for (const cookie of selected) headers.append("Set-Cookie", cookie);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function authenticationRequiredResponse(
+  representation: Representation,
+  requestUrl: string,
+): Response {
+  const signIn = new URL(
+    chatGPTSignInPath(new URL(requestUrl).pathname),
+    requestUrl,
+  );
+  if (representation === "html") {
+    return htmlResponse(
+      page(
+        "Sign in",
+        `<main class="history-main history-message"><p class="history-kicker">Owner workspace</p><h1>Sign in to continue</h1><a href="${escapeAttribute(signIn.href)}">Sign in</a></main>`,
+      ),
+      401,
+    );
+  }
+  return hypermediaResponse({
+    api_version: INVESTOR_APP_API_VERSION,
+    type: "error",
+    id: "authentication-required",
+    data: {
+      code: "authentication_required",
+      message: "Sign in is required to continue.",
+    },
+    links: [{ rel: ["self"], href: new URL(requestUrl).href }],
+    actions: [{
+      name: "sign-in",
+      title: "Sign in",
+      href: signIn.href,
+      method: "GET",
+      type: "text/html",
+      fields: [],
+    }],
+  }, 401);
+}
+
+function methodNotAllowedResponse(
+  representation: Representation,
+  requestUrl: string,
+): Response {
+  return errorResponse(
+    representation,
+    requestUrl,
+    405,
+    "method_not_allowed",
+    "The request method is not allowed.",
+  );
+}
+
+function mappedFailureResponse(
+  representation: Representation,
+  requestUrl: string,
+  error: unknown,
+): Response {
+  if (error instanceof MutationSecurityFailure) {
+    const failure = toPublicMutationSecurityFailure(error);
+    return errorResponse(
+      representation,
+      requestUrl,
+      failure.status,
+      failure.body.error.code.toLowerCase(),
+      failure.body.error.message,
+    );
+  }
+  if (error instanceof StorageFailure) {
+    const failure = storageFailure(error.code);
+    return errorResponse(
+      representation,
+      requestUrl,
+      failure.status,
+      failure.code,
+      failure.message,
+    );
+  }
+  return errorResponse(
+    representation,
+    requestUrl,
+    503,
+    "temporarily_unavailable",
+    "This resource is temporarily unavailable.",
+  );
+}
+
+function storageFailure(code: StorageFailure["code"]): Readonly<{
+  status: number;
+  code: string;
+  message: string;
+}> {
+  switch (code) {
+    case "INVALID_REQUEST":
+      return { status: 400, code: "invalid_request", message: "The request is invalid." };
+    case "NOT_FOUND":
+      return { status: 404, code: "not_found", message: "The requested resource was not found." };
+    case "CONFLICT":
+      return { status: 409, code: "conflict", message: "The request conflicts with current state." };
+    case "PRECONDITION_FAILED":
+      return { status: 412, code: "precondition_failed", message: "A required condition has changed." };
+    case "UNAVAILABLE":
+      return { status: 503, code: "temporarily_unavailable", message: "This resource is temporarily unavailable." };
+  }
+}
+
+function errorResponse(
+  representation: Representation,
+  requestUrl: string,
+  status: number,
+  code: string,
+  message: string,
+): Response {
+  if (representation === "html") {
+    return htmlResponse(
+      page(
+        status === 404 ? "Not found" : "Owner activity",
+        `<main class="history-main history-message"><h1>${escapeHtml(message)}</h1><a href="/owner">Return to owner workspace</a></main>`,
+      ),
+      status,
+    );
+  }
+  return hypermediaResponse({
+    api_version: INVESTOR_APP_API_VERSION,
+    type: "error",
+    id: code,
+    data: { code, message },
+    links: [{ rel: ["self"], href: new URL(requestUrl).href }],
+    actions: [],
+  }, status);
+}
+
+function renderAuditCollection(document: OwnerAuditCollectionDocument): string {
+  const rows = document.data.items.length === 0
+    ? `<p class="history-empty">No audit events have been recorded.</p>`
+    : `<ol class="history-list">${document.data.items.map((item) =>
+      `<li><article><div><p>${escapeHtml(auditDetailLabel(item.detail))}</p><h2>${escapeHtml(item.detail.kind)}</h2></div><dl><div><dt>Event</dt><dd>${escapeHtml(item.id)}</dd></div><div><dt>Occurred</dt><dd><time datetime="${escapeAttribute(item.occurred_at)}">${escapeHtml(item.occurred_at)}</time></dd></div><div><dt>Actor</dt><dd>${escapeHtml(item.actor.type)}${item.actor.subject === undefined ? "" : `: ${escapeHtml(item.actor.subject)}`}</dd></div></dl></article></li>`
+    ).join("")}</ol>`;
+  const next = document.links.find((link) => link.rel.includes("next"));
+  const notifications = document.links.find((link) =>
+    link.rel.includes("manual-notifications")
+  );
+  return page(
+    "Audit events",
+    `<main class="history-main"><div class="history-title"><div><p class="history-kicker">Owner activity</p><h1>Audit events</h1></div>${notifications ? `<a href="${escapeAttribute(notifications.href)}">Manual notifications</a>` : ""}</div>${rows}${next ? `<a class="history-next" href="${escapeAttribute(next.href)}">Next page</a>` : ""}</main>`,
+  );
+}
+
+function renderNotificationCollection(
+  document: OwnerNotificationCollectionDocument,
+): string {
+  const itemLinks = document.links.filter((link) => link.rel.includes("item"));
+  const rows = document.data.items.length === 0
+    ? `<p class="history-empty">No manual notifications have been prepared.</p>`
+    : `<ol class="history-list">${document.data.items.map((item, index) =>
+      `<li><article><div><p>${escapeHtml(item.delivery_state === "marked-sent" ? "Marked sent" : "Not marked sent")}</p><h2>${escapeHtml(item.subject_line)}</h2></div><dl><div><dt>Generated</dt><dd><time datetime="${escapeAttribute(item.generated_at)}">${escapeHtml(item.generated_at)}</time></dd></div><div><dt>Copies</dt><dd>${item.copy_count}</dd></div></dl><a href="${escapeAttribute(itemLinks[index]?.href ?? "#")}">Open notification</a></article></li>`
+    ).join("")}</ol>`;
+  const next = document.links.find((link) => link.rel.includes("next"));
+  return page(
+    "Manual notifications",
+    `<main class="history-main"><div class="history-title"><div><p class="history-kicker">Owner activity</p><h1>Manual notifications</h1></div><a href="/owner/audit-events">Audit events</a></div>${rows}${next ? `<a class="history-next" href="${escapeAttribute(next.href)}">Next page</a>` : ""}</main>`,
+  );
+}
+
+function renderNotificationDetail(
+  resource: OwnerNotificationDetailResource,
+  csrfToken: string | null,
+): string {
+  const { data } = resource.document;
+  const audit = resource.document.links.find((link) =>
+    link.rel.includes("audit-events")
+  );
+  const actions = [
+    resource.recordCopy,
+    resource.markSent,
+    resource.terminalRetry,
+  ]
+    .filter((value): value is OwnerNotificationControl => value !== null)
+    .map((control) => renderActivityForm(control.form, csrfToken))
+    .join("");
+  const copies = data.copy_history.length === 0
+    ? `<p class="history-empty">No template copies have been recorded.</p>`
+    : `<ol class="history-evidence">${data.copy_history.map((item) =>
+      `<li><span>${escapeHtml(item.id)}</span><time datetime="${escapeAttribute(item.copied_at)}">${escapeHtml(item.copied_at)}</time></li>`
+    ).join("")}</ol>`;
+  const sent = data.sent_marker === null
+    ? "Not marked sent"
+    : `Marked sent at ${escapeHtml(data.sent_marker.sent_at)}`;
+  const sentEvidence = data.sent_marker === null
+    ? "Not recorded"
+    : escapeHtml(data.sent_marker.id);
+  return page(
+    data.subject_line,
+    `<main class="history-main"><nav class="history-detail-nav" aria-label="Notification history"><a href="/owner/manual-notifications">Manual notifications</a>${audit ? `<a href="${escapeAttribute(audit.href)}">Audit events</a>` : ""}</nav><div class="history-title history-title--detail"><div><p class="history-kicker">${escapeHtml(sent)}</p><h1>${escapeHtml(data.subject_line)}</h1></div><span>Revision ${data.revision}</span></div><dl class="history-metadata"><div><dt>Notification ID</dt><dd>${escapeHtml(resource.document.id)}</dd></div><div><dt>Purpose ID</dt><dd>${escapeHtml(data.purpose_id)}</dd></div><div><dt>Recipient subject</dt><dd>${escapeHtml(data.recipient_subject)}</dd></div><div><dt>Related resource</dt><dd>${escapeHtml(data.related_resource.type)}: ${escapeHtml(data.related_resource.id)}</dd></div><div><dt>Generated</dt><dd>${escapeHtml(data.generated_at)}</dd></div><div><dt>Sent evidence</dt><dd>${sentEvidence}</dd></div></dl><section class="history-template" aria-labelledby="notification-body"><h2 id="notification-body">Message template</h2><pre>${escapeHtml(data.body)}</pre></section><div class="history-actions">${actions}</div><section class="history-copy-log"><h2>Copy history</h2>${copies}</section></main>`,
+  );
+}
+
+function renderActivityForm(
+  form: HtmlFormAction,
+  csrfToken: string | null,
+): string {
+  if (csrfToken === null) return "";
+  const fields = form.fields.map((field) =>
+    `<input type="hidden" name="${escapeAttribute(field.name)}" value="${escapeAttribute(String(field.value ?? field.defaultValue ?? ""))}">`
+  ).join("");
+  return `<form data-action="${escapeAttribute(form.name)}" action="${escapeAttribute(form.action)}" method="post"><input type="hidden" name="_csrf" value="${escapeAttribute(csrfToken)}">${fields}<button type="submit">${escapeHtml(form.title)}</button></form>`;
+}
+
+function auditDetailLabel(detail: OwnerAuditEventItemDetail): string {
+  if (detail.kind === "resource-transition") {
+    return `${detail.resource_type} ${detail.resource_id}: ${detail.transition}`;
+  }
+  if (detail.kind === "export-created") return detail.export_type;
+  return `${detail.activity}: ${detail.notification_id}`;
+}
+
+type OwnerAuditEventItemDetail =
+  OwnerAuditCollectionDocument["data"]["items"][number]["detail"];
+
+function page(title: string, body: string): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)}</title><link rel="stylesheet" href="/owner-history.css"></head><body><header class="history-header"><a href="/owner">Campaign workspace</a><nav aria-label="Owner navigation"><a href="/">View campaign</a></nav></header>${body}</body></html>`;
+}
+
+function htmlResponse(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": "default-src 'self'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+      "Content-Type": "text/html; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      Vary: "Accept",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function escapeAttribute(value: string): string {
+  return escapeHtml(value)
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}

@@ -1,0 +1,419 @@
+.owner-setup-page {
+  --setup-canvas: #f4f6f3;
+  --setup-surface: #ffffff;
+  --setup-ink: #17221e;
+  --setup-muted: #5b6761;
+  --setup-line: #d4ddd7;
+  --setup-green: #176148;
+  --setup-green-dark: #104a37;
+  --setup-green-pale: #e5f1eb;
+  --setup-amber: #a66f05;
+  --setup-amber-pale: #fff5d6;
+  --setup-red: #8b3e32;
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--setup-canvas);
+  color: var(--setup-ink);
+  font-family: system-ui, "Segoe UI", sans-serif;
+  letter-spacing: 0;
+}
+
+.owner-setup-page,
+.owner-setup-page * {
+  box-sizing: border-box;
+  letter-spacing: 0;
+}
+
+.owner-setup-page a {
+  color: var(--setup-green);
+}
+
+.owner-setup-page a:focus-visible,
+.owner-setup-page button:focus-visible,
+.owner-setup-page input:focus-visible,
+.owner-setup-page select:focus-visible,
+.owner-setup-page summary:focus-visible,
+.owner-setup-page textarea:focus-visible {
+  outline: 3px solid rgba(23, 97, 72, 0.3);
+  outline-offset: 2px;
+}
+
+.owner-setup-page h1,
+.owner-setup-page h2,
+.owner-setup-page p,
+.owner-setup-page label,
+.owner-setup-page li,
+.owner-setup-page span,
+.owner-setup-page strong {
+  overflow-wrap: anywhere;
+}
+
+.owner-setup-header {
+  display: flex;
+  min-height: 66px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 12px max(24px, calc((100% - 1180px) / 2));
+  border-bottom: 1px solid var(--setup-line);
+  background: var(--setup-surface);
+}
+
+.owner-setup-brand {
+  color: var(--setup-ink) !important;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.owner-setup-header nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 18px;
+}
+
+.owner-setup-header nav a {
+  font-size: 0.88rem;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.owner-setup-main {
+  width: min(1180px, calc(100% - 48px));
+  margin: 0 auto;
+  padding: 40px 0 72px;
+}
+
+.owner-setup-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 36px;
+  padding-bottom: 28px;
+  border-bottom: 1px solid var(--setup-line);
+}
+
+.owner-setup-kicker {
+  margin: 0 0 8px;
+  color: var(--setup-green);
+  font-size: 0.76rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.owner-setup-title h1 {
+  margin: 0;
+  font-size: 2.1rem;
+  line-height: 1.1;
+}
+
+.owner-setup-title p:last-child {
+  max-width: 660px;
+  margin: 12px 0 0;
+  color: var(--setup-muted);
+  line-height: 1.5;
+}
+
+.owner-setup-state {
+  display: grid;
+  min-width: 160px;
+  justify-items: end;
+  gap: 4px;
+  padding-top: 5px;
+}
+
+.owner-setup-state strong {
+  color: var(--setup-green-dark);
+}
+
+.owner-setup-state span {
+  color: var(--setup-muted);
+  font-size: 0.82rem;
+}
+
+.owner-setup-readiness {
+  margin: 24px 0 0;
+  padding: 16px 18px;
+  border-left: 4px solid var(--setup-amber);
+  background: var(--setup-amber-pale);
+  color: #59420f;
+}
+
+.owner-setup-readiness-ready {
+  border-left-color: var(--setup-green);
+  background: var(--setup-green-pale);
+  color: var(--setup-green-dark);
+}
+
+.owner-setup-readiness h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.owner-setup-readiness p,
+.owner-setup-readiness ul {
+  margin: 8px 0 0;
+  line-height: 1.5;
+}
+
+.owner-setup-readiness ul {
+  padding-left: 20px;
+}
+
+.owner-setup-readiness details {
+  margin-top: 12px;
+}
+
+.owner-setup-readiness summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.owner-setup-form {
+  margin-top: 34px;
+}
+
+.owner-setup-section {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.32fr) minmax(0, 1fr);
+  gap: 40px;
+  padding: 30px 0;
+  border-top: 1px solid var(--setup-line);
+}
+
+.owner-setup-section:first-child {
+  border-top: 0;
+}
+
+.owner-setup-section-heading h2,
+.owner-setup-unavailable h2 {
+  margin: 0;
+  font-size: 1.08rem;
+  line-height: 1.3;
+}
+
+.owner-setup-section-heading p,
+.owner-setup-unavailable p {
+  margin: 8px 0 0;
+  color: var(--setup-muted);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.owner-setup-section-content,
+.owner-campaign-fields,
+.owner-campaign-optional {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  min-width: 0;
+}
+
+.owner-setup-section-content > .owner-campaign-repeatable,
+.owner-setup-section-content > .owner-campaign-toggle,
+.owner-setup-section-content > .owner-campaign-optional,
+.owner-campaign-optional > .owner-campaign-repeatable,
+.owner-setup-review,
+.owner-setup-paths {
+  grid-column: 1 / -1;
+}
+
+.owner-setup-field {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+}
+
+.owner-setup-field-wide {
+  grid-column: 1 / -1;
+}
+
+.owner-setup-field label,
+.owner-campaign-toggle label,
+.owner-setup-paths > span {
+  color: #33413b;
+  font-size: 0.79rem;
+  font-weight: 720;
+}
+
+.owner-setup-page input,
+.owner-setup-page select,
+.owner-setup-page textarea {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid #b9c6bf;
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: var(--setup-surface);
+  color: var(--setup-ink);
+  font: inherit;
+  font-size: 0.9rem;
+}
+
+.owner-setup-page textarea {
+  min-height: 94px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
+.owner-setup-page input:disabled,
+.owner-setup-page select:disabled,
+.owner-setup-page textarea:disabled {
+  background: #eef1ef;
+  color: #6a746f;
+}
+
+.owner-campaign-toggle {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 10px;
+}
+
+.owner-campaign-toggle input {
+  width: 20px;
+  min-height: 20px;
+  flex: 0 0 20px;
+  margin: 0;
+}
+
+.owner-campaign-repeatable,
+.owner-campaign-repeatable [data-repeatable-rows] {
+  display: grid;
+  gap: 13px;
+}
+
+.owner-campaign-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+  padding: 0 0 15px 14px;
+  border-bottom: 1px solid var(--setup-line);
+  border-left: 3px solid #acc3b7;
+}
+
+.owner-setup-paths,
+.owner-setup-review {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 22px;
+  min-height: 42px;
+}
+
+.owner-setup-paths > span {
+  width: 100%;
+}
+
+.owner-setup-page button {
+  min-height: 42px;
+  border: 1px solid var(--setup-green);
+  border-radius: 6px;
+  padding: 9px 16px;
+  background: var(--setup-green);
+  color: #ffffff;
+  font: inherit;
+  font-size: 0.88rem;
+  font-weight: 740;
+  cursor: pointer;
+}
+
+.owner-setup-page button:hover {
+  background: var(--setup-green-dark);
+}
+
+.owner-setup-page button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.owner-campaign-add {
+  justify-self: start;
+  border-color: #9fb5aa !important;
+  background: var(--setup-surface) !important;
+  color: var(--setup-green-dark) !important;
+}
+
+.owner-campaign-remove {
+  min-width: 82px;
+  border-color: #ccbdb8 !important;
+  background: var(--setup-surface) !important;
+  color: var(--setup-red) !important;
+}
+
+.owner-setup-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 18px;
+  padding-top: 30px;
+  border-top: 1px solid var(--setup-line);
+}
+
+.owner-setup-actions a {
+  font-size: 0.88rem;
+  font-weight: 720;
+}
+
+.owner-setup-unavailable,
+.owner-setup-message {
+  max-width: 680px;
+  margin-top: 34px;
+}
+
+.owner-setup-message {
+  width: min(680px, calc(100% - 40px));
+  margin-right: auto;
+  margin-left: auto;
+  padding-top: 10vh;
+}
+
+@media (max-width: 780px) {
+  .owner-setup-header,
+  .owner-setup-title,
+  .owner-setup-actions {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .owner-setup-main {
+    width: min(100% - 28px, 1180px);
+    padding-top: 28px;
+  }
+
+  .owner-setup-state {
+    justify-items: start;
+  }
+
+  .owner-setup-section {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 18px;
+  }
+
+  .owner-setup-section-content,
+  .owner-campaign-fields,
+  .owner-campaign-optional {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .owner-setup-field-wide,
+  .owner-setup-section-content > .owner-campaign-repeatable,
+  .owner-setup-section-content > .owner-campaign-toggle,
+  .owner-setup-section-content > .owner-campaign-optional,
+  .owner-campaign-optional > .owner-campaign-repeatable,
+  .owner-setup-review,
+  .owner-setup-paths {
+    grid-column: auto;
+  }
+
+  .owner-campaign-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .owner-setup-actions,
+  .owner-setup-actions button {
+    width: 100%;
+  }
+}

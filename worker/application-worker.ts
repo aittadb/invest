@@ -1,0 +1,1721 @@
+import {
+  parseActorSubject,
+  parseStableId,
+  type ActorSubject,
+} from "../domain/foundation.ts";
+import type { AmountConfiguration } from "../domain/amount-aggregate-configuration.ts";
+import type {
+  ContributionAreaChoice,
+  FounderApplicationId,
+} from "../domain/founder-application.ts";
+import type {
+  InvestmentIndicationId,
+  TrustedPackageAcknowledgmentContext,
+} from "../domain/investment-indication.ts";
+import { isConfiguredOwner } from "../domain/owner-identity.ts";
+import {
+  authorizeParticipantAccess,
+  type AuthorizedParticipantAccess,
+  type ParticipantAccessStateReader,
+} from "../domain/participant-home-resource.ts";
+import { isPhaseAcceptingParticipation } from "../domain/phase-configuration.ts";
+import {
+  PARTICIPANT_REGISTRATION_PATH,
+  createParticipantRegistrationNoticeEvidence,
+  participantRegistrationNoticesFromCampaignPolicy,
+} from "../domain/participant-registration-resource.ts";
+import { PARTICIPANT_PROFILE_PATH } from "../domain/participant-profile-resource.ts";
+import { PARTICIPANT_HOME_PATH } from "../domain/participant-navigation.ts";
+import { parseParticipantAccount } from "../domain/participant-profile.ts";
+import {
+  parsePublicCampaignConfiguration,
+  type PublicCampaignConfiguration,
+} from "../domain/public-campaign-configuration.ts";
+import {
+  FOUNDER_INTEREST_PATH,
+  FOUNDER_SECONDARY_AREAS_FIELD,
+} from "../domain/participant-founder-interest-resource.ts";
+import { OWNER_INDICATIONS_PATH } from "../domain/owner-indication-moderation-resource.ts";
+import { INVESTMENT_INTEREST_PATH } from "../domain/participant-investment-interest-resource.ts";
+import { resolveAppOrigin, withAppOrigin } from "../http/app-origin.ts";
+import { withRuntimeCapabilities } from "../http/runtime-capabilities.ts";
+import { withRuntimeCampaign } from "../http/runtime-campaign.ts";
+import { withRuntimeOwner } from "../http/runtime-owner.ts";
+import { withRuntimeParticipantAccess } from "../http/runtime-participant.ts";
+import { withRuntimePublicAggregate } from "../http/runtime-public-aggregate.ts";
+import {
+  withRuntimeCampaignPreview,
+  type RuntimeCampaignPreview,
+} from "../http/runtime-preview.ts";
+import type {
+  AtomicCampaignAuditRepository,
+  CampaignSetupRevision,
+  PublicCampaignPresentationReader,
+} from "../repositories/in-memory-campaign-repository.ts";
+import type {
+  FounderApplicationReviewCollectionRepository,
+  FounderApplicationReviewDetailRepository,
+} from "../repositories/in-memory-founder-application-repository.ts";
+import type {
+  PublicCampaignStateReader,
+  PublishedPublicCampaignState,
+} from "../repositories/storage-public-campaign-state-reader.ts";
+import type {
+  ParticipantFounderApplicationRepositories,
+  ParticipantPackageAcknowledgmentRepositories,
+  ParticipantRequestRepositoryScope,
+} from "../repositories/storage-application-repository-factory.ts";
+import type {
+  ParticipantProfileSnapshot,
+  ParticipantRepository,
+} from "../repositories/in-memory-participant-repository.ts";
+import {
+  StorageFailure,
+  parseStorageOperationId,
+  type StorageOperationId,
+} from "../domain/storage-adapter.ts";
+import type {
+  ApplicationFetcher,
+  ApplicationRouteContext,
+  ApplicationRouteHandler,
+  AuthenticatedActor,
+  ImageFetcher,
+  InvestorAppEnv,
+  WorkerExecutionContext,
+} from "./contracts.ts";
+import type {
+  ApplicationRuntimeDeploymentCapability,
+  CampaignWorkspaceDeploymentCapability,
+} from "./deployment-capabilities.ts";
+import { hasHostedAittaDBApplicationRuntimeValues } from "./hosted-application-configuration.ts";
+import {
+  MAX_OWNER_INDICATION_MODERATION_MUTATION_BYTES,
+  MAX_OWNER_INDICATION_MODERATION_MUTATION_FIELDS,
+  type OwnerIndicationModerationRouteDependencies,
+} from "./routes/owner-indication-moderation.ts";
+import {
+  MAX_OWNER_NOTIFICATION_MUTATION_BYTES,
+  ownerNotificationMutationFieldLimit,
+  type OwnerAuditHistoryRouteDependencies,
+  type OwnerAuditNotificationRouteDependencies,
+} from "./routes/owner-audit-notification-history.ts";
+import {
+  isExactOwnerAggregateReconciliationMutation,
+  MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_BYTES,
+  ownerAggregateCorrectionReplayScopeFor,
+  ownerAggregateReconciliationMutationFieldLimit,
+  type OwnerAggregateReconciliationRouteOptions,
+} from "./routes/owner-aggregate-reconciliation.ts";
+import {
+  MAX_OWNER_PACKAGE_MUTATION_BYTES,
+  MAX_OWNER_PACKAGE_MUTATION_FIELDS,
+  type OwnerPackageRouteDependencies,
+} from "./routes/owner-package.ts";
+import {
+  founderWithdrawalReplayScopeFor,
+  investmentWithdrawalReplayScopeFor,
+  investmentWithdrawalReplayScopeRequired,
+  MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
+  MAX_ACKNOWLEDGMENT_MUTATION_FIELDS,
+  MAX_FOUNDER_INTEREST_MUTATION_BYTES,
+  MAX_FOUNDER_INTEREST_MUTATION_FIELDS,
+  MAX_REGISTRATION_MUTATION_BYTES,
+  MAX_REGISTRATION_MUTATION_FIELDS,
+  participantProfileMutationLimits,
+  type FounderInterestRouteDependencies,
+  type InvestmentInterestRouteDependencies,
+  type ParticipantPackageAcknowledgmentRouteDependencies,
+  type ParticipantPackageReaderDependencies,
+  type ParticipantProfileRouteDependencies,
+  type ParticipantRegistrationRouteDependencies,
+} from "./routes/participant.ts";
+import { createParticipantFounderInterestService } from "./founder-interest-service.ts";
+import {
+  createParticipantInvestmentInterestService,
+  type InvestmentInterestPermissions,
+} from "./investment-interest-service.ts";
+import {
+  type OwnerOAuthProofRouteDependencies,
+} from "./routes/owner-oauth-proof.ts";
+import {
+  type OwnerReviewExportRouteDependencies,
+} from "./routes/owner-review-exports.ts";
+import {
+  composeRequestCapabilities,
+  unavailableRequestRuntimeCapabilities,
+  type RequestPackageRoutes,
+} from "./request-capability-composition.ts";
+
+export type ApplicationWorkerDependencies = Readonly<{
+  fetchApplication: ApplicationFetcher;
+  fetchOptimizedImage: ImageFetcher;
+  dispatchRoute?: ApplicationRouteHandler;
+  ownerPackage?: OwnerPackageRouteDependencies;
+  ownerIndicationModeration?: OwnerIndicationModerationRouteDependencies;
+  ownerReviewExports?: OwnerReviewExportRouteDependencies;
+  ownerAuditHistory?: OwnerAuditHistoryRouteDependencies;
+  ownerFounderReview?: FounderApplicationReviewCollectionRepository;
+  ownerFounderReviewDetail?: FounderApplicationReviewDetailRepository;
+  ownerAuditNotificationHistory?: OwnerAuditNotificationRouteDependencies;
+  ownerAggregateReconciliation?: OwnerAggregateReconciliationRouteOptions;
+  participantFounderInterest?: FounderInterestRouteDependencies;
+  participantInvestmentInterests?: InvestmentInterestRouteDependencies;
+  participantProfile?: ParticipantProfileRouteDependencies;
+  participantPackageReader?: ParticipantPackageReaderDependencies;
+  participantPackageAcknowledgment?: ParticipantPackageAcknowledgmentRouteDependencies;
+  participantAccessReader?: ParticipantAccessStateReader;
+  ownerOAuthProof?: OwnerOAuthProofRouteDependencies;
+  resolveOwnerOAuthProof?: (
+    env: InvestorAppEnv,
+  ) => Promise<OwnerOAuthProofRouteDependencies | null | undefined>;
+  applicationRuntime?: ApplicationRuntimeDeploymentCapability;
+  resolveApplicationRuntime?: (
+    env: InvestorAppEnv,
+  ) => Promise<ApplicationRuntimeDeploymentCapability | null | undefined>;
+  publicCampaignReader?: PublicCampaignPresentationReader;
+  publicCampaignStateReader?: PublicCampaignStateReader;
+  campaignWorkspace?: CampaignWorkspaceDeploymentCapability;
+  resolveCampaignWorkspace?: () =>
+    CampaignWorkspaceDeploymentCapability | null | undefined;
+}>;
+
+export function createApplicationWorker(
+  dependencies: ApplicationWorkerDependencies,
+): Readonly<{
+  fetch(
+    request: Request,
+    env: InvestorAppEnv,
+    context: WorkerExecutionContext,
+  ): Promise<Response>;
+}> {
+  return {
+    async fetch(request, env, executionContext) {
+      const url = new URL(request.url);
+      const appOrigin = resolveAppOrigin(request.url, env.APP_BASE_URL);
+      const resourceUrl = canonicalResourceUrl(url, appOrigin);
+      const actor = authenticatedActor(request);
+      const isOwner = isConfiguredOwner(actor?.email, env.OWNER_EMAIL);
+      const applicationRuntime = await resolveApplicationRuntime(
+        dependencies,
+        env,
+      );
+      const participantRequest = runtimeParticipantRequest(
+        applicationRuntime,
+        actor,
+        isOwner,
+        url.pathname,
+      );
+      const packageRoutes = dependencies.dispatchRoute === undefined &&
+          applicationRuntime !== null
+        ? runtimePackageRoutes(
+            applicationRuntime,
+            actor,
+            isOwner,
+            resourceUrl,
+            participantRequest,
+          )
+        : null;
+      const ownerPackage = dependencies.dispatchRoute === undefined
+        ? dependencies.ownerPackage ?? packageRoutes?.owner
+        : undefined;
+      const participantPackageReader = dependencies.dispatchRoute === undefined
+        ? dependencies.participantPackageReader ?? packageRoutes?.participantReader
+        : undefined;
+      const participantPackageAcknowledgment =
+        dependencies.dispatchRoute === undefined
+          ? dependencies.participantPackageAcknowledgment ??
+            packageRoutes?.participantAcknowledgment
+          : undefined;
+      const ownerIndicationModeration =
+        dependencies.dispatchRoute === undefined
+          ? dependencies.ownerIndicationModeration ??
+            await runtimeOwnerIndicationModeration(
+              applicationRuntime,
+              actor,
+              isOwner,
+              resourceUrl,
+              url.pathname,
+            )
+          : undefined;
+      const ownerAuditNotificationHistory =
+        dependencies.dispatchRoute === undefined
+          ? dependencies.ownerAuditNotificationHistory ??
+            (dependencies.ownerAuditHistory === undefined
+              ? runtimeOwnerAuditNotificationHistory(
+                  applicationRuntime,
+                  actor,
+                  isOwner,
+                  resourceUrl,
+                )
+              : undefined)
+          : undefined;
+      const ownerAuditHistory = dependencies.dispatchRoute === undefined &&
+          ownerAuditNotificationHistory === undefined
+        ? dependencies.ownerAuditHistory ??
+          runtimeOwnerAuditHistory(applicationRuntime)
+        : undefined;
+      const ownerFounderReview = dependencies.dispatchRoute === undefined
+        ? dependencies.ownerFounderReview ??
+          runtimeOwnerFounderReview(applicationRuntime)
+        : undefined;
+      const ownerFounderReviewDetail = dependencies.dispatchRoute === undefined
+        ? dependencies.ownerFounderReviewDetail ??
+          runtimeOwnerFounderReviewDetail(applicationRuntime)
+        : undefined;
+      const ownerOAuthProof = dependencies.dispatchRoute === undefined
+        ? await resolveOwnerOAuthProof(dependencies, env)
+        : null;
+      const campaignWorkspace = dependencies.dispatchRoute === undefined
+        ? resolveCampaignWorkspace(dependencies, applicationRuntime, appOrigin)
+        : null;
+      const publicState = await resolvePublicCampaignState(
+        request.method === "GET" && url.pathname === "/"
+          ? resolvePublicCampaignStateReader(dependencies, applicationRuntime)
+          : undefined,
+        campaignWorkspace?.publicReader ?? dependencies.publicCampaignReader,
+        hasHostedAittaDBApplicationRuntimeValues(env)
+          ? undefined
+          : env.CAMPAIGN_CONFIG_JSON,
+      );
+      const publicCampaign = publicState?.campaign ?? null;
+      const publicAggregate = publicState?.aggregate ?? null;
+      const campaign = isOwner && isOwnerPath(url.pathname) && campaignWorkspace
+        ? await resolveOwnerCampaign(campaignWorkspace, publicCampaign)
+        : publicCampaign;
+      const ownerAggregateReconciliation =
+        dependencies.dispatchRoute === undefined
+          ? dependencies.ownerAggregateReconciliation ??
+            await runtimeOwnerAggregateReconciliation(
+              applicationRuntime,
+              actor,
+              isOwner,
+              resourceUrl,
+              url.pathname,
+            )
+          : undefined;
+      const participantAccessReader = dependencies.participantAccessReader ??
+        participantRequest?.participantAccessReader();
+      const participantAccessResolution = await resolveParticipantAccess(
+        actor,
+        participantAccessReader,
+      );
+      const participantAccess = participantAccessResolution.access;
+      const participantRegistration = dependencies.dispatchRoute === undefined &&
+          applicationRuntime !== null &&
+          (url.pathname === PARTICIPANT_REGISTRATION_PATH ||
+            (url.pathname === PARTICIPANT_HOME_PATH &&
+              participantAccessResolution.kind === "missing"))
+        ? await runtimeParticipantRegistrationRoute(
+            applicationRuntime,
+            actor,
+            isOwner,
+            resourceUrl,
+            url.pathname,
+          )
+        : null;
+      const participantProfile = dependencies.dispatchRoute === undefined
+        ? dependencies.participantProfile ??
+          (applicationRuntime !== null
+            ? runtimeParticipantProfileRoute(
+                applicationRuntime,
+                actor,
+                isOwner,
+                participantAccess,
+                resourceUrl,
+                url.pathname,
+                participantRequest,
+              )
+            : null)
+        : null;
+      const participantFounderInterest = dependencies.dispatchRoute === undefined
+        ? dependencies.participantFounderInterest ??
+          await runtimeParticipantFounderInterestRoute(
+            applicationRuntime,
+            actor,
+            isOwner,
+            participantAccess,
+            resourceUrl,
+            url.pathname,
+            participantRequest,
+          )
+        : undefined;
+      const participantInvestmentInterests =
+        dependencies.dispatchRoute === undefined
+          ? dependencies.participantInvestmentInterests ??
+            await runtimeParticipantInvestmentInterestRoute(
+              applicationRuntime,
+              actor,
+              isOwner,
+              participantAccess,
+              resourceUrl,
+              url.pathname,
+              participantRequest,
+            )
+          : undefined;
+      const capabilities = composeRequestCapabilities({
+        injectedRoute: dependencies.dispatchRoute,
+        ownerPackage,
+        ownerIndicationModeration,
+        ownerReviewExports: dependencies.dispatchRoute === undefined
+          ? dependencies.ownerReviewExports
+          : undefined,
+        ownerAuditHistory,
+        ownerFounderReview,
+        ownerFounderReviewDetail,
+        ownerAuditNotificationHistory,
+        ownerAggregateReconciliation,
+        participantRegistration,
+        participantProfile,
+        participantFounderInterest: participantFounderInterest ?? null,
+        participantInvestmentInterests: participantInvestmentInterests ?? null,
+        ownerOAuthProof,
+        campaignWorkspace,
+        packageRoutes: {
+          owner: ownerPackage,
+          participantReader: participantPackageReader,
+          participantAcknowledgment: participantPackageAcknowledgment,
+        },
+        isOwner,
+      });
+      const renderEnvironment = applicationRenderEnvironment(env);
+      const renderApplication: ApplicationRouteContext["renderApplication"] = (
+        options = {},
+      ) => {
+        const preview = options.preview ?? null;
+        const normalApplication = preview === null;
+        return dependencies.fetchApplication(
+          withRuntimeConfiguration(
+            options.request ?? request,
+            env,
+            normalApplication ? participantAccess : null,
+            Object.hasOwn(options, "campaign")
+              ? options.campaign ?? null
+              : campaign,
+            normalApplication
+              ? Object.hasOwn(options, "publicAggregate")
+                ? options.publicAggregate ?? null
+                : publicAggregate
+              : null,
+            normalApplication
+              ? capabilities.runtimeCapabilities
+              : unavailableRequestRuntimeCapabilities(),
+            preview,
+          ),
+          renderEnvironment,
+          executionContext,
+        );
+      };
+
+      const routeResponse = await capabilities.dispatchRoute({
+        request,
+        url,
+        resourceUrl,
+        actor,
+        isOwner,
+        participantAccess,
+        campaign,
+        publicAggregate,
+        renderApplication,
+      });
+      if (routeResponse) return routeResponse;
+
+      if (url.pathname === "/_vinext/image") {
+        return dependencies.fetchOptimizedImage(request, renderEnvironment);
+      }
+
+      return renderApplication();
+    },
+  };
+}
+
+function applicationRenderEnvironment(
+  env: InvestorAppEnv,
+): Readonly<Pick<InvestorAppEnv, "ASSETS" | "IMAGES">> {
+  return Object.freeze({
+    ASSETS: env.ASSETS,
+    IMAGES: env.IMAGES,
+  });
+}
+
+function runtimeParticipantProfileRoute(
+  runtime: ApplicationRuntimeDeploymentCapability,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  participantAccess: AuthorizedParticipantAccess | null,
+  resourceUrl: string,
+  pathname: string,
+  participantRequest: ParticipantRequestRepositoryScope | null,
+): ParticipantProfileRouteDependencies | null {
+  if (
+    (pathname !== PARTICIPANT_HOME_PATH &&
+      pathname !== PARTICIPANT_PROFILE_PATH) ||
+    actor === null ||
+    isOwner ||
+    participantAccess === null
+  ) {
+    return null;
+  }
+
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (
+    !account.ok ||
+    participantAccess.subject !== account.value.subject ||
+    participantAccess.email !== account.value.accountEmailLabel
+  ) {
+    return null;
+  }
+
+  try {
+    const participant = requiredParticipantRequest(participantRequest)
+      .participantProfileRepository();
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "participant" as const,
+      subject: account.value.subject,
+    });
+    const sameAccount = (candidate: typeof account.value) =>
+      candidate.subject === account.value.subject &&
+      candidate.accountEmailLabel === account.value.accountEmailLabel;
+
+    return Object.freeze({
+      repositoryFor(candidate) {
+        if (!sameAccount(candidate)) {
+          throw new Error("Participant profile is unavailable.");
+        }
+        return participant;
+      },
+      verifyMutation: (request: Request) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          participantProfileMutationLimits(request.method),
+        ),
+      csrfTokenFor: (request, candidate) =>
+        sameAccount(candidate)
+          ? runtime.mutationSession.issue(request, identity, appOrigin)
+          : Promise.resolve(null),
+      now: runtime.now,
+      createOperationId: (operation) =>
+        randomOperationId(`participant-profile-${operation}`),
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function runtimeParticipantRegistrationRoute(
+  runtime: ApplicationRuntimeDeploymentCapability,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  resourceUrl: string,
+  pathname: string,
+): Promise<ParticipantRegistrationRouteDependencies | null> {
+  if (
+    (pathname !== PARTICIPANT_REGISTRATION_PATH &&
+      pathname !== PARTICIPANT_HOME_PATH) ||
+    actor === null ||
+    isOwner
+  ) {
+    return null;
+  }
+
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (!account.ok) return null;
+
+  try {
+    const repositories = runtime.repositoryFactory;
+    const currentCampaign = await repositories.campaignRepository().readSetup();
+    if (currentCampaign === null) return null;
+    const newRegistrationAllowed =
+      currentCampaign.setup.publicCampaign.published === true &&
+      currentCampaign.setup.publicCampaign.status === "open";
+    if (pathname === PARTICIPANT_HOME_PATH && !newRegistrationAllowed) {
+      return null;
+    }
+    const noticeEvidence = createParticipantRegistrationNoticeEvidence(
+      currentCampaign.revision,
+      participantRegistrationNoticesFromCampaignPolicy(
+        currentCampaign.setup.campaignPolicy,
+      ),
+    );
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "participant" as const,
+      subject: account.value.subject,
+    });
+    const sameAccount = (candidate: typeof account.value) =>
+      candidate.subject === account.value.subject &&
+      candidate.accountEmailLabel === account.value.accountEmailLabel;
+
+    return Object.freeze({
+      repositoryFor(candidate) {
+        if (!sameAccount(candidate)) {
+          throw new Error("Participant registration is unavailable.");
+        }
+        return repositories.participantRepository(account.value);
+      },
+      verifyMutation: (request, validateBeforeReplayClaim) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          {
+            maxBodyBytes: MAX_REGISTRATION_MUTATION_BYTES,
+            maxFields: MAX_REGISTRATION_MUTATION_FIELDS,
+            repeatedFormFields: [],
+            validateBeforeReplayClaim,
+          },
+        ),
+      csrfTokenFor: (request, candidate) =>
+        sameAccount(candidate)
+          ? runtime.mutationSession.issue(request, identity, appOrigin)
+          : Promise.resolve(null),
+      newRegistrationAllowed,
+      noticeEvidence,
+      now: runtime.now,
+      createOperationId: () => randomOperationId("participant-operation"),
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function runtimeParticipantFounderInterestRoute(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  participantAccess: AuthorizedParticipantAccess | null,
+  resourceUrl: string,
+  pathname: string,
+  participantRequest: ParticipantRequestRepositoryScope | null,
+): Promise<FounderInterestRouteDependencies | null> {
+  const exactFounderResource = pathname === FOUNDER_INTEREST_PATH;
+  if (
+    runtime === null ||
+    (pathname !== "/participant" && !exactFounderResource)
+  ) {
+    return null;
+  }
+  const unavailableRoute = exactFounderResource
+    ? unavailableFounderInterestRoute()
+    : null;
+  if (
+    actor === null ||
+    isOwner ||
+    participantAccess === null ||
+    participantAccess.subject !== actor.userId ||
+    participantAccess.accountStatus !== "active"
+  ) {
+    return unavailableRoute;
+  }
+  if (pathname === PARTICIPANT_HOME_PATH) {
+    return unavailableFounderInterestRoute();
+  }
+
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (!account.ok) return unavailableRoute;
+
+  try {
+    const founder = requiredParticipantRequest(participantRequest)
+      .participantFounderApplications();
+    const campaign = await founder.campaign.readSetup();
+    const contributionAreaChoices = campaign?.setup.campaignPolicy
+      .founderContributionChoices ?? Object.freeze([]);
+    const repository = founder.applications(contributionAreaChoices);
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "participant" as const,
+      subject: account.value.subject,
+    });
+    const applicationId = selfFounderApplicationId();
+
+    return Object.freeze({
+      serviceFor(candidateSubject) {
+        if (candidateSubject !== account.value.subject) {
+          throw new StorageFailure("NOT_FOUND");
+        }
+        return createParticipantFounderInterestService({
+          actorSubject: account.value.subject,
+          applicationId,
+          contributionAreaChoices,
+          repository,
+          repositoryForCreate: async () => {
+            const revisions = await founderCreationPolicyRevision(
+              founder,
+              account.value.subject,
+              contributionAreaChoices,
+            );
+            return revisions === null
+              ? null
+              : founder.policyBoundApplications(
+                  contributionAreaChoices,
+                  revisions.campaignSetupRevision,
+                  revisions.participantProfileRevision,
+                );
+          },
+          repositoryForEdit: async () => {
+            const revision = await founderEditPolicyRevision(
+              founder,
+              contributionAreaChoices,
+            );
+            return revision === null
+              ? null
+              : founder.policyBoundApplications(
+                  contributionAreaChoices,
+                  revision,
+                );
+          },
+          canCreate: async () =>
+            (await founderCreationPolicyRevision(
+              founder,
+              account.value.subject,
+              contributionAreaChoices,
+            )) !== null,
+          now: runtime.now,
+        });
+      },
+      verifyMutation: (request: Request) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          {
+            maxBodyBytes: MAX_FOUNDER_INTEREST_MUTATION_BYTES,
+            maxFields: MAX_FOUNDER_INTEREST_MUTATION_FIELDS,
+            repeatedFormFields: [FOUNDER_SECONDARY_AREAS_FIELD],
+            exactReplayScopeFor: founderWithdrawalReplayScopeFor,
+          },
+        ),
+      csrfTokenFor: (request, candidateSubject, exactReplayScope) =>
+        candidateSubject === account.value.subject
+          ? exactReplayScope === null
+            ? runtime.mutationSession.issue(request, identity, appOrigin)
+            : runtime.mutationSession.issueExactReplay(
+                request,
+                identity,
+                appOrigin,
+                exactReplayScope,
+              )
+          : Promise.resolve(null),
+      createOperationId: () => randomOperationId("founder-operation"),
+    });
+  } catch {
+    return unavailableRoute;
+  }
+}
+
+function unavailableFounderInterestRoute(): FounderInterestRouteDependencies {
+  return Object.freeze({
+    serviceFor() {
+      throw new StorageFailure("NOT_FOUND");
+    },
+    async verifyMutation() {
+      throw new StorageFailure("NOT_FOUND");
+    },
+    csrfTokenFor: () => null,
+  });
+}
+
+async function runtimeParticipantInvestmentInterestRoute(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  participantAccess: AuthorizedParticipantAccess | null,
+  resourceUrl: string,
+  pathname: string,
+  participantRequest: ParticipantRequestRepositoryScope | null,
+): Promise<InvestmentInterestRouteDependencies | null> {
+  const investmentResource = pathname === INVESTMENT_INTEREST_PATH ||
+    pathname.startsWith(`${INVESTMENT_INTEREST_PATH}/`);
+  if (
+    runtime === null ||
+    (pathname !== "/participant" && !investmentResource)
+  ) {
+    return null;
+  }
+  const unavailableRoute = investmentResource
+    ? unavailableInvestmentInterestRoute()
+    : null;
+  if (
+    actor === null ||
+    isOwner ||
+    participantAccess === null ||
+    participantAccess.subject !== actor.userId ||
+    participantAccess.accountStatus !== "active"
+  ) {
+    return unavailableRoute;
+  }
+  if (pathname === PARTICIPANT_HOME_PATH) {
+    return participantAccess.declaredInterest === "investor" ||
+        participantAccess.declaredInterest === "both"
+      ? unavailableInvestmentInterestRoute()
+      : null;
+  }
+  if (
+    participantAccess.declaredInterest !== "investor" &&
+    participantAccess.declaredInterest !== "both"
+  ) {
+    return unavailableRoute;
+  }
+
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (
+    !account.ok ||
+    participantAccess.email !== account.value.accountEmailLabel
+  ) {
+    return unavailableRoute;
+  }
+
+  try {
+    const participantScope = requiredParticipantRequest(participantRequest);
+    const participant = participantScope.participantProfileRepository();
+    const acknowledgments = participantScope.participantPackageAcknowledgments(
+      account.value.subject,
+    );
+    const policyCampaign =
+      participantScope.participantInvestmentPolicyCampaign();
+    const campaign = await policyCampaign.readSetup();
+    if (campaign === null) return unavailableRoute;
+    const amountConfiguration = campaign.setup.amountAggregate.amount;
+    const interests = participantScope.participantInvestmentInterests(
+      amountConfiguration,
+    );
+    let policySnapshot: Promise<InvestmentPolicySnapshot> | null = null;
+    const loadPolicySnapshot = (): Promise<InvestmentPolicySnapshot> => {
+      policySnapshot ??= loadInvestmentPolicySnapshot(
+        policyCampaign,
+        participant,
+        acknowledgments,
+        account.value.subject,
+        campaign.revision,
+        amountConfiguration,
+      );
+      return policySnapshot;
+    };
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "participant" as const,
+      subject: account.value.subject,
+    });
+
+    return Object.freeze({
+      serviceFor(candidateSubject) {
+        if (candidateSubject !== account.value.subject) {
+          throw new Error("Investment interests are unavailable.");
+        }
+        return createParticipantInvestmentInterestService({
+          actorSubject: account.value.subject,
+          amountConfiguration,
+          reader: interests,
+          mutations: interests,
+          loadAcknowledgmentContext: async () =>
+            (await loadPolicySnapshot()).acknowledgmentContext,
+          loadPermissions: async () =>
+            (await loadPolicySnapshot()).permissions,
+          indicationIdForOperation: investmentIndicationIdForOperation,
+          now: runtime.now,
+        });
+      },
+      verifyMutation: (request, limits) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          {
+            ...limits,
+            exactReplayScopeFor: (verified) =>
+              investmentWithdrawalReplayScopeFor(verified, pathname),
+            requireExactReplayScope:
+              investmentWithdrawalReplayScopeRequired(pathname),
+          },
+        ),
+      csrfTokenFor: (request, candidateSubject, exactReplayScope) =>
+        candidateSubject === account.value.subject
+          ? exactReplayScope === null
+            ? runtime.mutationSession.issue(request, identity, appOrigin)
+            : runtime.mutationSession.issueExactReplay(
+                request,
+                identity,
+                appOrigin,
+                exactReplayScope,
+              )
+          : Promise.resolve(null),
+      createOperationId: () => randomOperationId("investment-operation"),
+    });
+  } catch {
+    return unavailableRoute;
+  }
+}
+
+function unavailableInvestmentInterestRoute(): InvestmentInterestRouteDependencies {
+  return Object.freeze({
+    serviceFor() {
+      throw new StorageFailure("NOT_FOUND");
+    },
+    async verifyMutation() {
+      throw new StorageFailure("NOT_FOUND");
+    },
+    csrfTokenFor: () => null,
+  });
+}
+
+type InvestmentPolicySnapshot = Readonly<{
+  acknowledgmentContext: TrustedPackageAcknowledgmentContext | null;
+  permissions: InvestmentInterestPermissions;
+}>;
+
+async function loadInvestmentPolicySnapshot(
+  campaignRepository: Pick<AtomicCampaignAuditRepository, "readSetup">,
+  participant: Pick<ParticipantRepository, "current">,
+  repositories: ParticipantPackageAcknowledgmentRepositories,
+  subject: ActorSubject,
+  expectedCampaignRevision: number,
+  expectedAmountConfiguration: AmountConfiguration,
+): Promise<InvestmentPolicySnapshot> {
+  const [firstCampaign, firstParticipant] = await Promise.all([
+    campaignRepository.readSetup(),
+    participant.current(),
+  ]);
+  const firstPackage = await repositories.packages.current();
+  const latest = firstPackage === null
+    ? null
+    : await repositories.acknowledgments.latest();
+  const secondPackage = await repositories.packages.current();
+  const [secondParticipant, secondCampaign] = await Promise.all([
+    participant.current(),
+    campaignRepository.readSetup(),
+  ]);
+  if (
+    !sameCampaignRevision(firstCampaign, secondCampaign) ||
+    !sameParticipantRevision(firstParticipant, secondParticipant) ||
+    !samePackageRevision(firstPackage, secondPackage) ||
+    (latest !== null && latest.snapshot.participantSubject !== subject)
+  ) {
+    throw new StorageFailure("PRECONDITION_FAILED");
+  }
+  const acknowledgmentContext = secondPackage === null
+    ? null
+    : Object.freeze({
+      currentVersion: secondPackage.snapshot,
+      latestAcceptance: latest?.snapshot ?? null,
+    });
+  return Object.freeze({
+    acknowledgmentContext,
+    permissions: investmentInterestPermissions(
+      secondCampaign,
+      secondParticipant,
+      subject,
+      expectedCampaignRevision,
+      expectedAmountConfiguration,
+    ),
+  });
+}
+
+function investmentInterestPermissions(
+  campaign: CampaignSetupRevision | null,
+  currentParticipant: ParticipantProfileSnapshot | null,
+  subject: ActorSubject,
+  expectedCampaignRevision: number,
+  expectedAmountConfiguration: AmountConfiguration,
+): InvestmentInterestPermissions {
+  const permitted = campaign !== null &&
+    campaign.revision === expectedCampaignRevision &&
+    sameAmountConfiguration(
+      campaign.setup.amountAggregate.amount,
+      expectedAmountConfiguration,
+    ) &&
+    currentParticipant !== null &&
+    profilePermitsInvestor(currentParticipant.snapshot, subject) &&
+    campaign.setup.publicCampaign.published === true &&
+    campaign.setup.publicCampaign.status === "open" &&
+    campaign.setup.phases.some((phase) => {
+      const result = isPhaseAcceptingParticipation(
+        phase,
+        "investor",
+        currentParticipant.snapshot.country,
+      );
+      return result.ok && result.value;
+    });
+  return Object.freeze({
+    createPersonal: permitted,
+    createCompany: permitted,
+    edit: permitted,
+    reactivatePersonal: permitted,
+    reactivateCompany: permitted,
+  });
+}
+
+function sameCampaignRevision(
+  left: CampaignSetupRevision | null,
+  right: CampaignSetupRevision | null,
+): boolean {
+  return left === null
+    ? right === null
+    : right !== null && left.revision === right.revision;
+}
+
+function sameParticipantRevision(
+  left: ParticipantProfileSnapshot | null,
+  right: ParticipantProfileSnapshot | null,
+): boolean {
+  return left === null
+    ? right === null
+    : right !== null && left.revision === right.revision;
+}
+
+function samePackageRevision(
+  left: Awaited<ReturnType<ParticipantPackageAcknowledgmentRepositories["packages"]["current"]>>,
+  right: Awaited<ReturnType<ParticipantPackageAcknowledgmentRepositories["packages"]["current"]>>,
+): boolean {
+  return left === null
+    ? right === null
+    : right !== null &&
+      left.revision === right.revision &&
+      left.snapshot.id === right.snapshot.id &&
+      left.snapshot.contentHash === right.snapshot.contentHash &&
+      left.snapshot.requiredAcceptanceHash ===
+        right.snapshot.requiredAcceptanceHash;
+}
+
+function profilePermitsInvestor(
+  profile: Readonly<{
+    subject: ActorSubject;
+    declaredInterest: string;
+    accountDeletionRequest: Readonly<{ state: string }>;
+  }>,
+  subject: ActorSubject,
+): boolean {
+  return profile.subject === subject &&
+    profile.accountDeletionRequest.state === "not-requested" &&
+    (profile.declaredInterest === "investor" ||
+      profile.declaredInterest === "both");
+}
+
+function sameAmountConfiguration(
+  left: AmountConfiguration,
+  right: AmountConfiguration,
+): boolean {
+  return left.currency === right.currency &&
+    left.minimum === right.minimum &&
+    left.increment === right.increment &&
+    left.maximum === right.maximum;
+}
+
+function investmentIndicationIdForOperation(
+  operationId: StorageOperationId,
+): InvestmentIndicationId {
+  const parsed = parseStableId<"investment-indication">(operationId);
+  if (!parsed.ok) throw new StorageFailure("UNAVAILABLE");
+  return parsed.value;
+}
+
+async function founderCreationPolicyRevision(
+  repositories: ParticipantFounderApplicationRepositories,
+  subject: ActorSubject,
+  expectedChoices: readonly ContributionAreaChoice[],
+): Promise<Readonly<{
+  campaignSetupRevision: number;
+  participantProfileRevision: number;
+}> | null> {
+  const [campaign, currentParticipant] = await Promise.all([
+    repositories.campaign.readSetup(),
+    repositories.participant.current(),
+  ]);
+  if (
+    campaign === null ||
+    expectedChoices.length === 0 ||
+    currentParticipant === null ||
+    !profilePermitsFounder(currentParticipant.snapshot, subject) ||
+    campaign.setup.publicCampaign.published !== true ||
+    campaign.setup.publicCampaign.status !== "open" ||
+    !sameContributionAreaChoices(
+      campaign.setup.campaignPolicy.founderContributionChoices,
+      expectedChoices,
+    )
+  ) {
+    return null;
+  }
+
+  const accepting = campaign.setup.phases.some((phase) => {
+    const result = isPhaseAcceptingParticipation(
+      phase,
+      "founder",
+      currentParticipant.snapshot.country,
+    );
+    return result.ok && result.value;
+  });
+  return accepting
+    ? Object.freeze({
+        campaignSetupRevision: campaign.revision,
+        participantProfileRevision: currentParticipant.revision,
+      })
+    : null;
+}
+
+async function founderEditPolicyRevision(
+  repositories: ParticipantFounderApplicationRepositories,
+  expectedChoices: readonly ContributionAreaChoice[],
+): Promise<number | null> {
+  const campaign = await repositories.campaign.readSetup();
+  return campaign !== null &&
+      expectedChoices.length > 0 &&
+      sameContributionAreaChoices(
+        campaign.setup.campaignPolicy.founderContributionChoices,
+        expectedChoices,
+      )
+    ? campaign.revision
+    : null;
+}
+
+function profilePermitsFounder(
+  profile: Readonly<{
+    subject: ActorSubject;
+    declaredInterest: string;
+    accountDeletionRequest: Readonly<{ state: string }>;
+  }>,
+  subject: ActorSubject,
+): boolean {
+  return profile.subject === subject &&
+    profile.accountDeletionRequest.state === "not-requested" &&
+    (profile.declaredInterest === "founder" ||
+      profile.declaredInterest === "both");
+}
+
+function sameContributionAreaChoices(
+  left: readonly ContributionAreaChoice[],
+  right: readonly ContributionAreaChoice[],
+): boolean {
+  return left.length === right.length && left.every((choice, index) =>
+    choice.id === right[index]?.id && choice.label === right[index]?.label
+  );
+}
+
+function selfFounderApplicationId(): FounderApplicationId {
+  const parsed = parseStableId<"founder-application">(
+    "founder-application:self",
+  );
+  if (!parsed.ok) throw new Error("Founder application is unavailable.");
+  return parsed.value;
+}
+
+function runtimePackageRoutes(
+  runtime: ApplicationRuntimeDeploymentCapability,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  resourceUrl: string,
+  participantRequest: ParticipantRequestRepositoryScope | null,
+): RequestPackageRoutes | null {
+  try {
+    const appOrigin = new URL(resourceUrl).origin;
+    const ownerIdentity = actor !== null && isOwner
+      ? Object.freeze({ type: "owner" as const, subject: actor.userId })
+      : null;
+    const participantIdentity = actor !== null && !isOwner
+      ? Object.freeze({ type: "participant" as const, subject: actor.userId })
+      : null;
+    const repositories = runtime.repositoryFactory;
+    const session = runtime.mutationSession;
+
+    return Object.freeze({
+      owner: Object.freeze({
+        workspace: repositories.ownerPackageWorkspace(),
+        verifyMutation: (request: Request) =>
+          session.verifyMutation(request, ownerIdentity, appOrigin, {
+            maxBodyBytes: MAX_OWNER_PACKAGE_MUTATION_BYTES,
+            maxFields: MAX_OWNER_PACKAGE_MUTATION_FIELDS,
+            repeatedFormFields: [],
+          }),
+        csrfToken: (request: Request, owner: Readonly<{ subject: string }>) =>
+          ownerIdentity !== null && owner.subject === ownerIdentity.subject
+            ? session.issue(request, ownerIdentity, appOrigin)
+            : Promise.resolve(null),
+        issueOperationId: () => randomOperationId("package-operation"),
+      }),
+      participantReader: Object.freeze({
+        repositoryFor: (participantSubject: ActorSubject) =>
+          requiredParticipantRequest(participantRequest)
+            .participantPackageReader(participantSubject),
+      }),
+      participantAcknowledgment: Object.freeze({
+        repositoryFor: (participantSubject: ActorSubject) =>
+          requiredParticipantRequest(participantRequest)
+            .participantPackageAcknowledgments(participantSubject),
+        verifyMutation: (request: Request) =>
+          session.verifyMutation(
+            request,
+            participantIdentity,
+            appOrigin,
+            {
+              maxBodyBytes: MAX_ACKNOWLEDGMENT_MUTATION_BYTES,
+              maxFields: MAX_ACKNOWLEDGMENT_MUTATION_FIELDS,
+              repeatedFormFields: [],
+            },
+          ),
+        csrfTokenFor: (
+          request: Request,
+          participantSubject: string,
+        ) =>
+          participantIdentity !== null &&
+            participantSubject === participantIdentity.subject
+            ? session.issue(request, participantIdentity, appOrigin)
+            : Promise.resolve(null),
+        now: runtime.now,
+        createOperationId: () =>
+          randomOperationId("package-acknowledgment"),
+      }),
+    });
+  } catch {
+    return null;
+  }
+}
+
+function randomOperationId(namespace: string): StorageOperationId {
+  const parsed = parseStorageOperationId(
+    `${namespace}:${crypto.randomUUID()}`,
+  );
+  if (!parsed.ok) throw new Error("Unable to issue a package operation ID.");
+  return parsed.value;
+}
+
+async function runtimeOwnerIndicationModeration(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  resourceUrl: string,
+  pathname: string,
+): Promise<OwnerIndicationModerationRouteDependencies | undefined> {
+  const exactResource = pathname === OWNER_INDICATIONS_PATH ||
+    pathname.startsWith(`${OWNER_INDICATIONS_PATH}/`);
+  if (
+    runtime === null ||
+    runtime.ownerIndicationReviewTokens === undefined ||
+    (pathname !== "/owner" && !exactResource)
+  ) {
+    return undefined;
+  }
+  if (actor === null || !isOwner) {
+    return exactResource ? unavailableOwnerIndicationModeration() : undefined;
+  }
+  const owner = parseActorSubject(actor.userId);
+  if (!owner.ok) {
+    return exactResource ? unavailableOwnerIndicationModeration() : undefined;
+  }
+
+  try {
+    const campaign = await runtime.repositoryFactory
+      .campaignRepository()
+      .readSetup();
+    if (campaign === null) {
+      return exactResource ? unavailableOwnerIndicationModeration() : undefined;
+    }
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "owner" as const,
+      subject: owner.value,
+    });
+    return Object.freeze({
+      repository: runtime.repositoryFactory.ownerIndicationModeration(
+        owner.value,
+        owner.value,
+        campaign.setup.amountAggregate.amount,
+        runtime.ownerIndicationReviewTokens,
+      ),
+      verifyMutation: (request: Request) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          {
+            maxBodyBytes: MAX_OWNER_INDICATION_MODERATION_MUTATION_BYTES,
+            maxFields: MAX_OWNER_INDICATION_MODERATION_MUTATION_FIELDS,
+            repeatedFormFields: [],
+          },
+        ),
+      csrfToken: (request: Request) =>
+        runtime.mutationSession.issue(request, identity, appOrigin),
+      issueOperationId: () => randomOperationId("owner-rejection"),
+      now: runtime.now,
+    });
+  } catch {
+    return exactResource ? unavailableOwnerIndicationModeration() : undefined;
+  }
+}
+
+function unavailableOwnerIndicationModeration():
+  OwnerIndicationModerationRouteDependencies {
+  const unavailable = (): never => {
+    throw new StorageFailure("UNAVAILABLE");
+  };
+  return Object.freeze({
+    repository: Object.freeze({
+      moderationConsistency:
+        "atomic-indication-aggregate-audit-notification" as const,
+      list: async () => unavailable(),
+      get: async () => unavailable(),
+      rejectWithEffects: async () => unavailable(),
+    }),
+    verifyMutation: async () => unavailable(),
+    csrfToken: async () => null,
+    issueOperationId: unavailable,
+  });
+}
+
+function runtimeOwnerAuditHistory(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+): OwnerAuditHistoryRouteDependencies | undefined {
+  if (runtime === null) return undefined;
+  try {
+    return Object.freeze({
+      audit: runtime.repositoryFactory.ownerAuditEvents(),
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function runtimeOwnerFounderReview(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+): FounderApplicationReviewCollectionRepository | undefined {
+  if (runtime === null) return undefined;
+  try {
+    return runtime.repositoryFactory.ownerFounderApplicationReviews();
+  } catch {
+    return undefined;
+  }
+}
+
+function runtimeOwnerAuditNotificationHistory(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  resourceUrl: string,
+): OwnerAuditNotificationRouteDependencies | undefined {
+  if (runtime === null) return undefined;
+  try {
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = actor !== null && isOwner
+      ? Object.freeze({ type: "owner" as const, subject: actor.userId })
+      : null;
+    const session = runtime.mutationSession;
+    return Object.freeze({
+      audit: runtime.repositoryFactory.ownerAuditEvents(),
+      notifications:
+        runtime.repositoryFactory.ownerManualNotificationActivity(),
+      mutationVerificationMode: "persistent-claim" as const,
+      verifyMutation: (
+        request,
+        validateBeforeReplayClaim,
+        exactReplayScopeFor,
+      ) =>
+        session.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          {
+            maxBodyBytes: MAX_OWNER_NOTIFICATION_MUTATION_BYTES,
+            maxFields: ownerNotificationMutationFieldLimit(request),
+            repeatedFormFields: [],
+            validateBeforeReplayClaim,
+            exactReplayScopeFor,
+          },
+        ),
+      csrfToken: (request, exactReplayScope = null) =>
+        exactReplayScope === null
+          ? session.issue(request, identity, appOrigin)
+          : session.issueExactReplay(
+              request,
+              identity,
+              appOrigin,
+              exactReplayScope,
+            ),
+      issueOperationId: () =>
+        randomOperationId("manual-notification-activity"),
+      now: runtime.now,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function runtimeOwnerFounderReviewDetail(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+): FounderApplicationReviewDetailRepository | undefined {
+  if (runtime === null) return undefined;
+  try {
+    return runtime.repositoryFactory.ownerFounderApplicationReviewDetail();
+  } catch {
+    return undefined;
+  }
+}
+
+const OWNER_AGGREGATE_RECONCILIATION_PATH =
+  "/owner/aggregate-reconciliation";
+
+async function runtimeOwnerAggregateReconciliation(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  resourceUrl: string,
+  pathname: string,
+): Promise<OwnerAggregateReconciliationRouteOptions | undefined> {
+  if (
+    runtime === null ||
+    (pathname !== "/owner" &&
+      pathname !== OWNER_AGGREGATE_RECONCILIATION_PATH)
+  ) {
+    return undefined;
+  }
+  if (actor === null || !isOwner) {
+    return pathname === OWNER_AGGREGATE_RECONCILIATION_PATH
+      ? unavailableOwnerAggregateReconciliationRoute()
+      : undefined;
+  }
+
+  const ownerSubject = parseActorSubject(actor.userId);
+  if (!ownerSubject.ok) {
+    return pathname === OWNER_AGGREGATE_RECONCILIATION_PATH
+      ? unavailableOwnerAggregateReconciliationRoute()
+      : undefined;
+  }
+
+  try {
+    const campaign = await runtime.repositoryFactory.campaignRepository()
+      .readSetup();
+    if (campaign === null) {
+      return pathname === OWNER_AGGREGATE_RECONCILIATION_PATH
+        ? unavailableOwnerAggregateReconciliationRoute()
+        : undefined;
+    }
+    const appOrigin = new URL(resourceUrl).origin;
+    const identity = Object.freeze({
+      type: "owner" as const,
+      subject: ownerSubject.value,
+    });
+    return Object.freeze({
+      repository: runtime.repositoryFactory.ownerAggregateReconciliation(
+        ownerSubject.value,
+        campaign,
+      ),
+      guardMutation: (request: Request) =>
+        runtime.mutationSession.verifyMutation(
+          request,
+          identity,
+          appOrigin,
+          {
+            maxBodyBytes:
+              MAX_OWNER_AGGREGATE_RECONCILIATION_MUTATION_BYTES,
+            maxFields:
+              ownerAggregateReconciliationMutationFieldLimit(request),
+            repeatedFormFields: [],
+            validateBeforeReplayClaim:
+              isExactOwnerAggregateReconciliationMutation,
+            exactReplayScopeFor: ownerAggregateCorrectionReplayScopeFor,
+          },
+        ),
+      csrfToken: (request: Request, exactReplayScope: string | null) =>
+        exactReplayScope === null
+          ? runtime.mutationSession.issue(request, identity, appOrigin)
+          : runtime.mutationSession.issueExactReplay(
+              request,
+              identity,
+              appOrigin,
+              exactReplayScope,
+            ),
+      issueOperationId: () => randomOperationId("aggregate-correction"),
+      now: runtime.now,
+    });
+  } catch {
+    return pathname === OWNER_AGGREGATE_RECONCILIATION_PATH
+      ? unavailableOwnerAggregateReconciliationRoute()
+      : undefined;
+  }
+}
+
+function unavailableOwnerAggregateReconciliationRoute():
+  OwnerAggregateReconciliationRouteOptions {
+  return Object.freeze({
+    repository: Object.freeze({
+      correctionConsistency: "unavailable" as const,
+      previewReconciliation: () =>
+        Promise.reject(new StorageFailure("UNAVAILABLE")),
+    }),
+    guardMutation: () =>
+      Promise.reject(new StorageFailure("UNAVAILABLE")),
+    csrfToken: () => Promise.resolve(null),
+  });
+}
+
+async function resolveApplicationRuntime(
+  dependencies: ApplicationWorkerDependencies,
+  env: InvestorAppEnv,
+): Promise<ApplicationRuntimeDeploymentCapability | null> {
+  if (dependencies.applicationRuntime !== undefined) {
+    return dependencies.applicationRuntime;
+  }
+  try {
+    return await dependencies.resolveApplicationRuntime?.(env) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveOwnerOAuthProof(
+  dependencies: ApplicationWorkerDependencies,
+  env: InvestorAppEnv,
+): Promise<OwnerOAuthProofRouteDependencies | null> {
+  if (dependencies.ownerOAuthProof !== undefined) {
+    return dependencies.ownerOAuthProof;
+  }
+  try {
+    return await dependencies.resolveOwnerOAuthProof?.(env) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function canonicalResourceUrl(url: URL, appOrigin: string): string {
+  return new URL(`${url.pathname}${url.search}`, `${appOrigin}/`).href;
+}
+
+function withRuntimeConfiguration(
+  request: Request,
+  env: InvestorAppEnv,
+  participantAccess: AuthorizedParticipantAccess | null,
+  campaign: PublicCampaignConfiguration | null,
+  publicAggregate: PublishedPublicCampaignState["aggregate"],
+  capabilities: Readonly<{
+    ownerPackageWorkspace: boolean;
+    ownerIndicationModeration: boolean;
+    ownerReviewExports: boolean;
+    ownerAuditHistory: boolean;
+    ownerFounderReview: boolean;
+    ownerNotificationHistory: boolean;
+    ownerAggregateReconciliation: boolean;
+    participantFounderInterest: boolean;
+    participantInvestmentInterests: boolean;
+    participantProfileSelfService: boolean;
+    ownerCampaignEditor: boolean;
+    ownerCampaignSetup: boolean;
+    ownerAittadbConnection: boolean;
+  }>,
+  preview: RuntimeCampaignPreview | null,
+): Request {
+  return withRuntimeCampaignPreview(
+    withRuntimeCapabilities(
+      withRuntimeParticipantAccess(
+        withRuntimePublicAggregate(
+          withRuntimeCampaign(
+            withRuntimeOwner(
+              withAppOrigin(request, env.APP_BASE_URL),
+              preview === null ? env.OWNER_EMAIL : undefined,
+            ),
+            campaign === null ? undefined : JSON.stringify(campaign),
+          ),
+          publicAggregate,
+        ),
+        participantAccess,
+      ),
+      capabilities,
+    ),
+    preview,
+  );
+}
+
+async function resolvePublicCampaign(
+  reader: PublicCampaignPresentationReader | undefined,
+  bootstrapConfiguration: string | undefined,
+): Promise<PublicCampaignConfiguration | null> {
+  if (reader === undefined) {
+    return parsePublicCampaignConfiguration(bootstrapConfiguration);
+  }
+  try {
+    return await reader.readPublishedCampaign();
+  } catch {
+    return null;
+  }
+}
+
+function resolvePublicCampaignStateReader(
+  dependencies: ApplicationWorkerDependencies,
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+): PublicCampaignStateReader | undefined {
+  if (dependencies.publicCampaignStateReader !== undefined) {
+    return dependencies.publicCampaignStateReader;
+  }
+  if (
+    runtime === null ||
+    dependencies.publicCampaignReader !== undefined ||
+    dependencies.campaignWorkspace !== undefined ||
+    dependencies.resolveCampaignWorkspace !== undefined
+  ) {
+    return undefined;
+  }
+  try {
+    return runtime.repositoryFactory.publicCampaignStateReader();
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolvePublicCampaignState(
+  stateReader: PublicCampaignStateReader | undefined,
+  campaignReader: PublicCampaignPresentationReader | undefined,
+  bootstrapConfiguration: string | undefined,
+): Promise<PublishedPublicCampaignState | null> {
+  if (stateReader !== undefined) {
+    try {
+      return await stateReader.readPublishedState();
+    } catch {
+      return null;
+    }
+  }
+  const campaign = await resolvePublicCampaign(
+    campaignReader,
+    bootstrapConfiguration,
+  );
+  return campaign === null
+    ? null
+    : Object.freeze({ campaign, aggregate: null });
+}
+
+async function resolveOwnerCampaign(
+  workspace: CampaignWorkspaceDeploymentCapability,
+  fallback: PublicCampaignConfiguration | null,
+): Promise<PublicCampaignConfiguration | null> {
+  try {
+    return (await workspace.repository.readSetup())?.setup.publicCampaign ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function resolveCampaignWorkspace(
+  dependencies: ApplicationWorkerDependencies,
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  appOrigin: string,
+): CampaignWorkspaceDeploymentCapability | null {
+  if (dependencies.campaignWorkspace) return dependencies.campaignWorkspace;
+  try {
+    const injected = dependencies.resolveCampaignWorkspace?.() ?? null;
+    if (injected !== null) return injected;
+    if (runtime === null) return null;
+    return Object.freeze({
+      repository: runtime.repositoryFactory.campaignRepository(),
+      publicReader: runtime.repositoryFactory.publicCampaignReader(),
+      checkPublicationReadiness: async () => runtime.publicationReady === true,
+      mutationSession: runtime.mutationSession,
+      appOrigin,
+      now: runtime.now,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function isOwnerPath(pathname: string): boolean {
+  return pathname === "/owner" || pathname.startsWith("/owner/");
+}
+
+type ParticipantAccessResolution =
+  | Readonly<{ kind: "authorized"; access: AuthorizedParticipantAccess }>
+  | Readonly<{ kind: "missing" | "unavailable"; access: null }>;
+
+async function resolveParticipantAccess(
+  actor: AuthenticatedActor | null,
+  reader: ParticipantAccessStateReader | undefined,
+): Promise<ParticipantAccessResolution> {
+  if (actor === null || reader === undefined) {
+    return Object.freeze({ kind: "unavailable", access: null });
+  }
+
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (!account.ok) {
+    return Object.freeze({ kind: "unavailable", access: null });
+  }
+
+  try {
+    const state = await reader.read(account.value);
+    if (state === null) {
+      return Object.freeze({ kind: "missing", access: null });
+    }
+    const access = authorizeParticipantAccess(account.value, state);
+    return access === null
+      ? Object.freeze({ kind: "unavailable", access: null })
+      : Object.freeze({ kind: "authorized", access });
+  } catch {
+    return Object.freeze({ kind: "unavailable", access: null });
+  }
+}
+
+function runtimeParticipantRequest(
+  runtime: ApplicationRuntimeDeploymentCapability | null,
+  actor: AuthenticatedActor | null,
+  isOwner: boolean,
+  pathname: string,
+): ParticipantRequestRepositoryScope | null {
+  if (
+    runtime === null ||
+    actor === null ||
+    isOwner ||
+    !isParticipantAccessPath(pathname)
+  ) {
+    return null;
+  }
+  const account = parseParticipantAccount({
+    subject: actor.userId,
+    accountEmailLabel: actor.email,
+  });
+  if (!account.ok) return null;
+  try {
+    return runtime.repositoryFactory.participantRequest(account.value);
+  } catch {
+    return null;
+  }
+}
+
+function requiredParticipantRequest(
+  value: ParticipantRequestRepositoryScope | null,
+): ParticipantRequestRepositoryScope {
+  if (value === null) {
+    throw new Error("Participant request repositories are unavailable.");
+  }
+  return value;
+}
+
+function isParticipantAccessPath(pathname: string): boolean {
+  return pathname !== PARTICIPANT_REGISTRATION_PATH &&
+    (pathname === "/" ||
+    pathname === "/participant" ||
+    pathname.startsWith("/participant/"));
+}
+
+function authenticatedActor(request: Request): AuthenticatedActor | null {
+  const userId = request.headers.get("oai-authenticated-user-id")?.trim();
+  const email = request.headers.get("oai-authenticated-user-email")?.trim();
+
+  if (!userId || !email) return null;
+  const subject = parseActorSubject(userId);
+  if (!subject.ok) return null;
+
+  return {
+    userId: subject.value,
+    email,
+    displayName: email,
+  };
+}

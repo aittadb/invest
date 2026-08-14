@@ -1,0 +1,53 @@
+{
+  "name": "@aittadb/invest",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
+    "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
+    "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
+    "test": "npm run build && npm run runtime-secrets:check && node --experimental-strip-types --test tests/*.test.mjs tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "agents:check": "node scripts/check-agents-size.mjs",
+    "plan:check": "node scripts/check-plan.mjs",
+    "instances:check": "node scripts/check-instance-boundaries.mjs",
+    "runtime-secrets:check": "node scripts/check-runtime-secret-boundaries.mjs",
+    "hosted-storage:prove": "node --experimental-strip-types scripts/prove-hosted-storage-adapter.ts",
+    "sites:archive": "node scripts/package-sites-archive.mjs",
+    "sites:package": "node scripts/require-active-hosting.mjs && npm run build && npm run sites:archive && node scripts/check-runtime-secret-boundaries.mjs --archive work/sites-package.tar.gz",
+    "validate": "npm run agents:check && npm run plan:check && npm run instances:check && npm run lint && npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "mdast-util-from-markdown": "2.0.3",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "1.37.1",
+    "@eslint/js": "9.39.4",
+    "@next/eslint-plugin-next": "16.2.6",
+    "@tailwindcss/postcss": "4.2.1",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "@vitejs/plugin-rsc": "0.5.26",
+    "eslint": "9.39.4",
+    "eslint-plugin-jsx-a11y": "6.10.2",
+    "eslint-plugin-react": "7.37.5",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "16.4.0",
+    "react-server-dom-webpack": "19.2.6",
+    "tailwindcss": "4.2.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.59.3",
+    "vinext": "1.0.0-beta.2",
+    "vite": "8.0.13",
+    "wrangler": "4.92.0"
+  },
+  "type": "module"
+}

@@ -1,0 +1,149 @@
+.oauth-proof-page {
+  margin: 0;
+  min-height: 100vh;
+  background: #f4f6f8;
+  color: #17212b;
+  font-family: system-ui, "Segoe UI", sans-serif;
+  letter-spacing: 0;
+}
+
+.oauth-proof-page *,
+.oauth-proof-page *::before,
+.oauth-proof-page *::after {
+  box-sizing: border-box;
+}
+
+.oauth-proof-main {
+  width: min(100% - 32px, 720px);
+  margin: 0 auto;
+  padding: 56px 0 80px;
+}
+
+.oauth-proof-back {
+  display: inline-flex;
+  margin-bottom: 48px;
+  color: #245b47;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.oauth-proof-back:focus-visible,
+.oauth-proof-button:focus-visible,
+.oauth-proof-form button:focus-visible {
+  outline: 3px solid #0b6bcb;
+  outline-offset: 3px;
+}
+
+.oauth-proof-kicker {
+  margin: 0 0 8px;
+  color: #52606d;
+  font-size: 0.875rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.oauth-proof-main h1 {
+  margin: 0;
+  max-width: 18ch;
+  font-size: 2.5rem;
+  line-height: 1.08;
+}
+
+.oauth-proof-intro {
+  max-width: 58ch;
+  margin: 20px 0 32px;
+  color: #3f4d59;
+  font-size: 1.0625rem;
+  line-height: 1.65;
+}
+
+.oauth-proof-panel {
+  border: 1px solid #c9d2da;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 24px;
+}
+
+.oauth-proof-panel > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid #dce2e7;
+  padding-bottom: 16px;
+}
+
+.oauth-proof-panel p {
+  margin: 16px 0 0;
+  line-height: 1.6;
+}
+
+.oauth-proof-panel > div p {
+  margin: 0;
+  color: #52606d;
+}
+
+.oauth-proof-panel h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.oauth-proof-form {
+  margin-top: 24px;
+}
+
+.oauth-proof-form button,
+.oauth-proof-button {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #174f3c;
+  border-radius: 6px;
+  background: #245b47;
+  color: #ffffff;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  padding: 10px 18px;
+  text-decoration: none;
+}
+
+.oauth-proof-form button:hover,
+.oauth-proof-button:hover {
+  background: #174f3c;
+}
+
+.oauth-proof-status {
+  color: #7a3e14;
+}
+
+@media (max-width: 560px) {
+  .oauth-proof-main {
+    width: min(100% - 24px, 720px);
+    padding: 32px 0 56px;
+  }
+
+  .oauth-proof-back {
+    margin-bottom: 32px;
+  }
+
+  .oauth-proof-main h1 {
+    font-size: 2rem;
+  }
+
+  .oauth-proof-panel {
+    padding: 18px;
+  }
+
+  .oauth-proof-panel > div {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .oauth-proof-form button,
+  .oauth-proof-button {
+    width: 100%;
+  }
+}
